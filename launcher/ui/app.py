@@ -563,6 +563,7 @@ class App:
                         'Look for a new version of NX2navi each time the launcher opens. Nothing is installed '
                         'until you choose Update.'),
             self.channel_row(),
+            self.shader_workers_row(),
             Row('divider'),
             Row('action', 'Begin Installation', on=self.begin_install, desc=begin_desc, enabled=True),
         ]
@@ -585,6 +586,24 @@ class App:
                    left=flip, right=flip,
                    desc=('Stable gets each finished release. Preview also gets test builds before they are '
                          'released, which may have new problems.',))
+
+    def shader_workers_row(self):
+        maximum = min(64, (getattr(os, 'process_cpu_count', os.cpu_count)() or 1))
+
+        def value():
+            return min(maximum, self.settings['shader_workers'])
+
+        def adjust(delta):
+            limit = max(0, min(maximum, value() + delta))
+            self.settings['shader_workers'] = limit
+            if self.job is not None:
+                self.job.set_shader_workers(limit)
+            self.settings.save()
+
+        return Row('enum', 'Max Shader Workers', get=lambda: str(value()) if value() else 'Auto',
+                   left=lambda: adjust(-1), right=lambda: adjust(1),
+                   desc=('Limits shader translation and driver compilation during installation. Lowering it lets '
+                         'active shaders finish. Auto uses the default for each phase.',))
 
     def choose_dump(self):
         start = str(Path(self.settings.get('dump')).parent) if self.settings.get('dump') else str(Path.home())
@@ -829,6 +848,7 @@ class App:
             self.toggle('Keep Build Cache', 'keep_cache',
                         'Keep the translated code and compiled files (about 5 GB) in the game folder, so an update '
                         'compiles only what changed. Off: they are deleted after each build.'),
+            self.shader_workers_row(),
             self.channel_row(),
             Row('divider'),
             Row('value', 'Game Folder', gd or 'Not chosen', on=lambda: gd and self.open(gd),
@@ -896,12 +916,15 @@ class App:
             if st.id in ('romfs', 'verify') and st is not j.steps[-1]:
                 rows.append(Row('divider'))
         if j.result is None:
+            if j.step('shaders'):
+                rows.append(self.shader_workers_row())
             label = {'install': 'Cancel Installation', 'update': 'Cancel Update'}.get(j.kind, 'Cancel')
             rows.append(Row('action', label, on=self.cancel_job, height=44))
         elif j.result == 'failed':
             rows.append(Row('pair', actions=[('Try Again', self.retry_job), ('Copy Report', self.copy_report)]))
         for r in rows:
-            r.desc = self.job_desc
+            if r.desc is None:
+                r.desc = self.job_desc
         return rows
 
     def job_focus(self):
@@ -1049,8 +1072,10 @@ class App:
                     if self.job.result is not None:
                         self.job_finished()
                     else:
+                        adjusting = self.focused() and self.focused().kind == 'enum'
                         self.rows = self.rows_job()
-                        self.focus = self.job_focus()
+                        if not adjusting:
+                            self.focus = self.job_focus()
                         self.render()
                 elif int(time.time()) != self.last_second and self.job.result is None:
                     self.render()
@@ -1076,9 +1101,10 @@ class App:
             if not (0 <= self.focus < len(self.rows)) or not self.rows[self.focus].focusable:
                 self.focus = self.job_focus()
         x0, x1, y = ROWS
+        gap = min(GAP, (H - 42 - y - sum(r.h for r in self.rows)) // max(1, len(self.rows) - 1))
         for i, r in enumerate(self.rows):
             self.draw_row(r, self.X(x0), self.X(y), self.X(x1), self.X(y + r.h))
-            y += r.h + GAP
+            y += r.h + gap
         self.draw_status()
         self.draw_cursor()
         self.draw_desc()

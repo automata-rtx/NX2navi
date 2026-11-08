@@ -10,6 +10,7 @@ DEFAULTS = {
     'channel': 'stable',          # 'stable' or 'preview' (GitHub pre-releases)
     'hide_while_playing': True,   # hide the window while the game runs, show it again when it exits
     'keep_cache': True,           # keep build-cache/ (the lift and objects) so an update recompiles only changes
+    'shader_workers': 0,          # 0 selects the automatic limit for each preparation phase
     'desktop_shortcut': True,
     'feed_repo': '',              # owner/name overriding feed.json, for testing a fork's releases
     'github_token': '',           # only for a private release repository; stored as plain text
@@ -28,6 +29,7 @@ class Settings(dict):
                 self.update({k: v for k, v in data.items() if k in DEFAULTS and type(v) is type(DEFAULTS[k])})
         except (OSError, ValueError):
             pass
+        self['shader_workers'] = max(0, min(64, self['shader_workers']))
 
     def save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)

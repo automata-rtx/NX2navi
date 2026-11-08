@@ -43,6 +43,7 @@
 #include "gfx.h"
 #include "host.h"
 #include "platform/platform.h"
+#include "shader_workers.h"
 
 #define CONTROL_SIZE 0x880
 #define CODE_SKIP 0x30                                     // graphics code starts after the first 0x30 bytes of the program
@@ -536,6 +537,11 @@ static void key_hex(const uint8_t key[32], char out[65]) {
     static const char hex[] = "0123456789abcdef";
     for (int i = 0; i < 32; i++) out[i * 2] = hex[key[i] >> 4], out[i * 2 + 1] = hex[key[i] & 15];
     out[64] = 0;
+}
+
+void gfx_shader_cache_identity(char translator[65], const char **storage) {
+    key_hex(xlate_id, translator);
+    *storage = cache_dir;
 }
 
 // A .res.json the translator wrote: one JSON object that names its stage, no NUL inside. A file an interrupted write
@@ -2155,7 +2161,8 @@ typedef struct {
     const uint8_t *ans;
     size_t n_ans;
     uint8_t (*iid)[32];                                    // per answers record: the resolved input id, zero on failure
-    volatile int64_t next, done, missing, failed, refined;
+    ShaderWork work;
+    volatile int64_t done, missing, failed, refined;
 } Prep;
 
 static int prg_cmp(const void *x, const void *y) { return memcmp(((const PrgIdx *)x)->rec + 12, ((const PrgIdx *)y)->rec + 12, 32); }
@@ -2167,9 +2174,8 @@ static void prg_collect(const uint8_t *rec, void *ctx) {
 
 static void prep_worker(void *arg) {
     Prep *p = arg;
-    for (;;) {
-        size_t i = (size_t)plat_inc64(&p->next) - 1;
-        if (i >= p->n_ans) return;
+    size_t i = SIZE_MAX;
+    while ((i = shader_work_next(&p->work, i)) != SIZE_MAX) {
         const uint8_t *r = p->ans + i * ANS_REC;
         uint8_t key_rec[12 + 32];
         memcpy(key_rec + 12, r + 4, 32);
@@ -2209,13 +2215,18 @@ static long long prepare_files(const char *ans_path, const char *prg_path, int t
         return -1;
     }
     Prep p = {.progs = {calloc(pn / PRG_HEAD + 1, sizeof(PrgIdx)), 0}, .ans = ab, .n_ans = an / ANS_REC};
+    if (!shader_work_open(&p.work, p.n_ans, procs, iid_out != NULL)) {
+        rt_log("gfx_shader: cannot open the launcher's shader worker control");
+        return free(p.progs.idx), free(ab), free(pb), -1;
+    }
+    if (!p.work.limit) p.work.automatic = 64;   // the translator pool itself limits standalone runs
     if (iid_out) p.iid = calloc(p.n_ans + 1, 32);
     if (!p.progs.idx || (iid_out && !p.iid)) return free(p.progs.idx), free(p.iid), free(ab), free(pb), -1;
     prg_walk(pb, pn, prg_collect, &p.progs);
     qsort(p.progs.idx, p.progs.n, sizeof *p.progs.idx, prg_cmp);
     uint64_t xl0 = (uint64_t)n_xlated;
     threads = threads < 1 ? 1 : threads > 64 ? 64 : threads;
-    svc_set_limit(procs);
+    svc_set_limit(p.work.limit ? threads : procs);
     PlatThread *t[64];
     int k = 0;
     for (int i = 0; i < threads; i++)

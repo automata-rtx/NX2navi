@@ -79,6 +79,7 @@ void gfx_shader_prepare_recorded(int threads, int procs);
 // nx2navi.exe --prepare-shaders: translates <dir>/seed-answers.bin + seed-programs.bin (tools/prepare_shaders.py) and
 // writes <dir>/shader-prepared.bin (stage, priority, input id per variant). 0 on success.
 int gfx_shader_prepare_seed(const char *dir, int threads, int procs);
+void gfx_shader_cache_identity(char translator[65], const char **storage);   // after gfx_shader_set_host
 // gfx_shader_guess.c: the answers of a prepared default variant, read from its first translation s: vertex inputs the
 // shader reads as integers become uint, a compute shader's textures and images take the types its translation
 // declares. 1 when *out differs from *a (translate again with *out).

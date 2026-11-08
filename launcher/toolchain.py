@@ -156,7 +156,7 @@ def load_lock(layout, version='dev'):
         if lock.get('format') != LOCK_FORMAT:
             raise ToolchainError(f'{layout.lock_file}: unknown format {lock.get("format")}')
         return lock
-    return make_lock(version=version)
+    return make_lock(version=version, fast_repo=FAST_REPO)
 
 
 # ---------------------------------------------------------------- install
@@ -175,6 +175,8 @@ def missing_files(msys):
 
 def is_current(layout, lock):
     inst = installed(layout)
+    if lock.get('fast_repo') and not (layout.msys_root / 'clang64/bin/clang.exe').is_file():
+        return False
     return bool(inst) and inst.get('digest') == lock_digest(lock) and not missing_files(layout.msys)
 
 

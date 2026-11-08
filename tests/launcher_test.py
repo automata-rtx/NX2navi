@@ -31,6 +31,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 import zipfile
 from pathlib import Path
 
@@ -268,6 +269,28 @@ class SettingsTest(Tmp):
         self.assertEqual((s['auto_check'], s['channel']), (True, 'preview'))
         self.assertNotIn('junk', s)
 
+    def test_shader_worker_arrows(self):
+        try:
+            from launcher.ui.app import App
+        except ImportError:
+            self.skipTest('needs the launcher UI dependencies')
+        app = App.__new__(App)
+        app.settings = settings.Settings(self.layout.settings)
+        app.job = None
+        app.settings['shader_workers'] = 12
+        with patch('launcher.ui.app.os.process_cpu_count', return_value=16, create=True):
+            row = app.shader_workers_row()
+            self.assertEqual(row.get(), '12')
+            for _ in range(4):
+                row.left()
+            self.assertEqual(row.get(), '8')
+            self.assertEqual(settings.Settings(self.layout.settings)['shader_workers'], 8)
+            for _ in range(9):
+                row.left()
+            self.assertEqual(row.get(), 'Auto')
+            row.right()
+            self.assertEqual(row.get(), '1')
+
 
 # ---------------------------------------------------------------- toolchain
 
@@ -316,6 +339,8 @@ class ToolchainTest(Tmp):
         self.assertFalse((fast / 'bin' / 'clang-repl.exe').exists())
         self.assertFalse((fast / 'share').exists())
         self.assertTrue(toolchain.is_current(self.layout, lock))
+        (fast / 'bin' / 'clang.exe').unlink()
+        self.assertFalse(toolchain.is_current(self.layout, lock))
 
     def test_fast_clang_left_out_on_another_version(self):
         repo = self.tmp / 'repo'
@@ -795,14 +820,14 @@ class MakeGameTest(Tmp):
         (kits[1] / 'runtime' / 'h.h').write_text('#define V 2\n')        # the new version changed the header
         self.assertEqual(go(kits[1])[:2], (1, 0))
 
-    def main_with(self, romfs, lift, compile_):
+    def main_with(self, romfs, lift, compile_, until='compile'):
         """make_game.main() in this process for a first build, with the given step functions in place of the real
         lift and compile (they need real modules and clang). Returns the SystemExit code, or 0."""
         sys.path.insert(0, str(self.layout.pydeps))   # the fake zbic
         saved = (self.mg.step_romfs, self.mg.step_lift, self.mg.step_compile, sys.argv)
         self.mg.step_romfs, self.mg.step_lift, self.mg.step_compile = romfs, lift, compile_
         sys.argv = ['make_game.py', '--nup', str(self.nup), '--out', str(self.out), '--msys', str(self.msys),
-                    '--until', 'compile']   # the shaders step needs the shader translator
+                    '--until', until]
         try:
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 self.mg.main()
@@ -812,6 +837,49 @@ class MakeGameTest(Tmp):
         finally:
             self.mg.step_romfs, self.mg.step_lift, self.mg.step_compile, sys.argv = saved
             sys.path.remove(str(self.layout.pydeps))
+
+    def test_independent_shader_cache(self):
+        cache = self.out / 'shader-cache'
+        launches = []
+
+        def prepare(out):
+            launches.append('shaders')
+            (out / 'shader-prepared.bin').write_bytes(struct.pack('<8sII', b'NX2NSPRP', 1, 36) + bytes(36))
+            cache.mkdir(exist_ok=True)
+            (cache / 'test.spv').touch()
+
+        def compile_(out, cache_dir, msys, jobs, romfs_job=None):
+            launches.append('compile')
+            if romfs_job:
+                romfs_job.join()
+
+        def build_game():
+            self.assertEqual(self.main_with(self.mg.step_romfs, lambda *_: None, compile_, 'shaders'), 0)
+
+        with patch.object(self.mg, 'step_shaders', prepare), patch.object(self.mg, 'shader_device',
+                return_value=('driver A', cache)) as device:
+            build_game()
+            with patch.object(self.mg, 'kit_version', return_value='new native build'):
+                build_game()
+                self.assertEqual(launches, ['compile', 'shaders', 'compile'])
+                device.return_value = ('driver B', cache)
+                build_game()
+                (cache / 'test.spv').unlink()
+                build_game()
+                (self.out / 'shader-prepared.bin').unlink()
+                build_game()
+                build_game()
+                self.assertEqual(launches[3:], ['shaders'] * 3)
+
+        kit = self.tmp / 'test kit'
+        runtime = kit / 'runtime'
+        runtime.mkdir(parents=True)
+        with patch.object(self.mg, 'KIT', kit):
+            before = self.mg.shader_key(self.out, 'driver', cache)
+            (runtime / 'input_map.c').write_text('/* controller changes */')
+            self.assertEqual(before, self.mg.shader_key(self.out, 'driver', cache))
+            (runtime / 'gfx_shader_guess.c').write_text('/* shader variant changes */')
+            self.assertNotEqual(before, self.mg.shader_key(self.out, 'driver', cache))
 
     def test_romfs_beside_lift_and_compile(self):
         """A first build packs the RomFS image while the lift and the compile run; the compile gets the running step
@@ -977,6 +1045,42 @@ ev(ev='end', exe='x')
 
 
 class JobTest(Tmp):
+    @unittest.skipUnless(os.name == 'nt' and shutil.which('clang') and shutil.which('ld.lld'),
+                         'needs Windows and the MSYS2 clang and lld on PATH')
+    def test_live_shader_worker_limit(self):
+        exe = self.tmp / 'queue.exe'
+        subprocess.run(['clang', '-std=gnu11', '-O1', '-Iruntime', '-ffunction-sections', '-fdata-sections',
+                        'tests/shader_workers_check.c', 'runtime/platform/win32.c', '-fuse-ld=lld', '-Wl,--gc-sections',
+                        '-lwinmm', '-lbcrypt', '-o', str(exe)], cwd=ROOT, check=True)
+        ctx = self.make_ctx('ok')
+        ctx.settings['shader_workers'] = 12
+        job = jobs.InstallJob(ctx, self.tmp / 'g.nup', self.tmp / 'game')
+        # The normal build runner supplies the mapping to its descendants. The synthetic build acknowledges
+        # each checkpoint once the launcher has actually changed the byte, as the native workers see it.
+        ctx.layout.make_game.write_text(
+            'import mmap, os, subprocess, sys, time\n'
+            f'with subprocess.Popen([{str(exe)!r}], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as p:\n'
+            '    with open(os.environ["NX2NAVI_SHADER_WORKER_FILE"], "rb") as f, '
+            'mmap.mmap(f.fileno(), 1, access=mmap.ACCESS_READ) as limit:\n'
+            '        for line in p.stdout:\n'
+            '            print(line.strip(), flush=True)\n'
+            '            deadline = time.monotonic() + 5\n'
+            '            while limit[0] != int(line.split()[1]) and time.monotonic() < deadline: time.sleep(.01)\n'
+            '            p.stdin.write("\\n"); p.stdin.flush()\n'
+            '    sys.exit(p.wait())\n')
+        changes = []
+
+        def log(line):
+            if line in ('set 8', 'set 12'):
+                changes.append(line)
+                job.set_shader_workers(int(line.split()[1]))
+
+        self.patch_tools()
+        with patch.object(job, 'log', log):
+            job.run_inline()
+        self.assertEqual(job.result, 'ok', job.error)
+        self.assertEqual(changes, ['set 8', 'set 12'])
+
     def make_ctx(self, mode):
         app = self.tmp / 'app'
         (app / 'tools').mkdir(parents=True)

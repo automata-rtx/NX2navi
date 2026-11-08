@@ -473,13 +473,13 @@ def pe_imports(path):
     return names
 
 
-def copy_if_changed(src, dst):
+def copy_if_changed(src, dst, force=False):
     """Copy src over dst unless dst already has its size and modification time. A file the running game holds open
     cannot be replaced on Windows: that stops the build with a message instead of a traceback."""
     s = os.stat(src)
     try:
         d = os.stat(dst)
-        if d.st_size == s.st_size and int(d.st_mtime) == int(s.st_mtime):
+        if not force and d.st_size == s.st_size and int(d.st_mtime) == int(s.st_mtime):
             return False
     except FileNotFoundError:
         pass
@@ -966,8 +966,11 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None):
             fail(f'{exe} is in use: close the game and try again')
         state_link.write_text(link_key, encoding='utf-8')
     copy_if_changed(gen / 'romfs-index.bin', out / 'romfs-index.bin')
-    for name in ('nx2navi_xlate.exe', 'nx2navi_xlate.id'):
-        copy_if_changed(KIT / 'bin' / name, out / name)
+    # Release archives can give different translator builds identical timestamps. Publish the ID last.
+    id_name = 'nx2navi_xlate.id'
+    changed = not (out / id_name).is_file() or (out / id_name).read_bytes() != (KIT / 'bin' / id_name).read_bytes()
+    for name in ('nx2navi_xlate.exe', id_name):
+        copy_if_changed(KIT / 'bin' / name, out / name, force=changed)
     if (KIT / 'bin' / 'amd_fidelityfx_vk.dll').is_file():   # FSR 3.1 (runtime/vk_ffx.cpp)
         copy_if_changed(KIT / 'bin' / 'amd_fidelityfx_vk.dll', out / 'amd_fidelityfx_vk.dll')
     say(f'  {EXE_NAME} {exe.stat().st_size / 1e6:.0f} MB; beside it: {", ".join(copy_dlls(exe, msys / "bin", out))}')
@@ -1029,6 +1032,49 @@ def cpu_tag():
         return 'any'
 
 
+# Changes to these inputs can alter the seed, stored translations, or Vulkan pipelines built by preparation.
+# The install uses prepare_shaders.py --no-list. If it starts consuming a variant list, include that list here.
+SHADER_INPUTS = ('tools/prepare_shaders.py', 'tools/shader_census.py', 'tools/zstd_compat.py',
+                 'runtime/gfx_shader.c', 'runtime/gfx_shader_guess.c', 'runtime/gfx.h', 'runtime/vk_pipeline.c',
+                 'runtime/vk_caps.c', 'runtime/vk_device.c', 'runtime/vk_formats.c', 'runtime/vk.h',
+                 'runtime/vk_gpa.c', 'runtime/vk_gpa.h', 'runtime/nvn_hmap.h', 'runtime/nvn_obj.h', 'runtime/tex.h')
+
+
+def shader_device(out):
+    # Ask the built renderer for its effective translator, Vulkan driver and pipeline-cache UUID.
+    probe = subprocess.run([str(out / EXE_NAME), '--shader-cache-id'], cwd=out, capture_output=True,
+                           encoding='utf-8', errors='replace')
+    device = re.search(r'^shader-cache-id (.+)$', probe.stdout, re.M)
+    storage = re.search(r'^shader-storage (.+)$', probe.stdout, re.M)
+    if probe.returncode or not device or not storage:
+        fail(f'could not identify the shader translator and Vulkan device: {probe.stderr[-1000:]}')
+    return device[1].strip(), out / storage[1].strip()
+
+
+def shader_key(out, device, storage):
+    # The RomFS index includes the image's content digest.
+    inputs = [str(out.resolve()), exefs_digest(out), sha256_file(out / 'romfs' / 'index.json'),
+              tree_digest(KIT, SHADER_INPUTS), device, str(storage)]
+    return 'shaders-2|' + sha256_bytes(json.dumps(inputs).encode())
+
+
+def shader_outputs_present(out, cache):
+    try:
+        manifest = out / 'shader-prepared.bin'
+        with manifest.open('rb') as f:
+            header = f.read(16)
+        size = manifest.stat().st_size
+        if header != struct.pack('<8sII', b'NX2NSPRP', 1, 36) or size <= 16 or (size - 16) % 36:
+            return False
+        pack = cache / 'shader-cache.pack'
+        if pack.is_file() and pack.stat().st_size > 0:
+            return True
+        with os.scandir(cache) as files:
+            return any(f.name.endswith('.spv') and f.is_file() for f in files)
+    except OSError:
+        return False
+
+
 def step_key(step, identity, out=None):
     """What a step's output depends on. exefs and romfs: the game files only; lift: the unpacked ExeFS and the
     lifter; compile: the lift, the runtime sources, this script and the processor (cpu_tag)."""
@@ -1037,12 +1083,9 @@ def step_key(step, identity, out=None):
     lift = f'lift|{exefs_digest(out)}|{lift_digest()}'
     if step == 'lift':
         return lift
-    compile_key = (f'compile|{lift}|{tree_digest(KIT / "runtime", ("**/*",))}|{sha256_file(Path(__file__))}|{kit_version()}'
-                   f'|cpu {cpu_tag()}')
-    if step == 'compile':
-        return compile_key
-    # shaders: the built game and the translator that prepared them
-    return f'shaders-1|{compile_key}|{sha256_file(KIT / "tools" / "prepare_shaders.py")}|{sha256_file(KIT / "bin" / "nx2navi_xlate.id")}'
+    assert step == 'compile'
+    return (f'compile|{lift}|{tree_digest(KIT / "runtime", ("**/*",))}|{sha256_file(Path(__file__))}|{kit_version()}'
+            f'|cpu {cpu_tag()}|{tree_digest(KIT / "bin", ("nx2navi_xlate.id",))}')
 
 
 def main():
@@ -1109,39 +1152,47 @@ def main():
 
     def save():
         with state_lock:
-            state_path.write_text(json.dumps(state, indent=1), encoding='utf-8')
+            tmp = state_path.with_suffix('.tmp')
+            tmp.write_text(json.dumps(state, indent=1), encoding='utf-8')
+            os.replace(tmp, state_path)
 
-    def run(name):
+    def run(name, key):
         t = time.time()
         runs[name]()
         with state_lock:
-            state['steps'][name] = step_key(name, src.identity, out)
+            state['steps'][name] = key
         save()
         say(f'{name}: {time.time() - t:.0f} s')
         emit('step', step=name, state='done', seconds=round(time.time() - t, 1))
 
     try:
         for name in STEPS:
-            key = step_key(name, src.identity, out)
-            if state['steps'].get(name) == key:
+            if name == 'shaders':
+                if romfs_job:
+                    romfs_job.join()
+                device, storage = shader_device(out)
+                key = shader_key(out, device, storage)
+            else:
+                key = step_key(name, src.identity, out)
+            if state['steps'].get(name) == key and (name != 'shaders' or shader_outputs_present(out, storage)):
                 say(f'{name}: done before')
                 emit('step', step=name, state='skip')
             else:
-                # a step that runs makes every step after it run too: their keys hash its output, not its key
+                # The shader key follows the actual game and renderer inputs independently of the native build.
                 with state_lock:
                     for later in STEPS[STEPS.index(name):]:
-                        state['steps'].pop(later, None)
+                        if later != 'shaders' or name == 'shaders':
+                            state['steps'].pop(later, None)
+                save()
                 say(f'{name}:')
                 emit('step', step=name, state='start')
-                if name == 'shaders' and romfs_job:   # the shaders come out of the RomFS image
-                    romfs_job.join()
                 if name == 'romfs' and a.until != 'romfs':
                     # The RomFS image is mostly disk work, the lift and the compile are processor work: they run side
                     # by side, and only the RomFS index and the files that include it wait for the image
                     # (step_compile). A first build takes about as long as the longer of the two, not their sum.
-                    romfs_job = Background(lambda: run('romfs'))
+                    romfs_job = Background(lambda key=key: run('romfs', key))
                 else:
-                    run(name)
+                    run(name, key)
             if romfs_job and romfs_job.failed():
                 romfs_job.join()
             if name == a.until:

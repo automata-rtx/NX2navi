@@ -48,7 +48,7 @@ class Run:
     """One make_game.py process. on_event(dict) for each "@@" line, on_line(str) for every other line; wait()
     returns the exit code. cancel() ends the process and its children."""
 
-    def __init__(self, cmd, on_event, on_line, cwd=None):
+    def __init__(self, cmd, on_event, on_line, cwd=None, shader_control=None):
         self.error = None
         kw = {}
         if os.name == 'nt':
@@ -56,6 +56,8 @@ class Run:
         else:
             kw['start_new_session'] = True
         env = dict(os.environ, PYTHONUNBUFFERED='1', PYTHONIOENCODING='utf-8')
+        if shader_control is not None:
+            env['NX2NAVI_SHADER_WORKER_FILE'] = str(shader_control)
         self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                      cwd=cwd, env=env, text=True, encoding='utf-8', errors='replace', bufsize=1, **kw)
         self.cancelled = False

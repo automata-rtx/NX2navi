@@ -47,6 +47,7 @@
 #include "host.h"
 #include "nvn_hmap.h"
 #include "platform/platform.h"
+#include "shader_workers.h"
 #include "tex.h"
 
 #define LOG_ONCE(...) do { static volatile int32_t once_; if (!plat_xchg32(&once_, 1)) rt_log(__VA_ARGS__); } while (0)
@@ -2972,6 +2973,26 @@ static void gpu_key(char *out, size_t n) {   // vendor:device:driver version, as
     snprintf(out, n, "%04x:%04x:%08x", p->vendorID, p->deviceID, p->driverVersion);
 }
 
+int vk_shader_cache_id(void) {
+    if (!vk_init()) return 1;
+    const VkPhysicalDeviceProperties *p = &vk_ctx()->props;
+    char gpu[64], translator[65];
+    gpu_key(gpu, sizeof gpu);
+    const char *storage;
+    gfx_shader_cache_identity(translator, &storage);
+    printf("shader-cache-id %s %s %d %u %u ", gpu, translator, vk_caps.gpl, vk_caps.sg_size, vk_caps.sg_pin_stages);
+    for (size_t i = 0; i < VK_UUID_SIZE; i++) printf("%02x", p->pipelineCacheUUID[i]);
+    static const char *const options[] = {"NX2NAVI_PUSH_STAGE", "NX2NAVI_VS_OUTS", "NX2NAVI_VK_DYN_VERTEX",
+                                          "NX2NAVI_VK_DYN_A2C", "NX2NAVI_FEEDBACK", "NX2NAVI_PIPELINE_CACHE"};
+    for (size_t i = 0; i < sizeof options / sizeof options[0]; i++) {
+        const char *value = cfg_get(options[i]);
+        printf("|%s", value ? value : "");
+    }
+    putchar('\n');
+    printf("shader-storage %s\n", storage);
+    return 0;
+}
+
 static const char *stage_name(int st) {
     return st == GFX_STAGE_VS ? "vertex" : st == GFX_STAGE_FS ? "fragment" : st == GFX_STAGE_CS ? "compute" : "other";
 }
@@ -3388,13 +3409,13 @@ static void lb_stop(void) {
     LB.threads = 0;
 }
 
-// Preparation: one prepared variant at a time into the driver's disk cache (private shader copy, nothing kept). arg is
-// the worker's journal slot.
+// Each driver worker has its own crash-journal slot and draws variants from the same bounded queue.
+typedef struct { ShaderWork *work; int slot; } WarmWorker;
 static void lb_warm_worker(void *arg) {
-    int slot = (int)(intptr_t)arg;
-    for (;;) {
-        size_t i = (size_t)plat_inc64(&LB.next) - 1;
-        if (i >= LB.n) return;
+    WarmWorker *worker = arg;
+    int slot = worker->slot;
+    size_t i = SIZE_MAX;
+    while ((i = shader_work_next(worker->work, i)) != SIZE_MAX) {
         int owned = 0, skip = skip_listed(LB.e[i].iid);
         const GfxShader *sh = skip ? NULL : gfx_shader_load_private(LB.e[i].iid, &owned);
         int st = sh ? gfx_shader_stage(sh) : -1;
@@ -3429,7 +3450,7 @@ static void lb_warm_worker(void *arg) {
 }
 
 // Preparation: every variant of <dir>/shader-prepared.bin on every core at normal priority.
-static void lb_warm_prepared(const char *dir) {
+static int lb_warm_prepared(const char *dir) {
     char path[PLAT_PATH_MAX * 2 + 32];
     snprintf(path, sizeof path, "%s/shader-prepared.bin", dir);
     uint64_t size = 0;
@@ -3439,7 +3460,14 @@ static void lb_warm_prepared(const char *dir) {
     for (size_t i = 0; LB.e && i < n; i++)
         memcpy(LB.e[i].iid, f + 16 + 36 * i + 4, 32), LB.e[i].stage = f[16 + 36 * i], LB.e[i].prio = f[16 + 36 * i + 1];
     free(f);
-    if (!LB.e) return;
+    if (!LB.e) return n ? 1 : 0;
+    int cpus = (int)plat_cpu_usable(), k = 0;
+    ShaderWork work = {0};
+    if (!shader_work_open(&work, n, cpus, 1)) {
+        rt_log("vk_pipeline: cannot open the launcher's shader worker control");
+        free(LB.e), LB.e = NULL;
+        return 1;
+    }
     skip_init(dir);
     char jp[PLAT_PATH_MAX * 2 + 48];
     snprintf(jp, sizeof jp, "%s/shader-prepare-journal.bin", dir);
@@ -3448,11 +3476,13 @@ static void lb_warm_prepared(const char *dir) {
     LB.n = n, LB.idle = 0, LB.t0 = now_ms();
     static const uint32_t no_pr[16], no_fs[4];
     lb_state(no_pr, no_fs);
-    int cpus = (int)plat_cpu_usable(), k = 0;
     PlatThread *t[JR_SLOTS];
-    for (int i = 0; i < cpus && i < JR_SLOTS; i++)
-        if ((t[k] = plat_thread_new(lb_warm_worker, (void *)(intptr_t)k, "lib warm"))) k++;
-    if (!k) lb_warm_worker((void *)(intptr_t)0);
+    WarmWorker workers[JR_SLOTS];
+    for (int i = 0; i < cpus && i < JR_SLOTS; i++) {
+        workers[k] = (WarmWorker){&work, k};
+        if ((t[k] = plat_thread_new(lb_warm_worker, &workers[k], "lib warm"))) k++;
+    }
+    if (!k) lb_warm_worker(&(WarmWorker){&work, 0});
     for (int i = 0; i < k; i++) plat_thread_join(t[i]);
     if (SK.journal) plat_file_close(SK.journal), SK.journal = NULL, plat_file_delete(jp);   // every build returned
     lb_report("preparation done");
@@ -3460,16 +3490,17 @@ static void lb_warm_prepared(const char *dir) {
     unsigned long long skipped = LB.skipped;
     size_t tried = n - (size_t)skipped;
     if (LB.nolib)
-        printf("prepare-shaders: %zu variants on %d threads in %.0f ms, %llu vertex/fragment variants skipped (graphics "
-               "pipeline library off, they build at their first draw)\n", tried, k, now_ms() - LB.t0,
+        printf("prepare-shaders: %zu variants on up to %d workers in %.0f ms, %llu vertex/fragment variants skipped (graphics "
+               "pipeline library off, they build at their first draw)\n", tried, work.peak, now_ms() - LB.t0,
                (unsigned long long)LB.nolib);
     else
-        printf("prepare-shaders: %zu variants built into the driver cache on %d threads in %.0f ms\n", tried, k,
+        printf("prepare-shaders: %zu variants built into the driver cache on up to %d workers in %.0f ms\n", tried, work.peak,
                now_ms() - LB.t0);
     if (skipped)   // installer/steps.py Prepare reads this line
         printf("prepare-shaders: %llu variants skipped: the graphics driver crashed while building them in an earlier "
                "run (shader-prepare-skip.txt); they build at their first draw\n", skipped);
     free(LB.e), LB.e = NULL, LB.n = 0, LB.next = 0, LB.done = 0, LB.skipped = 0;
+    return 0;
 }
 
 // nx2navi.exe --prepare-shaders (tools/prepare_shaders.py): the device sets the translator's host answers (they are in every
@@ -3486,8 +3517,7 @@ int vk_pipeline_prepare_shaders(void) {
     const char *pe = cfg_get("NX2NAVI_PREWARM_XLATE");   // no fixed default: half the CPUs, at most 16, when unset
     int procs = pe && *pe ? atoi(pe) : cpus / 2 > 16 ? 16 : cpus / 2;
     int rc = gfx_shader_prepare_seed(dir, cpus, procs < 1 ? 1 : procs);
-    if (!rc) lb_warm_prepared(dir);
-    return rc;
+    return rc ? rc : lb_warm_prepared(dir);
 }
 
 // nx2navi.exe --warm-shaders: every variant of shader-prepared.bin built into the driver's disk cache again from the shader
@@ -3507,8 +3537,7 @@ int vk_pipeline_warm_shaders(void) {
         fprintf(stderr, "warm-shaders: no %s (tools/prepare_shaders.py writes it)\n", prp);
         return 1;
     }
-    lb_warm_prepared(dir);
-    return 0;
+    return lb_warm_prepared(dir);
 }
 
 // ---- dynamic state

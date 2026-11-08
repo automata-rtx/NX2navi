@@ -90,6 +90,13 @@ A path the Windows ANSI code page cannot hold breaks the MSYS2 tools, so the too
      runs on the PC that builds it, and a generic build would do every fused multiply-add of the game in software.
 3. **Prepare the Shaders**: make_game.py's last step translates every shader of the game into the game's shader
    cache and the driver's own cache (`tools/prepare_shaders.py`), so play does not stop to compile them.
+   **Max Shader Workers** appears in first-time setup, Settings and the build progress screen. The arrows change
+   the limit during translation and driver compilation. Lowering it lets active variants finish before workers
+   take more. Raising it makes additional workers available immediately. Auto uses each phase's default.
+   The launcher remembers the choice for the next build.
+   Preparation has its own build key covering the installed game data, preparation code, translator, Vulkan
+   device and driver. A native-only rebuild can reuse prepared shaders. The first build from an older key format
+   runs preparation once and can reuse compatible translations already on disk.
 4. The game's Cetra Display is decoded for the window.
 
 ## Updating

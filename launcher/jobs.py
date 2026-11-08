@@ -2,9 +2,12 @@
 list of steps the window shows as rows; the window reads the job's state on a timer (rev changes on every change)
 and never blocks on it. The same jobs run headless from launcher/cli.py."""
 import collections
+import mmap
+import tempfile
 import threading
 import time
 import traceback
+from pathlib import Path
 
 from . import build, feed, gamefiles, net, toolchain, updater, versions
 
@@ -63,6 +66,12 @@ class Job:
         self.finished = None
         self.after = None           # what the window does next ('restart', ...)
         self._lock = threading.Lock()
+        self._shader_control = None
+
+    def set_shader_workers(self, limit):
+        with self._lock:
+            if self._shader_control is not None:
+                self._shader_control[0] = limit
 
     # ---- state the window reads
     def step(self, sid):
@@ -239,10 +248,27 @@ class Job:
             elif kind == 'error':
                 self.error = ev.get('message', '')
 
-        self.proc = build.Run(build.command(self.ctx.layout, args), on_event, self.log)
-        code = self.proc.wait()
-        err = self.proc.error
-        self.proc = None
+        # Each build and its driver-crash retries share one byte with the UI for their lifetime.
+        with tempfile.TemporaryDirectory(dir=self.ctx.layout.data) as tmp:
+            path = Path(tmp).resolve() / 'shader-workers'
+            with path.open('w+b') as f:
+                f.write(bytes(1))
+                f.flush()
+                with mmap.mmap(f.fileno(), 1) as control:
+                    with self._lock:
+                        control[0] = self.ctx.settings['shader_workers']
+                        self._shader_control = control
+                    try:
+                        self.proc = build.Run(build.command(self.ctx.layout, args), on_event, self.log,
+                                              shader_control=path)
+                        if self.cancelled():
+                            self.proc.cancel()
+                        code = self.proc.wait()
+                        err = self.proc.error
+                    finally:
+                        with self._lock:
+                            self._shader_control = None
+                        self.proc = None
         if self.cancelled():
             raise net.Cancelled()
         if code:
