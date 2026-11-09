@@ -977,7 +977,8 @@ static int test_mirror(const GfxBackend *b, uint8_t *guest, int *bytes) {
     uint8_t *m = pool.mem;
     for (int i = 0; i < 4096; i++) m[i] = (uint8_t)(i * 13 + 1);
     memset(m + 0x1000, 0xEE, 0x5000);
-    CHECK(vk_mem_mirror_probe((uint64_t)(uintptr_t)m), "the pool got no VRAM mirror");
+    int direct;
+    CHECK(vk_mem_mirror_probe((uint64_t)(uintptr_t)m, &direct), "the pool got no VRAM mirror");
     static _Alignas(8) uint8_t stream[1024];
     uint64_t a = (uint64_t)(uintptr_t)m;
     // 1: B2B in the mirror after its first-use copy, and a fill; both written back.
@@ -1007,7 +1008,8 @@ static int test_mirror(const GfxBackend *b, uint8_t *guest, int *bytes) {
     CHECK(xf_submit(b, stream, p), "fence_wait of the third mirror submission timed out");
     for (int i = 0; i < 0x800; i++) CHECK(m[0x4000 + i] == 0x11, "CPU byte %#x beside a fill is %02x", i, m[0x4000 + i]);
     for (int i = 0; i < 0x800; i++) CHECK(m[0x4800 + i] == 0x77, "fill byte %#x is %02x", i, m[0x4800 + i]);
-    // 4: two small flushes at the ends of the pool copy their own pages, not what lies between them.
+    // Flushing untouched bytes leaves the mirror alone. CPU changes at opposite ends of a
+    // flushed pool, including one on a page previously filled by the GPU, still reach it.
     int fl_bad = vk_mem_flush_add_probe();
     CHECK(!fl_bad, "flush range list check %d failed", fl_bad);
     p = put(stream, OP_BEGIN, NULL, 0);
@@ -1020,12 +1022,21 @@ static int test_mirror(const GfxBackend *b, uint8_t *guest, int *bytes) {
     p = put(stream, OP_BEGIN, NULL, 0);
     p = put(p, OP_COPY_B2B, &c4, sizeof c4);
     CHECK(xf_submit(b, stream, p), "fence_wait of the mirror submission after the flushes timed out");
-    // A submission's copies reach the counter with the next one, and c4's own write-back adds its destination page.
+    // The next submission publishes the copy counters.
     CHECK(xf_submit(b, stream, p), "fence_wait of the mirror submission that counts the flushes timed out");
     uint64_t up = vk_mem_mirror_uploaded() - up0;
-    if (!rt_knob("FLUSH_SPAN", "0"))
-        CHECK(up >= 0x2000 && up < 0x10000, "two flushed pages copied %#llx bytes, 0xeb000 would be the span",
-              (unsigned long long)up);
+    if (direct)
+        CHECK(up == 0, "unchanged flushes or GPU write-back uploaded %#llx bytes", (unsigned long long)up);
+    m[0x4800] = 0x31;
+    m[0xf0000] = 0xcb;
+    nvn_pool_flushed(&pool, 0, pool.size);
+    const p_copy_b2b low = {a + 0x4000, a + 0x7000, 4096}, high = {a + 0xf0000, a + 0x8000, 4096};
+    p = put(stream, OP_BEGIN, NULL, 0);
+    p = put(p, OP_COPY_B2B, &low, sizeof low);
+    p = put(p, OP_COPY_B2B, &high, sizeof high);
+    CHECK(xf_submit(b, stream, p), "dirty flush readback timed out");
+    CHECK(m[0x7800] == 0x31 && m[0x7801] == 0x77 && m[0x8000] == 0xcb,
+          "flushed CPU edits or adjacent GPU data changed");
     b->pool_fini(&pool);
     *bytes = 4096 + 0x1000 + 4096 + 0x1000;
     return 0;
@@ -1127,6 +1138,23 @@ static int test_held_uniforms(const GfxBackend *b, uint8_t *guest) {
     CHECK(b->submit(NULL, 0) == fence && b->fence_wait(fence, UINT64_MAX), "held uniform retirement");
     b->pool_fini(&pool);
     puts("probe-vkqueues: retained program, compiler constants and two versions of inherited uniforms passed");
+    return 0;
+}
+
+int probe_vkmirror(void) {
+    uint64_t heap = 0;
+    CHECK(!mem_set_heap_size(16ull << 20, &heap) && heap, "mirror probe heap");
+    vk_sync_start();
+    CHECK(vk_mirror_on, "mirror probe requires device-local mirrors");
+    const GfxBackend *b = &gfx_vulkan_backend;
+    int bytes = 0;
+    int bad = test_mirror(b, (uint8_t *)(uintptr_t)heap, &bytes);
+    b->finish();
+    vk_exec_draw_shutdown();
+    vk_exec_xfer_shutdown();
+    vk_backend_shutdown();
+    if (bad || vk_validation_errors_total()) return 1;
+    printf("probe-vkmirror: GPU write-back, CPU edits and flush checks passed\n");
     return 0;
 }
 

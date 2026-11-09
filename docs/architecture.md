@@ -71,9 +71,9 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   the submitting thread (`vk_exec*.c`); a recorder thread makes the `vkCmd*` calls from a ring of packets
   (`vk_rec.c`).
 - Memory pools are imported as host memory (`VK_EXT_external_memory_host`). On a discrete GPU, pools bound as buffers
-  are mirrored in device-local memory and the pages the CPU wrote (write watch) plus the ranges the game flushes are
-  uploaded before a replay (`vk_memory.c`); without the mirrors the GPU reads them over PCIe and Kokiri Forest runs at
-  7 fps. GPU-rendered textures are written back when the CPU reads them.
+  are mirrored in device-local memory. Before replay, the renderer uploads pages changed by the CPU or another GPU
+  buffer. A guest flush refreshes write tracking for its range. Shadow-backed pools and ranges where tracking is
+  unavailable use explicit flush copies. GPU-rendered textures are written back when the CPU reads them.
 - Uniform snapshot. The game rewrites per-object uniform blocks soon after it submits the frame that reads them; at
   the start of a submission's replay every uniform range it binds from CPU-written pools is copied, and the draws bind
   the copy (`vk_usnap.c`).

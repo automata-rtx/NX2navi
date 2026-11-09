@@ -654,6 +654,7 @@ int vk_mem_vram(uint64_t *used, uint64_t *budget, int *exact) {
 #define GEN_CHUNKS (RT_ADDRESS_LIMIT >> GEN_CHUNK_SHIFT)
 #define GEN_PER_CHUNK (1u << (GEN_CHUNK_SHIFT - GEN_PAGE_SHIFT))
 static uint32_t *gen_chunk[GEN_CHUNKS];
+static uint32_t *upload_chunk[GEN_CHUNKS];   // excludes writes already in this pool's mirror
 static uint32_t gen_now;                 // last generation handed out
 static PlatMutex gen_lock = PLAT_MUTEX_INIT;
 static uint64_t gen_pages[1024];
@@ -661,6 +662,7 @@ static uint64_t gen_pages[1024];
 // sync skips regions with nothing newer than its pool's mirror.
 #define REG_SHIFT 21
 static uint32_t reg_max[RT_ADDRESS_LIMIT >> REG_SHIFT];
+static uint32_t upload_max[RT_ADDRESS_LIMIT >> REG_SHIFT];
 
 // Every write-watch query of the generation table (gen_lock held exclusively): calls, bytes and time since the last
 // mirror summary, all consumers together; the queries that found written pages (they also flush TLBs) apart.
@@ -692,25 +694,33 @@ static uint32_t *fcand;                       // gen_lock: regions to try at the
 static int nfcand, cfcand;
 static uint64_t n_frz_refused;                // gen_lock: candidates mem_freeze refused
 
-static uint32_t *gen_slot(uint64_t page_addr, int create) {
+static uint32_t *page_slot(uint32_t **chunks, uint64_t page_addr, int create) {
     uint64_t ci = page_addr >> GEN_CHUNK_SHIFT;
     if (ci >= GEN_CHUNKS) return NULL;
-    if (!gen_chunk[ci]) {
+    if (!chunks[ci]) {
         if (!create) return NULL;
-        gen_chunk[ci] = calloc(GEN_PER_CHUNK, sizeof(uint32_t));
-        if (!gen_chunk[ci]) rt_fatal("vk: out of memory for page generations");
+        chunks[ci] = calloc(GEN_PER_CHUNK, sizeof(uint32_t));
+        if (!chunks[ci]) rt_fatal("vk: out of memory for page generations");
     }
-    return &gen_chunk[ci][(page_addr >> GEN_PAGE_SHIFT) & (GEN_PER_CHUNK - 1)];
+    return &chunks[ci][(page_addr >> GEN_PAGE_SHIFT) & (GEN_PER_CHUNK - 1)];
 }
 
+static uint32_t *gen_slot(uint64_t addr, int create) { return page_slot(gen_chunk, addr, create); }
+
 // gen_lock held exclusively; g is the newest generation handed out.
-static void stamp_page(uint64_t a, uint32_t g) {
+static void stamp_write(uint64_t a, uint32_t g, int mirrored) {
     uint32_t *s = gen_slot(a, 1);
     if (!s) return;
     *s = g;
     reg_max[a >> REG_SHIFT] = g;
     reg_last[a >> REG_SHIFT] = ww_ep;
+    if (vk_mirror_on && !mirrored) {
+        *page_slot(upload_chunk, a, 1) = g;
+        upload_max[a >> REG_SHIFT] = g;
+    }
 }
+
+static void stamp_page(uint64_t a, uint32_t g) { stamp_write(a, g, 0); }
 
 static void stamp_range(uint64_t lo, uint64_t hi, uint32_t g) {
     for (uint64_t a = lo; a < hi; a += 1ull << GEN_PAGE_SHIFT) stamp_page(a, g);
@@ -1035,6 +1045,27 @@ void vk_mem_gpu_pending(uint64_t addr, uint64_t size) {
     plat_mutex_unlock(&shadow_lock);
 }
 
+// Keep the texture cache aware of every GPU write. Only omit an upload stamp when the
+// buffer actually written is still the device-local mirror for this entire guest range.
+void vk_buffer_written(uint64_t addr, uint64_t size, VkBuffer destination) {
+    // Shadow pools have a host-side copy that must still be copied back into guest memory.
+    if (destination && vk_mirror_on && !shadow_on && size && !nvn_gpu_only(addr)) {
+        plat_mutex_lock_shared(&pool_lock);
+        const pidx_ent *e = pidx_find(&pool_index, addr, size);
+        const PoolRec *r = e ? e->buf : NULL;
+        if (r && r->mbuf == destination && addr >= r->import_lo && addr < r->import_hi && size <= r->import_hi - addr) {
+            plat_mutex_lock(&gen_lock);
+            uint32_t g = ++gen_now;
+            for (uint64_t a = addr & ~0xfffull; a < addr + size; a += 0x1000) stamp_write(a, g, 1);
+            plat_mutex_unlock(&gen_lock);
+            plat_mutex_unlock_shared(&pool_lock);
+            return;
+        }
+        plat_mutex_unlock_shared(&pool_lock);
+    }
+    vk_gpu_written(addr, size);
+}
+
 void vk_gpu_written(uint64_t addr, uint64_t size) {
     if (shadow_on && size) {
         plat_mutex_lock_shared(&pool_lock);
@@ -1198,10 +1229,8 @@ static void dirty_frame(uint64_t frame) {
 // the CPU reads and writes; textures and every host path that reads or writes pool bytes keep using it.
 // - CPU -> mirror: the first access of a submission to a mirror syncs it (mirror_sync): the 2 MiB write-watch
 //   snapshots of its regions for this epoch (snap_regions, shared with the texture checks: the OS bits keep one
-//   consumer, the shared page generations) and every page stamped after the mirror's mgen goes into a copy; so do the
-//   nvnMemoryPoolFlushMappedRange ranges, each on its own: one span from the lowest to the highest flush of a 252 MiB
-//   pool copied up to the whole pool for a few MiB flushed, 30-50 ms of GPU time over PCIe 3.0 x8 in crowded towns
-//   (NX2NAVI_FLUSH_SPAN=1 restores it). Writes between the ranges need no copy: the write watch sees them. The first use
+//   consumer). Upload generations include CPU writes and GPU writes made outside this mirror. A flush refreshes
+//   its regions' snapshots. Where the OS cannot track writes, copy the flushed ranges explicitly. The first use
 //   copies the whole range. The copies run in a prologue command
 //   buffer that vk_sync.c submits right before the part that accessed the mirror first, between full barriers.
 //   vk_mem_mirror_begin snaps the regions of the pools the previous submission accessed in a few merged queries.
@@ -1387,14 +1416,16 @@ static void mirror_create(PoolRec *r) {
                              .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
                                   .requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT};
-    VkResult res = vmaCreateBuffer(c->vma, &bi, &ai, &r->mbuf, &r->malloc_, NULL);
+    VkBuffer mirror;
+    VkResult res = vmaCreateBuffer(c->vma, &bi, &ai, &mirror, &r->malloc_, NULL);
     if (res != VK_SUCCESS) {
-        r->mbuf = VK_NULL_HANDLE, r->malloc_ = NULL;
+        r->malloc_ = NULL;
         char why[96];
         snprintf(why, sizeof why, "device-local allocation of %.1f MiB failed (%d)", n / 1048576.0, (int)res);
         return refuse(r, MR_ALLOC, why);
     }
     plat_mutex_lock(&pool_lock);
+    r->mbuf = mirror;
     if (nm == mcap) grow((void **)&mlist, &mcap, sizeof *mlist);
     int at = nm;
     while (at > 0 && mlist[at - 1]->import_lo > r->import_lo) at--;
@@ -1450,22 +1481,51 @@ static void mirror_sync(PoolRec *r) {
     r->acc_sub = msub;
     uint64_t lo = r->import_lo, hi = r->import_hi;
     uint64_t r0 = lo >> SNAP_SHIFT, r1 = (hi - 1) >> SNAP_SHIFT;
-    int excl = 0;
-    plat_mutex_lock_shared(&gen_lock);
-    for (uint64_t k = r0; k <= r1; k++)
-        if (snap_at[k] != mepoch) { excl = 1; break; }
+    FlushRange fl[FLUSH_RANGES + 1];
+    int n = 0;
+    if (__atomic_load_n(&r->fl_n, __ATOMIC_ACQUIRE)) {
+        plat_mutex_lock(&flush_lock);
+        n = r->fl_n;
+        memcpy(fl, r->fl, (size_t)n * sizeof *fl);
+        uint64_t calls = r->fl_calls, sum = r->fl_sum;
+        r->fl_n = 0, r->fl_calls = r->fl_sum = 0;
+        plat_mutex_unlock(&flush_lock);
+        mrep.flush_calls += calls, mrep.flush_sum += sum;
+    }
+    int excl = n != 0;
+    if (!excl) {
+        plat_mutex_lock_shared(&gen_lock);
+        for (uint64_t k = r0; k <= r1; k++)
+            if (snap_at[k] != mepoch) { excl = 1; break; }
+        if (excl) plat_mutex_unlock_shared(&gen_lock);
+    }
     if (excl) {
-        plat_mutex_unlock_shared(&gen_lock);
         plat_mutex_lock(&gen_lock);
+        // A CPU flush may arrive after this epoch's pre-snapshot. Observe its pages again
+        // before consuming it. A flush arriving after the drain stays queued for the next sync.
+        for (int i = 0; i < n; i++) {
+            uint64_t a = fl[i].lo > lo ? fl[i].lo : lo, b = fl[i].hi < hi ? fl[i].hi : hi;
+            if (a < b)
+                for (uint64_t k = a >> SNAP_SHIFT; k <= (b - 1) >> SNAP_SHIFT; ++k) snap_at[k] = 0;
+        }
         mrep.sync_queries += snap_regions(r0, r1, mepoch);
     }
     uint32_t since = r->mgen;
     for (uint64_t k = r0; k <= r1; k++) {
-        if (reg_max[k] <= since) continue;
         uint64_t a = k << SNAP_SHIFT, b = a + (1ull << SNAP_SHIFT);
         if (a < lo) a = lo;
         if (b > hi) b = hi;
-        const uint32_t *ch = gen_chunk[a >> GEN_CHUNK_SHIFT];   // a 2 MiB region lies in one chunk
+        if (shadow_on || snap_untracked[k]) {
+            for (int i = 0; i < n; ++i) {
+                uint64_t first = a > fl[i].lo ? a : fl[i].lo, last = b < fl[i].hi ? b : fl[i].hi;
+                if (first < last) {
+                    range_add(&pend, &npend, &cpend, r, first - lo, last - first);
+                    mrep.flush_n++, mrep.flush_bytes += last - first;
+                }
+            }
+        }
+        if (upload_max[k] <= since) continue;
+        const uint32_t *ch = upload_chunk[a >> GEN_CHUNK_SHIFT];   // a 2 MiB region lies in one chunk
         if (!ch) continue;
         for (uint64_t x = a; x < b; x += 1ull << GEN_PAGE_SHIFT)
             if (ch[(x >> GEN_PAGE_SHIFT) & (GEN_PER_CHUNK - 1)] > since)
@@ -1474,26 +1534,6 @@ static void mirror_sync(PoolRec *r) {
     r->mgen = gen_now;
     if (excl) plat_mutex_unlock(&gen_lock);
     else plat_mutex_unlock_shared(&gen_lock);
-    if (__atomic_load_n(&r->fl_n, __ATOMIC_ACQUIRE)) {
-        FlushRange fl[FLUSH_RANGES + 1];
-        plat_mutex_lock(&flush_lock);
-        int n = r->fl_n;
-        memcpy(fl, r->fl, (size_t)n * sizeof *fl);
-        uint64_t calls = r->fl_calls, sum = r->fl_sum;
-        r->fl_n = 0, r->fl_calls = r->fl_sum = 0;
-        plat_mutex_unlock(&flush_lock);
-        mrep.flush_calls += calls, mrep.flush_sum += sum;
-        for (int i = 0; i < n; i++) {
-            uint64_t a = fl[i].lo > lo ? fl[i].lo : lo, b = fl[i].hi < hi ? fl[i].hi : hi;
-            if (a >= b) continue;
-            range_add(&pend, &npend, &cpend, r, a - lo, b - a);
-            mrep.flush_n++, mrep.flush_bytes += b - a;
-            if ((rt_trace & RT_TRACE_PERF) && b - a >= 16u << 20)
-                rt_log("mem: mirror frame %llu: flush range %.1f MiB at +%.1f MiB of a %.1f MiB pool (%d ranges from %llu "
-                       "flushes of %.3f MiB)", (unsigned long long)mirror_frame, (b - a) / 1048576.0, (a - lo) / 1048576.0,
-                       (hi - lo) / 1048576.0, n, (unsigned long long)calls, sum / 1048576.0);
-        }
-    }
     mrep.syncs++;
     mrep.sync_t += qpc() - t0;
 }
@@ -1527,8 +1567,9 @@ void vk_mem_pick(VkMemSpan *sp) {
     sp->buffer = r->mbuf;
 }
 
-int vk_mem_mirror_probe(uint64_t addr) {
+int vk_mem_mirror_probe(uint64_t addr, int *direct) {
     VkMemSpan sp;
+    *direct = !shadow_on;
     if (!vk_mirror_on || !vk_mem_resolve(addr, 1, &sp) || !sp.pool) return 0;
     mepoch = vk_texture_epoch();
     vk_mem_use(&sp);
@@ -1955,10 +1996,12 @@ static uint64_t ver_off;
 
 // The CPU wrote the page since the mirror's sync that mgen records: stamped later, or its write-watch bit is set.
 static int page_dirty(uint64_t a, uint32_t mgen) {
-    uint32_t *s = gen_slot(a, 0);
-    if (s && __atomic_load_n(s, __ATOMIC_RELAXED) > mgen) return 1;
+    plat_mutex_lock_shared(&gen_lock);
+    uint32_t *s = page_slot(upload_chunk, a, 0);
     uint64_t p[1];
-    return mem_written_peek(a, 1ull << GEN_PAGE_SHIFT, p, 1) != 0;   // UINT64_MAX (not watched) counts as written
+    int dirty = (s && *s > mgen) || mem_written_peek(a, 1ull << GEN_PAGE_SHIFT, p, 1) != 0;
+    plat_mutex_unlock_shared(&gen_lock);
+    return dirty;
 }
 
 static void verify_cb(void *arg) {   // completion thread
@@ -2515,6 +2558,9 @@ void vk_mem_shutdown(void) {
     nphys = 0;
     plat_mutex_unlock(&pool_lock);
     plat_mutex_lock(&gen_lock);
-    for (uint64_t i = 0; i < GEN_CHUNKS; i++) free(gen_chunk[i]), gen_chunk[i] = NULL;
+    for (uint64_t i = 0; i < GEN_CHUNKS; i++) {
+        free(gen_chunk[i]); gen_chunk[i] = NULL;
+        free(upload_chunk[i]); upload_chunk[i] = NULL;
+    }
     plat_mutex_unlock(&gen_lock);
 }

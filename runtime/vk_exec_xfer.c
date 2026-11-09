@@ -59,21 +59,21 @@ static uint32_t max1(uint32_t v) { return v ? v : 1; }
 
 // ---- completion callbacks (completion thread)
 
-typedef struct { uint64_t addr, size; } Range;
+typedef struct { uint64_t addr, size; VkBuffer buffer; } Range;
 
 static void guest_written_cb(void *arg) {
     Range *r = arg;
-    vk_gpu_written(r->addr, r->size);
+    vk_buffer_written(r->addr, r->size, r->buffer);
     free(r);
 }
 
 // The GPU wrote [addr, addr+size) of CPU-visible memory: tell the texture cache once the fence is reached.
-static void note_gpu_write(VkExec *ex, uint64_t addr, uint64_t size) {
+static void note_gpu_write(VkExec *ex, uint64_t addr, uint64_t size, VkBuffer buffer) {
     vk_usnap_drop(addr, size);
     if (nvn_gpu_only(addr)) return;
     Range *r = malloc(sizeof *r);
     if (!r) rt_fatal("vk: out of memory");
-    *r = (Range){addr, size};
+    *r = (Range){addr, size, buffer};
     vk_mem_gpu_pending(addr, size);
     vk_completion_add(ex->fence, guest_written_cb, r);
 }
@@ -621,7 +621,7 @@ static void copy_buffer_image(VkExec *ex, const p_copy_b2t *p, int to_image) {
         vk_dlaa_ui_invalidate(s.img->image);
         vk_texture_gpu_written(p->tex);
     }
-    else vk_mem_gpu_wrote(&m, size), note_gpu_write(ex, p->src, size);
+    else vk_mem_gpu_wrote(&m, size), note_gpu_write(ex, p->src, size, m.buffer);
 }
 
 static void copy_t2t(VkExec *ex, const p_copy_t2t *p) {
@@ -700,12 +700,12 @@ static void copy_b2b(VkExec *ex, const p_copy_b2b *p) {
         VkBufferCopy bc = {s.offset, d.offset, n};
         vkCmdCopyBuffer(ex->cb, s.buffer, d.buffer, 1, &bc);
         vk_mem_gpu_wrote(&d, n);
+        note_gpu_write(ex, dst, n, d.buffer);
         ex->recorded++;
         vk_mem_count(s.cls, VK_MUSE_COPY_SRC, n);
         vk_mem_count(d.cls, VK_MUSE_GPU_WRITE, n);
         src += n, dst += n, left -= n;
     }
-    if (started) note_gpu_write(ex, p->dst, p->size - left);
 }
 
 // ---- buffer fills (ClearBuffer, and ReportValue as a 4-byte one): vkCmdFillBuffer in GPU order after a full
@@ -733,11 +733,11 @@ static void clear_buf(VkExec *ex, const p_clear_buf *p) {
         VK_MEM_PICK(d);
         vkCmdFillBuffer(ex->cb, d.buffer, d.offset, n, p->value);
         vk_mem_gpu_wrote(&d, n);
+        note_gpu_write(ex, dst, n, d.buffer);
         ex->recorded++;
         vk_mem_count(d.cls, VK_MUSE_GPU_WRITE, n);
         dst += n, left -= n;
     }
-    if (started) note_gpu_write(ex, p->addr, p->size - left);
 }
 
 // ---- texture clears

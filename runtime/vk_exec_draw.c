@@ -75,7 +75,7 @@ typedef struct {
     uint32_t aspect, level0, levels, layer0, layers, swz;
 } ViewKey;
 _Static_assert(sizeof(ViewKey) == 40, "ViewKey is hashed as bytes: no padding");
-typedef struct { uint64_t addr, size; } Range;
+typedef struct { uint64_t addr, size; VkBuffer buffer; } Range;
 typedef struct {
     Chunk *chunks;
     int nchunks, cchunks;
@@ -182,7 +182,7 @@ static uint64_t bind_gen = 1;            // bumped by every bind op that writes 
 static void cb_done(void *arg) {   // completion thread
     CbRes *r = arg;
     VkCtx *c = vk_ctx();
-    for (int i = 0; i < r->nwritten; i++) vk_gpu_written(r->written[i].addr, r->written[i].size);
+    for (int i = 0; i < r->nwritten; i++) vk_buffer_written(r->written[i].addr, r->written[i].size, r->written[i].buffer);
     for (int i = 0; i < r->npools; i++) {
         vkResetDescriptorPool(c->device, r->pools[i], 0);
         plat_mutex_lock(&spare_lock);
@@ -277,12 +277,12 @@ static uint8_t *scratch(VkExec *ex, uint64_t size, VkBuffer *buf, VkDeviceSize *
     return p;
 }
 
-static void note_written(VkExec *ex, uint64_t addr, uint64_t size) {
+static void note_written(VkExec *ex, uint64_t addr, uint64_t size, VkBuffer buffer) {
     CbRes *r = cb_res(ex);
     for (int i = 0; i < r->nwritten; i++)
-        if (r->written[i].addr == addr && r->written[i].size == size) return;
+        if (r->written[i].addr == addr && r->written[i].size == size && r->written[i].buffer == buffer) return;
     if (r->nwritten == r->cwritten) r->written = grow(r->written, &r->cwritten, sizeof *r->written);
-    r->written[r->nwritten++] = (Range){addr, size};
+    r->written[r->nwritten++] = (Range){addr, size, buffer};
     vk_mem_gpu_pending(addr, size);
 }
 
@@ -1385,7 +1385,7 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
         uint64_t lead = vk_caps.sbuf_align ? b->addr & (vk_caps.sbuf_align - 1) : 0;
         if (bind_range(ex, b->addr - lead, b->size ? b->size + lead : 0, align, max, ubo ? VK_MUSE_UBO : VK_MUSE_SSBO,
                        written, &bi)) {
-            if (written && bi.buffer != VK_NULL_HANDLE) note_written(ex, b->addr - lead, bi.range);
+            if (written && bi.buffer != VK_NULL_HANDLE) note_written(ex, b->addr - lead, bi.range, bi.buffer);
             return bi;
         }
         if (b->addr) warn_once(W_SSBO_ALIGN, "storage buffer %#llx is not backed or not aligned: a zero buffer is bound",
@@ -4598,7 +4598,7 @@ static void op_update_ub(VkExec *ex, const p_update_ub *u) {
     vk_usnap_drop(u->dst, u->size);
     ex->recorded++;
     vk_mem_count(sp.cls, VK_MUSE_GPU_WRITE, u->size);
-    note_written(ex, u->dst, u->size);
+    note_written(ex, u->dst, u->size, sp.buffer);
     upd_note(ex, u);
 }
 
