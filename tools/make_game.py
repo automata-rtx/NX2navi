@@ -53,6 +53,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -494,6 +495,53 @@ def copy_if_changed(src, dst, force=False):
     except PermissionError:
         fail(f'{dst} is in use: close the game and try again')
     return True
+
+
+DLSS_DLL, DLSS_NOTICE = 'nvngx_dlss.dll', 'nvngx_dlss-NOTICE.txt'   # tools/dlss_pin.py, in the kit's bin/
+
+
+def replace_file(src, dst):
+    # Publish a complete file, also when a build is interrupted during the copy.
+    with tempfile.NamedTemporaryFile(dir=dst.parent, delete=False) as f:
+        tmp = Path(f.name)
+    try:
+        shutil.copy2(src, tmp)
+        os.replace(tmp, dst)
+    except PermissionError:
+        fail(f'{dst} is in use: close the game and try again')
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def notice_sha256(path):
+    """The sha256 line of a DLSS notice: the DLL a kit placed beside the game."""
+    try:
+        for line in path.read_text(encoding='utf-8').splitlines():
+            if re.fullmatch(r'sha256 [0-9a-fA-F]{64}', line):
+                return line[7:].lower()
+    except (OSError, UnicodeDecodeError):
+        pass
+    return None
+
+
+def place_dlss(out):
+    """NVIDIA's DLSS library from the kit's bin/ beside the game, where NGX loads it (runtime/vk_dlaa.c), with its
+    notice. A different nvngx_dlss.dll the player put there (another DLSS version) is kept; the one an earlier build
+    placed, named by the notice beside it, is replaced. Returns a line for the build's log when it kept the player's."""
+    src, dst, note = KIT / 'bin' / DLSS_DLL, out / DLSS_DLL, KIT / 'bin' / DLSS_NOTICE
+    if not src.is_file():
+        return None
+    incoming = sha256_file(src)
+    if incoming != notice_sha256(note):
+        fail(f'{src} differs from its kit notice')
+    have = sha256_file(dst) if dst.is_file() else None
+    if have != incoming:
+        if have and have != notice_sha256(out / DLSS_NOTICE):
+            return f"{DLSS_DLL} kept: the player supplied this version"
+        replace_file(src, dst)
+    if not (out / DLSS_NOTICE).is_file() or (out / DLSS_NOTICE).read_bytes() != note.read_bytes():
+        replace_file(note, out / DLSS_NOTICE)
+    return None
 
 
 def copy_dlls(exe, msys_bin, out):
@@ -975,6 +1023,9 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None):
     refresh_translator(out)
     if (KIT / 'bin' / 'amd_fidelityfx_vk.dll').is_file():   # FSR 3.1 (runtime/vk_ffx.cpp)
         copy_if_changed(KIT / 'bin' / 'amd_fidelityfx_vk.dll', out / 'amd_fidelityfx_vk.dll')
+    kept = place_dlss(out)   # NVIDIA DLSS (runtime/vk_dlaa.c)
+    if kept:
+        say(f'  {kept}')
     say(f'  {EXE_NAME} {exe.stat().st_size / 1e6:.0f} MB; beside it: {", ".join(copy_dlls(exe, msys / "bin", out))}')
     (out / 'profile').mkdir(exist_ok=True)
 
@@ -1102,7 +1153,7 @@ def step_key(step, identity, out=None):
         return lift
     assert step == 'compile'
     return (f'compile|{lift}|{tree_digest(KIT / "runtime", ("**/*",))}|{sha256_file(Path(__file__))}|{kit_version()}'
-            f'|cpu {cpu_tag()}|{tree_digest(KIT / "bin", ("nx2navi_xlate.id",))}')
+            f'|cpu {cpu_tag()}|{tree_digest(KIT / "bin", ("nx2navi_xlate.id", DLSS_NOTICE))}')
 
 
 def reuse_extracts(source, out, src, steps):

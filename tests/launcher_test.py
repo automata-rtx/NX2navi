@@ -1035,6 +1035,42 @@ class MakeGameTest(Tmp):
         self.assertEqual((compiled, len(bad)), (1, 1))
         self.assertNotIn('b.o', json.loads((obj / 'objects.json').read_text()))
 
+    def test_dlss_beside_the_game(self):
+        """The kit's nvngx_dlss.dll and its notice go beside the game; a newer kit replaces the copy an earlier build
+        placed, and a DLSS the player put there is kept."""
+        import dlss_pin
+        from unittest import mock
+        kit, out = self.tmp / 'kit', self.tmp / 'game'
+        (kit / 'bin').mkdir(parents=True)
+        out.mkdir()
+
+        def kit_dll(data, when):
+            (kit / 'bin' / 'nvngx_dlss.dll').write_bytes(data)
+            os.utime(kit / 'bin' / 'nvngx_dlss.dll', (when, when))
+            (kit / 'bin' / 'nvngx_dlss-NOTICE.txt').write_text(f'NVIDIA DLSS\n\nsha256 {hashlib.sha256(data).hexdigest()}\n')
+
+        dll, note = out / 'nvngx_dlss.dll', out / 'nvngx_dlss-NOTICE.txt'
+        with mock.patch.object(self.mg, 'KIT', kit):
+            self.assertIsNone(self.mg.place_dlss(out))   # a kit without DLSS: nothing
+            self.assertFalse(dll.exists())
+            kit_dll(b'dlss one', 1_700_000_000)
+            self.assertIsNone(self.mg.place_dlss(out))
+            self.assertEqual(dll.read_bytes(), b'dlss one')
+            self.assertTrue(note.is_file())
+            self.assertIsNone(self.mg.place_dlss(out))   # unchanged
+            kit_dll(b'dlss two', 1_700_000_000)          # a newer kit: the copy the last build placed goes
+            self.assertIsNone(self.mg.place_dlss(out))
+            self.assertEqual(dll.read_bytes(), b'dlss two')
+            self.assertIn(hashlib.sha256(b'dlss two').hexdigest(), note.read_text())
+            dll.write_bytes(b"custom!!")
+            os.utime(dll, (1_700_000_000, 1_700_000_000))    # another version the player put there: kept
+            self.assertIn('kept', self.mg.place_dlss(out))
+            self.assertEqual(dll.read_bytes(), b"custom!!")
+        # the notice the release scripts write is the one make_game reads
+        (self.tmp / 'n.txt').write_text(dlss_pin.notice_text(), encoding='utf-8')
+        self.assertEqual(self.mg.notice_sha256(self.tmp / 'n.txt'), dlss_pin.SHA256)
+        self.assertEqual((dlss_pin.NAME, dlss_pin.NOTICE), (self.mg.DLSS_DLL, self.mg.DLSS_NOTICE))
+
     @unittest.skipIf(os.name == 'nt', 'a script stands in for windres.exe')
     def test_compile_resources(self):
         # The toolchain, the kit and the game under folders with spaces, as under C:\Users\Ali Sayed. windres must

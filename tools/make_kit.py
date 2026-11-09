@@ -1,10 +1,12 @@
 """Assemble the build kit: what a player needs to build Ocarina of Time on their own PC with tools/make_game.py.
 
-    python tools/make_kit.py --xlate <dir with nx2navi_xlate.exe and .id> [--out build/kit] [--zip]
+    python tools/make_kit.py --xlate <dir with nx2navi_xlate.exe and .id> [--ffx amd_fidelityfx_vk.dll]
+                             [--dlss nvngx_dlss.dll | --no-dlss] [--out build/kit] [--zip]
 
-The kit holds this repository's runtime/, recomp/, the build tools, the shader translator built from tools/xlate and
-README-BuildKit.md; no game code, data or anything generated from the game. check_content runs over the folder before
-it is zipped.
+The kit holds this repository's runtime/, recomp/, the build tools, the shader translator built from tools/xlate,
+NVIDIA's DLSS library with its notice (tools/dlss_pin.py: downloaded from NVIDIA's DLSS SDK repository and checked,
+or --dlss; not with --no-dlss), AMD's FSR 3.1 library with --ffx, and README-BuildKit.md; no game code, data or
+anything generated from the game. check_content runs over the folder before it is zipped.
 """
 import argparse
 import shutil
@@ -34,9 +36,15 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('--xlate', type=Path, required=True, help='folder with nx2navi_xlate.exe and nx2navi_xlate.id')
     ap.add_argument('--ffx', type=Path, help="AMD's signed amd_fidelityfx_vk.dll (FidelityFX SDK 1.1.4, MIT) for FSR 3.1")
+    ap.add_argument('--dlss', type=Path, help="NVIDIA's nvngx_dlss.dll from disk instead of downloading it from "
+                                               "NVIDIA's DLSS SDK repository")
+    ap.add_argument('--no-dlss', action='store_true', help='leave NVIDIA DLSS out of the kit')
     ap.add_argument('--out', type=Path, default=ROOT / 'build' / 'kit')
     ap.add_argument('--zip', action='store_true')
     a = ap.parse_args()
+    sys.path.insert(0, str(ROOT / 'tools'))
+    import dlss_pin
+    dlss = None if a.no_dlss else dlss_pin.resolve(a.dlss, ROOT / 'build' / 'dl')
     kit = a.out / NAME
     if kit.exists():
         shutil.rmtree(kit)
@@ -55,10 +63,11 @@ def main():
         shutil.copy2(a.xlate / n, kit / 'bin' / n)
     if a.ffx:   # FSR 3.1 loads it from beside the game (runtime/vk_ffx.cpp); its licence is runtime/third_party/ffx_api
         shutil.copy2(a.ffx, kit / 'bin' / 'amd_fidelityfx_vk.dll')
-    sys.path.insert(0, str(ROOT / 'tools'))
+    if dlss:   # DLSS: NGX loads it from beside the game (runtime/vk_dlaa.c); make_game.py copies it there
+        dlss_pin.place(dlss, kit / 'bin')
     import check_content
     bad = [f'{p.relative_to(kit)}: {m}' for p in sorted(kit.rglob('*')) if p.is_file()
-           for m in check_content.problems_for(p, allow_large=p.suffix in ('.exe', '.dll'))]   # the translator, AMD's DLL
+           for m in check_content.problems_for(p, allow_large=p.suffix in ('.exe', '.dll'))]   # the translator, the DLLs
     if bad:
         sys.exit('check_content refuses these kit files, not zipped:\n  ' + '\n  '.join(bad[:20]))
     size = sum(p.stat().st_size for p in kit.rglob('*') if p.is_file())
