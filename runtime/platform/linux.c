@@ -1060,6 +1060,10 @@ const void *plat_file_map(PlatFile *f) {
     return v == MAP_FAILED ? NULL : v;
 }
 
+void plat_file_unmap(const void *view, size_t size) {
+    munmap((void *)view, size);
+}
+
 int plat_fs_os_error(void) { return errno; }
 
 static int fs_err(int e) {

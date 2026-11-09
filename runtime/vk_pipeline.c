@@ -163,26 +163,26 @@ static void cache_path_init(void) {
     snprintf(P.cache_path, sizeof P.cache_path, "%s/pipeline-cache.bin", exe);
 }
 
-// Cache data whose header names another device or driver is dropped before Vulkan sees it.
+// Check the header on the same file handle used for mapping. Shader preparation can produce
+// a cache several GiB long. Mapping it keeps a second private copy out of the process commit.
+static size_t cache_file_size(PlatFile *f, const VkPhysicalDeviceProperties *props) {
+    PlatFileId id;
+    VkPipelineCacheHeaderVersionOne h;
+    if (!f || !plat_file_id(f, &id) || id.size <= sizeof h || id.size > SIZE_MAX ||
+        plat_file_pread(f, &h, sizeof h, 0) != sizeof h) return 0;
+    if (h.headerSize != sizeof h || h.headerVersion != VK_PIPELINE_CACHE_HEADER_VERSION_ONE ||
+        h.vendorID != props->vendorID || h.deviceID != props->deviceID ||
+        memcmp(h.pipelineCacheUUID, props->pipelineCacheUUID, VK_UUID_SIZE)) return 0;
+    return (size_t)id.size;
+}
+
 static void cache_load(VkCtx *c) {
     cache_path_init();
-    void *data = NULL;
-    size_t size = 0;
-    FILE *f = P.cache_path[0] ? fopen(P.cache_path, "rb") : NULL;
-    if (f) {
-        int64_t len = plat_file_size(P.cache_path);
-        if (len > (int64_t)sizeof(VkPipelineCacheHeaderVersionOne) && (data = malloc((size_t)len)) &&
-            fread(data, 1, (size_t)len, f) == (size_t)len)
-            size = (size_t)len;
-        fclose(f);
-        VkPipelineCacheHeaderVersionOne h;
-        if (size) memcpy(&h, data, sizeof h);
-        if (size && (h.headerVersion != VK_PIPELINE_CACHE_HEADER_VERSION_ONE || h.vendorID != c->props.vendorID ||
-                     h.deviceID != c->props.deviceID || memcmp(h.pipelineCacheUUID, c->props.pipelineCacheUUID, VK_UUID_SIZE))) {
-            rt_log("vk_pipeline: %s was written by another device or driver; starting empty", P.cache_path);
-            size = 0;
-        }
-    }
+    PlatFile *f = P.cache_path[0] ? plat_file_open(P.cache_path) : NULL;
+    size_t size = cache_file_size(f, &c->props);
+    const void *data = size ? plat_file_map(f) : NULL;
+    if (f) plat_file_close(f);
+    if (!data) size = 0;
     VkPipelineCacheCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, .initialDataSize = size,
                                     .pInitialData = size ? data : NULL};
     if (vkCreatePipelineCache(c->device, &ci, NULL, &P.cache) != VK_SUCCESS) {
@@ -190,7 +190,7 @@ static void cache_load(VkCtx *c) {
         if (vkCreatePipelineCache(c->device, &ci, NULL, &P.cache) != VK_SUCCESS) P.cache = VK_NULL_HANDLE;
     }
     P.cache_loaded = P.cache && ci.initialDataSize != 0;
-    free(data);
+    if (data) plat_file_unmap(data, size);
 }
 
 static int cache_dir(char *dir, size_t n);
@@ -3104,6 +3104,10 @@ int vk_shader_cache_id(void) {
         printf("|%s", value ? value : "");
     }
     putchar('\n');
+    cache_path_init();
+    PlatFile *cache = P.cache_path[0] ? plat_file_open(P.cache_path) : NULL;
+    printf("shader-driver-cache-ready %d\n", cache_file_size(cache, p) != 0);
+    if (cache) plat_file_close(cache);
     printf("shader-storage %s\n", storage);
     return 0;
 }

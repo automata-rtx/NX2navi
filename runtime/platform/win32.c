@@ -1078,6 +1078,11 @@ const void *plat_file_map(PlatFile *f) {
     return v;
 }
 
+void plat_file_unmap(const void *view, size_t size) {
+    (void)size;
+    UnmapViewOfFile(view);
+}
+
 static __thread DWORD fs_last_error;
 int plat_fs_os_error(void) { return (int)fs_last_error; }
 

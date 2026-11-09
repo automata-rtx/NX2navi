@@ -875,10 +875,10 @@ class MakeGameTest(Tmp):
         def probe(*args, **kwargs):
             self.assertEqual((self.out / 'nx2navi_xlate.exe').read_bytes(), b'new')
             self.assertEqual((self.out / 'nx2navi_xlate.id').read_bytes(), b'new')
-            return subprocess.CompletedProcess(args, 0, 'shader-cache-id new\nshader-storage cache\n', '')
+            return subprocess.CompletedProcess(args, 0, 'shader-cache-id new\nshader-storage cache\nshader-driver-cache-ready 1\n', '')
 
         with patch.object(self.mg, 'KIT', kit), patch.object(subprocess, 'run', probe):
-            self.assertEqual(self.mg.shader_device(self.out), ('new', self.out / 'cache'))
+            self.assertEqual(self.mg.shader_device(self.out), ('new', self.out / 'cache', True))
 
     def test_independent_shader_cache(self):
         cache = self.out / 'shader-cache'
@@ -901,12 +901,12 @@ class MakeGameTest(Tmp):
             self.assertEqual(self.main_with(self.mg.step_romfs, lambda *_: None, compile_, 'shaders'), 0)
 
         with patch.object(self.mg, 'step_shaders', prepare), patch.object(self.mg, 'shader_device',
-                return_value=('driver A', cache)) as device:
+                return_value=('driver A', cache, True)) as device:
             build_game()
             with patch.object(self.mg, 'kit_version', return_value='new native build'):
                 build_game()
                 self.assertEqual(launches, ['compile', 'shaders', 'compile'])
-                device.return_value = ('driver B', cache)
+                device.return_value = ('driver B', cache, True)
                 build_game()
                 (cache / 'test.spv').unlink()
                 build_game()
@@ -918,6 +918,9 @@ class MakeGameTest(Tmp):
                 (self.out / 'vertex-programs.bin').unlink()
                 build_game()
                 self.assertEqual(launches[3:], ['shaders'] * 5)
+                device.return_value = ('driver B', cache, False)
+                build_game()
+                self.assertEqual(launches[3:], ['shaders'] * 6)
 
         kit = self.tmp / 'test kit'
         runtime = kit / 'runtime'

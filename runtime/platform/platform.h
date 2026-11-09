@@ -325,7 +325,8 @@ int64_t plat_file_pread(PlatFile *f, void *buf, uint32_t n, uint64_t off);
 // status change) times in the OS's units. 0 on failure.
 typedef struct { uint64_t volume, file_id, size, write_time, create_time; } PlatFileId;
 int plat_file_id(PlatFile *f, PlatFileId *out);
-const void *plat_file_map(PlatFile *f);                   // a read-only view of the whole file, kept until exit; NULL
+const void *plat_file_map(PlatFile *f);                   // a read-only view of the whole file, NULL on failure
+void plat_file_unmap(const void *view, size_t size);
 
 // ---- the host file system under the game's save data (fs_host.c). Calls that can fail return PLAT_FS_OK (0) or the
 // reason; other processes may open the same files meanwhile.

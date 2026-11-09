@@ -1057,9 +1057,10 @@ def shader_device(out):
                            encoding='utf-8', errors='replace')
     device = re.search(r'^shader-cache-id (.+)$', probe.stdout, re.M)
     storage = re.search(r'^shader-storage (.+)$', probe.stdout, re.M)
-    if probe.returncode or not device or not storage:
+    driver = re.search(r'^shader-driver-cache-ready ([01])$', probe.stdout, re.M)
+    if probe.returncode or not device or not storage or not driver:
         fail(f'could not identify the shader translator and Vulkan device: {probe.stderr[-1000:]}')
-    return device[1].strip(), out / storage[1].strip()
+    return device[1].strip(), out / storage[1].strip(), driver[1] == '1'
 
 
 def shader_key(out, device, storage):
@@ -1241,11 +1242,11 @@ def main():
             if name == 'shaders':
                 if romfs_job:
                     romfs_job.join()
-                device, storage = shader_device(out)
+                device, storage, driver_ready = shader_device(out)
                 key = shader_key(out, device, storage)
             else:
                 key = step_key(name, src.identity, out)
-            if state['steps'].get(name) == key and (name != 'shaders' or shader_outputs_present(out, storage)):
+            if state['steps'].get(name) == key and (name != 'shaders' or (driver_ready and shader_outputs_present(out, storage))):
                 say(f'{name}: done before')
                 emit('step', step=name, state='skip')
             else:
