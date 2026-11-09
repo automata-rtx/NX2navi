@@ -45,6 +45,7 @@
 // with c1 and length at control+0x700) follows tools/shader_census.py.
 #include <ctype.h>
 #include <stdio.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -2169,27 +2170,41 @@ static void unpack_answers(const uint8_t *p, GfxShaderAnswers *a) {
     a->depth_minus_w = *p & 0x7f, a->mvprev = *p >> 7;
 }
 
-// Reads a record file's body (after its header) into *body; 0 when absent, and a file with another header is removed.
-static int rec_read(const char *path, const char *magic, uint32_t version, uint32_t rec_size, uint8_t **body, size_t *n) {
+// Returns 1 for a matching record file, 0 when a new one may be started, and -1 when it must be kept untouched.
+static int rec_load(const char *path, const char *magic, uint32_t version, uint32_t rec_size, uint8_t **body, size_t *n) {
     *body = NULL, *n = 0;
     FILE *f = fopen(path, "rb");
-    if (!f) return 0;
+    if (!f) return errno == ENOENT ? 0 : -1;
     RecHeader h;
-    fseek(f, 0, SEEK_END);
-    long len = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    int ok = len >= (long)sizeof h && fread(&h, sizeof h, 1, f) == 1 && !memcmp(h.magic, magic, 8) &&
-             h.version == version && h.rec_size == rec_size;
-    if (ok && len > (long)sizeof h) {
+    int64_t len = plat_fseek64(f, 0, SEEK_END) == 0 ? plat_ftell64(f) : -1;
+    int ok = len >= 0 && plat_fseek64(f, 0, SEEK_SET) == 0;
+    if (ok && len >= (int64_t)sizeof h) ok = fread(&h, sizeof h, 1, f) == 1;
+    if (ok && (len < (int64_t)sizeof h || memcmp(h.magic, magic, 8) || h.version != version || h.rec_size != rec_size)) {
+        fclose(f);
+        if (!len) return 0;
+        rt_log("gfx_shader: %s has an incompatible or incomplete header", path);
+        return remove(path) == 0 ? 0 : -1;
+    }
+    if (ok && len > (int64_t)sizeof h) {
         *n = (size_t)len - sizeof h;
-        ok = (*body = malloc(*n)) && fread(*body, 1, *n, f) == *n;
+        *body = malloc(*n);
+        ok = *body != NULL;
+        for (size_t at = 0; ok && at < *n;) {
+            size_t chunk = *n - at;
+            if (chunk > (64u << 20)) chunk = 64u << 20;
+            ok = fread(*body + at, 1, chunk, f) == chunk;
+            at += chunk;
+        }
     }
     fclose(f);
-    if (!ok) {
-        free(*body), *body = NULL, *n = 0;
-        if (len > 0) rt_log("gfx_shader: %s has another format or version; it is rewritten", path), remove(path);
-    }
-    return ok;
+    if (ok) return 1;
+    free(*body), *body = NULL, *n = 0;
+    rt_log("gfx_shader: could not read %s; kept its records", path);
+    return -1;
+}
+
+static int rec_read(const char *path, const char *magic, uint32_t version, uint32_t rec_size, uint8_t **body, size_t *n) {
+    return rec_load(path, magic, version, rec_size, body, n) == 1;
 }
 
 // Walks shader-programs.bin records; returns the byte length of the whole records. fn may be NULL.
@@ -2208,9 +2223,10 @@ static size_t prg_walk(const uint8_t *b, size_t n, void (*fn)(const uint8_t *rec
 
 static void prg_seen(const uint8_t *rec, void *ctx) { set_add(ctx, hash8(rec + 12)); }
 
-static void truncate_to(const char *path, size_t size) {
-    if (!plat_file_truncate(path, size)) return;
+static int truncate_to(const char *path, size_t size) {
+    if (!plat_file_truncate(path, size)) return 0;
     rt_log("gfx_shader: %s had a torn tail; cut to %zu bytes", path, size);
+    return 1;
 }
 
 void gfx_shader_record_at(const char *keys_path) {
@@ -2223,16 +2239,23 @@ void gfx_shader_record_at(const char *keys_path) {
     snprintf(RC.prg_path, sizeof RC.prg_path, "%.*sshader-programs.bin", dir, keys_path);
     uint8_t *b;
     size_t n;
-    if (rec_read(RC.ans_path, "NX2NSANS", ANS_VERSION, ANS_REC, &b, &n)) {
+    int answers = rec_load(RC.ans_path, "NX2NSANS", ANS_VERSION, ANS_REC, &b, &n);
+    if (answers == 1) {
         for (size_t o = 0; o + ANS_REC <= n; o += ANS_REC) set_add(&RC.pairs, hash8(b + o + 36));
-        if (n % ANS_REC) truncate_to(RC.ans_path, sizeof(RecHeader) + n / ANS_REC * ANS_REC);
+        if (n % ANS_REC && !truncate_to(RC.ans_path, sizeof(RecHeader) + n / ANS_REC * ANS_REC)) answers = -1;
     }
     free(b);
-    if (rec_read(RC.prg_path, "NX2NSPRG", PRG_VERSION, 0, &b, &n)) {
+    int programs = rec_load(RC.prg_path, "NX2NSPRG", PRG_VERSION, 0, &b, &n);
+    if (programs == 1) {
         size_t whole = prg_walk(b, n, prg_seen, &RC.progs);
-        if (whole != n) truncate_to(RC.prg_path, sizeof(RecHeader) + whole);
+        if (whole != n && !truncate_to(RC.prg_path, sizeof(RecHeader) + whole)) programs = -1;
     }
     free(b);
+    if (answers < 0 || programs < 0) {
+        rt_log("gfx_shader: recording disabled because a previous record file could not be read or repaired");
+        plat_mutex_unlock(&RC.lock);
+        return;
+    }
     rt_log("gfx_shader: recording answers met in play to %s (%u records, %u programs recorded before)", RC.ans_path,
            RC.pairs.n, RC.progs.n);
     plat_xchg32(&RC.on, 1);
@@ -2265,9 +2288,9 @@ static void ans_note(const Req *r, int stage, const uint8_t *control, const uint
 static int rec_append(const char *path, const char *magic, uint32_t version, uint32_t rec_size, const Bytes *b) {
     FILE *f = fopen(path, "ab");
     if (!f) return 0;
-    fseek(f, 0, SEEK_END);
-    int ok = 1;
-    if (ftell(f) == 0) {
+    int64_t len = plat_fseek64(f, 0, SEEK_END) == 0 ? plat_ftell64(f) : -1;
+    int ok = len >= 0;
+    if (len == 0) {
         RecHeader h = {{0}, version, rec_size};
         memcpy(h.magic, magic, 8);
         ok = fwrite(&h, sizeof h, 1, f) == 1;
