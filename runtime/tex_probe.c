@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "cfg.h"
 #include "host.h"
 #include "nvn_api.h"
 #include "tex.h"
@@ -463,6 +464,7 @@ static tex_t make_tex(pool_t *pool, uint64_t off, int format, uint32_t w, uint32
     t.magic = MAGIC('T', 'E', 'X', 0);
     t.d.target = 1, t.d.format = format, t.d.width = w, t.d.height = h, t.d.depth = 1, t.d.levels = levels;
     nvn_tex_layout(&t.d, &t.L);
+    t.pool_flags = (uint16_t)pool->flags;   // nvnTextureInitialize snapshots them
     t.pool = pool, t.off = (int64_t)off, t.mem = pool->mem + off, t.serial = serial;
     return t;
 }
@@ -540,6 +542,7 @@ static int test_textures(pool_t *tpool, pool_t *phys) {
     vk_texture_register(5, &b, NULL);
     vk_texture_release(&b);
     tex_t b2 = make_tex(tpool, 0x40000, 0x25, 16, 12, 1, 4);
+    vk_texture_gpu_written(&b2);   // the slot follows the replacement when its GPU image owns the content
     const VkTexImage *live = vk_texture_get(&b2);
     VkImage live_img = live ? live->image : VK_NULL_HANDLE;
     const VkTexImage *slot = vk_texture_by_id(5, NULL, NULL);
@@ -563,19 +566,40 @@ static int test_textures(pool_t *tpool, pool_t *phys) {
     return 0;
 }
 
+// Run with TEX_RELEASED_MB=1 to exercise the released-image budget on a small synthetic pool.
+static int test_released_budget(pool_t *pool) {
+    if (cfg_int("NX2NAVI_TEX_RELEASED_MB") != 1) return 0;
+    for (unsigned i = 0; i < 2; ++i) {
+        tex_t t = make_tex(pool, 0x100000 + i * 0x100000, 0x25, 512, 512, 1, 20 + i);
+        GCHECK(vk_texture_get(&t), "release-budget image %u", i);
+        vk_texture_release(&t);
+    }
+    VkTexCensus young, stale;
+    for (int i = 0; i < 8; ++i) vk_texture_new_submit();
+    vk_texture_census(&young);
+    GCHECK(young.bytes_released > (1u << 20), "young release-budget images were evicted");
+    gfx_counters.frames += 120;
+    for (int i = 0; i < 8; ++i) vk_texture_new_submit();
+    vk_texture_census(&stale);
+    GCHECK(stale.bytes_released <= (1u << 20), "stale release-budget images were retained");
+    printf("probe-vkmem: released-image budget: %llu young bytes, %llu after 120 frames\n",
+           (unsigned long long)young.bytes_released, (unsigned long long)stale.bytes_released);
+    return 0;
+}
+
 static int test_gpu(void) {
     uint64_t heap = 0;
     GCHECK(mem_set_heap_size(16ull << 20, &heap) == 0 && heap, "SetHeapSize 16 MiB");
     uint8_t *h = (uint8_t *)(uintptr_t)heap;
     pool_t pool = {.magic = NVN_POOL_MAGIC, .flags = 0x24, .mem = h + 0x100000, .size = 0x40000, .game_mem = h + 0x100000};
-    pool_t tpool = {.magic = NVN_POOL_MAGIC, .flags = 0x22, .mem = h + 0x400000, .size = 0x100000, .game_mem = h + 0x400000};
+    pool_t tpool = {.magic = NVN_POOL_MAGIC, .flags = 0x22, .mem = h + 0x400000, .size = 0x300000, .game_mem = h + 0x400000};
     pool_t phys = {.magic = NVN_POOL_MAGIC, .flags = 0x189, .mem = (uint8_t *)(uintptr_t)(RT_GPU_VA_BASE + 0x100000000ull),
                    .size = 0x40000, .game_mem = h + 0x800000, .span = 0x40000};
     pool_t virt = {.magic = NVN_POOL_MAGIC, .flags = 0x2a1, .mem = (uint8_t *)(uintptr_t)(RT_GPU_VA_BASE + 0x200000000ull),
                    .size = 0x80000, .span = 0x80000};
     if (test_import(&pool) || test_readfile(pool.mem + 0x38000) || test_virtual(&phys, &virt)) return 1;
     GCHECK(vk_pool_init(&tpool), "vk_pool_init of the texture pool");
-    if (test_textures(&tpool, &phys)) return 1;
+    if (test_textures(&tpool, &phys) || test_released_budget(&tpool)) return 1;
     VkMemStats st;
     vk_mem_stats(&st);
     GCHECK(st.imported_pools == 2 && st.physical_pools == 1 && st.virtual_pools == 1 && !st.import_failures,

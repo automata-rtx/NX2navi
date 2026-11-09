@@ -1622,6 +1622,20 @@ void plat_commit_info(double *proc_mb, double *used_mb, double *limit_mb) {
     if (private_bytes) *proc_mb = (double)(private_bytes >> 20);
 }
 
+int plat_commit_enforced(void) {
+    static int v = -1;   // read once
+    if (v < 0) {
+        int mode = 0;
+        FILE *f = fopen("/proc/sys/vm/overcommit_memory", "r");
+        if (f) {
+            if (fscanf(f, "%d", &mode) != 1) mode = 0;
+            fclose(f);
+        }
+        v = mode == 2;
+    }
+    return v;
+}
+
 // ---- child processes
 
 struct PlatChild {
