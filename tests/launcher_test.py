@@ -1071,6 +1071,43 @@ class MakeGameTest(Tmp):
         self.assertEqual(self.mg.notice_sha256(self.tmp / 'n.txt'), dlss_pin.SHA256)
         self.assertEqual((dlss_pin.NAME, dlss_pin.NOTICE), (self.mg.DLSS_DLL, self.mg.DLSS_NOTICE))
 
+    def test_frame_generation_payload_repair(self):
+        import dlssg_kit as fg
+        kind = (*fg.LIBRARIES, *fg.LICENSES)
+        src, out = self.tmp / 'fg-kit', self.tmp / 'game'
+        src.mkdir()
+        out.mkdir()
+
+        def payload(version):
+            for name in kind:
+                (src / name).write_bytes((name + version).encode())
+            (src / fg.NOTICE).write_text(''.join(f'{n} sha256 {fg.digest(src / n)}\n' for n in kind))
+
+        payload('old')
+        fg.install(src, out, self.mg.replace_file)
+        payload('new')
+        (out / fg.LIBRARIES[1]).write_bytes(b'custom')
+        self.assertIn('kept', fg.install(src, out, self.mg.replace_file))
+        self.assertEqual((out / fg.BRIDGE).read_bytes(), (fg.BRIDGE + 'old').encode())
+        (out / fg.LIBRARIES[1]).unlink()
+        (src / fg.LIBRARIES[2]).write_bytes(b'corrupt')
+        with self.assertRaises(SystemExit):
+            fg.install(src, out, self.mg.replace_file)
+        self.assertTrue((out / fg.BRIDGE).is_file())
+        payload('new')
+
+        def interrupt(src, dst):
+            if src.name == fg.LIBRARIES[2]:
+                raise OSError('interrupted')
+            self.mg.replace_file(src, dst)
+
+        with self.assertRaises(OSError):
+            fg.install(src, out, interrupt)
+        self.assertFalse((out / fg.BRIDGE).exists())
+        fg.install(src, out, self.mg.replace_file)
+        for name in (*kind, fg.NOTICE):
+            self.assertEqual((out / name).read_bytes(), (src / name).read_bytes())
+
     @unittest.skipIf(os.name == 'nt', 'a script stands in for windres.exe')
     def test_compile_resources(self):
         # The toolchain, the kit and the game under folders with spaces, as under C:\Users\Ali Sayed. windres must

@@ -60,6 +60,7 @@ from pathlib import Path
 
 KIT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(KIT / 'tools'))
+import dlssg_kit  # noqa: E402
 import nup  # noqa: E402
 
 TITLE_ID = 0x0400486024DEC000
@@ -1023,9 +1024,9 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None):
     refresh_translator(out)
     if (KIT / 'bin' / 'amd_fidelityfx_vk.dll').is_file():   # FSR 3.1 (runtime/vk_ffx.cpp)
         copy_if_changed(KIT / 'bin' / 'amd_fidelityfx_vk.dll', out / 'amd_fidelityfx_vk.dll')
-    kept = place_dlss(out)   # NVIDIA DLSS (runtime/vk_dlaa.c)
-    if kept:
-        say(f'  {kept}')
+    for message in (place_dlss(out), dlssg_kit.install(KIT / 'bin' / 'dlssg', out, replace_file)):
+        if message:
+            say(f'  {message}')
     say(f'  {EXE_NAME} {exe.stat().st_size / 1e6:.0f} MB; beside it: {", ".join(copy_dlls(exe, msys / "bin", out))}')
     (out / 'profile').mkdir(exist_ok=True)
 
@@ -1153,7 +1154,7 @@ def step_key(step, identity, out=None):
         return lift
     assert step == 'compile'
     return (f'compile|{lift}|{tree_digest(KIT / "runtime", ("**/*",))}|{sha256_file(Path(__file__))}|{kit_version()}'
-            f'|cpu {cpu_tag()}|{tree_digest(KIT / "bin", ("nx2navi_xlate.id", DLSS_NOTICE))}')
+            f'|cpu {cpu_tag()}|{tree_digest(KIT / "bin", ("nx2navi_xlate.id", DLSS_NOTICE, "dlssg/" + dlssg_kit.NOTICE))}')
 
 
 def reuse_extracts(source, out, src, steps):

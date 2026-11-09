@@ -17,7 +17,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 NAME = 'NX2navi-BuildKit'
 TOOLS = ('make_game.py', 'nup.py', 'romfs_index.py', 'check_content.py', 'hostmem.py', 'prepare_shaders.py',
-         'shader_census.py', 'shader_passes.py', 'shader_list.py', 'zstd_compat.py')
+         'dlssg_kit.py', 'shader_census.py', 'shader_passes.py', 'shader_list.py', 'zstd_compat.py')
 TOP = ('LICENSE', 'LICENSE-ADDITIONS', 'THIRD_PARTY_NOTICES.md', 'VERSION', 'nx2navi.ini.example')
 SKIP_DIRS = {'__pycache__', '.pytest_cache'}
 SKIP_SUFFIXES = {'.o', '.obj', '.pyc', '.exe', '.dll', '.a', '.lib'}
@@ -38,12 +38,15 @@ def main():
     ap.add_argument('--ffx', type=Path, help="AMD's signed amd_fidelityfx_vk.dll (FidelityFX SDK 1.1.4, MIT) for FSR 3.1")
     ap.add_argument('--dlss', type=Path, help="NVIDIA's nvngx_dlss.dll from disk instead of downloading it from "
                                                "NVIDIA's DLSS SDK repository")
+    ap.add_argument('--dlssg', type=Path, metavar='DLL', help='frame generation bridge built by tools/build_dlssg.py')
+    ap.add_argument('--streamline', type=Path, metavar='SDK', help='matching Streamline SDK folder for --dlssg')
     ap.add_argument('--no-dlss', action='store_true', help='leave NVIDIA DLSS out of the kit')
     ap.add_argument('--out', type=Path, default=ROOT / 'build' / 'kit')
     ap.add_argument('--zip', action='store_true')
     a = ap.parse_args()
     sys.path.insert(0, str(ROOT / 'tools'))
     import dlss_pin
+    import dlssg_kit
     dlss = None if a.no_dlss else dlss_pin.resolve(a.dlss, ROOT / 'build' / 'dl')
     kit = a.out / NAME
     if kit.exists():
@@ -65,6 +68,7 @@ def main():
         shutil.copy2(a.ffx, kit / 'bin' / 'amd_fidelityfx_vk.dll')
     if dlss:   # DLSS: NGX loads it from beside the game (runtime/vk_dlaa.c); make_game.py copies it there
         dlss_pin.place(dlss, kit / 'bin')
+    dlssg_kit.assemble(a.dlssg, a.streamline, kit / 'bin' / 'dlssg')
     import check_content
     bad = [f'{p.relative_to(kit)}: {m}' for p in sorted(kit.rglob('*')) if p.is_file()
            for m in check_content.problems_for(p, allow_large=p.suffix in ('.exe', '.dll'))]   # the translator, the DLLs

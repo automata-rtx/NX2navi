@@ -48,6 +48,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / 'tools'))
 import check_content  # noqa: E402
+import dlssg_kit  # noqa: E402
 import dlss_pin  # noqa: E402
 from launcher import toolchain  # noqa: E402
 from launcher.paths import Layout  # noqa: E402
@@ -64,7 +65,7 @@ PINS = {
               'ac87609db3f715404dd41a989c2f1706ea1512f3d86217f938d11c63af8eb505'),
 }
 TOOLS = ('make_game.py', 'nup.py', 'romfs_index.py', 'check_content.py', 'hostmem.py', 'prepare_shaders.py',
-         'shader_census.py', 'shader_passes.py', 'shader_list.py', 'zstd_compat.py')
+         'dlssg_kit.py', 'shader_census.py', 'shader_passes.py', 'shader_list.py', 'zstd_compat.py')
 TOP = ('LICENSE', 'LICENSE-ADDITIONS', 'THIRD_PARTY_NOTICES.md', 'nx2navi.ini.example')
 SKIP_DIRS = {'__pycache__', '.pytest_cache', 'native'}
 SKIP_SUFFIXES = {'.o', '.obj', '.pyc', '.exe', '.dll', '.a', '.lib'}
@@ -159,7 +160,7 @@ def build_python(py):
 
 # ---------------------------------------------------------------- app/<version>/
 
-def build_app(app, ver, xlate, feed_repo, lock, ffx=None, dlss=None):
+def build_app(app, ver, xlate, feed_repo, lock, ffx=None, dlss=None, dlssg=None, streamline=None):
     copy_tree(ROOT / 'launcher', app / 'launcher')
     for d in ('runtime', 'recomp'):
         copy_tree(ROOT / d, app / d)
@@ -179,6 +180,7 @@ def build_app(app, ver, xlate, feed_repo, lock, ffx=None, dlss=None):
         shutil.copy2(ffx, app / 'bin' / 'amd_fidelityfx_vk.dll')
     if dlss:   # DLSS: NGX loads it from beside the game (runtime/vk_dlaa.c); make_game.py copies it there
         dlss_pin.place(dlss, app / 'bin')
+    dlssg_kit.assemble(dlssg, streamline, app / 'bin' / 'dlssg')
     (app / 'toolchain.lock.json').write_text(json.dumps(lock, indent=1), encoding='utf-8')
     (app / 'feed.json').write_text(json.dumps({'type': 'github', 'repo': feed_repo}, indent=1), encoding='utf-8')
 
@@ -290,6 +292,8 @@ def main():
     ap.add_argument('--ffx', type=Path, help="AMD's signed amd_fidelityfx_vk.dll (FidelityFX SDK 1.1.4, MIT) for FSR 3.1")
     ap.add_argument('--dlss', type=Path, help=f"NVIDIA's nvngx_dlss.dll (DLSS {dlss_pin.VERSION}) from disk instead of "
                                                "downloading it from NVIDIA's DLSS SDK repository")
+    ap.add_argument('--dlssg', type=Path, metavar='DLL', help='frame generation bridge built by tools/build_dlssg.py')
+    ap.add_argument('--streamline', type=Path, metavar='SDK', help='matching Streamline SDK folder for --dlssg')
     ap.add_argument('--no-dlss', action='store_true', help='leave NVIDIA DLSS out of the release')
     ap.add_argument('--out', type=Path, default=MAIN_ROOT / 'build' / 'launcher-release')
     ap.add_argument('--feed', default=DEFAULT_FEED, help='the GitHub repository the launcher looks for releases in')
@@ -316,7 +320,7 @@ def main():
         + (f' (CLANG64 clang left out: {lock["fast_skipped"]})' if lock.get('fast_skipped') else ''))
     dlss = None if a.no_dlss else dlss_pin.resolve(a.dlss, DL)
     say(f'NVIDIA DLSS {dlss_pin.VERSION}: {dlss}' if dlss else 'NVIDIA DLSS left out (--no-dlss)')
-    build_app(folder / 'app' / ver, ver, a.xlate, a.feed, lock, a.ffx, dlss)
+    build_app(folder / 'app' / ver, ver, a.xlate, a.feed, lock, a.ffx, dlss, a.dlssg, a.streamline)
     (folder / 'app' / 'current.txt').write_text(ver + '\n', encoding='utf-8')
     build_python(folder / 'python')
     cc, windres = native_compiler(lock)

@@ -4,7 +4,8 @@
 
 Streamline's C++ types have MSVC's ABI, so this one DLL is built with Visual Studio's compiler (the Build Tools are
 enough; vswhere finds them), against the SDK's headers, which stay where they are. The Vulkan headers are MSYS2's.
-The build kit ships the DLL ready-made beside Streamline's own runtime DLLs (tools/make_kit.py --dlssg).
+A launcher release ships the DLL ready-made beside Streamline's own runtime DLLs (tools/make_launcher.py --dlssg
+and --streamline), and tools/make_game.py place_dlssg puts them beside the game.
 """
 import argparse
 import os
