@@ -124,6 +124,12 @@ int frame_step_realtime(void) { return step_word != NULL; }
 static int fps60_set = -2;
 static int game_interval = 1;   // the present interval of the newest frame (frame_step_present)
 
+// Assume 60 Hz until the window measures its display. Real TV refresh rates can fall below the game's 30 Hz floor.
+static double shown_hz(double hz) {
+    if (hz <= 0) return 60;
+    return hz < LIMIT_MIN_HZ ? LIMIT_MIN_HZ : hz;
+}
+
 // A build without the fps60 and realtime patch sets (Ocarina) steps its game by the clock itself: walked by the same
 // frame-numbered input script, Link covered half the distance at 120 fps that he covers at 60. There the pacer holds
 // frames to the limit alone (nvn_api_obj.c present_period), the game's own 60 Hz interval aside, and the limit may be
@@ -194,8 +200,7 @@ uint64_t frame_step_cap_ns(void) {
         rtss_limit_want(rtss ? 0 : -1);
         return 0;
     }
-    double hz = limit_hz ? limit_hz : gfx_window_refresh_hz();
-    if (hz < LIMIT_MIN_HZ) hz = 60;   // display rate unknown (no window yet)
+    double hz = shown_hz(limit_hz ? limit_hz : gfx_window_refresh_hz());
     double max = frame_free_running() ? LIMIT_FREE_MAX_HZ : LIMIT_MAX_HZ;
     if (hz > max) hz = max;
     // Frame generation presents a generated frame between each two of the game's (vk_fg.cpp): the game is paced at
@@ -213,13 +218,11 @@ double frame_step_limit_hz(void) {
     if (frame_free_running()) {   // 0 for unlimited, as before the first read
         frame_limit_live();
         if (limit_hz == -2 || limit_hz == -1) return 0;
-        double r = limit_hz ? limit_hz : gfx_window_refresh_hz();
-        return r < LIMIT_MIN_HZ ? 60 : r;
+        return shown_hz(limit_hz ? limit_hz : gfx_window_refresh_hz());
     }
     int hz = limit_hz;
     if (hz < 0) return 0;
-    double r = hz ? hz : gfx_window_refresh_hz();
-    if (r < LIMIT_MIN_HZ) r = 60;
+    double r = shown_hz(hz ? hz : gfx_window_refresh_hz());
     return !step_word && r > 60 ? 60 : r > LIMIT_MAX_HZ ? LIMIT_MAX_HZ : r;
 }
 
