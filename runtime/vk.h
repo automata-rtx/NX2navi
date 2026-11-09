@@ -378,6 +378,7 @@ typedef struct {
     VkImageAspectFlags aspect;
     VkImageUsageFlags usage;
     uint32_t width, height, depth, levels, layers, samples;
+    uint64_t record_id;            // assigned when a logical texture record takes an image
     uint64_t addr;                 // storage GPU address
     uint8_t alpha_one;             // X format: sample alpha as 1 through the view swizzle
     uint8_t chan[4];               // TexVkFormat.chan: component order of a stand-in format, applied by the view swizzle

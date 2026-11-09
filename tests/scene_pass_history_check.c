@@ -41,9 +41,30 @@ int main(void) {
         ex.depth.image = (VkImage)(uintptr_t)3;
         assert(!vk_exec_targets_recent(&ex, 1, 1));
         ex.depth.image = (VkImage)(uintptr_t)1;
+        ex.color[0].image = (VkImage)(uintptr_t)77;   // a fresh colour needs the same role one frame ago
+        if (n == 2) ex.color[1].image = (VkImage)(uintptr_t)78;
+        gfx_counters.frames = first + 1;
+        assert(vk_exec_targets_recent(&ex, 1, 1));
         gfx_counters.frames = first + 2;
         assert(!vk_exec_targets_recent(&ex, 1, 1));
     }
+    VkExec ring = {.pass_ncolor = 1};
+    ring.color[0] = target(100, VK_FORMAT_R8G8B8A8_UNORM, 64, 64);
+    finish_pass(&ring, 30);
+    // These handles have the same high ten bits after multiplicative hashing.
+    uintptr_t collision = 101;
+    while ((collision * UINT64_C(0x9E3779B97F4A7C15) >> 54) !=
+           (UINT64_C(100) * UINT64_C(0x9E3779B97F4A7C15) >> 54)) ++collision;
+    ring.color[0].image = (VkImage)collision;
+    finish_pass(&ring, 31);
+    ring.color[0].image = (VkImage)(uintptr_t)100;
+    gfx_counters.frames = 33;   // fourth frame since this attachment was written
+    assert(vk_exec_targets_recent(&ring, 0, 0));
+    ring.color[0].record_id++;
+    assert(!vk_exec_targets_recent(&ring, 0, 0));
+    ring.color[0].record_id--;
+    gfx_counters.frames++;
+    assert(!vk_exec_targets_recent(&ring, 0, 0));
     puts("Scene pass history checks passed");
     return 0;
 }

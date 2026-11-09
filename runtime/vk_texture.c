@@ -546,6 +546,8 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
         }
     }
     VkTexImage *p = &e->pub;
+    static uint64_t next_record_id;   // create_tex runs under the texture lock
+    p->record_id = ++next_record_id;
     p->image = img;
     p->format = f.vk;
     p->type = type;

@@ -34,6 +34,7 @@ typedef struct {
     uint32_t width, height, samples;     // extent of that level; with blocks, in blocks
     int32_t nvn_format;                  // NVNformat of the view (VkPipeState.color_fmt / depth_fmt)
     const VkTexImage *img;               // the image (fb_usage, fb_learned)
+    uint64_t record_id;                  // texture record at resolve time, including BC stand-ins
     uint8_t scale;                       // VkTexImage.scale
 } VkExecTarget;
 
