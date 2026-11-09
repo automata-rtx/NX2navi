@@ -3118,7 +3118,8 @@ int vk_shader_cache_id(void) {
     char dir[PLAT_PATH_MAX * 2];
     printf("shader-translations-ready %d\n", cache_dir(dir, sizeof dir) && gfx_shader_prepared_present(dir));
     PlatFile *cache = P.cache_path[0] ? plat_file_open(P.cache_path) : NULL;
-    printf("shader-driver-cache-ready %d\n", cache_file_size(cache, p) != 0);
+    size_t bytes = cache_file_size(cache, p);
+    printf("shader-driver-cache-ready %d\nshader-driver-cache-bytes %zu\n", bytes != 0, bytes);
     if (cache) plat_file_close(cache);
     printf("shader-storage %s\n", storage);
     return 0;

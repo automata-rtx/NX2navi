@@ -1116,11 +1116,11 @@ def shader_device(out):
                            encoding='utf-8', errors='replace')
     device = re.search(r'^shader-cache-id (.+)$', probe.stdout, re.M)
     storage = re.search(r'^shader-storage (.+)$', probe.stdout, re.M)
-    driver = re.search(r'^shader-driver-cache-ready ([01])$', probe.stdout, re.M)
+    driver = re.search(r'^shader-driver-cache-bytes ([0-9]+)$', probe.stdout, re.M)
     translations = re.search(r'^shader-translations-ready ([01])$', probe.stdout, re.M)
-    if probe.returncode or not device or not storage or not driver:
+    if probe.returncode or not device or not storage or not driver or not translations:
         fail(f'could not identify the shader translator and Vulkan device: {probe.stderr[-1000:]}')
-    return device[1].strip(), out / storage[1].strip(), driver[1] == '1', bool(translations and translations[1] == '1')
+    return device[1].strip(), out / storage[1].strip(), int(driver[1]), translations[1] == '1'
 
 
 def shader_keys(out, device, storage):
@@ -1157,7 +1157,7 @@ def shader_manifests(out):
 
 
 def update_shader_preparation(out, previous):
-    device, storage, driver_ready, translations_ready = shader_device(out)
+    device, storage, driver_bytes, translations_ready = shader_device(out)
     key, inventory = shader_keys(out, device, storage)
     receipt = out / 'shader-preparation.json'
     try:
@@ -1171,7 +1171,8 @@ def update_shader_preparation(out, previous):
                       and saved.get('manifests') == manifests)
     # Before separate preparation records, the build state held the complete key only.
     legacy = bool(not receipt.exists() and previous == key and manifests and translations_ready)
-    if driver_ready and ((compatible and saved.get('pipelines') == key) or legacy):
+    minimum = saved.get('driver_bytes')
+    if compatible and saved.get('pipelines') == key and type(minimum) is int and 0 < minimum <= driver_bytes:
         skipped = True
     else:
         skipped = False
@@ -1185,15 +1186,15 @@ def update_shader_preparation(out, previous):
         else:
             say('shaders: preparing shaders and driver pipelines')
             step_shaders(out)
-        checked_device, checked_storage, driver_ready, translations_ready = shader_device(out)
+        checked_device, checked_storage, driver_bytes, translations_ready = shader_device(out)
         manifests = shader_manifests(out)
-        if (device != checked_device or storage != checked_storage or not driver_ready or not translations_ready
+        if (device != checked_device or storage != checked_storage or not driver_bytes or not translations_ready
                 or not manifests):
             fail('shader preparation did not leave a compatible driver cache, archive manifests and translated shaders')
-    if not skipped or legacy:
+    if not skipped:
         with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=out, delete=False) as f:
             temporary = Path(f.name)
-            json.dump(dict(inventory=inventory, pipelines=key, manifests=manifests), f)
+            json.dump(dict(inventory=inventory, pipelines=key, manifests=manifests, driver_bytes=driver_bytes), f)
         try:
             os.replace(temporary, receipt)
         finally:

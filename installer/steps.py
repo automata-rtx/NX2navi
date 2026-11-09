@@ -1022,14 +1022,15 @@ class Prepare(Step):
             return None
         device = re.search(r'^shader-cache-id (.+)$', result.stdout, re.M)
         storage = re.search(r'^shader-storage (.+)$', result.stdout, re.M)
+        size = re.search(r'^shader-driver-cache-bytes ([0-9]+)$', result.stdout, re.M)
         lines = result.stdout.splitlines()
-        if (result.returncode or not device or not storage or 'shader-driver-cache-ready 1' not in lines
+        if (result.returncode or not device or not storage or not size or 'shader-driver-cache-ready 1' not in lines
                 or 'shader-translations-ready 1' not in lines):
             return None
         groups = [dest / name for name in ('shader-prepared.bin', 'mesh-programs.bin', 'vertex-programs.bin')]
         if not all(p.is_file() for p in groups):
             return None
-        return fingerprint(device[1], storage[1], *groups)
+        return fingerprint(device[1], storage[1], *groups), int(size[1])
 
     def key(self, ctx):
         layout = ctx.layout
@@ -1043,9 +1044,11 @@ class Prepare(Step):
     def current(self, ctx, record):
         dest = ctx.dest
         xlate = dest / ctx.layout.xlate.name
-        return ((dest / 'romfs-patches' / 'manifest.tsv').is_file() and xlate.is_file()
-                and file_sha256(xlate) == record.get('xlate_sha256') and bool(record.get('prepared'))
-                and self.cached_preparation(dest) == record['prepared'])
+        if (not (dest / 'romfs-patches' / 'manifest.tsv').is_file() or not xlate.is_file()
+                or file_sha256(xlate) != record.get('xlate_sha256') or type(record.get('driver_bytes')) is not int):
+            return False
+        cached = self.cached_preparation(dest)
+        return bool(cached and cached[0] == record.get('prepared') and 0 < record['driver_bytes'] <= cached[1])
 
     def run(self, ctx):
         layout, rep, dest = ctx.layout, ctx.reporter, ctx.dest
@@ -1137,7 +1140,7 @@ class Prepare(Step):
         prepared = self.cached_preparation(dest)
         if not prepared:
             raise InstallError('prepare.shaders_failed', code=1, log=str(log))
-        return {'xlate_sha256': file_sha256(xlate), 'prepared': prepared}
+        return {'xlate_sha256': file_sha256(xlate), 'prepared': prepared[0], 'driver_bytes': prepared[1]}
 
 
 # ---- 7. NVIDIA DLSS

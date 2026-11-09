@@ -222,15 +222,20 @@ class PreparedCacheTest(unittest.TestCase):
             for name in ('shader-prepared.bin', 'mesh-programs.bin', 'vertex-programs.bin'):
                 (dest / name).write_bytes(b'prepared')
             step = steps.Prepare()
-            ready = 'shader-cache-id device A\nshader-storage cache\nshader-driver-cache-ready 1\nshader-translations-ready 1\n'
+            ready = ('shader-cache-id device A\nshader-storage cache\nshader-driver-cache-ready 1\n'
+                     'shader-driver-cache-bytes 16384\nshader-translations-ready 1\n')
             result = SimpleNamespace(returncode=0, stdout=ready)
             with mock.patch.object(steps.subprocess, 'run', return_value=result):
-                record = dict(xlate_sha256=steps.file_sha256(ctx.layout.xlate), prepared=step.cached_preparation(dest))
+                prepared, size = step.cached_preparation(dest)
+                record = dict(xlate_sha256=steps.file_sha256(ctx.layout.xlate), prepared=prepared, driver_bytes=size)
                 self.assertTrue(step.current(ctx, record))
                 for change in ('device A', 'shader-driver-cache-ready 1', 'shader-translations-ready 1'):
                     result.stdout = ready.replace(change, 'changed')
                     self.assertFalse(step.current(ctx, record))
-                result.stdout = ready
+                result.stdout = ready.replace('16384', '36')
+                self.assertFalse(step.current(ctx, record))
+                result.stdout = ready.replace('16384', '32768')
+                self.assertTrue(step.current(ctx, record))
                 (dest / 'vertex-programs.bin').write_bytes(b'different')
                 self.assertFalse(step.current(ctx, record))
 

@@ -906,10 +906,10 @@ class MakeGameTest(Tmp):
         def probe(*args, **kwargs):
             self.assertEqual((self.out / 'nx2navi_xlate.exe').read_bytes(), b'new')
             self.assertEqual((self.out / 'nx2navi_xlate.id').read_bytes(), b'new')
-            return subprocess.CompletedProcess(args, 0, 'shader-cache-id new\nshader-storage cache\nshader-driver-cache-ready 1\nshader-translations-ready 1\n', '')
+            return subprocess.CompletedProcess(args, 0, 'shader-cache-id new\nshader-storage cache\nshader-driver-cache-ready 1\nshader-driver-cache-bytes 16384\nshader-translations-ready 1\n', '')
 
         with patch.object(self.mg, 'KIT', kit), patch.object(subprocess, 'run', probe):
-            self.assertEqual(self.mg.shader_device(self.out), ('new', self.out / 'cache', True, True))
+            self.assertEqual(self.mg.shader_device(self.out), ('new', self.out / 'cache', 16384, True))
 
     def test_independent_shader_cache(self):
         cache = self.out / 'shader-cache'
@@ -933,16 +933,16 @@ class MakeGameTest(Tmp):
 
         translator = 'a' * 64
         driver = ['0001']
-        cache_ready = [True]
+        driver_bytes = [16384]
 
         def probe(_):
             identity = f'10de:2b85:{driver[0]} {translator} 1 32 0 ' + '0' * 32 + '||||||'
-            return identity, cache, cache_ready[0], (cache / 'test.spv').is_file()
+            return identity, cache, driver_bytes[0], (cache / 'test.spv').is_file()
 
         def warm(*args, **kwargs):
             self.assertEqual(args[0][-1], '--warm-shaders')
             launches.append('warm')
-            cache_ready[0] = True
+            driver_bytes[0] = 16384
             return subprocess.CompletedProcess(args, 0)
 
         with patch.object(self.mg, 'step_shaders', prepare), patch.object(self.mg, 'shader_device', probe):
@@ -959,10 +959,14 @@ class MakeGameTest(Tmp):
                 driver[0] = '0002'
                 with patch.object(subprocess, 'run', warm):
                     build_game()
-                    cache_ready[0] = False
+                    driver_bytes[0] = 0
                     build_game()
                     build_game()
-                self.assertEqual(launches.count('warm'), 2)
+                    driver_bytes[0] = 36   # a valid empty cache from the same driver
+                    build_game()
+                    driver_bytes[0] += 1024   # normal gameplay added entries
+                    build_game()
+                self.assertEqual(launches.count('warm'), 3)
                 translator = 'b' * 64
                 build_game()
                 (cache / 'test.spv').unlink()
