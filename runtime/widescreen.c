@@ -82,7 +82,7 @@ static unsigned picture_height(void) {
 // applies at once.
 // dlaa switched off in the menu stops DLSS at once (vk_dlaa.c vk_dlaa_frame reads it each frame), so the share follows
 // the setting too: the scene goes back to the game's own scale instead of staying small with nothing to enlarge it.
-static double dlss_share(void) {
+double wide_dlss_share(void) {
     if (!vk_dlaa_wanted() || !cfg_bool("NX2NAVI_DLAA") || (!vk_dlaa_fsr3() && !vk_dlaa_available())) return 0;
     const char *m = cfg_value("NX2NAVI_DLSS");
     return !strcmp(m, "quality") ? 2.0 / 3 : !strcmp(m, "balanced") ? 0.58 : !strcmp(m, "performance") ? 0.5
@@ -102,7 +102,7 @@ void wide_present(void) {
     unsigned v = cfg_version();
     if (v != seen) {
         seen = v;
-        float s = (float)dlss_share(), page_s = (float)(s * scale_k);
+        float s = (float)wide_dlss_share(), page_s = (float)(s * scale_k);
         if (s > 0) memcpy((uint8_t *)rt_patch_page() + 240, &page_s, 4);
         if (s <= 0 && rt_patch_enabled(set)) {
             rt_patch_switch(set, 0);
@@ -111,12 +111,12 @@ void wide_present(void) {
             rt_log("widescreen: DLSS render scale %.0f%% of the picture", s * 100);
         }
     }
-    if (++presents == RES_FIXED_AFTER && dlss_share() > 0) {
+    if (++presents == RES_FIXED_AFTER && wide_dlss_share() > 0) {
         rt_patch_switch(set, 1);
-        rt_log("widescreen: DLSS render scale %.0f%% of the picture (the game's dynamic resolution off)", dlss_share() * 100);
-    } else if (presents > RES_FIXED_AFTER && dlss_share() > 0 && !rt_patch_enabled(set)) {
+        rt_log("widescreen: DLSS render scale %.0f%% of the picture (the game's dynamic resolution off)", wide_dlss_share() * 100);
+    } else if (presents > RES_FIXED_AFTER && wide_dlss_share() > 0 && !rt_patch_enabled(set)) {
         rt_patch_switch(set, 1);   // DLSS switched on later in the run
-        rt_log("widescreen: DLSS on again: render scale %.0f%% of the picture", dlss_share() * 100);
+        rt_log("widescreen: DLSS on again: render scale %.0f%% of the picture", wide_dlss_share() * 100);
     }
 }
 

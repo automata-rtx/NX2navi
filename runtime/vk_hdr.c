@@ -668,10 +668,14 @@ static int init(VkCtx *c) {
     return H.ok = 1;
 }
 
+int vk_hdr_native_picture(VkFormat f) {
+    return f == VK_FORMAT_A2B10G10R10_UNORM_PACK32 && vk_hdr_native();
+}
+
 VkImage vk_hdr_encode(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat fmt, const int crop[4]) {
     VkCtx *c = vk_ctx();
     // native HDR: the game's picture holds PQ codes already; the present scales it into the swapchain as it is
-    if (vk_hdr_native() && (fmt == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || fmt == VK_FORMAT_A2R10G10B10_UNORM_PACK32)) {
+    if (vk_hdr_native_picture(fmt)) {
         static int told;
         if (!told++) rt_log("hdr: native: the game's own HDR10 picture goes to the swapchain as it is");
         return VK_NULL_HANDLE;

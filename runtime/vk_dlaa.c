@@ -1777,10 +1777,16 @@ void vk_dlaa_pass(VkExec *ex) {
     if (!deferred) {   // Ocarina's shape: the output pass ends the scene and runs DLSS
         int one = ex->pass_ncolor == 1 && c->image && !z->image && c->image != D.color.image && c->samples <= 1 &&
                   !c->is3d;
-        if (one && c->width > D.color.width && c->height > D.color.height) {
+        if (!one) return;
+        double share = wide_dlss_share();
+        // Intermediate post effects can be larger than an Ultra Performance scene.
+        // Allow rounding of the dynamic scene size when matching the output pass.
+        int output_size = share <= 0 || (c->width * share >= 0.95 * D.color.width &&
+                                          c->height * share >= 0.95 * D.color.height);
+        if (output_size && c->width > D.color.width && c->height > D.color.height) {
             D.ended = D.done = D.up = 1;
             evaluate(ex, c, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_FORMAT_UNDEFINED, VK_NULL_HANDLE);
-        } else if (one && srgb8(c->format) && c->width == D.color.width &&
+        } else if ((srgb8(c->format) || vk_hdr_native_picture(c->format)) && c->width == D.color.width &&
                    c->height == D.color.height) {
             D.ended = D.done = 1;
             evaluate(ex, NULL, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_FORMAT_UNDEFINED, VK_NULL_HANDLE);
