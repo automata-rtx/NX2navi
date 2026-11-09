@@ -48,6 +48,7 @@ int g_available = -1, g_multiplier = -1;
 std::mutex g_options_lock;
 bool g_suspended, g_faulted, g_wait_for_present;
 unsigned g_mismatched_ui_frames;
+unsigned g_ready_frames;
 std::atomic<int> g_api_error{VK_SUCCESS};
 
 // The SDK may report this from its own presenter thread.
@@ -164,21 +165,32 @@ extern "C" NX2SL_API int nx2sl_available(void) {
         o.mode = sl::ReflexMode::eLowLatency;
         sl::Result r = p_reflex(o);
         if (r != sl::Result::eOk) {
-            say("dlssg: Reflex low latency failed (%d)", (int)r);
-            g_available = 0;
+            say("dlssg: initial Reflex setting returned %d; retrying when the swapchain exists", (int)r);
         }
     }
     say("dlssg: DLSS Frame Generation %s", g_available ? "available" : "not available on this GPU or driver");
     return g_available;
 }
 
-extern "C" NX2SL_API void *nx2sl_begin(void) {
+extern "C" NX2SL_API int nx2sl_reflex_mode(int mode) {
+    if (g_available != 1 || !p_reflex) return 0;
+    sl::ReflexOptions options{};
+    options.mode = mode == 0 ? sl::ReflexMode::eOff :
+                   mode == 2 ? sl::ReflexMode::eLowLatencyWithBoost : sl::ReflexMode::eLowLatency;
+    sl::Result r = p_reflex(options);
+    say("dlssg: swapchain Reflex mode %d, result %d", mode, (int)r);
+    return r == sl::Result::eOk;
+}
+
+extern "C" NX2SL_API void *nx2sl_begin_paced(int sleep) {
     sl::FrameToken *token = nullptr;
     if (g_available != 1 || p_token(token, nullptr) != sl::Result::eOk || !token) return nullptr;
-    p_sleep(*token);
+    if (sleep) p_sleep(*token);
     p_marker(sl::PCLMarker::eSimulationStart, *token);
     return token;
 }
+
+extern "C" NX2SL_API void *nx2sl_begin(void) { return nx2sl_begin_paced(1); }
 
 extern "C" NX2SL_API void nx2sl_submit(void *handle, int end) {
     auto *token = static_cast<sl::FrameToken *>(handle);
@@ -206,6 +218,7 @@ extern "C" NX2SL_API void nx2sl_suspend(int suspend) {
     else {
         g_wait_for_present = true;
         g_mismatched_ui_frames = 0;
+        g_ready_frames = 0;
         g_faulted = false;
         g_recompose = -1;
     }
@@ -236,6 +249,10 @@ extern "C" NX2SL_API int nx2sl_frame(void *handle, VkCommandBuffer cb, const Nx2
     g_mismatched_ui_frames = change ? g_mismatched_ui_frames + 1 : 0;
     bool rebuild = g_mismatched_ui_frames == 60;
     if (rebuild || (g_recompose > 0 && (!ui || !hudless))) multiplier = 0;
+    // Drop interpolation on the first invalid frame. Resume once the scene has
+    // settled so a fade or loading overlay cannot repeatedly recreate the feature.
+    if (!multiplier) g_ready_frames = 0;
+    else if (g_ready_frames < 12 && ++g_ready_frames < 12) multiplier = 0;
     sl::ViewportHandle vp(0);
     if (multiplier && depth && mv && cam) {
         sl::Constants c{};

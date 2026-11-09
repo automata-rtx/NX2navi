@@ -356,15 +356,24 @@ static void queue_game_present(void *token, const tex_t *t, const int crop[4], u
     replay_enqueue(&it);
 }
 
-// A guest present closes its render submissions. The next guest frame begins
-// before returning to simulation, independently of the delayed host flip.
+// The acquire after the game's pacing wait starts the frame. The token follows
+// its submissions through the later host present, including when replay runs asynchronously.
 static void *game_token;
 static int submit_started;
 static PlatMutex token_lock = PLAT_MUTEX_INIT;
 
+static void vk_be_frame_start(void) {
+    if (!vk_dlssg_active()) return;
+    plat_mutex_lock(&token_lock);
+    if (!game_token) game_token = vk_dlssg_begin();
+    plat_mutex_unlock(&token_lock);
+}
+
 static void first_render_submit(void) {
     if (!vk_dlssg_active()) return;
     plat_mutex_lock(&token_lock);
+    // Some startup frames submit before their first window acquire.
+    if (!game_token) game_token = vk_dlssg_begin();
     if (game_token && !submit_started) {
         vk_dlssg_submit(game_token, 0);
         submit_started = 1;
@@ -381,13 +390,9 @@ static void vk_be_present(const tex_t *t, const int crop[4], uint64_t at_ns) {
     plat_mutex_lock(&token_lock);
     void *token = game_token;
     game_token = NULL;
+    submit_started = 0;
     plat_mutex_unlock(&token_lock);
     queue_game_present(token, t, crop, at_ns);
-    token = vk_dlssg_begin();
-    plat_mutex_lock(&token_lock);
-    submit_started = 0;
-    game_token = token;
-    plat_mutex_unlock(&token_lock);
 }
 
 // vk_pipeline.c drops a released program's pipelines here.
@@ -561,6 +566,7 @@ const GfxBackend gfx_vulkan_backend = {
     .fence_wait = vk_sync_fence_wait,
     .fence_done = vk_sync_fence_done,
     .present = vk_be_present,
+    .frame_start = vk_be_frame_start,
     .finish = vk_be_finish,
     .read_texels = vk_be_read_texels,
     .write_texels = vk_be_write_texels,

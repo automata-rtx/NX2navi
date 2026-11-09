@@ -28,6 +28,10 @@ static struct {
     PFN_nx2sl_device_proc gdpa;
     PFN_nx2sl_available available;
     PFN_nx2sl_begin begin;
+    PFN_nx2sl_begin_paced begin_paced;
+    PFN_nx2sl_reflex_mode reflex_mode;
+    int reflex;
+    uint64_t last_present_ns;
     PFN_nx2sl_submit submit;
     PFN_nx2sl_suspend suspend;
     PFN_nx2sl_frame frame;
@@ -85,6 +89,8 @@ int vk_dlssg_early(void) {
     S.gdpa = (PFN_nx2sl_device_proc)(void *)GetProcAddress(m, "nx2sl_device_proc");
     S.available = (PFN_nx2sl_available)(void *)GetProcAddress(m, "nx2sl_available");
     S.begin = (PFN_nx2sl_begin)(void *)GetProcAddress(m, "nx2sl_begin");
+    S.begin_paced = (PFN_nx2sl_begin_paced)(void *)GetProcAddress(m, "nx2sl_begin_paced");
+    S.reflex_mode = (PFN_nx2sl_reflex_mode)(void *)GetProcAddress(m, "nx2sl_reflex_mode");
     S.submit = (PFN_nx2sl_submit)(void *)GetProcAddress(m, "nx2sl_submit");
     S.suspend = (PFN_nx2sl_suspend)(void *)GetProcAddress(m, "nx2sl_suspend");
     S.frame = (PFN_nx2sl_frame)(void *)GetProcAddress(m, "nx2sl_frame");
@@ -143,7 +149,14 @@ void vk_dlssg_device_ready(VkDevice dev) {
     rt_log("dlssg: %s", S.active ? "DLSS Frame Generation on the swapchain" : "the swapchain hooks are missing: off");
 }
 
-void *vk_dlssg_begin(void) { return S.active ? S.begin() : NULL; }
+void *vk_dlssg_begin(void) {
+    if (!S.active) return NULL;
+    if (!S.begin_paced) return S.begin();
+    uint64_t last = __atomic_load_n(&S.last_present_ns, __ATOMIC_RELAXED);
+    // The driver cannot pace against a window that stopped presenting.
+    int recent = last && kern_now_ns() - last < 200000000ull;
+    return S.begin_paced(recent && __atomic_load_n(&S.reflex, __ATOMIC_RELAXED));
+}
 void vk_dlssg_submit(void *token, int end) { if (S.active && token) S.submit(token, end); }
 void vk_dlssg_suspend(int suspend) { if (S.active) S.suspend(suspend); }
 
@@ -151,7 +164,15 @@ int vk_dlssg_active(void) { return S.active; }
 uint64_t vk_dlssg_output_frames(void) { return S.active && S.output_frames ? S.output_frames() : 0; }
 
 VkResult vk_dlssg_create_swapchain(VkDevice d, const VkSwapchainCreateInfoKHR *ci, VkSwapchainKHR *sc) {
-    return S.create_sc(d, ci, NULL, sc);
+    VkResult r = S.create_sc(d, ci, NULL, sc);
+    if (r == VK_SUCCESS) {
+        int mode = cfg_int("NX2NAVI_REFLEX");
+        if (mode < 0 || mode > 2) mode = 1;
+        if (S.reflex_mode && !S.reflex_mode(mode)) mode = 0;
+        __atomic_store_n(&S.reflex, mode, __ATOMIC_RELAXED);
+        __atomic_store_n(&S.last_present_ns, 0, __ATOMIC_RELAXED);
+    }
+    return r;
 }
 void vk_dlssg_destroy_swapchain(VkDevice d, VkSwapchainKHR sc) { S.destroy_sc(d, sc, NULL); }
 VkResult vk_dlssg_get_images(VkDevice d, VkSwapchainKHR sc, uint32_t *n, VkImage *img) { return S.images(d, sc, n, img); }
@@ -165,6 +186,8 @@ VkResult vk_dlssg_present(VkQueue q, const VkPresentInfoKHR *pi) {
     VkResult async = VK_SUCCESS;
     int limit = S.marker(1, &async);
     if (async == VK_ERROR_DEVICE_LOST || (r == VK_SUCCESS && async != VK_SUCCESS)) r = async;
+    if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR)
+        __atomic_store_n(&S.last_present_ns, kern_now_ns(), __ATOMIC_RELAXED);
     if (limit && limit != vk_dlssg_max_multiplier()) {
         __atomic_store_n(&max_multiplier, limit, __ATOMIC_RELAXED);
         rt_log("dlssg: supported frame generation multipliers up to %dx", limit);

@@ -818,6 +818,8 @@ NVN_API(nvnWindowAcquireTexture) {
     }
     // The sync means "the display no longer reads this image". Presents are copies queued in submit order, so it is
     // already satisfied: fenced = 3 with fence 0.
+    const GfxBackend *backend = gfx_backend();
+    if (backend->frame_start) backend->frame_start();
     if (s) {
         s->fenced = 3;
         s->fence = 0;

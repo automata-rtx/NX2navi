@@ -50,6 +50,9 @@ typedef int (*PFN_nx2sl_available)(void);
 // The game thread starts simulation and marks its first render submission. The token
 // follows that frame through replay and the present worker.
 typedef void *(*PFN_nx2sl_begin)(void);
+// Optional v4 bridge extensions. Begin always emits the frame's simulation marker.
+typedef void *(*PFN_nx2sl_begin_paced)(int sleep);
+typedef int (*PFN_nx2sl_reflex_mode)(int mode);
 typedef void (*PFN_nx2sl_submit)(void *token, int end);
 typedef void (*PFN_nx2sl_suspend)(int suspend);
 typedef int (*PFN_nx2sl_frame)(void *token, VkCommandBuffer cb, const Nx2SlImage *depth, const Nx2SlImage *mv, const Nx2SlImage *hudless, const Nx2SlImage *ui,

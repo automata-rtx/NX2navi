@@ -159,6 +159,7 @@ typedef struct {
     // vk_texture_write_back_small).
     void (*cpu_synced)(uint64_t fence);
     void (*publish_movie_buffer)(uint64_t addr, uint64_t size);
+    void (*frame_start)(void);   // guest acquired the render image and can start work on this frame
 } GfxBackend;
 extern const GfxBackend gfx_null_backend, gfx_vulkan_backend;
 const GfxBackend *gfx_backend(void);                       // NX2NAVI_GPU=null|vulkan (default vulkan)
