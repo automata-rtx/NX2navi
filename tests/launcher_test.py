@@ -862,6 +862,24 @@ class MakeGameTest(Tmp):
             self.mg.step_romfs, self.mg.step_lift, self.mg.step_compile, sys.argv = saved
             sys.path.remove(str(self.layout.pydeps))
 
+    def test_shader_probe_refreshes_translator_with_equal_timestamps(self):
+        kit = self.tmp / 'kit'
+        (kit / 'bin').mkdir(parents=True)
+        self.out.mkdir()
+        for directory, data in ((kit / 'bin', b'new'), (self.out, b'old')):
+            for name in ('nx2navi_xlate.exe', 'nx2navi_xlate.id'):
+                path = directory / name
+                path.write_bytes(data)
+                os.utime(path, (1000000000, 1000000000))
+
+        def probe(*args, **kwargs):
+            self.assertEqual((self.out / 'nx2navi_xlate.exe').read_bytes(), b'new')
+            self.assertEqual((self.out / 'nx2navi_xlate.id').read_bytes(), b'new')
+            return subprocess.CompletedProcess(args, 0, 'shader-cache-id new\nshader-storage cache\n', '')
+
+        with patch.object(self.mg, 'KIT', kit), patch.object(subprocess, 'run', probe):
+            self.assertEqual(self.mg.shader_device(self.out), ('new', self.out / 'cache'))
+
     def test_independent_shader_cache(self):
         cache = self.out / 'shader-cache'
         launches = []

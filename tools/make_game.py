@@ -972,11 +972,7 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None):
             fail(f'{exe} is in use: close the game and try again')
         state_link.write_text(link_key, encoding='utf-8')
     copy_if_changed(gen / 'romfs-index.bin', out / 'romfs-index.bin')
-    # Release archives can give different translator builds identical timestamps. Publish the ID last.
-    id_name = 'nx2navi_xlate.id'
-    changed = not (out / id_name).is_file() or (out / id_name).read_bytes() != (KIT / 'bin' / id_name).read_bytes()
-    for name in ('nx2navi_xlate.exe', id_name):
-        copy_if_changed(KIT / 'bin' / name, out / name, force=changed)
+    refresh_translator(out)
     if (KIT / 'bin' / 'amd_fidelityfx_vk.dll').is_file():   # FSR 3.1 (runtime/vk_ffx.cpp)
         copy_if_changed(KIT / 'bin' / 'amd_fidelityfx_vk.dll', out / 'amd_fidelityfx_vk.dll')
     say(f'  {EXE_NAME} {exe.stat().st_size / 1e6:.0f} MB; beside it: {", ".join(copy_dlls(exe, msys / "bin", out))}')
@@ -1046,7 +1042,16 @@ SHADER_INPUTS = ('tools/prepare_shaders.py', 'tools/shader_census.py', 'tools/sh
                  'runtime/vk_gpa.c', 'runtime/vk_gpa.h', 'runtime/nvn_hmap.h', 'runtime/nvn_obj.h', 'runtime/tex.h')
 
 
+def refresh_translator(out):
+    # Release archives can give different translator builds identical timestamps. Publish the ID last.
+    id_name = 'nx2navi_xlate.id'
+    changed = not (out / id_name).is_file() or (out / id_name).read_bytes() != (KIT / 'bin' / id_name).read_bytes()
+    for name in ('nx2navi_xlate.exe', id_name):
+        copy_if_changed(KIT / 'bin' / name, out / name, force=changed)
+
+
 def shader_device(out):
+    refresh_translator(out)
     # Ask the built renderer for its effective translator, Vulkan driver and pipeline-cache UUID.
     probe = subprocess.run([str(out / EXE_NAME), '--shader-cache-id'], cwd=out, capture_output=True,
                            encoding='utf-8', errors='replace')
