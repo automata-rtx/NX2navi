@@ -1553,7 +1553,18 @@ int vk_mem_mirror_probe(uint64_t addr) {
 #define SNAP_CHUNK (1u << 20)
 #define MERGE_SPAN (64ull << 20)   // the bytes of one pool a merge dispatch binds at most
 #define MERGE_WORDS (65535u * 64u) // the words one merge dispatch covers at most
-#define MERGE_MAX (4ull << 20)     // larger written ranges stay plain copies
+// One range must fit the compute dispatch. Larger or unaligned writes use the plain copy path.
+static uint64_t merge_max(void) {
+    static uint64_t limit;
+    if (!limit) {
+        int mib = cfg_int("NX2NAVI_WB_MERGE_MAX");
+        if (mib < 1) mib = 1;
+        if (mib > 16) mib = 16;
+        limit = (uint64_t)mib << 20;
+        if (limit > (uint64_t)MERGE_WORDS * 4) limit = (uint64_t)MERGE_WORDS * 4;
+    }
+    return limit;
+}
 typedef struct { PoolRec *r; uint64_t off, size, soff; int chunk; } SnapRange;
 typedef struct { VkBuffer buf; VmaAllocation alloc; uint64_t size, used; int host; } SnapChunk;
 typedef struct { int n; SnapChunk c[]; } SnapFree;   // a submission's chunks and range lists, pooled at its fence
@@ -1565,8 +1576,19 @@ static int nchunks, cchunks;
 // the pool holds the frames in flight: a VMA allocation that needs a new memory block costs 8-11 ms on the replay
 // thread. Chunk sizes are powers of two so that one fits the next request; what the pool cannot hold is destroyed.
 #define SNAP_LIST_MIN (64u << 10)
-#define SNAP_POOL_N 32
-#define SNAP_POOL_BYTES (16ull << 20)
+#define SNAP_POOL_N 64
+// Called under snap_pool_lock. Reuse enough chunks for the submissions in flight without reserving them in advance.
+static uint64_t snap_pool_cap(void) {
+    static uint64_t cap;
+    if (!cap) {
+        uint64_t used, budget;
+        int exact;
+        cap = vk_mem_vram(&used, &budget, &exact) ? budget / 64 : 0;
+        if (cap < (64ull << 20)) cap = 64ull << 20;
+        if (cap > (256ull << 20)) cap = 256ull << 20;
+    }
+    return cap;
+}
 static PlatMutex snap_pool_lock = PLAT_MUTEX_INIT;
 static SnapChunk snap_pool[SNAP_POOL_N];
 static int nsnap_pool;
@@ -1756,7 +1778,7 @@ static void snap_free(void *arg) {   // completion thread: the submission is don
     plat_mutex_lock(&snap_pool_lock);
     for (int i = 0; i < f->n; i++) {
         SnapChunk *ch = &f->c[i];
-        if (nsnap_pool == SNAP_POOL_N || snap_pool_bytes + ch->size > SNAP_POOL_BYTES) continue;
+        if (nsnap_pool == SNAP_POOL_N || snap_pool_bytes + ch->size > snap_pool_cap()) continue;
         snap_pool[nsnap_pool++] = *ch;
         snap_pool_bytes += ch->size;
         ch->buf = VK_NULL_HANDLE;
@@ -1771,7 +1793,7 @@ static void gpu_wrote(const VkMemSpan *sp, uint64_t size, int shader) {
     PoolRec *r = sp->pool;
     if (!r || r->mstate != MS_ON || sp->buffer != r->mbuf || !size) return;
     // A binding to the end of its pool (no size) can span hundreds of MiB: those stay copies.
-    if (shader && !(sp->offset & 3) && !(size & 3) && size <= MERGE_MAX && merging() && snap_add(r, sp->offset, size))
+    if (shader && !(sp->offset & 3) && !(size & 3) && size <= merge_max() && merging() && snap_add(r, sp->offset, size))
         return;
     range_add(&wbl, &nwbl, &cwbl, r, sp->offset, size);
 }

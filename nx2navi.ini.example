@@ -372,6 +372,9 @@
 # cheat_0123abcd = 1
 
 [diagnostics]
+# Maximum size in MiB for merging shader storage writes back into guest memory.
+# The merge preserves CPU changes to words the shader left alone. Larger ranges use a whole-range copy.
+# wb_merge_max = 16
 # Extra lines in the log, comma separated: svc, host, ipc, fs, gfx, perf, sched, audio, present or all. The menu's
 # Performance log sets perf (frame timings). Default: none.
 # trace = perf
