@@ -35,8 +35,9 @@ from other projects, with its license, is listed in [THIRD_PARTY_NOTICES.md](../
 - The SDK boundary is at the `nn::*` function level: threads and synchronisation, IPC, memory, fs/RomFS, time,
   account, applet, hid, audio renderer and effects run as host code. Only `audren:u` and `sm:` are real IPC services.
 - Window, keyboard and mouse: Win32 (`gfx_window_win.c`, `input_win.c`). Gamepads and audio output: SDL3 (every
-  connected gamepad is open; the game reads the one pressed last, `input.c`). Voice: libopus. Movies: a host VP9
-  decoder over libvpx replaces the SDK's `movie::Decoder` (`runtime/ov_movie.c`).
+  connected gamepad is open; the game reads the one pressed last, `input.c`). Voice: libopus. Switch 2 movies use
+  a host AV1 decoder (`runtime/ov_movie2.c`, `ov_initialize`). The separate VP9 decoder implements the
+  `movie::Decoder` interface in `runtime/ov_movie.c`. See the [movie playback research notes](movie-playback.md).
 - Settings and menu: every key with its default is in one table (`cfg.c`), read from `nx2navi.ini` and `NX2NAVI_*`
   variables and written back when the in-game menu changes it. The menu and the performance overlay are Dear ImGui,
   drawn into the swapchain image (`runtime/ui/`); their text is in `ui_text.c`.
