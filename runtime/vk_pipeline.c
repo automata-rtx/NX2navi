@@ -2975,7 +2975,8 @@ static uint32_t *spv_override(const uint32_t *code, uint64_t words, uint64_t *ou
 }
 
 // A compute pipeline for cs in layout l; VK_NULL_HANDLE on failure. No lock needed (P.cache is driver-synchronised).
-static VkPipeline compute_create(const GfxShader *cs, const Layout *l) {
+static VkPipeline compute_create(const GfxShader *cs, const Layout *l, int cached_only, VkResult *status) {
+    if (status) *status = VK_ERROR_INITIALIZATION_FAILED;
     uint64_t words;
     const uint32_t *code = gfx_shader_spirv(cs, &words);
     uint64_t ow = 0;
@@ -2997,7 +2998,10 @@ static VkPipeline compute_create(const GfxShader *cs, const Layout *l) {
         ci.stage.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
     VkPipeline pipe = VK_NULL_HANDLE;
     crash_note("a compute pipeline", cs, NULL, NULL);
-    if (vkCreateComputePipelines(P.device, P.cache, 1, &ci, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
+    if (cached_only) ci.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+    VkResult result = vkCreateComputePipelines(P.device, P.cache, 1, &ci, NULL, &pipe);
+    if (status) *status = result;
+    if (result != VK_SUCCESS) pipe = VK_NULL_HANDLE;
     plat_crash_context(NULL);
     vkDestroyShaderModule(P.device, m, NULL);
     free(over);
@@ -3040,6 +3044,12 @@ static struct {
     size_t n;
     volatile int64_t next;
     volatile int32_t stop, running;
+    const GfxShader **cold;                // large compute cache misses; one prebuild worker drains them
+    size_t cold_count, cold_next, large_hits;
+    int draining, pressure;
+    int free_mb, growth_mb;
+    double cold_start_mb;
+    uint64_t large_words;
     int threads;
     PlatThread *th[LB_MAX_THREADS];
     uint8_t clamp, poly, minus_w, samples;             // library state (GKey fields)
@@ -3215,6 +3225,7 @@ static void journal_mark(int slot, const GfxWarmEnt *e) {
 // compiled a second copy of a pipeline the boot prebuild (lb_compute) was already compiling.
 #define CS_FLIGHT 32
 static const GfxShader *cs_flight[CS_FLIGHT];
+static PlatCond cs_done = PLAT_COND_INIT;
 // The cache hashes every byte. Give boot prebuilds and dispatches the same fully initialized key.
 typedef struct { const GfxShader *cs; uint64_t compute; } ComputeKey;
 
@@ -3232,7 +3243,11 @@ static int cs_flight_add(const GfxShader *cs) {   // 0 when the table is full (t
 
 static void cs_flight_remove(const GfxShader *cs) {
     for (int i = 0; i < CS_FLIGHT; i++)
-        if (cs_flight[i] == cs) cs_flight[i] = NULL;
+        if (cs_flight[i] == cs) {
+            cs_flight[i] = NULL;
+            plat_cond_broadcast(&cs_done);
+            break;
+        }
 }
 
 VkPipeline vk_pipeline_compute(const GfxShader *cs, const VkPipeInfo **info) {
@@ -3243,9 +3258,7 @@ VkPipeline vk_pipeline_compute(const GfxShader *cs, const VkPipeInfo **info) {
     plat_mutex_lock(&P.lock);
     Pipe *p = pipe_find(&k, sizeof k, h);
     while (!p && cs_flight_has(cs)) {   // another thread is compiling it: its result, not a second compile
-        plat_mutex_unlock(&P.lock);
-        plat_sleep_ms(1);
-        plat_mutex_lock(&P.lock);
+        plat_cond_wait(&cs_done, &P.lock);
         p = pipe_find(&k, sizeof k, h);
     }
     if (p) {
@@ -3259,7 +3272,7 @@ VkPipeline vk_pipeline_compute(const GfxShader *cs, const VkPipeInfo **info) {
             int flight = cs_flight_add(cs);
             plat_mutex_unlock(&P.lock);   // the compile runs without the lock
             uint64_t p0 = perf_begin();
-            pipe = compute_create(cs, l);
+            pipe = compute_create(cs, l, 0, NULL);
             perf_end(PERF_PIPE, p0);
             plat_mutex_lock(&P.lock);
             if (flight) cs_flight_remove(cs);
@@ -3319,7 +3332,9 @@ static uint32_t vs_union_peek(const GfxShader *vs, GfxShaderIo fin[32]) {
     return missing;
 }
 
-static void lb_compute(const GfxShader *cs) {
+// Returns 1 when this large shader actually needs compilation. Cache hits can be restored in parallel.
+static int lb_compute(const GfxShader *cs, int cached_only) {
+    if (cached_only && !vk_ctx()->pipeline_cache_control) return 1;
     ComputeKey k = {cs, 1};
     uint64_t h = key_hash(&k, sizeof k);
     Bindings B = {0};
@@ -3331,13 +3346,14 @@ static void lb_compute(const GfxShader *cs) {
     lb_unlock();
     if (!l) {
         lb_count(2, have ? 1 : 2, 0);
-        return;
+        return 0;
     }
     double t0 = now_ms();
     // at normal priority: while it is in flight a dispatch of the same shader waits for it (vk_pipeline_compute), and an
     // idle-priority compile under load held that frame for seconds
     if (LB.idle) plat_thread_priority(PLAT_PRIO_NORMAL);
-    VkPipeline pipe = compute_create(cs, l);
+    VkResult status;
+    VkPipeline pipe = compute_create(cs, l, cached_only, &status);
     double ms = now_ms() - t0;
     lb_lock();
     if (flight) cs_flight_remove(cs);
@@ -3349,7 +3365,14 @@ static void lb_compute(const GfxShader *cs) {
         have = 1;
     }
     lb_unlock();
+    if (cached_only && status == VK_PIPELINE_COMPILE_REQUIRED) return 1;
+    if (cached_only && status == VK_SUCCESS) {
+        plat_mutex_lock(&LB.stat);
+        LB.large_hits++;
+        plat_mutex_unlock(&LB.stat);
+    }
     lb_count(2, pipe ? have : 2, ms);
+    return 0;
 }
 
 // The pre-rasterization (vertex) or fragment-shader library of one shader with the LB state.
@@ -3440,6 +3463,31 @@ static void lb_report(const char *how) {
 }
 
 // Boot: compute pipelines and kept libraries, all entered for the process.
+static void lb_drain_cold(void) {
+    plat_mutex_lock(&LB.stat);
+    if (LB.draining || !LB.cold_count || LB.pressure) {
+        plat_mutex_unlock(&LB.stat);
+        return;
+    }
+    LB.draining = 1;
+    while (!LB.stop && LB.cold_next < LB.cold_count) {
+        double proc, used, limit;
+        plat_commit_info(&proc, &used, &limit);
+        if (LB.cold_start_mb <= 0) LB.cold_start_mb = proc;
+        if ((LB.free_mb && limit > 0 && used >= 0 && limit - used < LB.free_mb) ||
+            (LB.growth_mb && LB.cold_start_mb > 0 && proc - LB.cold_start_mb >= LB.growth_mb)) {
+            LB.pressure = 1;
+            break;
+        }
+        const GfxShader *sh = LB.cold[LB.cold_next++];
+        plat_mutex_unlock(&LB.stat);
+        lb_compute(sh, 0);   // a dispatch can claim any shader still waiting in the list
+        plat_mutex_lock(&LB.stat);
+    }
+    LB.draining = 0;
+    plat_mutex_unlock(&LB.stat);
+}
+
 static void lb_worker(void *arg) {
     (void)arg;
     plat_thread_priority(PLAT_PRIO_IDLE);
@@ -3461,7 +3509,14 @@ static void lb_worker(void *arg) {
             LB.noshader++;
             plat_mutex_unlock(&LB.stat);
         } else if (gfx_shader_stage(sh) == GFX_STAGE_CS) {
-            lb_compute(sh);
+            uint64_t words;
+            gfx_shader_spirv(sh, &words);
+            if (lb_compute(sh, LB.large_words && words > LB.large_words)) {
+                plat_mutex_lock(&LB.stat);
+                if (LB.cold) LB.cold[LB.cold_count] = sh;
+                LB.cold_count++;
+                plat_mutex_unlock(&LB.stat);
+            }
         } else if (gfx_shader_stage(sh) == GFX_STAGE_VS || gfx_shader_stage(sh) == GFX_STAGE_FS) {
             if (P.gpl) lb_library(sh, gfx_shader_stage(sh) == GFX_STAGE_VS, 1);
             else lb_skip_lib();
@@ -3470,7 +3525,12 @@ static void lb_worker(void *arg) {
         LB.done++;
         plat_mutex_unlock(&LB.stat);
     }
-    if (!plat_dec32(&LB.running)) lb_report(LB.stop ? "stopped" : "done");
+    lb_drain_cold();
+    if (!plat_dec32(&LB.running)) {
+        lb_report(LB.stop ? "stopped" : "done");
+        rt_log("vk_pipeline: large compute at boot: %zu driver hits, %zu misses, %zu taken by the worker, memory guard %s",
+               LB.large_hits, LB.cold_count, LB.cold_next, LB.pressure ? "on" : "off");
+    }
     return;
 }
 
@@ -3509,6 +3569,11 @@ static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
         return;
     }
     LB.n = n;
+    LB.large_words = (uint64_t)cfg_int("NX2NAVI_LIB_PREBUILD_BIG");
+    LB.free_mb = cfg_int("NX2NAVI_BIG_BUILD_FREE_MB");
+    LB.growth_mb = cfg_int("NX2NAVI_BIG_BUILD_MAX_MB");
+    LB.cold = calloc(n, sizeof *LB.cold);
+    if (!LB.cold) LB.pressure = 1;
     lb_state(pr_hist, fs_hist);
     LB.idle = 1;
     int cpus = (int)plat_cpu_usable();
@@ -3533,6 +3598,7 @@ static void lb_stop(void) {
     for (int i = 0; i < LB.threads; i++)
         if (LB.th[i]) plat_thread_join(LB.th[i]), LB.th[i] = NULL;
     LB.threads = 0;
+    free(LB.cold), LB.cold = NULL;
 }
 
 typedef struct { VkPipeState state; GfxWarmEnt journal; } WarmPipeline;
@@ -3736,7 +3802,7 @@ static void lb_warm_worker(void *arg) {
             Layout *l = compute_layout(sh, &B, &why);
             lb_unlock();
             double t0 = now_ms();
-            VkPipeline pipe = l ? compute_create(sh, l) : VK_NULL_HANDLE;
+            VkPipeline pipe = l ? compute_create(sh, l, 0, NULL) : VK_NULL_HANDLE;
             if (pipe) vkDestroyPipeline(P.device, pipe, NULL);
             lb_count(2, pipe ? 3 : 2, now_ms() - t0);
         } else if (st == GFX_STAGE_VS || st == GFX_STAGE_FS) {

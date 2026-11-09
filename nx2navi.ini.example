@@ -63,6 +63,13 @@
 # the CPU threads).
 # lib_prebuild = 1
 # lib_prebuild_threads = 4
+# At game startup, restore compute shaders above this many SPIR-V words from the driver cache first.
+# One worker compiles large misses while memory permits. Setup still prepares every selected size.
+# lib_prebuild_big = 524288
+# Minimum spare system commit and maximum process commit growth during these background builds, in MiB.
+# A zero disables the corresponding check.
+# big_build_free_mb = 8192
+# big_build_max_mb = 4096
 # Build known pipelines ahead of time.
 # pipe_prebuild = 1
 # 1: the start waits until every known pipeline is built. Default 0: with the graphics pipeline library the start

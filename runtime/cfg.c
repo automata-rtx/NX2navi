@@ -33,7 +33,7 @@ static int save_ok = 1;                         // the last cfg_save_to wrote (o
 static const char *const known[] = {
     "CORES", "TM_DISPATCH", "NVN2_CS_TABLE", "SKIP_SHADERS", "MOVIE_DEBAND", "MOVIE_SKIP", "MOVIE_OVERLAY", "MOVIES", "NPLN", "NVN2_PROGRAMS", "NVN_TRAP", "OCARINA_REALTIME", "OCARINA_STEP", "VI_HZ", "VI_VRR", "TIME_DUMP", "SHADER_DUMP", "SHOT_AFTER", "SHOT_DIR", "SHOT_EVERY",   // Switch 2 port: movie skip (romfs.c), NVN2 proc traps (nvn_procs.c)
     "AB", "AMIIBO_DIR", "ANISO", "APP_POOL", "ASPECT", "ASPECT_PATCH", "ASSUME_FOCUS", "ASTC", "ASTC_BC", "ASTC_TIME", "ASYNC_PREEMPT", "AUDIO", "AUDIO_CHANNELS", "AUDIO_OFF", "AUDIO_PREFILL_MS",
-    "BACKGROUND_WINDOW", "BIND_A", "BIND_B", "BIND_DOWN", "BIND_L", "BIND_LCLICK", "BIND_LEFT", "BIND_LSTICK_DOWN", "BIND_LSTICK_LEFT",
+    "BACKGROUND_WINDOW", "BIG_BUILD_FREE_MB", "BIG_BUILD_MAX_MB", "BIND_A", "BIND_B", "BIND_DOWN", "BIND_L", "BIND_LCLICK", "BIND_LEFT", "BIND_LSTICK_DOWN", "BIND_LSTICK_LEFT",
     "BIND_LSTICK_RIGHT", "BIND_LSTICK_UP", "BIND_MINUS",
     "BIND_PLUS", "BIND_R", "BIND_RCLICK", "BIND_RIGHT", "BIND_RSTICK_DOWN", "BIND_RSTICK_LEFT", "BIND_RSTICK_RIGHT", "BIND_RSTICK_UP",
     "BIND_SHAKE",
@@ -45,7 +45,7 @@ static const char *const known[] = {
     "FLIGHT_SPIKE_MS", "FLIGHT_THUMBS", "FLUSH_SPAN", "FOV", "FOV_PATCH", "FG_HUDLESS_SHOW", "FPS60", "FPS_LIMIT", "FRAMEGEN", "FREEZE_IDLE", "FREE_CORES",
     "FULLSCREEN", "FXAA", "GAME_ASPECT", "GAME_RES", "GPA", "GPA_EMPTY", "GPA_TWIN", "GPL", "GPL_DRAW_BUILD", "GPU", "GPU_INDEX", "GPU_NAME", "HDR", "HDR_GAME_NITS", "HDR_HUE",
     "HDR_PEAK_NITS", "HDR_UI_NITS", "HIGHFPS_FIX", "INPUT", "INPUT_RECORD", "INPUT_SCRIPT", "LANG", "LIB_PREBUILD",
-    "LIB_PREBUILD_KEEP", "LIB_PREBUILD_THREADS", "LOCALE", "LOD_GUARD", "LSTICK_DEADZONE", "MEMORY", "MENU_LANG", "MENU_SOUND_VOLUME", "MENU_TEST",
+    "LIB_PREBUILD_BIG", "LIB_PREBUILD_KEEP", "LIB_PREBUILD_THREADS", "LOCALE", "LOD_GUARD", "LSTICK_DEADZONE", "MEMORY", "MENU_LANG", "MENU_SOUND_VOLUME", "MENU_TEST",
     "MENU_CURSOR", "MENU_CURSOR_LOG", "MENU_TEST_DIR", "MENU_TEST_SET", "MINIMAL_LAYOUT", "MIRROR_GAP", "MODS_DIR", "MODS_DISABLED", "MODS_ORDER", "MODS_REBUILD", "MOTION", "MOUSE_MODE", "MOUSE_DIRECT_PATCH", "MOUSE_SENS", "MOVIE_HOST", "MOVIE_PACE",
     "MVOBJ_ALL", "MVOBJ_BANKS", "MVOBJ_EQUAL", "MVOBJ_EXACT", "MVOBJ_EXEC", "MVOBJ_NOC4", "MVOBJ_ONLY", "MVOBJ_TIMES", "MVPREV_CHECK", "MVPREV_GROW", "MVPREV_SKIP", "MVPREV_TRUST", "MV_CHECK",
     "MV_SURVEY",
@@ -96,7 +96,8 @@ static const struct { const char *key, *section; } sections[] = {
     {"BIND_RSTICK_UP", "input"}, {"BIND_RSTICK_RIGHT", "input"}, {"BIND_RSTICK_DOWN", "input"}, {"BIND_SHAKE", "input"},
     {"ASYNC_PREEMPT", "performance"}, {"REPLAY_ASYNC", "performance"}, {"EVENT_ORDER", "performance"}, {"FREE_CORES", "performance"},
     {"TIMER_1MS", "performance"}, {"PIPE_WAIT", "performance"}, {"PIPE_SKIP", "performance"},
-    {"LIB_PREBUILD", "performance"}, {"LIB_PREBUILD_THREADS", "performance"}, {"PIPE_PREBUILD", "performance"},
+    {"LIB_PREBUILD", "performance"}, {"LIB_PREBUILD_BIG", "performance"}, {"LIB_PREBUILD_THREADS", "performance"}, {"PIPE_PREBUILD", "performance"},
+    {"BIG_BUILD_FREE_MB", "performance"}, {"BIG_BUILD_MAX_MB", "performance"},
     {"PREWARM_XLATE", "performance"}, {"GPL", "performance"}, {"ASTC", "performance"}, {"MEMORY", "performance"},
     {"TEX_ALIAS", "performance"}, {"TEX_VRAM_PRESSURE", "performance"}, {"ASTC_BC", "performance"}, {"LOD_GUARD", "performance"}, {"FIX_C0", "performance"}, {"FIX_ZERO", "performance"},
     {"BIND_SKIP", "performance"}, {"SHADER_CACHE_FLUSH", "performance"}, {"SHADER_MEMO", "performance"}, {"PIPE_MEMO", "performance"}, {"TEX_MEMO", "performance"}, {"DESC_TEMPLATE", "performance"},
@@ -173,6 +174,8 @@ static const CfgMeta metas[] = {
     // shaders and pipelines
     {"PIPE_WAIT", "default", "default|draw", RESTART}, {"PIPE_SKIP", "effects", "strict|any|fullscreen|effects", RESTART},
     {"LIB_PREBUILD", "1", "0|1", RESTART}, {"LIB_PREBUILD_THREADS", "", "1..64", RESTART},
+    {"LIB_PREBUILD_BIG", "524288", "0..2147483647", RESTART},
+    {"BIG_BUILD_FREE_MB", "8192", "0..262144", RESTART}, {"BIG_BUILD_MAX_MB", "4096", "0..65536", RESTART},
     {"PIPE_PREBUILD", "1", "0|1", RESTART}, {"PREWARM_XLATE", "", "1..64", RESTART}, {"GPL", "1", "0|1", RESTART},
     // textures and memory
     {"ASTC", "auto", "auto|gpu|native|cpu", RESTART}, {"MEMORY", "auto", "auto|import|mirror|verify", RESTART},
