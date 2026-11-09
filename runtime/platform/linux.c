@@ -725,13 +725,13 @@ static void sync_dir_of(const char *path) {
     }
 }
 
-int plat_file_replace(const char *from, const char *to) {
+int plat_file_replace(const char *from, const char *to, int durable) {
     if (rename(from, to)) return 0;
-    sync_dir_of(to);
+    if (durable) sync_dir_of(to);
     return 1;
 }
 
-int plat_file_write_atomic(const char *path, const void *data, size_t n) {
+static int write_swap(const char *path, const void *data, size_t n, int durable) {
     // A rename replaces a read-only file here (only the folder's permission counts) but not on Windows: a file the
     // player made read-only stays as it is on both.
     if (access(path, W_OK) && errno != ENOENT) return 0;
@@ -740,15 +740,19 @@ int plat_file_write_atomic(const char *path, const void *data, size_t n) {
     if (len < 0 || len >= (int)sizeof tmp) return 0;
     int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd < 0) return 0;
-    int ok = write_all(fd, data, n) && fsync(fd) == 0;
+    int ok = write_all(fd, data, n) && (!durable || fsync(fd) == 0);
     ok = close(fd) == 0 && ok;
     if (ok && !rename(tmp, path)) {
-        sync_dir_of(path);
+        if (durable) sync_dir_of(path);
         return 1;
     }
     unlink(tmp);
     return 0;
 }
+
+int plat_file_write_atomic(const char *path, const void *data, size_t n) { return write_swap(path, data, n, 1); }
+
+int plat_file_write_cached(const char *path, const void *data, size_t n) { return write_swap(path, data, n, 0); }
 
 int plat_file_flush(const char *path) {
     int fd = open(path, O_WRONLY | O_CLOEXEC);

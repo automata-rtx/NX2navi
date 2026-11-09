@@ -521,13 +521,13 @@ int plat_append_write(PlatAppend *f, const void *data, size_t n) {
     return WriteFile((HANDLE)f, data, (DWORD)n, &put, &o) && put == n;
 }
 
-int plat_file_replace(const char *from, const char *to) {
+int plat_file_replace(const char *from, const char *to, int durable) {
     wchar_t a[WPATH], b[WPATH];
     if (!widen(from, a, WPATH) || !widen(to, b, WPATH)) return 0;
-    return MoveFileExW(a, b, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+    return MoveFileExW(a, b, MOVEFILE_REPLACE_EXISTING | (durable ? MOVEFILE_WRITE_THROUGH : 0)) != 0;
 }
 
-int plat_file_write_atomic(const char *path, const void *data, size_t n) {
+static int write_swap(const char *path, const void *data, size_t n, int durable) {
     char tmp[WPATH + 48];
     wchar_t a[WPATH], b[WPATH];
     int len = snprintf(tmp, sizeof tmp, "%s.%u.%u.tmp", path, (unsigned)GetCurrentProcessId(), (unsigned)GetCurrentThreadId());
@@ -541,12 +541,16 @@ int plat_file_write_atomic(const char *path, const void *data, size_t n) {
         if (!WriteFile(h, bytes + written, chunk, &put, NULL) || !put) break;
         written += put;
     }
-    int ok = written == n && FlushFileBuffers(h);
+    int ok = written == n && (!durable || FlushFileBuffers(h));
     CloseHandle(h);
-    if (ok && MoveFileExW(a, b, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return 1;
+    if (ok && MoveFileExW(a, b, MOVEFILE_REPLACE_EXISTING | (durable ? MOVEFILE_WRITE_THROUGH : 0))) return 1;
     DeleteFileW(a);
     return 0;
 }
+
+int plat_file_write_atomic(const char *path, const void *data, size_t n) { return write_swap(path, data, n, 1); }
+
+int plat_file_write_cached(const char *path, const void *data, size_t n) { return write_swap(path, data, n, 0); }
 
 int plat_file_flush(const char *path) {
     wchar_t w[WPATH];

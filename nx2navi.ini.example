@@ -104,6 +104,9 @@
 # skip push constants that did not change.
 # bind_skip = 1
 # shader_memo = 1
+# 1 flushes every shader cache file to the disk before it is used, as earlier versions did; 0 (default) flushes only
+# the stored game code, which makes shader preparation about twice as fast (a torn file is translated again).
+# shader_cache_flush = 0
 # pipe_memo = 1
 # tex_memo = 1
 # desc_template = 1

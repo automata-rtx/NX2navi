@@ -284,9 +284,10 @@ void plat_file_mkdir_p(const char *path);                 // creates every missi
 // Whole file into a malloc'd buffer with a NUL after the last byte; NULL when missing, empty or over 1 GiB.
 uint8_t *plat_file_read(const char *path, uint64_t *size);
 int plat_file_write(const char *path, const void *data, size_t n);   // create or truncate; 1 when all n bytes landed
-int plat_file_replace(const char *from, const char *to);  // rename, replacing to (write-through); 1 on success
+int plat_file_replace(const char *from, const char *to, int durable);   // rename over to, optionally write through
 // Writes path.<pid>.<tid>.tmp, flushes it to the disk and renames it over path: a crash leaves the old file or the new
 // one, never a torn or zero-filled one. 1 on success.
+int plat_file_write_cached(const char *path, const void *data, size_t n);   // atomic rename, no explicit disk flush
 int plat_file_write_atomic(const char *path, const void *data, size_t n);
 int plat_file_flush(const char *path);                   // flushes a written file's data to the disk; 1 on success
 int plat_file_sync(FILE *f);                              // fflush, then the file's data to the disk; 1 on success

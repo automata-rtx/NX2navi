@@ -28,6 +28,15 @@
 // input id, can be translated again under a new translator without guest memory (gfx_shader_load_input,
 // gfx_shader_prewarm).
 //
+// Durability. Every file appears whole: it is written under another name and renamed. Only the .in files are also
+// flushed to the disk before their rename (plat_file_write_atomic): they hold the guest's code, which nothing else can
+// give back once the game is not running, and in_load checks only their header and size, so a power cut that tore one
+// would have a wrong shader translated from it. The .spv, .res.json and .use files are not flushed
+// (plat_file_write_cached, plat_file_replace without durable): every read checks them (spirv_complete,
+// reflection_valid, the .use magic and size) and a torn one is translated again. A flush waits for the drive, 1-5 ms
+// on an NVMe drive and far longer on a SATA SSD or a hard drive, and the preparation of an install translates about
+// 36,000 shaders: flushing these files too held its translation at half speed on an NVMe drive.
+//
 // Reflection: every shader that enters the cache has its .res.json parsed into GfxShaderRes arrays and its SPIR-V
 // scanned for interface Locations and the workgroup size (gfx.h accessors at the end of the file).
 //
@@ -286,8 +295,11 @@ static void xlate_identity(void) {
 // next to nx2navi.exe, so every build dir has its own (as the pipeline cache, vk_pipeline.c cache_path_init).
 static void use_preload_start(void);
 
+static int cache_flush;   // set once before any translation workers run
+
 static void init_paths(void *param) {
     (void)param;
+    cache_flush = cfg_bool("NX2NAVI_SHADER_CACHE_FLUSH");
     char exe[PATH_CAP], root[PATH_CAP] = "", exe_dir[PATH_CAP] = "";
     if (plat_exe_path(exe, sizeof exe)) {
         char *last = plat_last_sep(exe);
@@ -1200,7 +1212,8 @@ static void use_store(const uint8_t h[32], const UseMask *m) {
     char p[PATH_CAP + 80];
     use_path(h, p);
     uint32_t f[5] = {USE_MAGIC, USE_VERSION, m->slots, m->attrs, m->fouts};
-    plat_file_write_atomic(p, f, sizeof f);
+    if (cache_flush) plat_file_write_atomic(p, f, sizeof f);
+    else plat_file_write_cached(p, f, sizeof f);   // not flushed: a torn mask fails its magic and size check (see the top)
     plat_mutex_lock(&cache_lock);
     use_put(h, 1, m);
     plat_mutex_unlock(&cache_lock);
@@ -1565,7 +1578,8 @@ static void in_path(const uint8_t iid[32], char *p) {
     snprintf(p, PATH_CAP + 80, "%s/in/%s.in", cache_dir, hex);
 }
 
-// Stores the inputs of a translation unless they are stored already; the file appears whole (written, then renamed).
+// Stores the inputs of a translation unless they are stored already; the file appears whole (written, then renamed)
+// and is on the disk before its rename, the one cache file that is (see "Durability" at the top).
 static void in_store(const uint8_t iid[32], int stage, const uint8_t *control, const uint8_t *code, const Req *r,
                      const GfxShaderAnswers *a) {
     char p[PATH_CAP + 80], tmp[PATH_CAP + 120];
@@ -1660,7 +1674,8 @@ static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *co
         if (r->sm86) plat_inc64(&n_sm86);
         return fail(reply, hex);
     }
-    plat_file_flush(spv_path), plat_file_flush(res_path);   // the translator wrote them; on disk before use or rename
+    // Not flushed (see "Durability" at the top): the translator wrote them whole, and disk_load checks both.
+    if (cache_flush) plat_file_flush(spv_path), plat_file_flush(res_path);
     if (!(s = disk_load(key, r->iid))) return fail("translator output missing or malformed", hex);
     if (!r->final) {                                       // name the files after the cache key, remember the mask
         m = use_of(s);
@@ -1668,9 +1683,9 @@ static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *co
         char mhex[65], to[PATH_CAP + 80];
         key_hex(mk, mhex);
         snprintf(to, PATH_CAP + 80, "%s/%s.spv", cache_dir, mhex);
-        int moved = plat_file_replace(spv_path, to);
+        int moved = plat_file_replace(spv_path, to, cache_flush);
         snprintf(to, PATH_CAP + 80, "%s/%s.res.json", cache_dir, mhex);
-        moved = moved && plat_file_replace(res_path, to);
+        moved = moved && plat_file_replace(res_path, to, cache_flush);
         if (moved) {
             use_store(r->code_hash, &m);
         } else {                                           // keep the mask for this run only

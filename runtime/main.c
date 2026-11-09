@@ -113,7 +113,7 @@ static void log_open(int game) {
             if (i > 1) snprintf(from, sizeof from, "%s/nx2navi.%d.log", dir, i - 1);
             else snprintf(from, sizeof from, "%s/nx2navi.log", dir);
             snprintf(to, sizeof to, "%s/nx2navi.%d.log", dir, i);
-            if (plat_file_exists(from)) plat_file_replace(from, to);
+            if (plat_file_exists(from)) plat_file_replace(from, to, 1);
         }
         snprintf(g_log_path, sizeof g_log_path, "%s/nx2navi.log", dir);
         g_log_file = plat_append_open(g_log_path);
