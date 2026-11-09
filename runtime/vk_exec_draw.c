@@ -4063,9 +4063,10 @@ static void op_draw_idx_ind(VkExec *ex, const p_draw_idx_ind *d) {
 // A compute dispatch whose shader cannot be translated: Switch 2 titles run tensor-core networks (HMMA/LDSM, an
 // AI upscaler: Ocarina's title movie goes 1920x1080 -> 2560x1440 through ten such passes) that the Maxwell translator
 // has no model for. Instead of leaving the outputs untouched (black), the largest bound storage image receives a
-// linear blit of the largest bound sampled RGBA8 texture that is a different image and no larger (the networks'
-// 10-bit intermediates are only partly meaningful as pictures, so they are not a source): what an upscaler
-// approximates. In-place passes (the output also sampled) are left alone. NX2NAVI_CS_FALLBACK=0 turns it off.
+// linear blit of the largest bound sampled RGBA8 texture that is a different image and no larger. When the program
+// has reflection, only its declared storage writes are eligible destinations. The networks'
+// 10-bit intermediates are only partly meaningful as pictures. In-place passes (the output also sampled) are left
+// alone. NX2NAVI_CS_FALLBACK=0 turns it off.
 // sRGB-ness of the RGBA8 formats the fallback blits: a blit converts between encodings, the game's network writes the
 // bits through a UNORM view, so a UNORM source and an sRGB target go through a scratch image in the source's format
 // (blit, scaling only) and then a raw copy.
@@ -4134,13 +4135,29 @@ static int native_tensor(const VkExec *ex) {
     return on || !uses_tensor_ops(ex);
 }
 
-static void untranslated_dispatch_fallback(VkExec *ex) {
+static void untranslated_dispatch_fallback(VkExec *ex, const GfxShader *cs) {
     static int on = -1;
     if (on < 0) on = rt_knob("CS_FALLBACK", "1");
     if (!on || !uses_tensor_ops(ex)) return;
+    // Image bindings persist across dispatches. A movie following gameplay can inherit a larger scene target
+    // in an unused slot. Only consider images this program stores into when its reflection is available.
+    uint32_t outputs = UINT32_MAX;
+    if (cs) {
+        const GfxShaderRes *images;
+        int count = gfx_shader_resources(cs, GFX_RES_IMG, &images);
+        outputs = 0;
+        for (int i = 0; i < count; i++) {
+            const GfxShaderRes *r = &images[i];
+            if (!(r->flags & 4) || r->slot < 0) continue;
+            int end = r->slot + (r->count ? r->count : 1);
+            for (int slot = r->slot; slot < end && slot < 32; slot++) outputs |= UINT32_C(1) << slot;
+        }
+        if (!outputs) return;
+    }
     const VkTexImage *dst = NULL, *src = NULL;
     vk_texture_lock();
     for (int i = 0; i < 32; i++) {
+        if (!(outputs & (UINT32_C(1) << i))) continue;
         uint64_t h = ex->img[NVN_STAGE_CS][i];
         view_t v; int hv = 0;
         const VkTexImage *t = h ? vk_texture_by_id_locked(NVN_HANDLE_TEX(h), &v, &hv) : NULL;
@@ -4350,7 +4367,7 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
             rt_log("%s%s", line, cs ? "" : " (not translated)");
         }
     }
-    if (!cs || !native_tensor(ex)) { untranslated_dispatch_fallback(ex); return; }
+    if (!cs || !native_tensor(ex)) { untranslated_dispatch_fallback(ex, cs); return; }
     const VkPipeInfo *info = NULL;
     VkPipeline p = vk_pipeline_compute(cs, &info);
     if (!p || !info) return warn_once(W_PIPELINE, "a compute pipeline could not be created: dispatches with it are skipped");
@@ -4395,7 +4412,7 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
     dummies_init();
     int present;
     const GfxShader *cs = shader_for(ex, NVN_STAGE_CS, &present, NULL, 0);
-    if (!cs || !native_tensor(ex)) { untranslated_dispatch_fallback(ex); return; }
+    if (!cs || !native_tensor(ex)) { untranslated_dispatch_fallback(ex, cs); return; }
     const VkPipeInfo *info = NULL;
     VkPipeline p = vk_pipeline_compute(cs, &info);
     if (!p || !info) return warn_once(W_PIPELINE, "a compute pipeline could not be created: dispatches with it are skipped");
