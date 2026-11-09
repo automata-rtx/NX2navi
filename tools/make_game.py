@@ -62,6 +62,7 @@ KIT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(KIT / 'tools'))
 import dlssg_kit  # noqa: E402
 import nup  # noqa: E402
+import pack_shader_cache  # noqa: E402
 
 TITLE_ID = 0x0400486024DEC000
 MAIN_BUILD_ID = 'e0f3ccfaf50065ae4ea01eb5aeb13b1a'   # main of game 1.1.1
@@ -1191,10 +1192,26 @@ def update_shader_preparation(out, previous):
         if (device != checked_device or storage != checked_storage or not driver_bytes or not translations_ready
                 or not manifests):
             fail('shader preparation did not leave a compatible driver cache, archive manifests and translated shaders')
+    # An older, otherwise current installation only needs its storage layout migrated.
+    pack_pending = False
+    try:
+        if storage.is_dir() and (not skipped or saved.get('pack_pending')
+                                 or not pack_shader_cache.shared_pack(storage / pack_shader_cache.PACK)):
+            if skipped:
+                emit('step', step='shaders', state='start')
+                driver_bytes = minimum   # packing does not establish a new driver-cache baseline
+                skipped = False
+            say('shaders: packing identical shader data together')
+            pack_shader_cache.pack(storage)
+    except (OSError, ValueError) as exc:
+        # Packing is optional. A full disk or a cache held open by a game can be retried during a later build.
+        pack_pending = True
+        say(f'shaders: could not finish packing the prepared cache: {exc}')
     if not skipped:
         with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=out, delete=False) as f:
             temporary = Path(f.name)
-            json.dump(dict(inventory=inventory, pipelines=key, manifests=manifests, driver_bytes=driver_bytes), f)
+            json.dump(dict(inventory=inventory, pipelines=key, manifests=manifests, driver_bytes=driver_bytes,
+                           pack_pending=pack_pending), f)
         try:
             os.replace(temporary, receipt)
         finally:

@@ -922,6 +922,8 @@ class MakeGameTest(Tmp):
             (out / 'mesh-programs.bin').write_bytes(struct.pack('<8sII', b'NX2NMSID', 1, 96))
             cache.mkdir(exist_ok=True)
             (cache / 'test.spv').touch()
+            for key in ('1' * 64, '2' * 64):
+                (cache / (key + '.spv')).write_bytes(b'same translated shader')
 
         def compile_(out, cache_dir, msys, jobs, romfs_job=None):
             launches.append('compile')
@@ -947,8 +949,24 @@ class MakeGameTest(Tmp):
 
         with patch.object(self.mg, 'step_shaders', prepare), patch.object(self.mg, 'shader_device', probe):
             build_game()
+            packer = self.mg.pack_shader_cache
+            archive = cache / packer.PACK
+            self.assertEqual(len(set(packer.read_pack(archive).values())), 1)
+            # A current preparation in the older pack format migrates during a compatible update.
+            with archive.open('r+b') as f:
+                f.seek(12)
+                f.write(bytes(4))
+            (cache / ('3' * 64 + '.spv')).write_bytes(b'same translated shader')
             with patch.object(self.mg, 'kit_version', return_value='new native build'):
+                with patch.object(packer, 'pack', side_effect=PermissionError('archive open')):
+                    build_game()
+                receipt = self.out / 'shader-preparation.json'
+                self.assertTrue(json.loads(receipt.read_bytes())['pack_pending'])
                 build_game()
+                self.assertFalse(json.loads(receipt.read_bytes())['pack_pending'])
+                entries = packer.read_pack(archive)
+                self.assertTrue(packer.shared_pack(archive))
+                self.assertEqual((len(entries), len(set(entries.values()))), (3, 1))
                 self.assertEqual(launches, ['compile', 'shaders', 'compile'])
                 state_file = self.out / 'build-cache' / 'state.json'
                 state = json.loads(state_file.read_text())

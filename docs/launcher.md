@@ -127,7 +127,8 @@ A path the Windows ANSI code page cannot hold breaks the MSYS2 tools, so the too
    and host options. A compatible native rebuild reuses the preparation even after the native build cache
    has been cleared. If just the driver cache needs rebuilding, setup warms the stages, archive passes and
    recorded pipelines from the existing inventories. A changed translator or incomplete inventory runs the full
-   preparation before play.
+   preparation before play. Setup packs identical shader data once and keeps every lookup key. It also compacts
+   an older shader archive when its preparation is already current. The game reads the shared bytes directly.
 4. The game's Cetra Display is decoded for the window.
 
 ## Updating
