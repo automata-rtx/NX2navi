@@ -52,6 +52,7 @@
 #include "host.h"
 #include "layout.h"
 #include "platform/platform.h"
+#include "vk_dlssg.h"
 #include "vk_fg.h"
 
 #define STEP_SAMPLES 5
@@ -194,7 +195,7 @@ uint64_t frame_step_cap_ns(void) {
     static int rtss = -1;
     if (rtss < 0) {
         const char *e = cfg_get("NX2NAVI_RTSS");
-        rtss = !(e && !strcmp(e, "0")) && !vk_fg_wanted();
+        rtss = !(e && !strcmp(e, "0")) && !vk_fg_wanted() && !vk_dlssg_wanted();
     }
     if (limit_hz == -2) {   // unlimited: the pacer does not hold frames, and RTSS's limit is cleared
         rtss_limit_want(rtss ? 0 : -1);
@@ -207,7 +208,7 @@ uint64_t frame_step_cap_ns(void) {
     // half the limit then, so the screen shows the limit
     if (vk_fg_generating()) hz /= 2;
     rtss_limit_want(rtss ? (int64_t)(hz * 1000 + 0.5) : -1);
-    if (rtss_limit_active()) return 0;
+    if (rtss && rtss_limit_active()) return 0;
     return (uint64_t)(1e9 / hz + 0.5);
 }
 
