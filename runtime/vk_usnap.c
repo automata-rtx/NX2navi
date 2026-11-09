@@ -345,6 +345,24 @@ const uint8_t *vk_usnap_bytes(uint64_t addr, uint64_t n) {
     return vk_usnap_find(addr, n, 1, &bi) ? host_copy() + bi.offset : NULL;
 }
 
+// Retain the draw's uniform bytes across submissions. A directly bound range is
+// readable only in an imported CPU pool and while no outstanding GPU writer overlaps it.
+int vk_usnap_read_draw(uint64_t addr, size_t n, void *dst) {
+    if (!n || addr > UINT64_MAX - n) return 0;
+    const uint8_t *bytes = vk_usnap_bytes(addr, n);
+    if (!bytes) {
+        VkMemSpan span;
+        if (U.mode <= 1 || !vk_mem_resolve(addr, n, &span) || !span.pool || span.alloc || span.avail < n ||
+            (span.cls != VK_MCLS_HOST_UNC && span.cls != VK_MCLS_HOST_CACHED)) return 0;
+        // vk_usnap_drop appends unsorted writes after the submission's initial prune.
+        for (int i = 0; i < U.nwr; i++)
+            if (addr < U.wr[i].hi && U.wr[i].lo < addr + n) return 0;
+        bytes = (const uint8_t *)(uintptr_t)addr;
+    }
+    memcpy(dst, bytes, n);
+    return 1;
+}
+
 // The arenas back on the free list (vk_exec_draw_shutdown: the device is idle, every completion ran).
 void vk_usnap_shutdown(void) {
     plat_mutex_lock(&free_lock);

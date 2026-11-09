@@ -304,6 +304,8 @@ int vk_dlaa_available(void) { return vk_dlaa_wanted() && N.available; }
 // over DLSS's picture, so the jittered scene reached the screen and the whole picture shook. So from DLSS's evaluation
 // to the frame's end, draws in passes larger than the light target sample DLSS's output in its place
 // (vk_dlaa_swap_img, applied by vk_exec_draw.c tex_info): whichever shader scales, it scales DLSS's picture.
+#define OCAM_BLOCK 0x3500u
+#define OCAM_BYTES 0xb0u     // scene context through the last projection row
 static struct {
     VkExecTarget color, depth;   // the armed pair, valid in the frame it was armed
     int pre_tonemap;            // previous evaluation took place before the game's color grade
@@ -353,7 +355,13 @@ static struct {
     // camera (vk_dlaa_draw) and motion vectors (mv_pass)
     uint64_t cam_addr;           // this frame's scene camera block (vk_dlaa_draw), 0: none seen
     uint32_t cam_size, cam_vp;   // its size and the offset of its view-projection rows
-    struct { uint64_t addr; uint32_t n; } views[8];   // Ocarina: this frame's scene contexts of light-target draws
+    struct {
+        uint64_t addr;
+        uint32_t n;
+        int captured;
+        float rows[OCAM_BYTES / sizeof(float)];
+    } views[8];                  // scene contexts used by this frame's light-target draws
+    uint64_t draw_cameras;       // evaluations that used camera rows captured during a scene draw
     int nviews;
     VkBuffer camb;               // two CAM_SLOT slots: this frame's block and last frame's
     VmaAllocation camb_mem;
@@ -602,8 +610,6 @@ static void times_begin(VkCommandBuffer cb) {
 // and the compute pass reprojects every pixel's depth through the two (inv4 and mv_pass below). Then the per-object
 // pass (vk_exec_draw.c, vk_mvobj_execute) writes the motion of whatever moves on its own over it.
 #define CAM_BYTES 256u   // vec4 rows 0-15: view, view-projection (3-6), projection, inverse view
-#define OCAM_BLOCK 0x3500u   // Ocarina's scene context block (vk_dlaa_draw)
-#define OCAM_BYTES 0xb0u     // its rows 0-10: the view and the projection
 #define CAM_BLOCK 0x940u   // the whole block, kept for the per-object motion pass's vertex shaders (vk_exec_draw.c)
 #define CAM_SLOT 0xa00u    // camb slot stride
 #define MVM_SLOTS 16u      // frames the GPU may still be reading the reprojection blocks of
@@ -766,16 +772,28 @@ static int mv_pass(VkExec *ex, struct Size *e, VkImageView zv, float jx, float j
     VkCommandBuffer cb = ex->cb;
     uint32_t w = e->w, h = e->h;
     VkDescriptorBufferInfo cam;
-    if (!mv_init() || !D.cam_addr ||
-        !vk_usnap_find(D.cam_addr, D.cam_size == OCAM_BLOCK ? OCAM_BYTES : D.cam_size, 4, &cam)) {
+    const float *cr = NULL;
+    if (D.cam_addr && mv_init()) {
+        if (D.cam_size == OCAM_BLOCK) {
+            // Evaluation can run in a later submission with a different uniform snapshot.
+            for (int i = 0; i < D.nviews; i++) {
+                if (D.views[i].addr == D.cam_addr && D.views[i].captured) {
+                    cr = D.views[i].rows;
+                    D.draw_cameras++;
+                    break;
+                }
+            }
+            if (!cr) cr = (const float *)vk_usnap_bytes(D.cam_addr, OCAM_BYTES);
+        } else if (vk_usnap_find(D.cam_addr, D.cam_size, 4, &cam)) {
+            cr = (const float *)vk_usnap_bytes(D.cam_addr + D.cam_vp, 64);
+        }
+    }
+    if (!cr) {
         D.mv_none++;
         D.cam_prev_ok = 0;
         e->chars_ok = e->dist_ok = 0;
         return 0;
     }
-    // this frame's view-projection as the snapshot holds it, for the reprojection; kept as last frame's for the next
-    const float *cr = D.cam_size == OCAM_BLOCK ? (const float *)vk_usnap_bytes(D.cam_addr, OCAM_BYTES)
-                                               : (const float *)vk_usnap_bytes(D.cam_addr + D.cam_vp, 64);
     double cur_vp[16], m[16], ci[16];
     int have_m = 0;
     if (cr && D.cam_size == OCAM_BLOCK) ocam_vp(cr, cur_vp);
@@ -1143,8 +1161,16 @@ void vk_dlaa_draw(VkExec *ex) {
         uint64_t a = ex->ubo[0][0].addr;
         int i = 0, best = 0;
         while (i < D.nviews && D.views[i].addr != a) i++;
-        if (i == D.nviews && D.nviews < 8) D.views[D.nviews].addr = a, D.views[D.nviews++].n = 0;
-        if (i < D.nviews) D.views[i].n++;
+        if (i == D.nviews && D.nviews < 8) {
+            D.views[i].addr = a;
+            D.views[i].n = D.views[i].captured = 0;
+            D.nviews++;
+        }
+        if (i < D.nviews) {
+            D.views[i].n++;
+            if (!D.views[i].captured)
+                D.views[i].captured = vk_usnap_read_draw(a, sizeof D.views[i].rows, D.views[i].rows);
+        }
         for (int k = 1; k < D.nviews; k++)
             if (D.views[k].n > D.views[best].n) best = k;
         D.cam_addr = D.views[best].addr, D.cam_size = OCAM_BLOCK, D.cam_vp = 0;
@@ -1588,11 +1614,12 @@ evaluated:
     if (++D.evals == 1 || D.evals == 300 || D.evals % 3600 == 0)   // 300: one early line with the frames counted
         rt_log("dlaa: %llu frames anti-aliased (scene %ux%u, output %ux%u; %llu frames without the DLAA point, %llu with camera "
                "motion, %llu with the characters' mask, %llu without a camera, %llu jittered, %llu jitter holds; resets: %llu size, %llu "
-               "camera, %llu target; reactive mask %llu, without its copy %llu)",
+               "camera, %llu target; reactive mask %llu, without its copy %llu; cameras captured at draw %llu)",
                (unsigned long long)D.evals, w, h, ow, oh, (unsigned long long)D.frames_missed,
                (unsigned long long)D.mv_frames, (unsigned long long)D.masked, (unsigned long long)D.mv_none,
                (unsigned long long)D.jittered, (unsigned long long)D.holds, (unsigned long long)D.why[0], (unsigned long long)D.why[1],
-               (unsigned long long)D.why[2], (unsigned long long)R.made, (unsigned long long)R.missed);
+               (unsigned long long)D.why[2], (unsigned long long)R.made, (unsigned long long)R.missed,
+               (unsigned long long)D.draw_cameras);
 }
 
 // The HUD-less picture (vk_dlaa_fg_hudless): DLSS's output, which the HUD is then drawn over, through the encode the
@@ -1863,6 +1890,7 @@ void vk_dlaa_frame(void) {
         // either way the next DLAA frame starts a new history from an unjittered frame
         D.reset = 1, D.cam_prev_ok = 0, D.jit_ok = D.jit_used = D.armed = D.done = D.gbuf = D.ended = D.up = 0;
         D.tensor_scene = D.hold = 0;
+        D.cam_addr = 0, D.nviews = 0;
         return;
     }
     if (!dl_active()) return;
