@@ -160,6 +160,11 @@ typedef struct {
     void (*cpu_synced)(uint64_t fence);
     void (*publish_movie_buffer)(uint64_t addr, uint64_t size);
     void (*frame_start)(void);   // guest acquired the render image and can start work on this frame
+    int (*event_order)(void);
+    int (*guest_wait)(uint64_t ticket, uint64_t timeout_ns);
+    uint64_t (*queue_dependency)(uintptr_t queue, uint64_t ticket);
+    void (*queue_release)(uintptr_t queue);
+    void (*event_changed)(void);
 } GfxBackend;
 extern const GfxBackend gfx_null_backend, gfx_vulkan_backend;
 const GfxBackend *gfx_backend(void);                       // NX2NAVI_GPU=null|vulkan (default vulkan)
@@ -181,3 +186,8 @@ void gfx_movie_frame(const uint8_t *rgba, int w, int h);
 void gfx_movie_frame_own(uint8_t *rgba, int w, int h);   // the same, taking the malloc'd buffer (freed later)
 void gfx_movie_stop(void);
 int gfx_movie_copy_source(uint64_t addr, uint64_t size);
+
+// Queue identity on the guest thread issuing a submission.
+extern _Thread_local uintptr_t gfx_submit_queue;
+extern _Thread_local uint64_t gfx_guest_ticket;
+#define GFX_GUEST_TICKET (UINT64_C(1) << 63)

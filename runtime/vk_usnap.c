@@ -30,6 +30,7 @@
 
 typedef struct Arena {
     struct Arena *next;
+    unsigned owners;
     VkBuffer buf;
     VmaAllocation alloc;
     uint8_t *map;
@@ -43,15 +44,23 @@ typedef struct { uint64_t lo, hi; } Rng;
 typedef struct { uint64_t lo, hi, off; int dropped; } Reg;
 typedef struct { uint64_t lo, hi, fence; } Wrote;
 
+// A deferred queue keeps its original arena and sorted range table. All accesses to the tables
+// are serialized by the replay lock. Only the arena return runs on the GPU completion thread.
+struct VkUniformSnapshot {
+    Arena *arena;
+    Reg *reg;
+    int nreg;
+    VkUniformSnapshot *next;
+};
+static VkUniformSnapshot submit_snapshot, empty_snapshot;
+static VkUniformSnapshot *active = &submit_snapshot, *held;
+
 static struct {
     int mode;                   // rt_knob: 0 off, 1 on, 2 ab
-    int on;                     // this submission has a snapshot
     uint64_t fence, gen;
-    Arena *arena;
     Rng *col;                   // collected ranges
     int ncol, ccol;
-    Reg *reg;                   // merged, sorted by lo, disjoint
-    int nreg, creg;
+    int creg;                   // capacity of the reusable submission range table
     Wrote *wr;                  // GPU writes of submissions not known to be complete
     int nwr, cwr;
     // since the last summary
@@ -78,9 +87,13 @@ static Arena *arena_get(uint64_t need) {
             break;
         }
     plat_mutex_unlock(&free_lock);
-    if (a) return a;
+    if (a) {
+        a->owners = 1;
+        return a;
+    }
     a = calloc(1, sizeof *a);
     if (!a) rt_fatal("vk_usnap: out of memory");
+    a->owners = 1;
     a->size = need < ARENA_MIN ? ARENA_MIN : (need + (1u << 20) - 1) & ~(uint64_t)((1u << 20) - 1);
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = a->size,
                              // transfer source: DLAA copies the camera block out (vk_dlaa.c mv_pass)
@@ -104,12 +117,46 @@ static Arena *arena_get(uint64_t need) {
 
 static void arena_done(void *arg) {   // completion thread: the GPU has read it
     Arena *a = arg;
+    if (__atomic_sub_fetch(&a->owners, 1, __ATOMIC_ACQ_REL)) return;
     plat_mutex_lock(&free_lock);
     a->next = free_arenas, free_arenas = a;
     plat_mutex_unlock(&free_lock);
 }
 
-static void collect(const op_hdr *h, int depth) {
+static void collect_binding(const p_bind_buf *b) {
+    if (!b->addr || !b->size) return;
+    uint64_t n = b->size < MAX_RANGE ? b->size : MAX_RANGE;
+    // the vertex stage's object and bone blocks: also the game's other copy on either side, which still
+    // holds last frame's (vk_mvprev.c)
+    uint64_t step = vk_mvprev_step(b->stage, b->index, b->size);
+    // which neighbours lie in an imported pool, per block and vk_mem_gen: the same blocks are bound by
+    // many draws, and two resolves for each binding were a quarter of the snapshot's time
+    static struct { uint64_t addr, size, gen; int ok; } nc[1024];
+    uint32_t ci = (uint32_t)((b->addr ^ n << 48) * 0x9E3779B97F4A7C15ull >> 54);
+    uint64_t gen = vk_mem_gen();
+    int known = step && nc[ci].addr == b->addr && nc[ci].size == n && nc[ci].gen == gen, ok = 0;
+    for (int k = step ? -1 : 0; k <= (step ? 1 : 0); k++) {
+        uint64_t at = b->addr + (uint64_t)((int64_t)k * (int64_t)step);
+        if (k < 0 && b->addr < step) continue;
+        // a neighbour past its pool would make the whole merged region fail the pool check below, and
+        // the bindings in it read live memory again
+        VkMemSpan sp;
+        uint64_t lo = at & ~(uint64_t)(ALIGN - 1);
+        if (k && known) {
+            if (!(nc[ci].ok >> (k + 1) & 1)) continue;
+        } else if (k) {
+            if (!vk_mem_resolve(lo, at + n - lo, &sp) || sp.alloc || !sp.pool || sp.avail < at + n - lo ||
+                (sp.cls != VK_MCLS_HOST_CACHED && sp.cls != VK_MCLS_HOST_UNC))
+                continue;
+            ok |= 1 << (k + 1);
+        }
+        if (U.ncol == U.ccol) U.col = grow(U.col, &U.ccol, sizeof *U.col);
+        U.col[U.ncol++] = (Rng){at & ~(uint64_t)(ALIGN - 1), at + n};
+    }
+    if (step && !known) nc[ci].addr = b->addr, nc[ci].size = n, nc[ci].gen = gen, nc[ci].ok = ok;
+}
+
+static void collect(const op_hdr *h, int depth, p_bind_buf bindings[8][18], int capture) {
     for (;;) {
         if (h->size < sizeof *h || (h->size & 7) || h->op >= OP_COUNT_)
             rt_fatal("vk_usnap: corrupt command record at %p: op %u size %u", (const void *)h, h->op, h->size);
@@ -119,40 +166,12 @@ static void collect(const op_hdr *h, int depth) {
             h = (const op_hdr *)(uintptr_t)((const p_jump *)a)->target;
             continue;
         }
-        if (h->op == OP_CALL && depth < CALL_DEPTH) collect(nvn_op_first(((const p_jump *)a)->target), depth + 1);
+        if (h->op == OP_CALL && depth < CALL_DEPTH) collect(nvn_op_first(((const p_jump *)a)->target), depth + 1, bindings, capture);
         if (h->op == OP_BIND_UBO) {
             const p_bind_buf *b = a;
-            if (b->addr && b->size) {
-                uint64_t n = b->size < MAX_RANGE ? b->size : MAX_RANGE;
-                // the vertex stage's object and bone blocks: also the game's other copy on either side, which still
-                // holds last frame's (vk_mvprev.c)
-                uint64_t step = vk_mvprev_step(b->stage, b->index, b->size);
-                // which neighbours lie in an imported pool, per block and vk_mem_gen: the same blocks are bound by
-                // many draws, and two resolves for each binding were a quarter of the snapshot's time
-                static struct { uint64_t addr, size, gen; int ok; } nc[1024];
-                uint32_t ci = (uint32_t)((b->addr ^ n << 48) * 0x9E3779B97F4A7C15ull >> 54);
-                uint64_t gen = vk_mem_gen();
-                int known = step && nc[ci].addr == b->addr && nc[ci].size == n && nc[ci].gen == gen, ok = 0;
-                for (int k = step ? -1 : 0; k <= (step ? 1 : 0); k++) {
-                    uint64_t at = b->addr + (uint64_t)((int64_t)k * (int64_t)step);
-                    if (k < 0 && b->addr < step) continue;
-                    // a neighbour past its pool would make the whole merged region fail the pool check below, and
-                    // the bindings in it read live memory again
-                    VkMemSpan sp;
-                    uint64_t lo = at & ~(uint64_t)(ALIGN - 1);
-                    if (k && known) {
-                        if (!(nc[ci].ok >> (k + 1) & 1)) continue;
-                    } else if (k) {
-                        if (!vk_mem_resolve(lo, at + n - lo, &sp) || sp.alloc || !sp.pool || sp.avail < at + n - lo ||
-                            (sp.cls != VK_MCLS_HOST_CACHED && sp.cls != VK_MCLS_HOST_UNC))
-                            continue;
-                        ok |= 1 << (k + 1);
-                    }
-                    if (U.ncol == U.ccol) U.col = grow(U.col, &U.ccol, sizeof *U.col);
-                    U.col[U.ncol++] = (Rng){at & ~(uint64_t)(ALIGN - 1), at + n};
-                }
-                if (step && !known) nc[ci].addr = b->addr, nc[ci].size = n, nc[ci].gen = gen, nc[ci].ok = ok;
-            }
+            if (bindings && (unsigned)b->stage < 8 && (unsigned)b->index < 18)
+                bindings[b->stage][b->index] = *b;
+            if (capture) collect_binding(b);
         }
         h = nvn_op_next(h);
     }
@@ -245,22 +264,33 @@ static void summary(void) {
     U.subs = U.off_subs = U.regions = U.bytes = U.copy_ns = U.hits = U.drops = U.inflight = U.refused = 0;
 }
 
-void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
+void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence, p_bind_buf bindings[8][18]) {
     if (!U.mode) U.mode = rt_knob("UBO_SNAPSHOT", "1") + 1;   // stored +1: 0 is "not read yet"
-    U.on = 0, U.fence = fence, U.gen++;
+    active = &submit_snapshot;
+    active->nreg = 0;
+    U.fence = fence;
+    U.gen++;
     summary();
-    if (!RT_KNOB_ON(U.mode - 1)) {
+    int capture = RT_KNOB_ON(U.mode - 1);
+    if (!capture) {
         U.off_subs++;
-        return;
+        if (U.mode == 1 || !bindings) return;
     }
     uint64_t t0 = kern_now_ns();
     U.ncol = 0;
+    // A submission can draw with a uniform bound by an earlier, still-blocked submission of
+    // its queue. Advance the queue's binding table in submit order, independently of replay.
+    if (capture && bindings) {
+        for (int st = 0; st < 8; ++st)
+            for (int slot = 0; slot < 18; ++slot)
+                if (bindings[st][slot].size) collect_binding(&bindings[st][slot]);
+    }
     for (int i = 0; i < n; i++)
-        if (handles[i]) collect(nvn_op_first(handles[i]), 0);
+        if (handles[i]) collect(nvn_op_first(handles[i]), 0, bindings, capture);
+    if (!capture) return;
     sort_col();
     wr_prune();
     // merge, keeping only what lies wholly in one imported pool and no GPU write in flight touches
-    U.nreg = 0;
     uint64_t total = 0;
     for (int i = 0; i < U.ncol;) {
         uint64_t lo = U.col[i].lo, hi = U.col[i].hi;
@@ -276,69 +306,111 @@ void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
             U.inflight++;
             continue;
         }
-        if (U.nreg == U.creg) U.reg = grow(U.reg, &U.creg, sizeof *U.reg);
-        U.reg[U.nreg++] = (Reg){lo, hi, total, 0};
+        if (active->nreg == U.creg) active->reg = grow(active->reg, &U.creg, sizeof *active->reg);
+        active->reg[active->nreg++] = (Reg){lo, hi, total, 0};
         total += (hi - lo + ALIGN - 1) & ~(uint64_t)(ALIGN - 1);
     }
-    if (!U.nreg) return;
-    if (!(U.arena = arena_get(total))) return;
-    uint8_t *dst = U.arena->map;
+    if (!active->nreg) return;
+    if (!(active->arena = arena_get(total))) return;
+    uint8_t *dst = active->arena->map;
     if (vk_dlaa_available()) {
-        if (!U.arena->cpu && !(U.arena->cpu = malloc(U.arena->size))) rt_fatal("vk_usnap: out of memory");
-        dst = U.arena->cpu;
+        if (!active->arena->cpu && !(active->arena->cpu = malloc(active->arena->size))) rt_fatal("vk_usnap: out of memory");
+        dst = active->arena->cpu;
     }
-    for (int i = 0; i < U.nreg; i++)
-        memcpy(dst + U.reg[i].off, (const void *)(uintptr_t)U.reg[i].lo, U.reg[i].hi - U.reg[i].lo);
-    if (dst != U.arena->map) memcpy(U.arena->map, dst, total);   // one sequential write into the device copy
-    vmaFlushAllocation(vk_ctx()->vma, U.arena->alloc, 0, total);   // a no-op on coherent memory
-    U.on = 1;
-    U.subs++, U.regions += (uint64_t)U.nreg, U.bytes += total, U.copy_ns += kern_now_ns() - t0;
+    for (int i = 0; i < active->nreg; i++)
+        memcpy(dst + active->reg[i].off, (const void *)(uintptr_t)active->reg[i].lo, active->reg[i].hi - active->reg[i].lo);
+    if (dst != active->arena->map) memcpy(active->arena->map, dst, total);   // one sequential write into the device copy
+    vmaFlushAllocation(vk_ctx()->vma, active->arena->alloc, 0, total);   // a no-op on coherent memory
+    U.subs++, U.regions += (uint64_t)active->nreg, U.bytes += total, U.copy_ns += kern_now_ns() - t0;
+}
+
+VkUniformSnapshot *vk_usnap_hold(void) {
+    if (!active->arena) return &empty_snapshot;
+    VkUniformSnapshot *s = malloc(sizeof *s + sizeof *s->reg * (size_t)active->nreg);
+    if (!s) rt_fatal("vk_usnap: out of memory (held uniforms)");
+    s->arena = active->arena;
+    __atomic_add_fetch(&s->arena->owners, 1, __ATOMIC_RELAXED);
+    s->nreg = active->nreg;
+    s->reg = (Reg *)(s + 1);
+    memcpy(s->reg, active->reg, sizeof *s->reg * (size_t)s->nreg);
+    s->next = held;
+    held = s;
+    return s;
+}
+
+void vk_usnap_use(VkUniformSnapshot *s) {
+    active = s ? s : &submit_snapshot;
+    U.gen++;
+}
+
+void vk_usnap_release(VkUniformSnapshot *s, uint64_t fence) {
+    if (s == &empty_snapshot) return;
+    VkUniformSnapshot **slot = &held;
+    while (*slot && *slot != s) slot = &(*slot)->next;
+    if (!*slot || s == active) rt_fatal("vk_usnap: releasing an invalid or active snapshot");
+    *slot = s->next;
+    vk_completion_add(fence, arena_done, s->arena);
+    free(s);
 }
 
 void vk_usnap_end(uint64_t fence) {
-    if (U.arena) vk_completion_add(fence, arena_done, U.arena), U.arena = NULL;
-    U.on = 0, U.gen++;
+    if (active != &submit_snapshot) rt_fatal("vk_usnap: a deferred snapshot is still selected");
+    if (active->arena) vk_completion_add(fence, arena_done, active->arena);
+    active->arena = NULL;
+    active->nreg = 0;
+    U.gen++;
 }
 
 // First region whose end is above a.
-static int first_above(uint64_t a) {
-    int lo = 0, hi = U.nreg;
+static int first_above(const VkUniformSnapshot *s, uint64_t a) {
+    int lo = 0, hi = s->nreg;
     while (lo < hi) {
         int m = (lo + hi) / 2;
-        if (U.reg[m].hi <= a) lo = m + 1;
+        if (s->reg[m].hi <= a) lo = m + 1;
         else hi = m;
     }
     return lo;
 }
 
 int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out) {
-    if (!U.on || !n) return 0;
-    int i = first_above(addr);
-    if (i >= U.nreg) return 0;
-    const Reg *r = &U.reg[i];
-    if (r->dropped || addr < r->lo || addr + n > r->hi) return 0;
+    if (!active->arena || !n) return 0;
+    int i = first_above(active, addr);
+    if (i >= active->nreg) return 0;
+    const Reg *r = &active->reg[i];
+    if (r->dropped || addr < r->lo || n > r->hi - addr) return 0;
     uint64_t off = r->off + (addr - r->lo);
     if (off % align) return 0;
-    *out = (VkDescriptorBufferInfo){U.arena->buf, off, n};
+    *out = (VkDescriptorBufferInfo){active->arena->buf, off, n};
     U.hits++;
     return 1;
+}
+
+static void drop_range(VkUniformSnapshot *s, uint64_t lo, uint64_t hi) {
+    for (int i = first_above(s, lo); i < s->nreg && s->reg[i].lo < hi; i++) {
+        if (!s->reg[i].dropped) {
+            s->reg[i].dropped = 1;
+            U.drops++;
+            U.gen++;
+        }
+    }
 }
 
 void vk_usnap_drop(uint64_t addr, uint64_t n) {
     if (!U.mode || !n) return;
     if (U.nwr == U.cwr) U.wr = grow(U.wr, &U.cwr, sizeof *U.wr);
     U.wr[U.nwr++] = (Wrote){addr, addr + n, U.fence};
-    if (!U.on) return;
-    for (int i = first_above(addr); i < U.nreg && U.reg[i].lo < addr + n; i++)
-        if (!U.reg[i].dropped) U.reg[i].dropped = 1, U.drops++, U.gen++;
+    // A producer can overwrite a waiting consumer's input, even when the consumer resumes after
+    // the producer's physical fence has already retired. Mark the overlapping snapshots now.
+    drop_range(&submit_snapshot, addr, addr + n);
+    for (VkUniformSnapshot *s = held; s; s = s->next) drop_range(s, addr, addr + n);
 }
 
 uint64_t vk_usnap_gen(void) { return U.gen; }
 
 // the host copy where there is one (DLSS), else the device copy
-static uint8_t *host_copy(void) { return U.arena->cpu ? U.arena->cpu : U.arena->map; }
+static uint8_t *host_copy(void) { return active->arena->cpu ? active->arena->cpu : active->arena->map; }
 
-const uint8_t *vk_usnap_map(void) { return U.arena ? host_copy() : NULL; }
+const uint8_t *vk_usnap_map(void) { return active->arena ? host_copy() : NULL; }
 
 const uint8_t *vk_usnap_bytes(uint64_t addr, uint64_t n) {
     VkDescriptorBufferInfo bi;

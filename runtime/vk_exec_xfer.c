@@ -334,7 +334,85 @@ static void oq_report(VkExec *ex, uint64_t addr) {
     if (!oq_keep) oq_counting = 0;
 }
 
+// ---- event order check
+// A recorded signal becomes visible to the guest CPU at its completion callback. Commands recorded after it
+// already see its new value. Once the fence completes, memory is authoritative again, including CPU resets
+// and new events at the same storage address. Accessed under the replay lock.
+typedef struct { volatile uint32_t *val; uint32_t value; uint64_t fence; } ReplayEvent;
+static ReplayEvent *ev_seen;
+static size_t ev_n, ev_cap;
+static uint64_t ev_waits, ev_unmet, ev_late, ev_late_subs;
+// Waits reached unmet, until a replayed signal meets them (ev_late: the signal came that many submissions later, so
+// the work after the wait ran before the work it waited for) or they are pushed out by newer ones.
+#define EV_OPEN 64
+static struct { volatile uint32_t *val; uint32_t mode, value; uint64_t sub; } ev_open[EV_OPEN];
+static int ev_open_n;
+
+static ReplayEvent *ev_slot(volatile uint32_t *val, int create) {
+    uint64_t done = vk_sync_fence_done();
+    size_t reusable = ev_n;
+    for (size_t i = 0; i < ev_n; i++) {
+        if (ev_seen[i].fence <= done) reusable = i;
+        else if (ev_seen[i].val == val) return &ev_seen[i];
+    }
+    if (!create) return NULL;
+    if (reusable == ev_n) {
+        if (ev_n == ev_cap) {
+            ev_cap = ev_cap ? ev_cap * 2 : 32;
+            if (!(ev_seen = realloc(ev_seen, ev_cap * sizeof *ev_seen))) rt_fatal("vk: out of memory (events)");
+        }
+        ev_n++;
+    }
+    ev_seen[reusable] = (ReplayEvent){val, __atomic_load_n(val, __ATOMIC_ACQUIRE), 0};
+    return &ev_seen[reusable];
+}
+
+static int ev_holds(uint32_t have, uint32_t mode, uint32_t want) {
+    return mode == NVN_EVENT_WAIT_MODE_GEQUAL_WRAP ? (int32_t)(have - want) >= 0 : have == want;
+}
+
+int vk_exec_event_met(const void *payload) {
+    const p_wait_event *p = payload;
+    const ReplayEvent *seen = ev_slot(p->val, 0);
+    return ev_holds(seen ? seen->value : __atomic_load_n(p->val, __ATOMIC_ACQUIRE), p->mode, p->value);
+}
+
+int vk_exec_signalled;
+
+int vk_exec_wait_event(const void *payload) {
+    const p_wait_event *p = payload;
+    ev_waits++;
+    if (vk_exec_event_met(payload)) return 1;
+    ev_unmet++;
+    if (ev_open_n == EV_OPEN) memmove(ev_open, ev_open + 1, sizeof ev_open - sizeof *ev_open), ev_open_n--;
+    ev_open[ev_open_n].val = p->val, ev_open[ev_open_n].mode = p->mode, ev_open[ev_open_n].value = p->value;
+    ev_open[ev_open_n++].sub = vk_exec_submit_seq;
+    static int logged;
+    if (logged++ < 8)
+        rt_log("vk: event wait reached before its signal: event %p, mode %u, wants %#x",
+               (void *)p->val, p->mode, p->value);
+    return 0;
+}
+
+void vk_exec_event_stats(uint64_t *waits, uint64_t *unmet, uint64_t *late, uint64_t *late_subs) {
+    *waits = ev_waits, *unmet = ev_unmet, *late = ev_late, *late_subs = ev_late_subs;
+    ev_waits = ev_unmet = ev_late = ev_late_subs = 0;
+}
+
+static void record_signal(VkExec *ex, const p_signal_event *p) {
+    ReplayEvent *seen = ev_slot(p->val, 1);
+    seen->value = p->mode == NVN_EVENT_SIGNAL_MODE_ADD ? seen->value + p->value : p->value;
+    seen->fence = ex->fence;
+    vk_exec_signalled = 1;
+    for (int i = 0; i < ev_open_n;)
+        if (ev_open[i].val == p->val && ev_holds(seen->value, ev_open[i].mode, ev_open[i].value)) {
+            ev_late++, ev_late_subs += vk_exec_submit_seq - ev_open[i].sub;
+            ev_open[i] = ev_open[--ev_open_n];
+        } else i++;
+}
+
 static void signal_event(VkExec *ex, const p_signal_event *p) {
+    if (vk_exec_event_order() || (rt_trace & RT_TRACE_GFX)) record_signal(ex, p);
     EventWrite *e = malloc(sizeof *e);
     if (!e) rt_fatal("vk: out of memory");
     *e = (EventWrite){p->val, p->mode, p->value};

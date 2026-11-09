@@ -80,6 +80,8 @@ uint64_t nvn_tex_view_offset(const tex_t *t, const view_t *v);
 // (nvn_pins_sweep). Deferred binds (p_bind_handles.src != 0) hold the
 // handles read at submit (nvn_submit_prepare). Payloads of the ops nvn_obj.h does not define:
 typedef struct { volatile uint32_t *val; uint32_t mode, value; } p_signal_event;   // OP_SIGNAL_EVENT; mode: NVNeventSignalMode
+typedef p_signal_event p_wait_event;   // OP_WAIT_EVENT; mode: NVNeventWaitMode
+void nvn_queue_publish(queue_t *q, uint64_t ticket);
 typedef struct { uint64_t type, addr; } p_report_counter;  // OP_REPORT_COUNTER: NVNcounterType, NVNcounterData address
 typedef struct { uint64_t type; } p_reset_counter;         // OP_RESET_COUNTER
 typedef struct { uint64_t src, dst, size; } p_copy_b2b;    // OP_COPY_B2B: GPU addresses
@@ -107,6 +109,8 @@ uint64_t nvn_submit_count(void);                           // QueueSubmitCommand
 // Frees the texture pins no recording copy has named for NVN_PIN_AGE submits (nvn_api_cmd.c, "texture pins"), except keep[0..nkeep):
 // the replay's current render targets, which carry over to the next submission. Called between submissions by the
 // thread that replays them; now = nvn_submit_count().
+void nvn_record_refs(const uint8_t *copy, int delta);
+void nvn_target_refs(const p_set_rt *rt, int delta);
 void nvn_pins_sweep(uint64_t now, const tex_t *const *keep, int nkeep);
 void nvn_pins_stats(uint64_t *live, uint64_t *freed);      // pins that exist, pins freed so far
 const char *nvn_op_name(uint32_t op);                      // "DRAW_IDX", ...; "?" past OP_COUNT_

@@ -268,8 +268,12 @@ void vk_mem_gpu_wrote(const VkMemSpan *sp, uint64_t size);
 void vk_mem_gpu_wrote_shader(const VkMemSpan *sp, uint64_t size);
 // Uniform blocks as of the submit call (vk_usnap.c): vk_exec_record copies the uniform ranges a submission binds before
 // it records, ubo bindings take the copy (0: not copied, bind memory), GPU writes of the replay drop the copies they touch.
-void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence);
+void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence, p_bind_buf bindings[8][18]);
 void vk_usnap_end(uint64_t fence);
+typedef struct VkUniformSnapshot VkUniformSnapshot;
+VkUniformSnapshot *vk_usnap_hold(void);   // own the current submission's uniforms across a queue wait
+void vk_usnap_use(VkUniformSnapshot *s);  // NULL restores this physical submission's original uniforms
+void vk_usnap_release(VkUniformSnapshot *s, uint64_t fence);  // after switching away, at its last GPU use
 int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out);
 const uint8_t *vk_usnap_map(void);   // a host copy of the current arena, at the offsets vk_usnap_find gives
 const uint8_t *vk_usnap_bytes(uint64_t addr, uint64_t n);   // the copy of [addr, addr+n) as of the submit, NULL: none

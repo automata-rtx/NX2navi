@@ -139,6 +139,9 @@ void vk_exec_inline_end(int reopen);
 // vk_exec_draw.c: forget what the command buffer being recorded has bound (pipeline, sets, dynamic state, vertex
 // buffers): the replay continues in a new one (vk_sync_split).
 void vk_exec_draw_new_cb(void);
+const prog_t *vk_exec_program_hold(const prog_t *p);
+void vk_exec_program_drop(const prog_t *owned);
+void vk_exec_record_programs(uint8_t *record, int delta);
 // vk_exec_draw.c: the vertex and fragment shader of the last draw recorded into this command buffer (NULL: none yet).
 void vk_exec_draw_shaders(const GfxShader **vs, const GfxShader **fs);
 VkBuffer vk_exec_inline_buffer(VkDeviceSize size);
@@ -215,6 +218,22 @@ VkImageView vk_exec_target_view(const VkTexImage *img, VkFormat format, VkImageV
 // vk_exec_xfer.c: OP_COPY_B2B, OP_COPY_B2T, OP_COPY_T2B, OP_COPY_T2T, OP_CLEAR_TEX, OP_SIGNAL_EVENT, OP_REPORT_COUNTER,
 // OP_RESET_COUNTER, OP_RENDER_ENABLE, OP_RENDER_COND, OP_CLEAR_BUF.
 void vk_exec_op_xfer(VkExec *ex, uint32_t op, const void *payload);
+int vk_exec_wait_event(const void *payload);
+int vk_exec_event_met(const void *payload);   // the same test without counting
+int vk_exec_event_order(void);               // enabled explicitly on synchronous replay
+extern int vk_exec_signalled;                 // set by every replayed SignalEvent; vk_exec.c clears it
+// Since the last call, which resets them: waits, waits reached before their signal, those of them a later replayed
+// signal met, and the sum of how many submissions later it came.
+void vk_exec_event_stats(uint64_t *waits, uint64_t *unmet, uint64_t *late, uint64_t *late_subs);
+extern uint64_t vk_exec_submit_seq;   // replay thread: submissions replayed so far
+int vk_exec_held(void);               // replay thread: held submissions waiting for a signal (event order)
+int vk_exec_held_ready(void);
+void vk_exec_queue_marker(uintptr_t queue, uint64_t ticket);
+int vk_exec_marker_first(uintptr_t queue, uint64_t ticket);
+void vk_exec_pop_marker(uintptr_t queue, uint64_t ticket);
+void vk_exec_queue_release(uintptr_t queue);
+void vk_guest_recorded(uint64_t ticket, uint64_t physical);
+extern _Thread_local int vk_guest_pumping;
 // vk_dlaa.c: once DLSS has scaled the scene this frame, passes larger than the scene's light target vk_dlaa_swap_img
 // sample DLSS's output vk_dlaa_swap_view in its place, so the game's scaling draw scales DLSS's picture.
 extern const VkTexImage *vk_dlaa_swap_img;

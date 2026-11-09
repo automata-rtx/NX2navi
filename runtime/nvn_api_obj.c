@@ -769,18 +769,7 @@ static void sleep_until(uint64_t deadline) {
     }
 }
 
-// The submit fence of each window image's newest present (win_t has no room: a side table for the first windows).
-static struct { const win_t *w; uint64_t fence[4]; } img_fence[4];
 static uint64_t last_present_fence;   // the submit fence at the newest present of any window
-
-static uint64_t *img_fence_of(const win_t *o, int idx) {
-    if (idx < 0 || idx >= 4) return NULL;
-    for (int i = 0; i < 4; i++) {
-        if (img_fence[i].w == o) return &img_fence[i].fence[idx];
-        if (!img_fence[i].w) return img_fence[i].w = o, &img_fence[i].fence[idx];
-    }
-    return NULL;
-}
 
 // NVNwindowAcquireTextureResult nvnWindowAcquireTexture(NVNwindow *w, NVNsync *s, int *index): blocks here, not in the
 // present, until the image's previous present plus one period has passed (the game often presents with a lock held).
@@ -806,11 +795,15 @@ NVN_API(nvnWindowAcquireTexture) {
     // clock; =2 waits for the newest present of any image (one frame in flight at most).
     static int acq_wait = -1;
     if (acq_wait < 0) acq_wait = rt_knob("ACQUIRE_WAIT", "1");
-    uint64_t *fe = img_fence_of(o, idx), want = fe ? *fe : 0;
-    if (acq_wait == 2) want = last_present_fence;
-    if (acq_wait && want) {
+    uint64_t want = __atomic_load_n(&o->ticket[idx], __ATOMIC_ACQUIRE);
+    if (acq_wait == 2) want = __atomic_load_n(&last_present_fence, __ATOMIC_ACQUIRE);
+    if ((acq_wait || (want & GFX_GUEST_TICKET)) && want) {
         const GfxBackend *b = gfx_backend();
-        if (b->fence_done() < want) {
+        if (want & GFX_GUEST_TICKET) {
+            uint64_t p0 = perf_begin();
+            b->guest_wait(want, UINT64_MAX);
+            perf_end(PERF_PACE, p0);
+        } else if (b->fence_done() < want) {
             uint64_t p0 = perf_begin();
             b->fence_wait(want, UINT64_MAX);
             perf_end(PERF_PACE, p0);
@@ -845,12 +838,16 @@ NVN_API(nvnQueuePresentTexture) {
     const tex_t *t = (const tex_t *)o->tex[idx];
     uint64_t period = present_period(o), now = kern_now_ns();
     uint64_t slot = now + pace(&o->pace, now, period);
+    queue_t *queue = arg_p(c, 0);
+    gfx_submit_queue = queue ? queue->identity : 0;
+    gfx_guest_ticket = 0;
     gfx_backend()->present(t, o->crop, slot);
-    o->ticket[idx] = o->presents;
+    gfx_submit_queue = 0;
+    uint64_t fence = gfx_guest_ticket ? gfx_guest_ticket : nvn_fence_last();
+    if (gfx_guest_ticket) nvn_queue_publish(queue, gfx_guest_ticket);
     o->avail[idx] = slot + period;
-    uint64_t *fe = img_fence_of(o, idx);
-    if (fe) *fe = nvn_fence_last();   // the frame drawn into it (nvnWindowAcquireTexture waits for it)
-    last_present_fence = nvn_fence_last();
+    __atomic_store_n(&o->ticket[idx], fence, __ATOMIC_RELEASE);
+    __atomic_store_n(&last_present_fence, fence, __ATOMIC_RELEASE);
     frame_step_present(slot, o->interval);   // frame_rate.c: the real-time step follows the display times
     rt_frame_presented(t, o->presents);
 }

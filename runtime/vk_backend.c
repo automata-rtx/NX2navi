@@ -34,7 +34,7 @@
 
 #define WEAK __attribute__((weak))
 
-typedef struct { void *token; VkImage image; VkFormat format; int w, h, has_crop, crop[4]; uint64_t frame, at, queued, value; } PresentJob;
+typedef struct { void *token; VkImage image; VkFormat format; int w, h, has_crop, crop[4]; uint64_t frame, at, queued, value, ticket; } PresentJob;
 
 static PlatMutex pl = PLAT_MUTEX_INIT;
 static PlatCond pcv = PLAT_COND_INIT;   // job queued, job taken, job submitted
@@ -62,6 +62,7 @@ static void present_main(void *arg) {
         if (flight_on || vk_dump_white) vk_thumbs_frame(j.frame);   // NX2NAVI_DUMP_WHITE reads them too
         vk_present_blit(j.token, j.image, VK_IMAGE_LAYOUT_GENERAL, j.format, j.w, j.h, j.has_crop ? j.crop : NULL);
         uint64_t f = vk_sync_submit(NULL, 0);   // a timeline value after the blit: deferred destruction waits for the blit too
+        if (j.ticket) vk_guest_recorded(j.ticket, f);
         if (j.value && f != j.value)
             rt_fatal("vk: the present of frame %llu signalled %llu, queued as %llu", (unsigned long long)j.frame,
                      (unsigned long long)f, (unsigned long long)j.value);
@@ -99,7 +100,7 @@ void vk_present_drain(void) {
 // The present after the frame count: resolves the image and hands the blit to the present thread. queued: when the game
 // presented; value: the timeline value queued for this present (asynchronous replay), 0 for the next one (synchronous).
 static void present_image(void *token, const tex_t *t, const int crop[4], uint64_t at_ns, uint64_t queued, uint64_t frame,
-                          uint64_t value) {
+                          uint64_t value, uint64_t ticket) {
     static volatile int32_t n_skipped;
     vk_exec_frame_log(t, frame);
     vk_dlaa_frame();
@@ -112,15 +113,16 @@ static void present_image(void *token, const tex_t *t, const int crop[4], uint64
     if (!img || !(img->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) {
         if (plat_inc32(&n_skipped) <= 8)
             rt_log("vk: present of texture %p (format %#x) skipped: no colour image", (const void *)t, t ? t->d.format : 0);
-        if (value) {   // the queued value is still signalled, in order
+        if (value || ticket) {   // the queued value is still signalled, in order
             vk_present_drain();
             uint64_t f = vk_sync_submit(NULL, 0);
-            if (f != value) rt_fatal("vk: skipped present signalled %llu, queued as %llu", (unsigned long long)f, (unsigned long long)value);
+            if (ticket) vk_guest_recorded(ticket, f);
+            if (value && f != value) rt_fatal("vk: skipped present signalled %llu, queued as %llu", (unsigned long long)f, (unsigned long long)value);
         }
         return;
     }
     PresentJob j = {.token = token, .image = img->image, .format = img->format, .w = (int)img->width, .h = (int)img->height, .frame = frame,
-                    .at = at_ns, .queued = queued, .value = value};
+                    .at = at_ns, .queued = queued, .value = value, .ticket = ticket};
     vk_hdr_present_source(img, &j.image, &j.format);   // NX2NAVI_HDR: the float picture the game copied into it, same size
     if (crop) {
         j.has_crop = 1;
@@ -193,11 +195,190 @@ uint64_t gfx_replayed_submits(void) {
     return v;
 }
 
+// Ticket IDs name guest submissions (including queue wait and present commands). A ticket with no
+// physical fence is still recording. Once sealed, its physical fence includes the last fragment and
+// its completion callbacks. Retired tickets need no storage and unrelated queues retire independently.
+typedef struct GuestTicket { uint64_t id, physical; struct GuestTicket *next; } GuestTicket;
+static GuestTicket *tickets;
+static uint64_t newest_ticket = GFX_GUEST_TICKET;
+static PlatMutex ticket_lock = PLAT_MUTEX_INIT;
+static PlatCond ticket_changed = PLAT_COND_INIT;
+
+static uint64_t ticket_new(void) {
+    GuestTicket *t = malloc(sizeof *t);
+    if (!t) rt_fatal("vk: out of memory (guest fence)");
+    plat_mutex_lock(&ticket_lock);
+    uint64_t done = vk_sync_fence_done();
+    for (GuestTicket **it = &tickets; *it;) {
+        GuestTicket *old = *it;
+        if (old->physical && old->physical <= done) { *it = old->next; free(old); }
+        else it = &old->next;
+    }
+    uint64_t id = ++newest_ticket;
+    *t = (GuestTicket){id, 0, tickets};
+    tickets = t;
+    plat_mutex_unlock(&ticket_lock);
+    return id;
+}
+
+void vk_guest_recorded(uint64_t id, uint64_t physical) {
+    plat_mutex_lock(&ticket_lock);
+    GuestTicket *t = tickets;
+    while (t && t->id != id) t = t->next;
+    if (!t || t->physical || !physical) rt_fatal("vk: invalid guest fence transition");
+    t->physical = physical;
+    plat_cond_broadcast(&ticket_changed);
+    plat_mutex_unlock(&ticket_lock);
+}
+
+static int guest_wait(uint64_t id, uint64_t timeout) {
+    if (!id) return 1;
+    uint64_t start = kern_now_ns();
+    plat_mutex_lock(&ticket_lock);
+    for (;;) {
+        GuestTicket *t = tickets;
+        while (t && t->id != id) t = t->next;
+        if (!t) {
+            int retired = (id & GFX_GUEST_TICKET) && id <= newest_ticket;
+            plat_mutex_unlock(&ticket_lock);
+            return retired;
+        }
+        uint64_t physical = t->physical, elapsed = kern_now_ns() - start;
+        uint64_t left = timeout == UINT64_MAX ? timeout : elapsed < timeout ? timeout-elapsed : 0;
+        if (physical && physical <= vk_sync_issued()) {
+            plat_mutex_unlock(&ticket_lock);
+            if (vk_sync_fence_done() >= physical) return 1;
+            return left && vk_sync_fence_wait(physical, left);
+        }
+        if (!left) { plat_mutex_unlock(&ticket_lock); return 0; }
+        if (left == UINT64_MAX) plat_cond_wait(&ticket_changed, &ticket_lock);
+        else plat_cond_wait_ns(&ticket_changed, &ticket_lock, left);
+    }
+}
+
+typedef struct HostCommand {
+    uintptr_t queue;
+    uint64_t ticket, dependency;
+    int present, has_image, has_crop, crop[4];
+    tex_t image;
+    void *token;
+    uint64_t frame, at, queued;
+    struct HostCommand *next;
+} HostCommand;
+static HostCommand *host_commands, **host_tail = &host_commands;
+static PlatMutex queue_order_lock = PLAT_MUTEX_INIT;
+static PlatCond order_changed = PLAT_COND_INIT;
+static int worker_started, worker_stop, worker_done;
+_Thread_local int vk_guest_pumping;
+
 static uint64_t submit_sync(const uint64_t *handles, int n) {
     vk_sync_start();
     vk_present_drain();
     vk_texture_new_submit();
-    return vk_sync_submit(handles, n);
+    uint64_t physical = vk_sync_submit(handles, n);
+    // A continuation seals its ticket inside vk_exec_record, before vk_sync_submit publishes the
+    // physical value. Only now can a waiter hand that value to vk_sync_fence_wait.
+    if (gfx_guest_ticket || vk_guest_pumping) {
+        plat_mutex_lock(&ticket_lock);
+        plat_cond_broadcast(&ticket_changed);
+        plat_mutex_unlock(&ticket_lock);
+    }
+    return physical;
+}
+
+// Only guest-facing submit paths and this service own the scheduler. The present thread records an
+// empty physical submission after its blit, but never resumes another frame inside it.
+static void service_order(void) {
+    if (!vk_exec_held()) return;
+    uintptr_t saved_queue = gfx_submit_queue;
+    uint64_t saved_ticket = gfx_guest_ticket;
+    gfx_submit_queue = 0;
+    gfx_guest_ticket = 0;
+    vk_present_drain();
+    for (;;) {
+        if (vk_exec_held_ready()) {
+            vk_guest_pumping = 1;
+            submit_sync(NULL, 0);
+            vk_guest_pumping = 0;
+            continue;
+        }
+        HostCommand **it = &host_commands;
+        while (*it && (!vk_exec_marker_first((*it)->queue, (*it)->ticket) ||
+                       ((*it)->dependency && !guest_wait((*it)->dependency, 0)))) it = &(*it)->next;
+        HostCommand *h = *it;
+        if (!h) break;
+        if (h->present) {
+            present_image(h->token, h->has_image ? &h->image : NULL, h->has_crop ? h->crop : NULL,
+                          h->at, h->queued, h->frame, 0, h->ticket);
+            vk_present_drain();   // the blit and its physical completion fence precede later work on this queue
+        } else vk_guest_recorded(h->ticket, submit_sync(NULL, 0));
+        vk_exec_pop_marker(h->queue, h->ticket);
+        *it = h->next;
+        if (!*it) host_tail = it;
+        free(h);
+    }
+    gfx_guest_ticket = saved_ticket;
+    gfx_submit_queue = saved_queue;
+}
+
+// Pool-backed events can also be changed by an ordinary CPU store. Poll only while a queue is
+// blocked, so a lone final present or a CPU waiting on a fence can progress without another submit.
+static void order_worker(void *unused) {
+    (void)unused;
+    plat_mutex_lock(&queue_order_lock);
+    while (!worker_stop) {
+        if (!vk_exec_held()) plat_cond_wait(&order_changed, &queue_order_lock);
+        else {
+            service_order();
+            if (vk_exec_held()) plat_cond_wait_ns(&order_changed, &queue_order_lock, 1000000);
+        }
+    }
+    worker_done = 1;
+    plat_cond_broadcast(&order_changed);
+    plat_mutex_unlock(&queue_order_lock);
+}
+
+static void start_order_worker(void) {
+    if (!vk_exec_held()) return;
+    if (!worker_started) {
+        if (!plat_thread_spawn(order_worker, NULL, "vk queue events", 0)) rt_fatal("vk: cannot start event service");
+        worker_started = 1;
+    }
+    plat_cond_broadcast(&order_changed);
+}
+
+static void event_changed(void) {
+    // The worker's timed wait also covers a signal arriving before it starts sleeping.
+    plat_cond_broadcast(&order_changed);
+}
+
+static HostCommand *host_command(uintptr_t queue) {
+    HostCommand *h = calloc(1, sizeof *h);
+    if (!h) rt_fatal("vk: out of memory (queue command)");
+    h->queue = queue;
+    h->ticket = ticket_new();
+    vk_exec_queue_marker(queue, h->ticket);
+    *host_tail = h;
+    host_tail = &h->next;
+    return h;
+}
+
+static uint64_t queue_dependency(uintptr_t queue, uint64_t dependency) {
+    plat_mutex_lock(&queue_order_lock);
+    HostCommand *h = host_command(queue);
+    uint64_t id = h->ticket;
+    h->dependency = dependency;
+    service_order();
+    start_order_worker();
+    plat_mutex_unlock(&queue_order_lock);
+    return id;
+}
+
+static void queue_release(uintptr_t queue) {
+    plat_mutex_lock(&queue_order_lock);
+    vk_present_drain();
+    vk_exec_queue_release(queue);
+    plat_mutex_unlock(&queue_order_lock);
 }
 
 static void replay_main(void *arg) {
@@ -224,7 +405,7 @@ static void replay_main(void *arg) {
             free((void *)it.tex);
         } else {
             uint64_t frame = __atomic_add_fetch(&gfx_counters.frames, 1, __ATOMIC_RELAXED);
-            present_image(it.token, it.tex, it.has_crop ? it.crop : NULL, it.at, it.queued, frame, it.value);
+            present_image(it.token, it.tex, it.has_crop ? it.crop : NULL, it.at, it.queued, frame, it.value, 0);
         }
         plat_mutex_lock(&rl);
         if (it.kind == RI_SUBMIT) r_submit_done = it.submit_no;
@@ -330,9 +511,25 @@ void gfx_exit_log(void) {
 static void queue_game_present(void *token, const tex_t *t, const int crop[4], uint64_t at_ns) {
     vk_sync_start();
     if (!gfx_replay_async()) {
+        int ordered = gfx_submit_queue && vk_exec_event_order();
+        if (ordered) plat_mutex_lock(&queue_order_lock);
         uint64_t frame = __atomic_add_fetch(&gfx_counters.frames, 1, __ATOMIC_RELAXED);
-        perf_present(frame);   // before vk_exec_frame_log, which resets the frame's exec counts the flight recorder reads
-        present_image(token, t, crop, at_ns, kern_now_ns(), frame, 0);
+        perf_present(frame);
+        uint64_t queued = kern_now_ns();
+        if (ordered) {
+            HostCommand *h = host_command(gfx_submit_queue);
+            gfx_guest_ticket = h->ticket;
+            h->present = 1;
+            h->token = token;
+            h->at = at_ns;
+            h->queued = queued;
+            h->frame = frame;
+            if (t) { h->has_image = 1; h->image = *t; }
+            if (crop) { h->has_crop = 1; memcpy(h->crop, crop, sizeof h->crop); }
+            service_order();
+            start_order_worker();
+            plat_mutex_unlock(&queue_order_lock);
+        } else present_image(token, t, crop, at_ns, queued, frame, 0, 0);
         return;
     }
     // Frame bound: the replay thread handled the previous present before this one is queued.
@@ -433,7 +630,16 @@ static void vk_be_program_release(const prog_t *p) { replay_drain(DR_PROG_RELEAS
 // the value returned is the one the replay will signal.
 static uint64_t vk_be_submit(const uint64_t *handles, int n) {
     first_render_submit();
-    if (!gfx_replay_async()) return submit_sync(handles, n);
+    if (!gfx_replay_async()) {
+        if (!gfx_submit_queue || !vk_exec_event_order()) return submit_sync(handles, n);
+        plat_mutex_lock(&queue_order_lock);
+        gfx_guest_ticket = ticket_new();
+        uint64_t fence = submit_sync(handles, n);
+        service_order();
+        start_order_worker();
+        plat_mutex_unlock(&queue_order_lock);
+        return fence;
+    }
     vk_sync_start();
     ReplayItem it = {.kind = RI_SUBMIT, .n = n, .submit_no = nvn_submit_count()};
     if (n > 0) {
@@ -567,6 +773,11 @@ const GfxBackend gfx_vulkan_backend = {
     .fence_done = vk_sync_fence_done,
     .present = vk_be_present,
     .frame_start = vk_be_frame_start,
+    .event_order = vk_exec_event_order,
+    .guest_wait = guest_wait,
+    .queue_dependency = queue_dependency,
+    .queue_release = queue_release,
+    .event_changed = event_changed,
     .finish = vk_be_finish,
     .read_texels = vk_be_read_texels,
     .write_texels = vk_be_write_texels,
@@ -577,6 +788,11 @@ const GfxBackend gfx_vulkan_backend = {
 };
 
 void vk_backend_shutdown(void) {
+    plat_mutex_lock(&queue_order_lock);
+    worker_stop = 1;
+    plat_cond_broadcast(&order_changed);
+    while (worker_started && !worker_done) plat_cond_wait(&order_changed, &queue_order_lock);
+    plat_mutex_unlock(&queue_order_lock);
     replay_drain(DR_FINISH);
     gfx_exit_log();
     vk_present_drain();

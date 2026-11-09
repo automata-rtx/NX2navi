@@ -41,6 +41,9 @@
 # Replay NVN submissions on their own thread, at most one frame behind the game, 0 or 1. Default: off. Helps where the
 # game waits for the GPU; adds up to a frame of latency.
 # replay_async = 0
+# With synchronous replay, a queue waiting for an event resumes when its producer signals.
+# Its fence covers the remaining draws and any queued present. Set to 0 to compare with submission order.
+# event_order = 1
 # EXPERIMENTAL, THE GAME CRASHES WITH 1. 1 lifts the virtual core gate: guest threads run without the console's limit
 # of one thread per core, and the game keeps per-core data without locks. With 1 the game crashes or hangs,
 # usually at start. Keep 0 to play.

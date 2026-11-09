@@ -8,7 +8,7 @@
 //     --probe-discord  the Rich Presence IPC exchange; skips without a Discord client; no game files
 //     --probe-dpi       the process DPI awareness (per-monitor v2) and the primary monitor's size; no game files
 //     --probe-gfx-abi   NVN object layouts against nvn.h's reserved sizes; needs no game files
-//     --probe-nvn, --probe-nvn-tex, --probe-window, --probe-shader, --probe-vkmem, --probe-vkexec    graphics probes
+//     --probe-nvn, --probe-nvn-tex, --probe-window, --probe-shader, --probe-vkmem, --probe-vkexec, --probe-vkqueues
 //     --probe-astc      the compute ASTC decoder against astc_decode_ldr; needs no game files
 //     --probe-movie     host VP9 movie::Decoder on one RomFS movie; skips without game data
 //     --boot            run the game to the first NVN call
@@ -475,7 +475,7 @@ static int usage(const char *argv0) {
     fprintf(stderr, "usage: %s [--exefs DIR] [--romfs DIR] [--profile DIR] [--selftest | --probe-loader | "
                     "--probe-cfg | --probe-dpi | --probe-mods | --probe-kernel | --probe-ipc | --probe-services | --probe-fs | --probe-gfx-abi | "
                     "--probe-nvn | --probe-nvn-tex | --probe-window | --probe-shader | --probe-vkmem | "
-                    "--probe-vkexec | --probe-astc | --probe-movie | --probe-crash-call | --probe-crash-null | --probe-discord | "
+                    "--probe-vkexec | --probe-vkqueues | --probe-astc | --probe-movie | --probe-crash-call | --probe-crash-null | --probe-discord | "
                     "--prepare-shaders | --warm-shaders | --warm-recorded-pipelines | --warm-archive-pipelines | --boot | --seconds S [--shot PNG]]\n", argv0);
     return 2;
 }
@@ -596,6 +596,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "--probe-shader")) return probe_shader();
     if (!strcmp(mode, "--probe-vkmem")) return probe_vkmem();
     if (!strcmp(mode, "--probe-vkexec")) return probe_vkexec();
+    if (!strcmp(mode, "--probe-vkqueues")) return probe_vkqueues();
     if (!strcmp(mode, "--probe-astc")) return probe_astc();
     if (!strcmp(mode, "--probe-vkdevice")) return probe_vkdevice();
     if (!strcmp(mode, "--probe-movie")) return probe_movie();

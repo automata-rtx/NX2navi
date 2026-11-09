@@ -201,7 +201,10 @@ static void cb_done(void *arg) {   // completion thread
     free(r->written), free(r->pools), free(r->chunks), free(r);
 }
 
-void vk_exec_draw_new_cb(void) { memset(&B, 0, sizeof B); }
+void vk_exec_draw_new_cb(void) {
+    memset(&B, 0, sizeof B);
+    bind_gen++;   // a queue switch can restore different resources without recording a bind op
+}
 
 void vk_exec_draw_shaders(const GfxShader **vs, const GfxShader **fs) {
     *vs = B.st_valid ? B.st.vs : NULL;
@@ -406,7 +409,11 @@ static void twins_release(VkCtx *c);
 
 // Releases the stand-ins and the depth twins. The device must be idle; the game path leaves them to process exit like
 // the pipelines.
+static void release_recent_programs(void);
 void vk_exec_draw_shutdown(void) {
+    release_recent_programs();
+    // Submissions can allocate uniform snapshots before the first draw creates its stand-ins.
+    vk_usnap_shutdown();
     if (!Z.ready) return;
     VkCtx *c = vk_ctx();
     twins_release(c);
@@ -426,7 +433,6 @@ void vk_exec_draw_shutdown(void) {
     for (int i = 0; i < nspare_pool; i++) vkDestroyDescriptorPool(c->device, spare_pool[i], NULL);
     for (int i = 0; i < nspare_chunk; i++) vmaDestroyBuffer(c->vma, spare_chunk[i].buf, spare_chunk[i].alloc);
     nspare_pool = nspare_chunk = 0;
-    vk_usnap_shutdown();
     vkDestroyBufferView(c->device, Z.zview, NULL);
     vmaDestroyBuffer(c->vma, Z.zbuf, Z.zalloc);
     if (Z.sink) vmaDestroyBuffer(c->vma, Z.sink, Z.sink_alloc);
@@ -743,6 +749,76 @@ static uint32_t ctl_c1(const uint8_t *c, uint32_t len) {   // offset of the c1 c
     return c1;
 }
 static const uint8_t *ctl_local(const uint8_t *c) { return c + (ctl_nvn2(c) ? 0x58 : 0x748); }
+
+// A queue can retain its current program after the submitting thread has reused the NVN object,
+// its control blocks and its code pool. Keep an immutable copy of that exact shader version.
+#define HELD_PROG_MAGIC MAGIC('H', 'P', 'R', 'G')
+typedef struct { prog_t program; unsigned refs; } HeldProgram;
+static HeldProgram *recent_programs[64];   // one cache reference per slot, independent of queue ownership
+
+void vk_exec_program_drop(const prog_t *p) {
+    if (!p) return;
+    HeldProgram *h = (HeldProgram *)p;
+    if (p->magic != HELD_PROG_MAGIC) rt_fatal("vk: releasing an unowned program");
+    if (--h->refs) return;
+    for (unsigned i = 0; i < p->nstage; ++i) free((void *)p->sd[i].control);
+    free(h);
+}
+
+static void release_recent_programs(void) {
+    for (unsigned i = 0; i < sizeof recent_programs / sizeof *recent_programs; ++i) {
+        if (recent_programs[i]) vk_exec_program_drop(&recent_programs[i]->program);
+        recent_programs[i] = NULL;
+    }
+}
+
+const prog_t *vk_exec_program_hold(const prog_t *p) {
+    if (!p) return NULL;
+    if (p->magic == HELD_PROG_MAGIC) {
+        ((HeldProgram *)p)->refs++;
+        return p;
+    }
+    HeldProgram **slot = &recent_programs[p->serial % (sizeof recent_programs / sizeof *recent_programs)];
+    if (p->serial && *slot && (*slot)->program.serial == p->serial) {
+        (*slot)->refs++;
+        return &(*slot)->program;
+    }
+    HeldProgram *h = calloc(1, sizeof *h);
+    if (!h) rt_fatal("vk: out of memory (held program)");
+    h->refs = 1;
+    h->program.magic = HELD_PROG_MAGIC;
+    h->program.serial = p->serial;
+    h->program.nstage = p->nstage < 6 ? p->nstage : 6;
+    size_t total = 0;
+    for (unsigned i = 0; i < h->program.nstage; ++i) {
+        const uint8_t *control = p->sd[i].control;
+        if (!control || !p->sd[i].data) continue;
+        uint32_t stage, len;
+        ctl_stage_len(control, &stage, &len);
+        size_t header = ctl_nvn2(control) ? 0xe0 : 0x880;
+        uint8_t *copy = malloc(header + len);
+        if (!copy) rt_fatal("vk: out of memory (held shader)");
+        memcpy(copy, control, header);
+        memcpy(copy + header, (const void *)(uintptr_t)p->sd[i].data, len);
+        h->program.sd[i] = (NVNshaderData){(uintptr_t)(copy + header), copy};
+        total += header + len;
+    }
+    if (p->serial && total <= (1u << 20)) {
+        if (*slot) vk_exec_program_drop(&(*slot)->program);
+        *slot = h;
+        h->refs++;
+    }
+    return &h->program;
+}
+
+void vk_exec_record_programs(uint8_t *record, int delta) {
+    for (const op_hdr *op = nvn_op_first((uintptr_t)record); op->op != OP_END; op = nvn_op_next(op)) {
+        if (op->op != OP_BIND_PROGRAM) continue;
+        p_bind_program *b = (p_bind_program *)(op + 1);
+        if (delta > 0) b->prog = vk_exec_program_hold(b->prog);
+        else vk_exec_program_drop(b->prog);
+    }
+}
 
 static int find_stage_scan(const prog_t *p, int nvn_stage, const uint8_t **ctl, const uint8_t **code, uint32_t *len) {
     for (uint32_t i = 0; i < p->nstage && i < 6; i++) {
@@ -1103,7 +1179,19 @@ static VkDescriptorBufferInfo ubo_info(VkExec *ex, int st, int slot) {
         uint32_t len, c1;
         if (find_stage(ex->prog, st, &ctl, &code, &len)) {
             c1 = ctl_c1(ctl, len);
-            if (ctl_nvn2(ctl)) memcpy(&len, ctl + 0x44, 4);   // NVN2: c1 is [+0x40, +0x44) after the code
+            if (ctl_nvn2(ctl)) {
+                uint32_t end;
+                memcpy(&end, ctl + 0x44, 4);
+                if (end < len || ex->prog->magic != HELD_PROG_MAGIC) len = end;
+            }
+            if (c1 < len && ex->prog->magic == HELD_PROG_MAGIC) {
+                uint64_t n = len - c1 < max ? len - c1 : max;
+                memcpy(scratch(ex, n, &bi.buffer, &bi.offset), code + c1, n);
+                bi.range = n;
+                RS.volatile_ = 1;
+                vk_mem_count(VK_MCLS_SCRATCH, VK_MUSE_UBO, n);
+                return bi;
+            }
             if (c1 < len && bind_range(ex, (uint64_t)(uintptr_t)code + c1, len - c1, align, max, VK_MUSE_UBO, 0, &bi))
                 return bi;
         }

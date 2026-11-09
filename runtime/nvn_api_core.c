@@ -493,15 +493,21 @@ NVN_API(nvnSyncFinalize) { ((sync_t *)arg_p(c, 0))->magic = 0; }
 // the queue so far has completed"
 NVN_API(nvnQueueFenceSync) {
     sync_t *s = arg_p(c, 1);
+    const queue_t *q = arg_p(c, 0);
+    const GfxBackend *b = gfx_backend();
     s->fenced = 1;
-    s->fence = nvn_fence_last();
+    s->fence = b->event_order && b->event_order() ? __atomic_load_n(&q->ticket, __ATOMIC_ACQUIRE) : nvn_fence_last();
 }
 // NVNboolean nvnQueueWaitSync(NVNqueue *q, const NVNsync *s): the queue's later work waits for the sync on the GPU.
-// Every queue here submits into one back-end timeline in submission order, so work submitted after FenceSync
-// already runs after it: a fenced sync needs nothing. A sync not fenced yet would stall the queue on hardware until
-// another queue fences it; that ordering cannot be expressed here and is logged once.
+// A guest ticket can span several physical submissions. Queue its dependency so other queues can
+// still make progress. Physical fences already precede subsequent work on the shared timeline.
 NVN_API(nvnQueueWaitSync) {
     const sync_t *s = arg_p(c, 1);
+    if (s && s->fenced && (s->fence & GFX_GUEST_TICKET)) {
+        NVN_BLOCKING();
+        queue_t *q = arg_p(c, 0);
+        nvn_queue_publish(q, gfx_backend()->queue_dependency(q->identity, s->fence));
+    }
     if (s && !s->fenced) {
         static volatile int32_t logged;
         if (!plat_xchg32(&logged, 1)) rt_log("nvn: QueueWaitSync on a sync not fenced yet: not waited for");
@@ -515,6 +521,17 @@ NVN_API(nvnSyncWait) {
     uint64_t timeout = arg_x(c, 1);
     if (!s->fenced) { ret_x(c, NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED); return; }
     const GfxBackend *b = gfx_backend();
+    if (s->fence & GFX_GUEST_TICKET) {
+        int ready = b->guest_wait(s->fence, 0), ok = ready;
+        if (!ok && timeout) {
+            NVN_BLOCKING();
+            ok = b->guest_wait(s->fence, timeout);
+        }
+        if (ok) b->cpu_synced(b->fence_done());
+        ret_x(c, !ok ? NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED :
+                 ready ? NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED : NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED);
+        return;
+    }
     if (b->fence_done() >= s->fence) { b->cpu_synced(s->fence); ret_x(c, NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED); return; }
     int ok;
     {
@@ -542,13 +559,14 @@ NVN_API(nvnEventInitialize) {
 // void nvnEventFinalize(NVNevent *e)
 NVN_API(nvnEventFinalize) { ((ev_t *)arg_p(c, 0))->magic = 0; }
 // uint32_t nvnEventGetValue(const NVNevent *e)
-NVN_API(nvnEventGetValue) { ret_x(c, *((const ev_t *)arg_p(c, 0))->val); }
+NVN_API(nvnEventGetValue) { ret_x(c, __atomic_load_n(((const ev_t *)arg_p(c, 0))->val, __ATOMIC_ACQUIRE)); }
 // void nvnEventSignal(NVNevent *e, NVNeventSignalMode mode, uint32_t value)
 NVN_API(nvnEventSignal) {
     const ev_t *e = arg_p(c, 0);
     uint32_t v = (uint32_t)arg_x(c, 2);
-    if ((uint32_t)arg_x(c, 1) == NVN_EVENT_SIGNAL_MODE_ADD) *e->val += v;
-    else *e->val = v;
+    if ((uint32_t)arg_x(c, 1) == NVN_EVENT_SIGNAL_MODE_ADD) __atomic_fetch_add(e->val, v, __ATOMIC_ACQ_REL);
+    else __atomic_store_n(e->val, v, __ATOMIC_RELEASE);
+    if (gfx_backend()->event_changed) gfx_backend()->event_changed();
 }
 
 // ---------- Queue
@@ -587,12 +605,23 @@ NVN_API(nvnQueueBuilderSetQueueMemory) {
 // NVNboolean nvnQueueInitialize(NVNqueue *q, const NVNqueueBuilder *b)
 NVN_API(nvnQueueInitialize) {
     queue_t *q = arg_p(c, 0);
-    *q = (queue_t){QUEUE_MAGIC, ((const queue_builder_t *)arg_p(c, 1))->dev, 0};
+    static uint64_t next_identity;
+    *q = (queue_t){.magic = QUEUE_MAGIC, .dev = ((const queue_builder_t *)arg_p(c, 1))->dev,
+                   .identity = __atomic_add_fetch(&next_identity, 1, __ATOMIC_RELAXED)};
     NVN_LOG("QueueInitialize %p", (void *)q);
     ret_x(c, 1);
 }
 // void nvnQueueFinalize(NVNqueue *q)
-NVN_API(nvnQueueFinalize) { ((queue_t *)arg_p(c, 0))->magic = 0; }
+NVN_API(nvnQueueFinalize) {
+    queue_t *q = arg_p(c, 0);
+    const GfxBackend *b = gfx_backend();
+    if (b->event_order && b->event_order()) {
+        NVN_BLOCKING();
+        b->guest_wait(__atomic_load_n(&q->ticket, __ATOMIC_ACQUIRE), UINT64_MAX);
+        b->queue_release(q->identity);
+    }
+    q->magic = 0;
+}
 // NVNqueueGetErrorResult nvnQueueGetError(NVNqueue *q, NVNqueueErrorInfo *info)
 NVN_API(nvnQueueGetError) {
     NVNqueueErrorInfo *info = arg_p(c, 1);
@@ -605,7 +634,11 @@ NVN_API(nvnQueueFlush) { (void)c; }
 NVN_API(nvnQueueFinish) {
     {
         NVN_BLOCKING();
-        gfx_backend()->finish();
+        const GfxBackend *b = gfx_backend();
+        if (b->event_order && b->event_order()) {
+            const queue_t *q = arg_p(c, 0);
+            b->guest_wait(__atomic_load_n(&q->ticket, __ATOMIC_ACQUIRE), UINT64_MAX);
+        } else b->finish();
     }
     gfx_backend()->cpu_synced(gfx_backend()->fence_done());
 }
@@ -619,6 +652,12 @@ NVN_API(nvnQueueFinish) {
 // lod_entered / lod_issued count submits that entered QueueSubmitCommands / reached the back end; lod_fence holds
 // the fence of the last LOD_RING. NX2NAVI_LOD_GUARD=0 turns the wait off.
 #define LOD_RING 64
+_Thread_local uintptr_t gfx_submit_queue;
+_Thread_local uint64_t gfx_guest_ticket;
+void nvn_queue_publish(queue_t *q, uint64_t ticket) {
+    uint64_t last = __atomic_load_n(&q->ticket, __ATOMIC_RELAXED);
+    while (ticket > last && !__atomic_compare_exchange_n(&q->ticket, &last, ticket, 1, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {}
+}
 int nvn_submits_in_frame;   // nvnQueueSubmitCommands calls since the last nvnQueuePresentTexture (NX2NAVI_SUBMIT_FINISH)
 static uint64_t lod_entered, lod_issued, lod_fence[LOD_RING];
 
@@ -633,7 +672,8 @@ NVN_API(nvnQueueSubmitCommands) {
     if (n < 0 || (n && !h)) rt_fatal("nvn: QueueSubmitCommands with %d handles at %p", n, (const void *)h);
     NVN_BLOCKING();
     uint64_t no = __atomic_add_fetch(&lod_entered, 1, __ATOMIC_SEQ_CST);
-    q->submits++;
+    __atomic_add_fetch(&q->submits, 1, __ATOMIC_RELAXED);
+    gfx_guest_ticket = 0;
     uint64_t f;
     if (gfx_replay_async()) {
         // Prepare and queue under one lock: submit numbers follow queue order (gfx_replayed_submits).
@@ -642,13 +682,18 @@ NVN_API(nvnQueueSubmitCommands) {
         if (!hs) rt_fatal("nvn: out of memory (submit of %d handles)", n);
         plat_mutex_lock(&submit_lock);
         nvn_submit_prepare_async(h, hs, n);
+        gfx_submit_queue = q->identity;
         f = gfx_backend()->submit(hs, n);
+        gfx_submit_queue = 0;
         plat_mutex_unlock(&submit_lock);
         if (hs != local) free(hs);
     } else {
         nvn_submit_prepare(h, n);
+        gfx_submit_queue = q->identity;
         f = gfx_backend()->submit(h, n);
+        gfx_submit_queue = 0;
     }
+    if (gfx_guest_ticket) nvn_queue_publish(q, gfx_guest_ticket);
     uint64_t prev = __atomic_load_n(&last_fence, __ATOMIC_RELAXED);
     while (f > prev && !__atomic_compare_exchange_n(&last_fence, &prev, f, 1, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {}
     __atomic_store_n(&lod_fence[no % LOD_RING], f, __ATOMIC_RELAXED);
