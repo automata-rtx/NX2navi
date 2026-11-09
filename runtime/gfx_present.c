@@ -310,6 +310,24 @@ static void free_capture(void) {
     g_cap_valid = 0;
 }
 
+static void release_swapchain(VkCtx *c, VkSwapchainKHR sc) {
+    for (uint32_t i = 0; i < g_sc_n; i++) {
+        if (g_sc_view[i]) vkDestroyImageView(c->device, g_sc_view[i], NULL);
+        g_sc_view[i] = VK_NULL_HANDLE;
+    }
+    if (sc) {
+        if (vk_fg_active()) vk_fg_destroy_swapchain(sc);
+        else if (vk_dlssg_active()) vk_dlssg_destroy_swapchain(c->device, sc);
+        else vkDestroySwapchainKHR(c->device, sc, NULL);
+    }
+    // The presenter can hold a wait on the final render semaphore until destruction.
+    for (uint32_t i = 0; i < g_sc_n; i++) {
+        if (g_render_done[i]) vkDestroySemaphore(c->device, g_render_done[i], NULL);
+        g_render_done[i] = VK_NULL_HANDLE;
+    }
+    g_sc_n = 0;
+}
+
 // Returns 1 with a usable swapchain, 0 when the window has no area (minimised) or the create failed, which leaves
 // g_dirty set so the next present tries again. Called with g_pl held. g_dirty is cleared before the window's size is
 // read: a resize that arrives while the swapchain is being made (AMD's frame generation swapchain takes tens of ms)
@@ -359,8 +377,7 @@ static int create_swapchain(void) {
     // one is gone; a first creation that fails leaves the plain swapchain below.
     VkResult r = VK_ERROR_FEATURE_NOT_PRESENT;
     if (vk_fg_wanted()) {
-        if (old && vk_fg_active()) vk_fg_destroy_swapchain(old);
-        else if (old) vkDestroySwapchainKHR(c->device, old, NULL);
+        release_swapchain(c, old);
         ci.oldSwapchain = VK_NULL_HANDLE;
         old = g_sc = VK_NULL_HANDLE;
         r = vk_fg_create_swapchain(&ci, &g_sc);
@@ -379,18 +396,14 @@ static int create_swapchain(void) {
     else if (r != VK_SUCCESS) r = vkCreateSwapchainKHR(c->device, &ci, NULL, &g_sc);
     if (r != VK_SUCCESS) {
         rt_log("gfx: vkCreateSwapchainKHR failed (%d)", (int)r);
-        g_sc = old;
+        // Passing oldSwapchain retires it even when creation fails. Retry with an empty chain.
+        release_swapchain(c, old);
+        g_sc = VK_NULL_HANDLE;
         vk_queue_unlock();
         plat_xchg32(&g_dirty, 1);
         return 0;
     }
-    for (uint32_t i = 0; i < g_sc_n; i++) {
-        vkDestroySemaphore(c->device, g_render_done[i], NULL);
-        if (g_sc_view[i]) vkDestroyImageView(c->device, g_sc_view[i], NULL);
-        g_sc_view[i] = VK_NULL_HANDLE;
-    }
-    if (old && vk_dlssg_active()) vk_dlssg_destroy_swapchain(c->device, old);
-    else if (old) vkDestroySwapchainKHR(c->device, old, NULL);
+    release_swapchain(c, old);
     g_sc_fmt = sf.format;
     g_sc_hdr = hdr;
     vk_hdr_set_active(hdr);
@@ -949,7 +962,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     plat_rmutex_lock(&g_pl);
     flip_locked();
     if (!g_sc || plat_cas32(&g_dirty, 0, 0)) {
-        if (!wsys_minimized() && !create_swapchain() && !g_sc) goto out;
+        if (!wsys_minimized() && !create_swapchain()) goto out;
     }
     if (wsys_minimized() || !g_sc) goto out;
 
@@ -1196,7 +1209,7 @@ void gfx_window_release_vk(void) {
     plat_rmutex_lock(&g_pl);
     if (c && g_started) {
         vk_queue_lock();
-        vk_queue_lock(), vkDeviceWaitIdle(c->device), vk_queue_unlock();
+        vkDeviceWaitIdle(c->device);
         vk_queue_unlock();
         g_flip_on = 0;   // its blit is done (device idle); the swapchain goes away unpresented
         free_ui_scaled();
@@ -1211,15 +1224,9 @@ void gfx_window_release_vk(void) {
             vkDestroySemaphore(c->device, g_acquire[i], NULL);
             vkDestroyFence(c->device, g_fence[i], NULL);
         }
-        for (uint32_t i = 0; i < g_sc_n; i++) {
-            vkDestroySemaphore(c->device, g_render_done[i], NULL);
-            if (g_sc_view[i]) vkDestroyImageView(c->device, g_sc_view[i], NULL);
-            g_sc_view[i] = VK_NULL_HANDLE;
-        }
+        release_swapchain(c, g_sc);
         if (g_pool) vkDestroyCommandPool(c->device, g_pool, NULL);
-        if (g_sc && vk_fg_active()) vk_fg_destroy_swapchain(g_sc), vk_fg_release();
-        else if (g_sc && vk_dlssg_active()) vk_dlssg_destroy_swapchain(c->device, g_sc);
-        else if (g_sc) vkDestroySwapchainKHR(c->device, g_sc, NULL);
+        vk_fg_release();
         if (g_surface) vkDestroySurfaceKHR(c->instance, g_surface, NULL);
         g_sc = VK_NULL_HANDLE; g_surface = VK_NULL_HANDLE; g_pool = VK_NULL_HANDLE; g_sc_n = 0;
         g_started = 0;     // the window and its thread stay; the next gfx_window_start makes a new surface
