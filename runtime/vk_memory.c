@@ -2384,6 +2384,10 @@ static void defer(int kind, uint64_t handle, VmaAllocation alloc) {
     static int stamp = -1;
     if (stamp < 0) stamp = rt_knob("DEFER_STAMP", "1") != 0;
     uint64_t tl = tl_noted, rf = stamp ? vk_exec_recording_fence() : 0;
+    // vk_exec_recording_fence knows only the recording thread's own submission. A texture a guest thread releases (the
+    // synchronous replay: vk_texture_release, entry_of, sweep_released on the game's loader threads) can be named by
+    // the submission another thread records meanwhile: that one is issued + 1 (vk_sync_submit sets issued after it).
+    if (stamp && !rf) rf = vk_sync_issued() + 1;
     if (rf > tl) tl = rf;
     dead[ndead++] = (Dead){kind, handle, alloc, open_active ? open_b.seq : next_seq, tl};
     rec_check_handle(kind == DEAD_VIEW ? REC_VIEW : kind == DEAD_BUFFER_VMA ? REC_BUFFER : REC_IMAGE, handle, 0, tl,
