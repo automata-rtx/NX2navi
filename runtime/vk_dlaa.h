@@ -18,9 +18,9 @@ int vk_dlaa_fg_inputs(VkFfxImage *depth, VkFfxImage *mv, float *jx, float *jy, i
 typedef struct {
     float view_to_clip[16], clip_to_view[16], clip_to_prev_clip[16], prev_clip_to_clip[16];
     float pos[3], up[3], right[3], fwd[3];
-    float fov_y, aspect;
+    float fov_y, aspect, znear, zfar;
 } VkDlaaCamera;
-int vk_dlaa_fg_views(VkImageView *depth, VkImageView *mv);
+int vk_dlaa_fg_views(VkImageView *depth, VkImageView *mv, VkImageUsageFlags usage[2]);
 // The picture without the HUD at the size of the game's picture, in *fmt: RGBA8 UNORM bytes like it (sRGB-encoded), or
 // RGBA16F linear with HDR on; made at each evaluation while vk_dlaa_hudless_wanted (frame generation sets it); 1 once per
 // evaluation.
@@ -40,10 +40,13 @@ int vk_dlaa_available(void);
 typedef struct VkExec VkExec;
 void vk_dlaa_pass(VkExec *ex);
 void vk_dlaa_frame(void);
-// vk_exec_draw.c, each draw before its fixed state is recorded: notes the scene camera block (vk_dlaa_draw), and moves
-// the viewport of the scene's draws by the frame's jitter (vk_dlaa_viewport, when the viewport is recorded).
+// vk_exec_draw.c notes the scene camera and requests the viewport offset for each submitted draw.
 void vk_dlaa_draw(VkExec *ex);
-void vk_dlaa_viewport(VkExec *ex, VkViewport *v);
+void vk_dlaa_draw_jitter(const VkExec *ex, int mesh, float *x, float *y);
+void vk_dlaa_depth_copy(VkImage src, VkImage dst, int whole);
+int vk_dlaa_replaces_edge_blend(void);
+int vk_dlaa_tensor_ready(uint32_t w, uint32_t h);
+int vk_dlaa_tensor_resolve(VkExec *ex, VkImage linear, VkImageView view, VkImage dst, uint32_t dw, uint32_t dh);
 // vk_mvsurvey.c (NX2NAVI_MV_SURVEY): notes the uniform blocks of each scene draw, beside vk_dlaa_draw; each present
 // compares them with the previous frames' and logs a summary now and then.
 void vk_mvsurvey_draw(VkExec *ex);

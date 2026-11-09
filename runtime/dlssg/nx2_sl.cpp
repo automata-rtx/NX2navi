@@ -37,12 +37,15 @@ PFun_slDLSSGSetOptions *p_dlssg_options;
 PFun_slDLSSGGetState *p_dlssg_state;
 PFun_slPCLSetMarker *p_marker;
 PFun_slReflexSetOptions *p_reflex;
+PFun_slReflexSleep *p_sleep;
 PFN_vkGetInstanceProcAddr p_gipa;
 PFN_vkGetDeviceProcAddr p_gdpa;
 sl::FrameToken *g_frame;
-int g_available = -1, g_mode = -1;
+int g_available = -1, g_multiplier = -1;
 uint64_t g_presented;
 uint32_t g_generated;
+uint64_t g_output_frames;
+uint64_t g_interval_start, g_interval_output;
 
 void say(const char *fmt, ...) {
     if (!g_log) return;
@@ -134,11 +137,16 @@ extern "C" NX2SL_API int nx2sl_available(void) {
     if (g_available && p_feature(sl::kFeatureDLSS_G, "slDLSSGGetState", f) == sl::Result::eOk) p_dlssg_state = (PFun_slDLSSGGetState *)f;
     if (p_feature(sl::kFeaturePCL, "slPCLSetMarker", f) == sl::Result::eOk) p_marker = (PFun_slPCLSetMarker *)f;
     if (p_feature(sl::kFeatureReflex, "slReflexSetOptions", f) == sl::Result::eOk) p_reflex = (PFun_slReflexSetOptions *)f;
-    if (!p_dlssg_options || !p_marker) g_available = 0;
-    if (g_available && p_reflex) {   // DLSS-G needs Reflex's low-latency mode
+    if (p_feature(sl::kFeatureReflex, "slReflexSleep", f) == sl::Result::eOk) p_sleep = (PFun_slReflexSleep *)f;
+    if (!p_dlssg_options || !p_dlssg_state || !p_marker || !p_reflex || !p_sleep) g_available = 0;
+    if (g_available) {
         sl::ReflexOptions o{};
         o.mode = sl::ReflexMode::eLowLatency;
-        p_reflex(o);
+        sl::Result r = p_reflex(o);
+        if (r != sl::Result::eOk) {
+            say("dlssg: Reflex low latency failed (%d)", (int)r);
+            g_available = 0;
+        }
     }
     say("dlssg: DLSS Frame Generation %s", g_available ? "available" : "not available on this GPU or driver");
     return g_available;
@@ -146,14 +154,15 @@ extern "C" NX2SL_API int nx2sl_available(void) {
 
 extern "C" NX2SL_API int nx2sl_frame(VkCommandBuffer cb, const Nx2SlImage *depth, const Nx2SlImage *mv,
                                      const Nx2SlImage *hudless, const Nx2SlCamera *cam, uint32_t out_w, uint32_t out_h,
-                                     int enable) {
+                                     int multiplier) {
     if (g_available != 1) return 0;
     if (p_token(g_frame, nullptr) != sl::Result::eOk || !g_frame) return 0;
+    p_sleep(*g_frame);
     p_marker(sl::PCLMarker::eSimulationStart, *g_frame);
     p_marker(sl::PCLMarker::eSimulationEnd, *g_frame);
     p_marker(sl::PCLMarker::eRenderSubmitStart, *g_frame);
     sl::ViewportHandle vp(0);
-    if (enable && depth && mv && cam) {
+    if (multiplier && depth && mv && cam) {
         sl::Constants c{};
         matrix(c.cameraViewToClip, cam->view_to_clip);
         matrix(c.clipToCameraView, cam->clip_to_view);
@@ -173,47 +182,79 @@ extern "C" NX2SL_API int nx2sl_frame(VkCommandBuffer cb, const Nx2SlImage *depth
         c.depthInverted = sl::Boolean::eFalse;
         c.cameraMotionIncluded = sl::Boolean::eTrue;
         c.motionVectors3D = sl::Boolean::eFalse;
-        c.reset = cam->reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
-        p_constants(c, *g_frame, vp);
+        c.reset = cam->reset || multiplier != g_multiplier ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+        sl::Result constants = p_constants(c, *g_frame, vp);
         sl::Resource rd = resource(depth), rm = resource(mv), rh = hudless ? resource(hudless) : sl::Resource{};
         sl::Extent ed{0, 0, depth->width, depth->height}, em{0, 0, mv->width, mv->height};
-        sl::Extent eh{0, 0, hudless ? hudless->width : 0, hudless ? hudless->height : 0};
-        sl::ResourceTag tags[3] = {sl::ResourceTag(&rd, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &ed),
-                                   sl::ResourceTag(&rm, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, &em),
-                                   sl::ResourceTag(&rh, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent, &eh)};
-        p_tag(*g_frame, vp, tags, hudless ? 3 : 2, (sl::CommandBuffer *)cb);
+        const VkRect2D &rect = cam->output_rect;
+        sl::Extent picture{(uint32_t)rect.offset.y, (uint32_t)rect.offset.x, rect.extent.width, rect.extent.height};
+        // The present worker submits this command buffer before waiting for its flip time.
+        // The replay can already be writing the next scene's depth and motion before that flip.
+        sl::ResourceTag tags[] = {sl::ResourceTag(&rd, sl::kBufferTypeDepth, sl::ResourceLifecycle::eOnlyValidNow, &ed),
+                                   sl::ResourceTag(&rm, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eOnlyValidNow, &em),
+                                   sl::ResourceTag(hudless ? &rh : nullptr, sl::kBufferTypeHUDLessColor,
+                                                   sl::ResourceLifecycle::eValidUntilPresent, hudless ? &picture : nullptr),
+                                   sl::ResourceTag(nullptr, sl::kBufferTypeBackbuffer, sl::ResourceLifecycle::eValidUntilPresent, &picture)};
+        sl::Result tagged = p_tag(*g_frame, vp, tags, sizeof tags / sizeof tags[0], (sl::CommandBuffer *)cb);
+        if (constants != sl::Result::eOk || tagged != sl::Result::eOk) {
+            static int warnings;
+            if (warnings++ < 8) say("dlssg: frame rejected: constants %d, resources %d", (int)constants, (int)tagged);
+            multiplier = 0;
+        }
     }
-    if ((enable != 0) != g_mode) {
+    if (multiplier != g_multiplier) {
         sl::DLSSGOptions o{};
-        o.mode = enable ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
-        o.numFramesToGenerate = 1;
+        // Menus and frames without camera inputs temporarily suspend interpolation.
+        // Keep the NGX resources ready for the next gameplay frame.
+        o.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
+        o.mode = multiplier ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
+        o.numFramesToGenerate = multiplier ? multiplier - 1 : 1;
         sl::Result r = p_dlssg_options(vp, o);
-        say("dlssg: frame generation %s (%d), output %ux%u", enable ? "on" : "off", (int)r, out_w, out_h);
-        g_mode = enable != 0;
+        say("dlssg: set multiplier %d (%d), output %ux%u", multiplier, (int)r, out_w, out_h);
+        if (r == sl::Result::eOk) {
+            g_multiplier = multiplier;
+            g_interval_start = g_presented;
+            g_interval_output = g_output_frames;
+        }
     }
     p_marker(sl::PCLMarker::eRenderSubmitEnd, *g_frame);
     return 1;
 }
 
-extern "C" NX2SL_API void nx2sl_present_marker(int after) {
-    if (g_available != 1 || !g_frame) return;
+extern "C" NX2SL_API int nx2sl_present_marker(int after) {
+    if (g_available != 1 || !g_frame) return 0;
     p_marker(after ? sl::PCLMarker::ePresentEnd : sl::PCLMarker::ePresentStart, *g_frame);
     if (after) {
         g_presented++;
-        if (p_dlssg_state && (g_presented == 600 || g_presented % 3600 == 0)) {
-            sl::DLSSGState s{};
-            if (p_dlssg_state(sl::ViewportHandle(0), s, nullptr) == sl::Result::eOk) {
-                g_generated = s.numFramesActuallyPresented;
-                say("dlssg: %llu frames, %u presented per frame, status %u", (unsigned long long)g_presented,
-                    s.numFramesActuallyPresented, (unsigned)s.status);
+        sl::DLSSGState s{};
+        sl::Result result = p_dlssg_state(sl::ViewportHandle(0), s, nullptr);
+        if (result == sl::Result::eOk) {
+            g_generated = s.numFramesActuallyPresented;
+            g_output_frames += g_generated;
+            uint64_t count = g_presented - g_interval_start;
+            if (count == 60 || count >= 300) {
+                say("dlssg: %llu game presents, %llu output frames in interval, last %u, multiplier %d, status %u",
+                    (unsigned long long)count, (unsigned long long)(g_output_frames - g_interval_output),
+                    g_generated, g_multiplier, (unsigned)s.status);
+                if (count >= 300) {
+                    g_interval_start = g_presented;
+                    g_interval_output = g_output_frames;
+                }
             }
+            if (s.numFramesToGenerateMax >= NX2SL_MAX_MULTIPLIER - 1) return NX2SL_MAX_MULTIPLIER;
+            if (s.numFramesToGenerateMax) return (int)s.numFramesToGenerateMax + 1;
+        } else if (g_presented == 1 || g_presented % 300 == 0) {
+            say("dlssg: could not read the presented frame count (%d)", (int)result);
         }
     }
+    return 0;
 }
 
 extern "C" NX2SL_API void nx2sl_stats(uint64_t *presented, uint32_t *generated_per_frame) {
     *presented = g_presented, *generated_per_frame = g_generated;
 }
+
+extern "C" NX2SL_API uint64_t nx2sl_output_frames(void) { return g_output_frames; }
 
 extern "C" NX2SL_API void nx2sl_shutdown(void) {
     if (p_shutdown && g_available >= 0) p_shutdown();

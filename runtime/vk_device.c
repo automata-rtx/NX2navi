@@ -231,6 +231,7 @@ typedef struct {
     VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT fsi;
     VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT gpl;
     VkPhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT fbl;
+    VkPhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT fbl_dynamic;
     VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR lr;
     VkPhysicalDeviceMeshShaderFeaturesEXT mesh;
 } FeatureChain;
@@ -278,6 +279,10 @@ static int create_device(void) {
         ext[n_ext++] = VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME;
         CHAIN(fbl, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_FEATURES_EXT);
         CHAIN(lr, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR);
+        if (has_ext(ep, ne, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {
+            ext[n_ext++] = VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME;
+            CHAIN(fbl_dynamic, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_FEATURES_EXT);
+        }
     }
     vk_dlaa_device_exts(ep, ne, ext, &n_ext, 40);   // NGX's; the eight slots after it stay for the eight below
     // FSR 3.1 (vk_ffx.cpp): its Vulkan back end looks vkGetBufferMemoryRequirements2KHR up by that name, which resolves
@@ -354,6 +359,7 @@ static int create_device(void) {
         if (!c->mesh.meshShader || !c->mesh.taskShader) g_vk.has_mesh_shader = 0;
         rt_log("vk: mesh shaders: %s", g_vk.has_mesh_shader ? "VK_EXT_mesh_shader" : "not supported (task/mesh draws are skipped)");
     }   // vkGetDeviceFaultInfoEXT needs the feature, not just the extension
+    g_vk.pipeline_cache_control = c->f13.pipelineCreationCacheControl;
     g_vk.has_buffer_device_address = c->f12.bufferDeviceAddress;
     g_vk.has_astc_ldr = h->textureCompressionASTC_LDR;
     {
@@ -361,10 +367,11 @@ static int create_device(void) {
         int layout_ok = has_fbl && has_lr && c->fbl.attachmentFeedbackLoopLayout && c->lr.dynamicRenderingLocalRead;
         g_vk.feedback = e && !strcmp(e, "0") ? VK_FEEDBACK_OFF
                       : layout_ok && !(e && !strcmp(e, "restart")) ? VK_FEEDBACK_LAYOUT : VK_FEEDBACK_RESTART;
-        rt_log("vk: feedback loops: %s (attachmentFeedbackLoopLayout %d, dynamicRenderingLocalRead %d)",
+        g_vk.dynamic_feedback = g_vk.feedback == VK_FEEDBACK_LAYOUT && c->fbl_dynamic.attachmentFeedbackLoopDynamicState;
+        rt_log("vk: feedback loops: %s (attachmentFeedbackLoopLayout %d, dynamicRenderingLocalRead %d, dynamic feedback %d)",
                g_vk.feedback == VK_FEEDBACK_LAYOUT ? "feedback layout + by-region barrier"
                : g_vk.feedback == VK_FEEDBACK_RESTART ? "pass restart + full barrier" : "off (NX2NAVI_FEEDBACK=0)",
-               has_fbl && c->fbl.attachmentFeedbackLoopLayout, has_lr && c->lr.dynamicRenderingLocalRead);
+               has_fbl && c->fbl.attachmentFeedbackLoopLayout, has_lr && c->lr.dynamicRenderingLocalRead, g_vk.dynamic_feedback);
     }
 
     // Frame generation (vk_fg.cpp) presents on a second queue of the graphics family and acquires on a third

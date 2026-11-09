@@ -5,7 +5,8 @@
 #include <stdint.h>
 #include <vulkan/vulkan.h>
 
-#define NX2SL_VERSION 1
+#define NX2SL_VERSION 3
+#define NX2SL_MAX_MULTIPLIER 6
 
 typedef struct {
     VkImage image;
@@ -22,6 +23,7 @@ typedef struct {
     float znear, zfar, fov_y, aspect;
     float jitter[2];           // render pixels
     float mv_scale[2];         // what makes the motion vectors fractions of the render size
+    VkRect2D output_rect;      // scene in the backbuffer and the HUD-less image, excluding the bars
     int reset;
 } Nx2SlCamera;
 
@@ -47,9 +49,11 @@ typedef int (*PFN_nx2sl_available)(void);
 // Each present, before the present call: a new frame, its latency markers up to the render's end, its constants and
 // tags, and frame generation on or off. Then nx2sl_present_marker(0) before and (1) after the present.
 typedef int (*PFN_nx2sl_frame)(VkCommandBuffer cb, const Nx2SlImage *depth, const Nx2SlImage *mv, const Nx2SlImage *hudless,
-                               const Nx2SlCamera *cam, uint32_t out_w, uint32_t out_h, int enable);
-typedef void (*PFN_nx2sl_present_marker)(int after);
+                               const Nx2SlCamera *cam, uint32_t out_w, uint32_t out_h, int multiplier);
+// The post-present state query also returns the highest supported total multiplier, or 0 if unknown.
+typedef int (*PFN_nx2sl_present_marker)(int after);
 typedef void (*PFN_nx2sl_stats)(uint64_t *presented, uint32_t *generated_per_frame);
+typedef uint64_t (*PFN_nx2sl_output_frames)(void);
 typedef void (*PFN_nx2sl_shutdown)(void);
 #ifdef __cplusplus
 }

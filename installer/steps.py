@@ -1016,7 +1016,7 @@ class Prepare(Step):
     def key(self, ctx):
         layout = ctx.layout
         xlate_id = layout.xlate.with_suffix('.id')
-        tools = [layout.tools / n for n in ('prepare_shaders.py', 'shader_census.py', 'make_romfs_patches.py',
+        tools = [layout.tools / n for n in ('prepare_shaders.py', 'shader_census.py', 'shader_passes.py', 'make_romfs_patches.py',
                                             'pack_shader_cache.py', 'ultrawide_layout.py', 'button_icons.py')]
         # not the compile key: a rebuild for the mods' code cheats keeps the prepared shaders
         return fingerprint('prepare-2', ctx.keys['extract'], runtime_key(ctx), layout.xlate, xlate_id,

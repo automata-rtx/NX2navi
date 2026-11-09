@@ -49,6 +49,10 @@
 
 typedef struct { uint8_t *nv12, *rgba; int w, h; int64_t ts; int eos; } Picture;
 typedef struct { uint8_t *data; size_t size; int64_t ts; int eos; } Sample;
+typedef struct FrameSource {
+    struct FrameSource *next;
+    uint64_t addr, size;
+} FrameSource;
 typedef struct {
     PlatMutex lock;          // queues, frames, flags
     PlatMutex codec;         // dav1d: the decoder thread while it decodes, Flush / Finalize
@@ -58,6 +62,7 @@ typedef struct {
     uint8_t in_ev[0x40], out_ev[0x40];   // nn::os::SystemEventType each
     int in_bound, out_bound;
     uint64_t frame[NFRAMES];
+    FrameSource sources[NFRAMES];
     int busy[NFRAMES], nframe;
     Picture q[QMAX];
     int qh, qn;
@@ -69,6 +74,44 @@ typedef struct {
 } Video;
 
 static Video *video_of(void *obj) { return obj ? *(Video **)obj : NULL; }
+
+// The player copies an acquired NV12 picture to its graphics buffer on a guest thread. Only that full frame
+// copy has a decoder-owned source. Release, re-registration and teardown end the ownership.
+static PlatMutex source_lock = PLAT_MUTEX_INIT;
+static FrameSource *source_head;
+static int have_sources;
+
+static void publish_source(FrameSource *s, uint8_t *data, uint64_t size) {
+    plat_mutex_lock(&source_lock);
+    s->addr = (uintptr_t)data;
+    s->size = size;
+    s->next = source_head;
+    source_head = s;
+    __atomic_store_n(&have_sources, 1, __ATOMIC_RELEASE);
+    plat_mutex_unlock(&source_lock);
+}
+
+// Called with the decoder lock held. Each slot is published once per successful acquisition.
+static void release_source(FrameSource *s) {
+    if (!s->addr) return;
+    plat_mutex_lock(&source_lock);
+    FrameSource **p = &source_head;
+    while (*p && *p != s) p = &(*p)->next;
+    if (*p) *p = s->next;
+    *s = (FrameSource){0};
+    __atomic_store_n(&have_sources, source_head != NULL, __ATOMIC_RELEASE);
+    plat_mutex_unlock(&source_lock);
+}
+
+int gfx_movie_copy_source(uint64_t addr, uint64_t size) {
+    if (!__atomic_load_n(&have_sources, __ATOMIC_ACQUIRE)) return 0;
+    plat_mutex_lock_shared(&source_lock);
+    FrameSource *s = source_head;
+    while (s && (s->addr != addr || s->size != size)) s = s->next;
+    int found = s != NULL;
+    plat_mutex_unlock_shared(&source_lock);
+    return found;
+}
 
 // under v->lock
 static void update_events(Video *v) {
@@ -400,6 +443,7 @@ static void finalize(Video *v) {
     plat_mutex_unlock(&v->codec);
     plat_mutex_lock(&v->lock);
     clear_queues(v);
+    for (int i = 0; i < v->nframe; i++) release_source(&v->sources[i]);
     memset(v->busy, 0, sizeof v->busy);
     plat_mutex_unlock(&v->lock);
 }
@@ -463,7 +507,8 @@ static void ov_register(Cpu *c) {
     int n = (int)arg_x(c, 2);
     if (!v || n < 0 || n > NFRAMES || (n && !frames)) rt_fatal("movie: RegisterVideoFrame of %d frames", n);
     plat_mutex_lock(&v->lock);
-    memcpy(v->frame, frames, (size_t)n * sizeof *frames);
+    for (int i = 0; i < v->nframe; i++) release_source(&v->sources[i]);
+    if (n) memcpy(v->frame, frames, (size_t)n * sizeof *frames);
     memset(v->busy, 0, sizeof v->busy);
     v->nframe = n;
     // Each frame buffer starts as NV12 black (Y 16, UV 128 in its last third). The game converts a frame it holds
@@ -593,10 +638,9 @@ static void ov_acquire(Cpu *c) {
     uint64_t ysz = (uint64_t)p.w * p.h, uvsz = ysz / 2;
     if (p.nv12 && buf && cap >= ysz + uvsz) {
         memcpy(buf, p.nv12, (size_t)(ysz + uvsz));
-        // The game's YUV pass reads this buffer on the GPU. A host write into pool storage is one the page write
-        // tracking may not see in time (a mirror or texture over it kept its older or still-empty bytes: frames
-        // with stripes of zeros, which NV12 shows as green), so the back end is told directly.
+        // The game may read this storage itself or copy the complete picture into a second graphics buffer.
         nvn_guest_written((uint64_t)(uintptr_t)buf, ysz + uvsz);
+        publish_source(&v->sources[f], buf, ysz + uvsz);
         uint64_t uvp = (uint64_t)(uintptr_t)(buf + ysz);
         memcpy(fr + 0x10, &uvp, 8);
         memcpy(fr + 0x28, &ysz, 8), memcpy(fr + 0x30, &uvsz, 8);
@@ -642,7 +686,10 @@ static void ov_release(Cpu *c) {
     if (v) {
         plat_mutex_lock(&v->lock);
         for (int i = 0; i < v->nframe; i++)
-            if (v->frame[i] == fr) v->busy[i] = 0;
+            if (v->frame[i] == fr) {
+                release_source(&v->sources[i]);
+                v->busy[i] = 0;
+            }
         update_events(v);
         plat_mutex_unlock(&v->lock);
     }

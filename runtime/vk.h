@@ -46,6 +46,8 @@ typedef struct VkCtx {
     int feedback;                           // VK_FEEDBACK_*
     uint32_t min_imported_host_alignment;   // VK_EXT_external_memory_host
     int device_index;                       // index in vkEnumeratePhysicalDevices
+    int dynamic_feedback;
+    int pipeline_cache_control;
 } VkCtx;
 enum { VK_FEEDBACK_OFF, VK_FEEDBACK_RESTART, VK_FEEDBACK_LAYOUT };
 
@@ -211,6 +213,7 @@ void vk_texture_release(const tex_t *t);   // TextureFinalize: the image stays f
 void vk_read_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uint8_t *dst, uint64_t row, uint64_t img);
 void vk_write_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r, const uint8_t *src, uint64_t row, uint64_t img);
 void vk_guest_written(uint64_t addr, uint64_t size);   // a host write write-watch may miss: textures there re-upload
+void vk_mem_publish_movie_buffer(uint64_t addr, uint64_t size);
 
 // GPU address -> backing (section 3.1). avail: bytes from offset that stay contiguous in buffer. alloc/alloc_offset:
 // the device-local memory behind physical and (through the page table) virtual pool addresses, NULL for imported pools.
@@ -395,6 +398,8 @@ typedef struct {
 void vk_hdr_present_source(const VkTexImage *win, VkImage *image, VkFormat *format);
 void vk_hdr_image_gone(VkImage image);
 const VkTexImage *vk_texture_get(const tex_t *t);   // created and made current; NULL for BUFFER or unmapped formats
+typedef enum { VK_HISTORY_SCENE_DEPTH, VK_HISTORY_SUN_DEPTH, VK_HISTORY_FOG_INTERVALS, VK_HISTORY_COUNT } VkDepthHistory;
+void vk_texture_restore_depth(VkCommandBuffer cb, VkDepthHistory role, int slot);
 // A texture slot; a slot whose texture was finalized follows the live texture at the same storage (hle_nvn.c).
 const VkTexImage *vk_texture_by_id(int id, view_t *view, int *has_view);
 // The replay looks up many slots per draw: it takes the texture lock once around them (vk_texture_lock) and uses the
@@ -427,7 +432,7 @@ VkDescriptorSetLayout vk_empty_set_layout(void);    // set 1 of layouts without 
 // The upscaler stand-in (vk_tonemap.c): src (sampled) scaled to dw x dh and tonemapped into its own RGBA16F image, which
 // it returns for the caller to blit into the target; VK_NULL_HANDLE when it cannot. The caller binds its own compute
 // pipeline again afterwards.
-VkImage vk_tonemap_record(VkCommandBuffer cb, VkImage src, VkFormat sf, uint32_t dw, uint32_t dh);
+VkImage vk_tonemap_record(VkCommandBuffer cb, VkImage src, VkFormat sf, uint32_t dw, uint32_t dh, VkImageView *out_view);
 // What vk_texture_by_id(id) returns can change only when this does: the slot is registered again, or a texture entry at
 // its storage address is created, dropped, released or taken back into use. Unlocked; read it before the lookup it
 // guards (a lookup may create an entry). 0 when the slot was never registered: nothing is kept under 0.
@@ -575,6 +580,11 @@ typedef union { VkDescriptorImageInfo image; VkDescriptorBufferInfo buffer; VkBu
 // Both return the cached pipeline (created on first use; failures are cached and logged once). info: may be NULL.
 // Valid until vk_pipeline_shutdown; thread-safe.
 VkPipeline vk_pipeline_graphics(const VkPipeState *s, const VkPipeInfo **info);
+// In asynchronous mode, report an absent or unfinished pipeline as pending without scheduling work.
+// The caller can then choose a wait budget before requesting it. Synchronous mode resolves it here.
+VkPipeline vk_pipeline_graphics_lookup(const VkPipeState *s, const VkPipeInfo **info, int *pending);
+// Same hash as the serialized pipeline-keys.bin record for this draw state.
+uint64_t vk_pipeline_record_id(const VkPipeState *s);
 // The replay's variant: after vk_pipeline_async_enable a missing pipeline is built by background workers and this
 // returns VK_NULL_HANDLE with *pending 1 until it is ready (the draw is skipped); otherwise as vk_pipeline_graphics.
 // wait_ms > 0 waits up to that long for a pending pipeline first. Pipelines built in a run are recorded to

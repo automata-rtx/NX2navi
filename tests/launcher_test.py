@@ -788,6 +788,30 @@ class MakeGameTest(Tmp):
         self.assertEqual(code, 1)
         self.assertTrue(any(e['ev'] == 'error' and 'rebuild' in e['message'] for e in ev))
 
+    def test_side_by_side_extraction(self):
+        def install(dump, target, *args):
+            return self.run_mg('--nup', dump, '--out', target, '--msys', self.msys, '--until', 'romfs', *args)
+
+        code, _, lines = install(self.nup, self.out)
+        self.assertEqual(code, 0, lines)
+        second = self.tmp / 'second'
+        code, events, lines = install(self.nup, second, '--reuse-from', self.out)
+        self.assertEqual(code, 0, lines)
+        for name in ('exefs', 'romfs'):
+            self.assertEqual((second / name).resolve(), self.out / name)
+            self.assertIn({'ev': 'step', 'step': name, 'state': 'skip'}, events)
+        state = second / 'build-cache' / 'state.json'
+        before = state.read_bytes()
+        another = self.tmp / 'another.nup'
+        shutil.copyfile(self.nup, another)
+        code, events, _ = install(another, second, '--reuse-from', self.out)
+        self.assertNotEqual(code, 0)
+        self.assertTrue(any(e['ev'] == 'error' and 'shared' in e['message'] for e in events))
+        self.assertEqual(state.read_bytes(), before)
+        code, _, lines = install(another, self.tmp / 'third', '--reuse-from', self.out)
+        self.assertEqual(code, 0, lines)
+        self.assertNotEqual((self.tmp / 'third' / 'romfs').resolve(), self.out / 'romfs')
+
     def test_wrong_version_refused(self):
         bad = self.tmp / 'bad.nup'
         write_nup(bad, {'main': nso(b'\x11' * 16), 'sdk': nso(), 'subsdk0': nso(), 'rtld': nso(),
@@ -845,6 +869,8 @@ class MakeGameTest(Tmp):
         def prepare(out):
             launches.append('shaders')
             (out / 'shader-prepared.bin').write_bytes(struct.pack('<8sII', b'NX2NSPRP', 1, 36) + bytes(36))
+            (out / 'vertex-programs.bin').write_bytes(struct.pack('<8sII', b'NX2NVSID', 1, 96))
+            (out / 'mesh-programs.bin').write_bytes(struct.pack('<8sII', b'NX2NMSID', 1, 96))
             cache.mkdir(exist_ok=True)
             (cache / 'test.spv').touch()
 
@@ -868,8 +894,12 @@ class MakeGameTest(Tmp):
                 build_game()
                 (self.out / 'shader-prepared.bin').unlink()
                 build_game()
+                (self.out / 'mesh-programs.bin').write_bytes(b'incomplete')
                 build_game()
-                self.assertEqual(launches[3:], ['shaders'] * 3)
+                build_game()
+                (self.out / 'vertex-programs.bin').unlink()
+                build_game()
+                self.assertEqual(launches[3:], ['shaders'] * 5)
 
         kit = self.tmp / 'test kit'
         runtime = kit / 'runtime'

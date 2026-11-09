@@ -39,7 +39,7 @@ static int tm_out(VkCommandBuffer cb, uint32_t w, uint32_t h) {
     VkImageCreateInfo ii = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
                             .format = VK_FORMAT_R16G16B16A16_SFLOAT, .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1,
                             .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
-                            .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                            .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                             .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
     if (vmaCreateImage(c->vma, &ii, &ai, &TM.out, &TM.out_alloc, NULL) != VK_SUCCESS) return TM.out = VK_NULL_HANDLE, 0;
@@ -116,7 +116,7 @@ static VkImageView tm_view(VkImage img, VkFormat f) {
 
 // Records the pass from src (sampled) into the pass's own RGBA16F image of dw x dh and returns it (the caller blits it
 // into the target); VK_NULL_HANDLE when it cannot (the caller blits the source instead).
-VkImage vk_tonemap_record(VkCommandBuffer cb, VkImage src, VkFormat sf, uint32_t dw, uint32_t dh) {
+VkImage vk_tonemap_record(VkCommandBuffer cb, VkImage src, VkFormat sf, uint32_t dw, uint32_t dh, VkImageView *out_view) {
     static int disp = -1;   // NX2NAVI_TM_DISPATCH=0: everything but the dispatch, =2: not at all (diagnosis)
     if (disp < 0) disp = rt_knob("TM_DISPATCH", "1");
     if (disp == 2 || !tm_init() || !tm_out(cb, dw, dh)) return VK_NULL_HANDLE;
@@ -144,6 +144,7 @@ VkImage vk_tonemap_record(VkCommandBuffer cb, VkImage src, VkFormat sf, uint32_t
                               .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT};
     VkDependencyInfo dep2 = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &after};
     vkCmdPipelineBarrier2(cb, &dep2);
+    *out_view = dv;
     return TM.out;
 }
 

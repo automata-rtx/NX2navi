@@ -133,6 +133,10 @@ static void ft_report(uint64_t now, const char *tag) {
                    (unsigned long long)w->frame, w->ns / 1e6, w->wait[PERF_XLATE] / 1e6, w->wait[PERF_PIPE] / 1e6,
                    w->wait[PERF_TEX] / 1e6, w->wait[PERF_ASTC] / 1e6, w->replay / 1e6,
                    (w->wait[PERF_FENCE] + w->wait[PERF_DRAIN]) / 1e6, w->wait[PERF_PACE] / 1e6);
+            if (w->wait[PERF_TEX] + w->wait[PERF_TEX_CREATE] + w->wait[PERF_TEX_POOL] >= 5000000)
+                rt_log("frametime:   frame %llu texture detail: staging %.1f ms, source copy %.1f ms, image creation %.1f ms, descriptor refresh %.1f ms (includes textures resolved during refresh)",
+                       (unsigned long long)w->frame, w->wait[PERF_TEX_STAGE] / 1e6, w->wait[PERF_TEX_COPY] / 1e6,
+                       w->wait[PERF_TEX_CREATE] / 1e6, w->wait[PERF_TEX_POOL] / 1e6);
         }
     }
     memset(&ft, 0, sizeof ft);

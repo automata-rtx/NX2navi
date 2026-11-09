@@ -528,6 +528,7 @@ const GfxBackend gfx_vulkan_backend = {
     .read_texels = vk_be_read_texels,
     .write_texels = vk_be_write_texels,
     .guest_written = vk_be_guest_written,
+    .publish_movie_buffer = vk_mem_publish_movie_buffer,
     .guest_read = vk_be_guest_read,
     .cpu_synced = vk_be_cpu_synced,
 };

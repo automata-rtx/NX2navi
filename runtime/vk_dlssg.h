@@ -2,6 +2,7 @@
 #pragma once
 #include <stdint.h>
 #include <vulkan/vulkan.h>
+#include "dlssg/nx2_sl.h"
 
 int vk_dlssg_wanted(void);   // NX2NAVI_FRAMEGEN = dlss with DLSS or FSR 3.1 upscaling on (read once)
 int vk_dlssg_early(void);    // before the instance exists: loads the DLL and Streamline; 1 when its proxies are there
@@ -12,11 +13,14 @@ PFN_vkVoidFunction vk_dlssg_instance_proc(VkInstance inst, const char *name);   
 VkResult vk_dlssg_create_device(VkInstance inst, VkPhysicalDevice pd, const VkDeviceCreateInfo *ci, VkDevice *out);
 void vk_dlssg_device_ready(VkDevice dev);   // after the device: checks DLSS-G and takes the swapchain hooks
 int vk_dlssg_active(void);
+int vk_dlssg_max_multiplier(void);   // 0 until Streamline reports the device limit
+int vk_dlssg_multiplier(void);       // saved choice limited to the device maximum
 // gfx_present.c's swapchain calls while active
 VkResult vk_dlssg_create_swapchain(VkDevice d, const VkSwapchainCreateInfoKHR *ci, VkSwapchainKHR *sc);
 void vk_dlssg_destroy_swapchain(VkDevice d, VkSwapchainKHR sc);
 VkResult vk_dlssg_get_images(VkDevice d, VkSwapchainKHR sc, uint32_t *n, VkImage *img);
 VkResult vk_dlssg_acquire(VkDevice d, VkSwapchainKHR sc, uint64_t timeout, VkSemaphore sem, uint32_t *idx);
 VkResult vk_dlssg_present(VkQueue q, const VkPresentInfoKHR *pi);
-void vk_dlssg_frame(VkCommandBuffer cb, VkExtent2D ext);   // each present, before its command buffer is submitted
+uint64_t vk_dlssg_output_frames(void);
+void vk_dlssg_frame(VkCommandBuffer cb, VkExtent2D ext, const int to[4], int scene, const Nx2SlImage *hudless);
 void vk_dlssg_release(void);

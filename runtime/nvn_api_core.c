@@ -57,8 +57,15 @@ void nvn_guest_written(uint64_t addr, uint64_t size) {
 // arguments are undefined for memcpy anyway.
 static void ov_memcpy(Cpu *c) {
     uint64_t dst = arg_x(c, 0), src = arg_x(c, 1), n = arg_x(c, 2);
-    if (n >= 1024) gfx_backend()->guest_read(src, n);
+    int movie = n >= 1024 && gfx_movie_copy_source(src, n);
+    if (n >= 1024 && !movie) gfx_backend()->guest_read(src, n);
     memmove((void *)(uintptr_t)dst, (const void *)(uintptr_t)src, n);
+    if (movie) {
+        // The decoder owns the source. The game alternates destinations and can read them through a GPU pointer.
+        const GfxBackend *b = gfx_backend();
+        b->guest_written(dst, n);
+        if (b->publish_movie_buffer) b->publish_movie_buffer(dst, n);
+    }
     ret_x(c, dst);
 }
 HOST_OVERRIDE("memcpy", ov_memcpy);

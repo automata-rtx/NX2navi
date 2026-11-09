@@ -62,6 +62,7 @@ typedef struct PoolRec {
     VkBuffer mbuf;                     // MS_ON: device-local copy of [import_lo, import_hi), same offsets as buf
     VmaAllocation malloc_;
     uint32_t acc_sub;                  // replay: the last submission that synced the mirror (mirror_sync)
+    int movie_written;                 // a copied movie frame may be addressed without a Vulkan buffer bind
     uint32_t wb_sub;                   // replay: the last submission that wrote mirror bytes back to guest memory
     uint32_t mgen;                     // gen_lock: every page write stamped up to this generation is in the mirror
                                        // (or in a copy queued before its next use)
@@ -1497,6 +1498,20 @@ static void mirror_sync(PoolRec *r) {
     mrep.sync_t += qpc() - t0;
 }
 
+static int movie_mirrors_pending;
+
+void vk_mem_publish_movie_buffer(uint64_t addr, uint64_t size) {
+    if (!vk_mirror_on || !size) return;
+    plat_mutex_lock_shared(&pool_lock);
+    const pidx_ent *e = pidx_find(&pool_index, addr, size);
+    PoolRec *r = e ? e->buf : NULL;
+    if (r && r->kind == POOL_IMPORT) {
+        __atomic_store_n(&r->movie_written, 1, __ATOMIC_RELEASE);
+        __atomic_store_n(&movie_mirrors_pending, 1, __ATOMIC_RELEASE);
+    }
+    plat_mutex_unlock_shared(&pool_lock);
+}
+
 void vk_mem_use(VkMemSpan *sp) {
     PoolRec *r = sp->pool;
     if (r->mstate == MS_NONE) mirror_create(r);
@@ -1882,6 +1897,10 @@ void vk_mem_mirror_begin(void) {
     mrep.presnap_bytes += ww_bytes - b0;
     if (freeze_idle) freeze_pass();
     plat_mutex_unlock(&gen_lock);
+    // Indirect GPU reads have no binding to trigger vk_mem_use. Sync a published movie buffer before the dispatch.
+    if (__atomic_exchange_n(&movie_mirrors_pending, 0, __ATOMIC_ACQ_REL))
+        for (int i = 0; i < nm; i++)
+            if (__atomic_exchange_n(&mlist[i]->movie_written, 0, __ATOMIC_ACQ_REL)) mirror_sync(mlist[i]);
     plat_mutex_unlock_shared(&pool_lock);
     mrep.subs++;
     mrep.presnap_queries += q;

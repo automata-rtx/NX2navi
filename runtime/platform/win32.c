@@ -534,8 +534,14 @@ int plat_file_write_atomic(const char *path, const void *data, size_t n) {
     if (len < 0 || len >= (int)sizeof tmp || !widen(tmp, a, WPATH) || !widen(path, b, WPATH)) return 0;
     HANDLE h = CreateFileW(a, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return 0;
-    DWORD put = 0;
-    int ok = WriteFile(h, data, (DWORD)n, &put, NULL) && put == n && FlushFileBuffers(h);
+    const unsigned char *bytes = data;
+    size_t written = 0;
+    while (written < n) {
+        DWORD chunk = n - written > (1u << 30) ? (1u << 30) : (DWORD)(n - written), put = 0;
+        if (!WriteFile(h, bytes + written, chunk, &put, NULL) || !put) break;
+        written += put;
+    }
+    int ok = written == n && FlushFileBuffers(h);
     CloseHandle(h);
     if (ok && MoveFileExW(a, b, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return 1;
     DeleteFileW(a);

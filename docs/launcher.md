@@ -79,6 +79,11 @@ A path the Windows ANSI code page cannot hold breaks the MSYS2 tools, so the too
    PyPI's sha256, into `pydeps/`.
 2. **Inspect Your Game** to **Compile**: `tools/make_game.py --nup <dump> --out <game> --msys <toolchain> --events`,
    whose `@@` progress lines drive the rows (check, exefs, romfs, lift, compile). How it keeps the build short:
+   - A side-by-side installation checks the standard launcher's game folder for a finished extraction from the same
+     `.nup`. It verifies the ExeFS files against the dump and the RomFS image against its recorded SHA-256, then
+     links the two directories into the new game folder. The source game folder must stay available. Each install
+     keeps its own saves, shader cache and build products. On the command line, `--reuse-from <game folder>` selects
+     the source explicitly.
    - The RomFS image (26 GB, mostly disk work) is packed beside the lift and the compile (processor work), so a first
      build takes about as long as the longer of the two. Only `romfs.c`, which includes the RomFS index's
      `romfs_config.h`, waits for the image.
@@ -88,8 +93,30 @@ A path the Windows ANSI code page cannot hold breaks the MSYS2 tools, so the too
      (it reads UCRT64's headers; `make_game.py` `fast_clang` checks that both report the same version and target).
    - The lifted code is compiled for the processor's own level, x86-64-v3 (AVX2, FMA) or v2 (`cpu_level`): the game
      runs on the PC that builds it, and a generic build would do every fused multiply-add of the game in software.
-3. **Prepare the Shaders**: make_game.py's last step translates every shader of the game into the game's shader
-   cache and the driver's own cache (`tools/prepare_shaders.py`), so play does not stop to compile them.
+3. **Prepare the Shaders** translates shader variants from the game files. It warms compute pipelines and, where
+   the driver supports them, vertex and fragment libraries. It includes variants already seen in play from
+   `shader-answers.bin`. If this install has `pipeline-keys.bin`, it also builds
+   complete recorded graphics pipelines, including mesh and task pipelines, and saves the Vulkan driver cache.
+   On mesh-capable GPUs, setup also reads the mesh, task and fragment stages paired in each game shader archive.
+   It prepares those programs for the scene colour, depth and shadow passes before the first playthrough.
+   On GPUs with dynamic vertex input, setup also builds complete graphics pipelines for the vertex and fragment
+   shaders paired in the archives. It uses the translated shader interface to select common triangle passes with
+   one scene-colour target, two floating-point targets, or depth alone. A shader that generates its own vertices
+   can also use the scene-colour pass without depth. These builds use the same adjustable worker limit.
+   Setup also reads each model program's pass assignment and its reference to the exact shader variation.
+   Depth-only and shadow assignments select 16-bit and 32-bit depth candidates. The layout shader and named
+   post-processing passes select attachment formats and topology seen for those operations. A single pass can
+   have several candidates because the game binds different images at runtime.
+   For model shaders that reinterpret vertex attributes 8 or 9 as integers, setup also prepares the layout where
+   those attributes are floats. It prepares unsigned fragment outputs for the archives' shading-rate image and
+   texture compression programs.
+   With a compatible cache and driver compile control, the first draw can reuse any complete pipeline the driver
+   can restore. A draw that must finish checks immediately. Effects that can appear a frame later check on a worker.
+   Other render targets, vertex interfaces and binding variants are recorded when the game uses them.
+   `ocarina.exe --warm-archive-pipelines` rebuilds the archive graphics pipelines from this install's prepared shaders.
+   A new combination of stages, attachment formats and draw state can still compile on first use.
+   From the game folder, `ocarina.exe --warm-recorded-pipelines` warms just the recorded variants and pipelines without
+   starting gameplay or repeating the shader inventory.
    **Max Shader Workers** appears in first-time setup, Settings and the build progress screen. The arrows change
    the limit during translation and driver compilation. Lowering it lets active variants finish before workers
    take more. Raising it makes additional workers available immediately. Auto uses each phase's default.

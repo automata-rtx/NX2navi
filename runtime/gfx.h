@@ -85,7 +85,7 @@ void gfx_shader_cache_identity(char translator[65], const char **storage);   // 
 // declares. 1 when *out differs from *a (translate again with *out).
 int gfx_shader_guess_refine(const GfxShader *s, int stage, const GfxShaderAnswers *a, GfxShaderAnswers *out);
 typedef struct { uint8_t iid[32]; uint8_t stage, prio; } GfxWarmEnt;   // prio 0: met in play; 1..3: prepared
-size_t gfx_shader_warm_list(GfxWarmEnt **out);              // malloc'd; recorded first, then prepared; needs recording on
+size_t gfx_shader_warm_list(const char *dir, int include_prepared, GfxWarmEnt **out, int *manifest_ok);
 // Disk-cache load the caller owns (*owned 1: release it), or the memory cache's entry (*owned 0). NULL if not cached.
 const GfxShader *gfx_shader_load_private(const uint8_t iid[32], int *owned);
 void gfx_shader_release_private(const GfxShader *s);
@@ -117,6 +117,13 @@ typedef struct {
                                 // cbuf_slot and handle name (a pointer table; the translator's patch 0022, res.json "ptr")
 } GfxShaderRes;
 typedef struct { uint8_t type, comps, packed; } GfxShaderIo;   // GFX_TYPE_*, components, 1 with a Component decoration
+typedef struct { uint8_t tag, color[8], depth, points, reserved; } GfxArchivePass;
+typedef struct {
+    uint8_t first[32], fs[32];
+    union { uint8_t ts[32]; GfxArchivePass pass; };  // task ID for mesh, attachment layout for vertex (tag 0: default)
+} GfxArchiveProgram;
+int gfx_archive_program_order(const void *a, const void *b);
+int gfx_shader_archive_programs(const char *dir, int mesh, GfxArchiveProgram **programs, size_t *count);
 int gfx_shader_stage(const GfxShader *s);                   // GFX_STAGE_VS, GFX_STAGE_FS or GFX_STAGE_CS
 int gfx_shader_resources(const GfxShader *s, int kind, const GfxShaderRes **res);   // count of GFX_RES_* kind; array in *res
 uint32_t gfx_shader_slot_mask(const GfxShader *s);                    // texture/image slots whose type its translation read
@@ -150,6 +157,7 @@ typedef struct {
     // The CPU waited for fence: small render targets written by work up to it go to their storage (vk_texture.c
     // vk_texture_write_back_small).
     void (*cpu_synced)(uint64_t fence);
+    void (*publish_movie_buffer)(uint64_t addr, uint64_t size);
 } GfxBackend;
 extern const GfxBackend gfx_null_backend, gfx_vulkan_backend;
 const GfxBackend *gfx_backend(void);                       // NX2NAVI_GPU=null|vulkan (default vulkan)
@@ -170,3 +178,4 @@ void rt_frame_presented(const tex_t *t, uint64_t n);       // boot.c: --frames N
 void gfx_movie_frame(const uint8_t *rgba, int w, int h);
 void gfx_movie_frame_own(uint8_t *rgba, int w, int h);   // the same, taking the malloc'd buffer (freed later)
 void gfx_movie_stop(void);
+int gfx_movie_copy_source(uint64_t addr, uint64_t size);

@@ -51,7 +51,7 @@ typedef struct Tex {
     uint32_t gpu_gen;             // page generation when the GPU write that set gpu_dirty was recorded
     uint64_t gpu_seq;             // order of that GPU write among all of them (gpu_writes)
     uint64_t gpu_fence;           // fence of the submission that made that write (0: not recorded in one)
-    uint64_t run_frame;           // mirrored: the frame of the newest GPU write
+    uint64_t run_frame;           // frame of the newest render or copy into this image
     uint8_t run;                  // frames in a row up to run_frame with a GPU write, counted up to WB_RUN
     uint64_t wr_fence;            // any entry: newest submission recorded to write its image (render, copy, clear,
                                   // storage binding); ReadTexels waits for it instead of draining the replay queue
@@ -62,6 +62,8 @@ typedef struct Tex {
     uint8_t chash_ok;             // chash holds it
     struct Tex *rel_prev, *rel_next;   // while released: the list of released entries, oldest first
 } Tex;
+
+static struct { Tex *entry; uint64_t frame; } depth_inputs[VK_HISTORY_COUNT];
 
 // A slot keeps what vk_texture_by_id resolved for it, so a draw binding skips the key lookup and the address chain: the
 // entry (ce), valid while the generation of its address (agen) is still cgen, the view and has_view handed out with it,
@@ -488,7 +490,15 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
     e->f = f;
     e->pub.addr = k->addr;
     VkImage img = VK_NULL_HANDLE;
-    if (scale == 1 && nvn_gpu_only(k->addr)) {   // storage in a physical or virtual pool: alias the pool memory (section 3.2)
+    // NVN2 lighting reads last frame's scalar depth, fog intervals and sun cascades before the
+    // next depth passes run. A later HDR target overlaps the intervals in the pool. Sharing its
+    // Vulkan memory made the fog interpret packed scene colour as near/far distances.
+    int depth_history = rt_nvn_api_version[0] >= 200 && levels == 1 && samples == 1 &&
+                        ((d->target == NVN_TEXTURE_TARGET_2D && (d->flags & NVN_TEXTURE_FLAGS_COMPRESSIBLE) &&
+                          (d->format == NVN_FORMAT_RGBA32F || d->format == NVN_FORMAT_R32F)) ||
+                         (d->target == NVN_TEXTURE_TARGET_2D_ARRAY && d->format == NVN_FORMAT_DEPTH16 &&
+                          layers == 3 && w == h));
+    if (scale == 1 && !depth_history && nvn_gpu_only(k->addr)) {   // alias the pool memory (section 3.2)
         if (vkCreateImage(c->device, &ci, NULL, &img) == VK_SUCCESS && !bind_pool_memory(c, e, img, L.size)) {
             vkDestroyImage(c->device, img, NULL);
             img = VK_NULL_HANDLE;
@@ -624,6 +634,8 @@ static void rel_unlink(Tex *e) {
 }
 
 static void destroy_tex(Tex *e) {
+    for (int i = 0; i < VK_HISTORY_COUNT; i++)
+        if (depth_inputs[i].entry == e) depth_inputs[i].entry = NULL;
     own_remove(e);
     n_site[0]++;
     tex_gen_bump(e->key.addr);
@@ -829,13 +841,16 @@ static void upload(Tex *e) {
         for (k1 = k0 + 1; k1 < n && (agpu || (k1 + 1 < n ? rg[k1 + 1].bufferOffset : total) - base <= UPLOAD_PART);) k1++;
         size = (k1 < n ? rg[k1].bufferOffset : total) - base;
         if (k0) parts++;
+        uint64_t stage_start = perf_begin();
         VkCommandBuffer cb = vk_upload_begin();
         uint8_t *stg = vk_staging(size, &sb, NULL);
         if (acheck) rmap = vk_staging(decoded, &rbuf, &ralloc);
+        perf_end(PERF_TEX_STAGE, stage_start);
         // The part's copies out of the storage, with it held mapped (mem_read_hold): the game releases a texture's
         // memory on its own thread, and a decommit in the middle of a copy faulted (tex_bl_copy). Only the copies run
         // held, so a waiting unmap and the guest's memory calls behind it never wait for the staging block or a decode.
         // Storage released since the check above uploads as zeros, as the game no longer has that texture.
+        uint64_t copy_start = perf_begin();
         uint8_t **tmps = calloc(k1 - k0, sizeof *tmps);
         int held = mem_read_hold(e->pub.addr, e->t.L.size);
         if (held) plat_crash_context(ctx);
@@ -864,6 +879,7 @@ static void upload(Tex *e) {
             plat_crash_context(NULL);
             mem_read_release();   // the part's reads of the storage are done
         }
+        perf_end(PERF_TEX_COPY, copy_start);
         for (k = k0; k < k1; k++) {   // the decodes, from the copies
             uint32_t lv = rg[k].imageSubresource.mipLevel, ly = rg[k].imageSubresource.baseArrayLayer;
             uint32_t w = rg[k].imageExtent.width, h = rg[k].imageExtent.height, sl = rg[k].imageExtent.depth;
@@ -1121,7 +1137,10 @@ static Tex *entry_of(const tex_t *t) {
             tex_alias = cfg_bool("NX2NAVI_TEX_ALIAS");
             rt_log("vk: texture aliases: %s", tex_alias ? "a new image takes the live image's content" : "a new image starts empty");
         }
-        if (!(e = create_tex(t, &k, tex_alias))) return create_failed(&k), NULL;
+        uint64_t start = perf_begin();
+        e = create_tex(t, &k, tex_alias);
+        perf_end(PERF_TEX_CREATE, start);
+        if (!e) return create_failed(&k), NULL;
         perf_count(PERF_CNT_TEX_NEW);
         // released entries of another descriptor at this address are replaced by the new one; a live one holding
         // GPU-written content is the alias source, preferring the one that differs only in swizzle (same_but_swizzle)
@@ -1239,7 +1258,7 @@ void vk_texture_gpu_written(const tex_t *t) {
             wb_cfg_init();
             if (wb_wanted(e)) __atomic_store_n(&small_pending, 1, __ATOMIC_RELEASE);
             own_add(e);
-        }
+        } else e->run_frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
     }
     unlock();
 }
@@ -1459,6 +1478,42 @@ const VkTexImage *vk_texture_by_id(int id, view_t *view, int *has_view) {
     const VkTexImage *r = vk_texture_by_id_locked(id, view, has_view);
     unlock();
     return r;
+}
+
+// The depth prepasses run after the lighting computes that sample their previous frame. When
+// the render heap moves, the new descriptor can point to an empty image or to an older use of
+// the new address. Carry the last render into the new image once, before its first consumer.
+// Only the two known lighting dispatches call this, with the replay outside a render pass.
+void vk_texture_restore_depth(VkCommandBuffer cb, VkDepthHistory role, int slot) {
+    static const VkFormat formats[VK_HISTORY_COUNT] = {
+        VK_FORMAT_R32_SFLOAT, VK_FORMAT_D16_UNORM, VK_FORMAT_R32G32B32A32_SFLOAT
+    };
+    lock();
+    Tex *dst = (Tex *)vk_texture_by_id_locked(slot, NULL, NULL);
+    Tex *src = depth_inputs[role].entry;
+    uint64_t frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+    if (!dst || dst->pub.format != formats[role] || dst->pub.levels != 1 || dst->pub.samples != 1 ||
+        dst->pub.type != VK_IMAGE_TYPE_2D || dst->pub.layers != (role == VK_HISTORY_SUN_DEPTH ? 3u : 1u) ||
+        !nvn_gpu_only(dst->pub.addr) || !dst->alloc) {
+        depth_inputs[role].entry = NULL;
+        unlock();
+        return;
+    }
+    if (src && src != dst && depth_inputs[role].frame + 1 == frame && src->pub.gpu_owned &&
+        src->run_frame + 1 == frame && (!dst->pub.gpu_owned || dst->run_frame < frame - 1) &&
+        src->t.pool == dst->t.pool && src->pub.width == dst->pub.width && src->pub.height == dst->pub.height) {
+        VkImageSubresourceLayers layers = {dst->pub.aspect, 0, 0, dst->pub.layers};
+        VkImageCopy copy = {.srcSubresource = layers, .dstSubresource = layers,
+                            .extent = {dst->pub.width, dst->pub.height, 1}};
+        barrier(cb, ALL_RW, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        vkCmdCopyImage(cb, src->pub.image, VK_IMAGE_LAYOUT_GENERAL, dst->pub.image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+        barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
+        dst->pub.gpu_owned = 1;
+        dst->wr_fence = vk_exec_recording_fence();
+    }
+    depth_inputs[role].entry = dst;
+    depth_inputs[role].frame = frame;
+    unlock();
 }
 
 const VkTexImage *vk_texture_by_id_locked(int id, view_t *view, int *has_view) {

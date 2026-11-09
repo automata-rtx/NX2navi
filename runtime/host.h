@@ -28,7 +28,8 @@ enum { RT_TRACE_SVC = 1, RT_TRACE_HOSTCALL = 2, RT_TRACE_IPC = 4, RT_TRACE_FS = 
 extern unsigned rt_trace;                       // from NX2NAVI_TRACE=svc,host,ipc,fs,gfx,perf,sched,audio,present (or all)
 // prof_win.c: NX2NAVI_PROFILE=<path> sampling profiler; NX2NAVI_TRACE=perf frame timing (waits of the render thread)
 // PERF_TEX: texture uploads on the render thread (deswizzle, decode, staging), PERF_ASTC included
-enum { PERF_PACE, PERF_FENCE, PERF_DRAIN, PERF_PIPE, PERF_XLATE, PERF_TEX, PERF_ASTC, PERF_N };
+enum { PERF_PACE, PERF_FENCE, PERF_DRAIN, PERF_PIPE, PERF_XLATE, PERF_TEX, PERF_ASTC,
+       PERF_TEX_STAGE, PERF_TEX_COPY, PERF_TEX_CREATE, PERF_TEX_POOL, PERF_N };
 void prof_start(void);
 void prof_write(void);                          // idempotent; boot.c calls it before _exit
 uint64_t perf_begin(void);                      // start time of a wait; pair with perf_end
@@ -347,3 +348,5 @@ int probe_movie(void);                                     // movie_probe.c: hos
 int vk_pipeline_prepare_shaders(void);                     // vk_pipeline.c: --prepare-shaders (tools/prepare_shaders.py)
 int vk_shader_cache_id(void);
 int vk_pipeline_warm_shaders(void);                        // vk_pipeline.c: --warm-shaders (tools/build_game.py)
+int vk_pipeline_warm_recorded(void);                       // only previously recorded complete graphics pipelines
+int vk_pipeline_warm_archive(void);                        // rebuild the prepared archive mesh combinations

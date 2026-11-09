@@ -96,7 +96,10 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   ring of Vulkan `{x, y, z}` records filled on the GPU.
 - Pipelines: `VK_EXT_graphics_pipeline_library` where the driver has it: stage libraries compiled ahead, a fast link
   at a new state, an optimised pipeline replacing it from a background thread. A draw whose pipeline is not ready is
-  skipped when one of its pass's targets was rendered in the previous frame, and waits otherwise. Compute pipelines
+  skipped in recurring passes. The default also recognizes the scene lighting and two-target effects passes when
+  their colour images change and the previous frame used the same depth subresource for the same pass shape.
+  Pending draws in these passes leave pipeline linking to the workers. A later draw can use the finished pipeline.
+  One-time passes can still wait for their output. Compute pipelines
   are compiled outside the pipeline lock, and one compile serves every thread that needs it.
 - The game's tensor-core upscaler is replaced by a decode-and-scale pass (`vk_tonemap.c`); `vk_fsr.c` runs AMD FSR 1
   (EASU, RCAS) on the present when the window is larger than the picture.

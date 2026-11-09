@@ -28,6 +28,7 @@ static struct {
     PFN_nx2sl_available available;
     PFN_nx2sl_frame frame;
     PFN_nx2sl_present_marker marker;
+    PFN_nx2sl_output_frames output_frames;
     PFN_nx2sl_shutdown shutdown;
     PFN_vkCreateSwapchainKHR create_sc;
     PFN_vkDestroySwapchainKHR destroy_sc;
@@ -37,6 +38,16 @@ static struct {
 } S = {.wanted = -1};
 
 static void sl_line(const char *line) { rt_log("%s", line); }
+static int max_multiplier;
+
+int vk_dlssg_max_multiplier(void) { return __atomic_load_n(&max_multiplier, __ATOMIC_RELAXED); }
+
+int vk_dlssg_multiplier(void) {
+    int requested = cfg_int("NX2NAVI_DLSSG_MULTIPLIER");
+    int limit = vk_dlssg_max_multiplier();
+    if (requested < 2 || requested > NX2SL_MAX_MULTIPLIER) requested = 2;
+    return requested > limit ? limit : requested;
+}
 
 int vk_dlssg_wanted(void) {
     if (S.wanted < 0) {
@@ -71,6 +82,7 @@ int vk_dlssg_early(void) {
     S.available = (PFN_nx2sl_available)(void *)GetProcAddress(m, "nx2sl_available");
     S.frame = (PFN_nx2sl_frame)(void *)GetProcAddress(m, "nx2sl_frame");
     S.marker = (PFN_nx2sl_present_marker)(void *)GetProcAddress(m, "nx2sl_present_marker");
+    S.output_frames = (PFN_nx2sl_output_frames)(void *)GetProcAddress(m, "nx2sl_output_frames");
     S.shutdown = (PFN_nx2sl_shutdown)(void *)GetProcAddress(m, "nx2sl_shutdown");
     if (!ver || ver() != NX2SL_VERSION || !S.init || !S.gipa || !S.gdpa || !S.available || !S.frame || !S.marker) {
         rt_log("dlssg: nx2navi_dlssg.dll is from another build: DLSS Frame Generation off");
@@ -119,10 +131,12 @@ void vk_dlssg_device_ready(VkDevice dev) {
     S.acquire = (PFN_vkAcquireNextImageKHR)g(dev, "vkAcquireNextImageKHR");
     S.present = (PFN_vkQueuePresentKHR)g(dev, "vkQueuePresentKHR");
     S.active = S.create_sc && S.destroy_sc && S.images && S.acquire && S.present;
+    if (S.active) vk_dlaa_hudless_wanted = 1;
     rt_log("dlssg: %s", S.active ? "DLSS Frame Generation on the swapchain" : "the swapchain hooks are missing: off");
 }
 
 int vk_dlssg_active(void) { return S.active; }
+uint64_t vk_dlssg_output_frames(void) { return S.active && S.output_frames ? S.output_frames() : 0; }
 
 VkResult vk_dlssg_create_swapchain(VkDevice d, const VkSwapchainCreateInfoKHR *ci, VkSwapchainKHR *sc) {
     return S.create_sc(d, ci, NULL, sc);
@@ -136,38 +150,52 @@ VkResult vk_dlssg_acquire(VkDevice d, VkSwapchainKHR sc, uint64_t t, VkSemaphore
 VkResult vk_dlssg_present(VkQueue q, const VkPresentInfoKHR *pi) {
     S.marker(0);
     VkResult r = S.present(q, pi);
-    S.marker(1);
+    int limit = S.marker(1);
+    if (limit && limit != vk_dlssg_max_multiplier()) {
+        __atomic_store_n(&max_multiplier, limit, __ATOMIC_RELAXED);
+        rt_log("dlssg: supported frame generation multipliers up to %dx", limit);
+    }
     return r;
 }
 
-void vk_dlssg_frame(VkCommandBuffer cb, VkExtent2D ext) {
+void vk_dlssg_frame(VkCommandBuffer cb, VkExtent2D ext, const int to[4], int scene, const Nx2SlImage *hudless) {
     if (!S.active) return;
-    VkFfxImage d, m;
-    VkImageView dv, mvv;
+    VkFfxImage d = {0}, m = {0};
+    VkImageView dv = VK_NULL_HANDLE, mvv = VK_NULL_HANDLE;
+    VkImageUsageFlags usage[2] = {0};
     VkDlaaCamera c;
     float jx = 0, jy = 0;
     int reset = 0;
-    int have = vk_dlaa_fg_inputs(&d, &m, &jx, &jy, &reset) && vk_dlaa_fg_views(&dv, &mvv) && vk_dlaa_fg_camera(&c);
-    int on = have && !menu_is_open();
-    Nx2SlImage zd = {d.image, dv, d.format, d.width, d.height, VK_IMAGE_LAYOUT_GENERAL,
-                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT};
-    Nx2SlImage zm = {m.image, mvv, m.format, m.width, m.height, VK_IMAGE_LAYOUT_GENERAL,
-                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT};
+    int inputs = vk_dlaa_fg_inputs(&d, &m, &jx, &jy, &reset);
+    int views = inputs && vk_dlaa_fg_views(&dv, &mvv, usage);
+    int camera = vk_dlaa_fg_camera(&c);
+    int have = scene && views && camera;
+    int menu = menu_is_open();
+    int on = have && !menu;
+    static unsigned frames;
+    if (frames++ % 300 == 0)
+        rt_log("dlssg: inputs scene=%d depth/motion=%d views=%d camera=%d hudless=%d menu=%d",
+               scene, inputs, views, camera, hudless != NULL, menu);
+    Nx2SlImage zd = {d.image, dv, d.format, d.width, d.height, VK_IMAGE_LAYOUT_GENERAL, usage[0]};
+    Nx2SlImage zm = {m.image, mvv, m.format, m.width, m.height, VK_IMAGE_LAYOUT_GENERAL, usage[1]};
     Nx2SlCamera k;
     memset(&k, 0, sizeof k);
     if (have) {
         memcpy(k.view_to_clip, c.view_to_clip, 64), memcpy(k.clip_to_view, c.clip_to_view, 64);
         memcpy(k.clip_to_prev_clip, c.clip_to_prev_clip, 64), memcpy(k.prev_clip_to_clip, c.prev_clip_to_clip, 64);
         memcpy(k.pos, c.pos, 12), memcpy(k.up, c.up, 12), memcpy(k.right, c.right, 12), memcpy(k.fwd, c.fwd, 12);
-        k.znear = 0.1f, k.zfar = 1e8f, k.fov_y = c.fov_y, k.aspect = c.aspect;   // Ocarina's projection (vk_ffx.cpp)
+        k.znear = c.znear, k.zfar = c.zfar, k.fov_y = c.fov_y, k.aspect = c.aspect;
         k.jitter[0] = jx, k.jitter[1] = jy;
         k.mv_scale[0] = 1.0f / (float)d.width, k.mv_scale[1] = 1.0f / (float)d.height;   // render pixels
+        k.output_rect = (VkRect2D){{to[0], to[1]}, {(uint32_t)to[2], (uint32_t)to[3]}};
         k.reset = reset;
     }
-    S.frame(cb, have ? &zd : NULL, have ? &zm : NULL, NULL, have ? &k : NULL, ext.width, ext.height, on);
+    S.frame(cb, have ? &zd : NULL, have ? &zm : NULL, hudless, have ? &k : NULL, ext.width, ext.height,
+            on ? vk_dlssg_multiplier() : 0);
 }
 
 void vk_dlssg_release(void) {
     if (S.loaded > 0 && S.shutdown) S.shutdown();
     S.active = 0;
+    __atomic_store_n(&max_multiplier, 0, __ATOMIC_RELAXED);
 }

@@ -61,7 +61,7 @@ static const char *const known[] = {
     "SWKBD_TEST", "TAA", "TEST_PAD", "TEST_PAD_AT", "TEST_PREPARE_SHADERS", "TEX_ALIAS", "TEX_MEMO", "TEX_VRAM_PRESSURE", "TIMER_1MS", "TRACE", "TXD_TRANSPOSE", "UBO_SNAPSHOT", "UPSCALER", "VK_DYN_A2C", "VK_DYN_VERTEX", "VK_NOOPT", "VK_NO_FLOAT64",
     "VK_PRESENT", "VK_RECORDER", "VK_SSBO_ALIGN", "VK_SUBGROUP", "VK_SUBGROUP_PIN", "VK_VALIDATION", "VOLUME", "VRAM_HEADROOM", "VS_OUTS",
     "WALK_KEY", "WALK_SCALE", "WB_EXACT", "WB_FENCE_LIMIT", "WB_MERGE", "WINDOW_SIZE", "XLATE", "XLATE_ID", "XLATE_KEEP", "XLATE_PROCS",
-    "ZSTD_CHECK", "ZSTD_NATIVE",
+    "ZSTD_CHECK", "ZSTD_NATIVE", "DLSSG_MULTIPLIER",
 };
 
 // The nx2navi.ini section a key cfg_set may write goes to when the file lacks it (nx2navi.ini.example's sections).
@@ -76,6 +76,7 @@ static const struct { const char *key, *section; } sections[] = {
     {"COLOR_GAMMA", "display"}, {"HDR", "display"}, {"HDR_PEAK_NITS", "display"}, {"HDR_GAME_NITS", "display"},
     {"HDR_UI_NITS", "display"}, {"HDR_HUE", "display"}, {"SHADOW_RES", "display"},
     {"DLAA", "display"}, {"DLSS", "display"}, {"DLSS_PRESET", "display"}, {"DLSS_CHAR_MASK", "display"}, {"FXAA", "display"},
+    {"FRAMEGEN", "display"}, {"DLSSG_MULTIPLIER", "display"},
     {"DEVICE_PROFILE", "display"}, {"ASSUME_FOCUS", "display"},
     {"DISCORD_RPC", "discord"}, {"DISCORD_APP_ID", "discord"}, {"DISCORD_IMAGE", "discord"},
     {"SHADOW_SCALE", "display"}, {"SHADOW_RANGE", "display"}, {"CONTACT_SHADOWS", "display"},
@@ -121,6 +122,7 @@ static const CfgMeta metas[] = {
     {"DLAA", "0", "0|1", RESTART}, {"DLSS", "dlaa", "dlaa|quality|balanced|performance|ultra_performance", LIVE},
     {"DLSS_PRESET", "default", "default|k|j", LIVE}, {"TAA", "dlss", "dlss|fsr3", RESTART},   // vk_dlaa.c fsr3
     {"FRAMEGEN", "off", "off|fsr3|dlss", RESTART},   // vk_fg.cpp, vk_dlssg.c
+    {"DLSSG_MULTIPLIER", "2", "2|3|4|5|6", LIVE},
     {"DLSS_CHAR_MASK", "65", "0|35|65|100", LIVE}, {"FXAA", "1", "0|1", LIVE},
     {"GAME_ASPECT", "16:9", "16:9|window|21:9|32:9", RESTART},   // widescreen.c
     {"GAME_RES", "1440", "1440|1800|2160|2880|window", RESTART},   // widescreen.c: the picture's height
@@ -168,7 +170,7 @@ static const CfgMeta metas[] = {
     {"ASYNC_PREEMPT", "1", "0|1|2", RESTART}, {"REPLAY_ASYNC", "0", "0|1", RESTART},
     {"FREE_CORES", "0", "0|1", RESTART}, {"TIMER_1MS", "1", "0|1", RESTART},
     // shaders and pipelines
-    {"PIPE_WAIT", "default", "default|draw", RESTART}, {"PIPE_SKIP", "fullscreen", "strict|any|fullscreen", RESTART},
+    {"PIPE_WAIT", "default", "default|draw", RESTART}, {"PIPE_SKIP", "effects", "strict|any|fullscreen|effects", RESTART},
     {"LIB_PREBUILD", "1", "0|1", RESTART}, {"LIB_PREBUILD_THREADS", "", "1..64", RESTART},
     {"PIPE_PREBUILD", "1", "0|1", RESTART}, {"PREWARM_XLATE", "", "1..64", RESTART}, {"GPL", "1", "0|1", RESTART},
     // textures and memory

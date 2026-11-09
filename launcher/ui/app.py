@@ -640,7 +640,7 @@ class App:
             self.choose_dump()
             return
         gd = self.game_dir()
-        if free_gb(gd) < 31 and not (Path(gd) / 'romfs' / 'romfs.bin').is_file():
+        if free_gb(gd) < 31 and not (Path(gd) / 'romfs' / 'romfs.bin').is_file() and not build.shared_install(dump, gd):
             self.message = f'{drive_of(gd)} has {free_gb(gd):.0f} GB free; the game needs about 30 GB.'
             self.render()
             return

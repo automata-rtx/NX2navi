@@ -103,6 +103,7 @@ static struct {
     VkPipeline pipe[2];                  // bound per bind point: 0 graphics, 1 compute
     VkPipeState st;                      // the state vk_pipeline_set_dynamic last recorded
     int st_valid;
+    float jitter_x, jitter_y;            // offset of the last recorded viewport, in render pixels
     VkBuffer vb[17];                     // vertex buffers last bound
     VkDeviceSize vo[17], vsz[17], vstr[17];
     int vcls[17];                        // their pool class and pool record, for the census
@@ -1637,7 +1638,7 @@ static struct {
     VkDescriptorSet sets[POOL_SETS];
     uint64_t set_fence[POOL_SETS];     // the timeline value of the last submission that bound it
     uint64_t set_synced[POOL_SETS];    // the change-log position up to which it holds every write
-    int nsets, cur, all;               // all: the first fill, written to every set
+    int nsets, cur;
     uint64_t cur_fence;                // the submission sets[cur] serves
     uint32_t *log;                     // POOL_LOG entries
     uint64_t logn;                     // writes so far
@@ -1756,13 +1757,8 @@ static void pool_write_to(VkDescriptorSet set, uint32_t binding, uint32_t id, Vk
     pool_nw++;
 }
 
-// An entry whose wanted value PL.view / PL.samp already hold: into the current set, and into the log for the others
-// (the first fill goes into every set).
+// An entry whose wanted value PL.view / PL.samp already hold: into the current set, and into the log for the others.
 static void pool_write(uint32_t binding, uint32_t id, VkImageView view, VkSampler samp) {
-    if (PL.all) {
-        for (int i = 0; i < PL.nsets; i++) pool_write_to(PL.sets[i], binding, id, view, samp);
-        return;
-    }
     pool_write_to(PL.set, binding, id, view, samp);
     uint32_t e = binding * VK_POOL_TEX + id;
     PL.last[e] = PL.logn;
@@ -1916,6 +1912,38 @@ static int pool_fill(VkExec *ex, uint32_t id, uint32_t mask, uint64_t tok) {
 
 static void pool_sync_entries(VkExec *ex);
 
+// All empty slots of a binding resolve to the same descriptor. Fill contiguous ranges in every set
+// before the first bind, then let the normal change log track individual slots.
+static void pool_init_entries(VkExec *ex) {
+    uint64_t start = kern_now_ns();
+    for (uint32_t k = 0; k <= VK_POOL_KINDS; k++) {
+        int sampler = k == VK_POOL_KINDS;
+        uint32_t count = sampler ? VK_POOL_SAMP : VK_POOL_TEX;
+        VkDescriptorImageInfo value = {.sampler = Z.samp};
+        if (sampler) {
+            for (uint32_t i = 0; i < count; i++) PL.samp[i] = Z.samp;
+        } else {
+            GfxShaderRes r = {.type = pool_kind_type(k)};
+            VkImage image;
+            tex_info_full(ex, &r, 0, 0, 1, &value, &image);
+            if (!value.imageView) continue;
+            for (uint32_t i = 0; i < count; i++) PL.view[(size_t)k * count + i] = value.imageView;
+        }
+        for (uint32_t i = 0; i < POOL_WBATCH; i++) pool_ii[i] = value;
+        for (uint32_t base = 0; base < count; base += POOL_WBATCH) {
+            VkWriteDescriptorSet writes[POOL_SETS];
+            uint32_t n = count - base < POOL_WBATCH ? count - base : POOL_WBATCH;
+            for (int i = 0; i < PL.nsets; i++)
+                writes[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = PL.sets[i],
+                    .dstBinding = k, .dstArrayElement = base, .descriptorCount = n, .pImageInfo = pool_ii,
+                    .descriptorType = sampler ? VK_DESCRIPTOR_TYPE_SAMPLER : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE};
+            vkUpdateDescriptorSets(vk_ctx()->device, PL.nsets, writes, 0, NULL);
+            PL.writes += (uint64_t)n * PL.nsets;
+        }
+    }
+    rt_log("vk: initialized empty texture pool descriptors in %.1f ms", (kern_now_ns() - start) / 1e6);
+}
+
 static void pool_sync(VkExec *ex) {
     if (!PL.layout) vk_pool_set_layout();
     uint64_t from = 0, pre = PL.logn;
@@ -1951,16 +1979,13 @@ static void pool_sync_entries(VkExec *ex) {
     uint32_t used = __atomic_load_n(&vk_pool_kinds_used, __ATOMIC_RELAXED);
     uint32_t gen = vk_texture_slots_gen(), ep = vk_texture_epoch(), sg = vk_sampler_gen();
     if (PL.ready && !PL.retry && used == PL.kinds && gen == PL.gen && ep == PL.epoch && sg == PL.sgen) return;
+    uint64_t start = perf_begin();
     vk_texture_lock();
     uint32_t fresh = used & ~PL.kinds;
     int n = vk_texture_slot_count_locked();
     if (n > VK_POOL_TEX) n = VK_POOL_TEX;
     if (!PL.ready) {   // every entry a stand-in first: partially bound arrays are still read out of range by guests
-        PL.all = 1;
-        for (uint32_t id = 0; id < VK_POOL_TEX; id++) pool_fill(ex, id, 0xffffu, 0);
-        for (uint32_t id = 0; id < VK_POOL_SAMP; id++) PL.samp[id] = Z.samp, pool_write(VK_POOL_KINDS, id, VK_NULL_HANDLE, Z.samp);
-        pool_flush();
-        PL.all = 0;
+        pool_init_entries(ex);
         PL.ready = 1, PL.sgen = 0;
     }
     int retry = 0;   // slots whose texture the creation budget left: filled again by the next sync
@@ -2003,6 +2028,7 @@ static void pool_sync_entries(VkExec *ex) {
     pool_flush();
     vk_texture_unlock();
     PL.kinds = used, PL.gen = gen, PL.epoch = ep, PL.sgen = sg;
+    perf_end(PERF_TEX_POOL, start);
 }
 
 // ---- depth twins: colour images under a compare sampler in a compute shader
@@ -2699,13 +2725,16 @@ static VkViewport draw_viewport(VkExec *ex) {
     if (w < 1) w = 1;
     if (h < 1) h = 1;
     VkViewport v = {x, y + h, w, -h, ex->depth_range[0], ex->depth_range[1]};   // the y flip: negative height
-    vk_dlaa_viewport(ex, &v);   // the scene's draws move by the DLAA jitter
+    v.x += B.jitter_x, v.y += B.jitter_y;
     return v;
 }
 
-static void record_fixed(VkExec *ex) {
+static void record_fixed(VkExec *ex, int mesh) {
     VkCommandBuffer cb = ex->cb;
-    if (ex->dirty & VK_EXEC_DIRTY_VIEWPORT) {
+    float jx, jy;
+    vk_dlaa_draw_jitter(ex, mesh, &jx, &jy);
+    if ((ex->dirty & VK_EXEC_DIRTY_VIEWPORT) || jx != B.jitter_x || jy != B.jitter_y) {
+        B.jitter_x = jx, B.jitter_y = jy;
         VkViewport v = draw_viewport(ex);
         vkCmdSetViewportWithCount(cb, 1, &v);
         ex->recorded++;
@@ -2783,18 +2812,20 @@ static void bind_vertex_buffers(VkExec *ex) {
 //   buffer or g-buffer with a colour target the frame before did not use: half-resolution effect buffers in fights).
 //   Passes with none (volumes, LUTs, shadow layers seen for the first time) still wait, and so do passes whose only
 //   recent target is the depth buffer while a colour target is rendered for the first time (item icon captures).
-// fullscreen (2, default): as any, and full-screen draws into such passes are skipped instead of waiting from their
+// fullscreen (2): as any, and full-screen draws into such passes are skipped instead of waiting from their
 //   budget. A full-screen pass whose stage libraries are cold in the driver cache took 86 ms on average (up to 194 ms)
 //   in a fight on an RX 9070: three frames in a row each spent the 50 ms budget, and some of the draws were skipped
 //   after all. Skipping costs the pass for the frames until the pipeline is ready.
+// effects (3): also skip recurring lighting and effects passes whose colour targets rotate.
 static int pipe_skip_mode(void) {
     static int mode = -1;
     if (mode < 0) {
         const char *e = cfg_value("NX2NAVI_PIPE_SKIP");
-        mode = !strcmp(e, "strict") || !strcmp(e, "0") ? 0 : !strcmp(e, "fullscreen") || !strcmp(e, "2") ? 2 : 1;
-        static const char *const what[3] = {"only draws into per-frame passes (NX2NAVI_PIPE_SKIP=strict)",
+        mode = !strcmp(e, "effects") ? 3 : !strcmp(e, "strict") || !strcmp(e, "0") ? 0 : !strcmp(e, "fullscreen") || !strcmp(e, "2") ? 2 : 1;
+        static const char *const what[] = {"only draws into per-frame passes (NX2NAVI_PIPE_SKIP=strict)",
                                             "draws into passes with a target the previous frame rendered",
-                                            "those and full-screen draws (NX2NAVI_PIPE_SKIP=fullscreen)"};
+                                            "those and full-screen draws (NX2NAVI_PIPE_SKIP=fullscreen)",
+                                            "recurring passes including scene effects with rotating colour targets"};
         rt_log("vk_exec: draws skipped while their pipeline builds: %s", what[mode]);
     }
     return mode;
@@ -2940,7 +2971,7 @@ static int prepare_draw_ex(VkExec *ex, int prim, int32_t count, int restart, int
     // session. A draw into per-frame targets is skipped until they are ready and comes back next frame.
     int oneshot = -1, skip = pipe_skip_mode();   // -1: not looked up
     if (vs_wait || fs_wait || ts_wait) {
-        if (!(oneshot = !vk_exec_targets_recent(ex, skip >= 1)))   // skipped until ready
+        if (!(oneshot = !vk_exec_targets_recent(ex, skip >= 1, skip == 3)))   // skipped until ready
             return perf_count(PERF_CNT_SHADER_SKIP), draw_skipped(ex, mesh, SK_SHADER_PENDING);
         perf_count(PERF_CNT_ONESHOT_WAIT);
         if (vs_wait) vs = shader_for(ex, vst, &has_vs, NULL, 1);
@@ -2986,18 +3017,22 @@ static int prepare_draw_ex(VkExec *ex, int prim, int32_t count, int restart, int
         info = PM.info, pending = 0;
         p = __atomic_load_n(&info->pipeline, __ATOMIC_ACQUIRE);
     } else {
-        w0 = t0 ? t0 : wait_ms ? kern_now_ns() : 0;   // the clock is read only for draws that may wait
-        p = vk_pipeline_graphics_async(&s, &info, &pending, wait_ms);
+        p = vk_pipeline_graphics_lookup(&s, &info, &pending);
+        if (pending) {
+            // Decide who should check the driver cache before a worker can take the job.
+            // Ready draws above need neither a target history lookup nor a driver call.
+            why = oneshot > 0 ? "one-shot, shader" : wait_ms ? "full-screen" : NULL;
+            if (oneshot < 0 && !vk_exec_targets_recent(ex, skip >= 1, skip == 3)) {
+                perf_count(PERF_CNT_ONESHOT_WAIT);
+                why = "one-shot";
+                wait_ms = ONESHOT_WAIT_MS;
+            }
+            w0 = wait_ms ? kern_now_ns() : 0;
+            p = vk_pipeline_graphics_async(&s, &info, &pending, wait_ms);
+        }
         if (t0) {
             uint64_t spent = kern_now_ns() - t0;
             wait_left_ns = spent < wait_left_ns ? wait_left_ns - spent : 0;
-        }
-        why = oneshot > 0 ? "one-shot, shader" : wait_ms ? "full-screen" : NULL;
-        if (pending && oneshot < 0 && !vk_exec_targets_recent(ex, skip >= 1)) {
-            perf_count(PERF_CNT_ONESHOT_WAIT);
-            why = "one-shot";
-            if (!w0) w0 = kern_now_ns();
-            p = vk_pipeline_graphics_async(&s, &info, &pending, ONESHOT_WAIT_MS);
         }
         PM.valid = !pending && p && info;
         if (PM.valid) PM.s = s, PM.info = info;
@@ -3008,9 +3043,10 @@ static int prepare_draw_ex(VkExec *ex, int prim, int32_t count, int restart, int
         char tg[512];
         wait_logs++;
         vk_exec_targets_describe(ex, tg, sizeof tg);
-        rt_log("vk_exec: frame %llu: a draw waited %.1f ms for its pipeline (%s%s): %u vertices, pass %ux%u, %s",
+        rt_log("vk_exec: frame %llu: a draw waited %.1f ms for its pipeline (%s%s): %u vertices, pass %ux%u, %s, record %016llx",
                (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1, waited / 1e6, why,
-               pending ? ", skipped after all" : "", count, ex->pass_w, ex->pass_h, tg);
+               pending ? ", skipped after all" : "", count, ex->pass_w, ex->pass_h, tg,
+               (unsigned long long)vk_pipeline_record_id(&s));
     }
     if (pending) return draw_skipped(ex, mesh, SK_PIPE_PENDING);   // a background worker is building it: skipped until it is ready
     if (!p || !info) return draw_skipped(ex, mesh, SK_PIPE_FAILED);
@@ -3027,7 +3063,7 @@ static int prepare_draw_ex(VkExec *ex, int prim, int32_t count, int restart, int
         vk_mvsurvey_draw(ex);
         vk_mvprev_draw(ex);
     }
-    record_fixed(ex);
+    record_fixed(ex, mesh);
     repeat_stats(ex, info);
     bind_resources(ex, info);
     if (fbl & ex->fb_dirty) feedback_barrier(ex);
@@ -4205,10 +4241,14 @@ static void untranslated_dispatch_fallback(VkExec *ex) {
 #if NX2NAVI_TONEMAP_STANDIN
     // The square decode of the stored picture (vk_tonemap.c). Builds of round 24 lost the device with it: its descriptor
     // push did not go through the recorder (vk_rec.h rec_push; PORT-HANDOFF 7.12 item 11), which it now does.
-    VkImage tm = e5 && dst_view ? vk_tonemap_record(ex->cb, e5, VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, dw, dh) : VK_NULL_HANDLE;
-    if (tm) {   // the tonemapped picture, already at the target's size, then the same blit as below
+    int temporal = e5 && dst_view && vk_dlaa_tensor_ready(sw, sh);
+    uint32_t tw = temporal ? sw : dw, th = temporal ? sh : dh;
+    VkImageView decoded_view = VK_NULL_HANDLE;
+    VkImage tm = e5 && dst_view ? vk_tonemap_record(ex->cb, e5, VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, tw, th, &decoded_view) : VK_NULL_HANDLE;
+    if (tm) {   // decode at scene resolution for temporal reconstruction, or at display resolution for the blit
         B.pipe[1] = VK_NULL_HANDLE;   // the replay must bind its compute pipeline again
-        si = tm, sw = dw, sh = dh;
+        if (temporal && vk_dlaa_tensor_resolve(ex, tm, decoded_view, di, dw, dh)) return;
+        si = tm, sw = tw, sh = th;
         bl.srcOffsets[1] = (VkOffset3D){(int32_t)sw, (int32_t)sh, 1};
     }
 #else
@@ -4258,6 +4298,32 @@ static void untranslated_dispatch_fallback(VkExec *ex) {
     vk_exec_barrier(ex);
 }
 
+// Identify the first consumers of last frame's depth by the guest compute program. The
+// translated shaders and dispatch sizes vary with driver capabilities and render resolution.
+static void restore_lighting_depth(VkExec *ex) {
+    if (rt_nvn_api_version[0] < 200) return;
+    static uint64_t scene_program, fog_program;
+    uint64_t serial = ex->prog->serial;
+    if (!serial) return;
+    if (serial != scene_program && serial != fog_program) {
+        const uint8_t *control, *code;
+        uint32_t size;
+        if (!find_stage(ex->prog, NVN_STAGE_CS, &control, &code, &size)) return;
+        if (size == 7424 && nvn_hm_hash(code, size) == UINT64_C(0xecafe2d29b9ff1ac))
+            scene_program = serial;
+        else if (size == 36096 && nvn_hm_hash(code, size) == UINT64_C(0xf6aec5e12fe4bf8c))
+            fog_program = serial;
+        else return;
+    }
+    const uint64_t *textures = ex->tex[NVN_STAGE_CS];
+    if (serial == scene_program) {
+        vk_texture_restore_depth(ex->cb, VK_HISTORY_SCENE_DEPTH, NVN_HANDLE_TEX(textures[0]));
+    } else {
+        vk_texture_restore_depth(ex->cb, VK_HISTORY_SUN_DEPTH, NVN_HANDLE_TEX(textures[0]));
+        vk_texture_restore_depth(ex->cb, VK_HISTORY_FOG_INTERVALS, NVN_HANDLE_TEX(textures[3]));
+    }
+}
+
 static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     if (d->x <= 0 || d->y <= 0 || d->z <= 0) return;
     if (!ex->prog) return warn_once(W_PROGRAM, "a dispatch without a bound program is skipped");
@@ -4289,6 +4355,7 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     if (!p || !info) return warn_once(W_PIPELINE, "a compute pipeline could not be created: dispatches with it are skipped");
     if ((info->pool && !pool_on()) || shader_skipped(cs)) return;   // NX2NAVI_POOL=0, NX2NAVI_SKIP_SHADERS
     vk_exec_barrier(ex);   // ends the pass; earlier writes are visible to the shader
+    restore_lighting_depth(ex);
     bind_pipeline(ex, VK_PIPELINE_BIND_POINT_COMPUTE, p);
     c0_dim[0] = (uint32_t)d->x, c0_dim[1] = (uint32_t)d->y, c0_dim[2] = (uint32_t)d->z;
     twin_dispatch = 1;
@@ -4301,10 +4368,25 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     if (vk_dump_armed) vk_dump_dispatch(ex, cs, p, info, d);
 }
 
+static int scene_edge_weights(const prog_t *program) {
+    static uint64_t serial;
+    if (serial && program->serial == serial) return 1;
+    const uint8_t *control, *code;
+    uint32_t size;
+    if (!find_stage(program, NVN_STAGE_CS, &control, &code, &size) || size != 21248 ||
+        nvn_hm_hash(code, size) != UINT64_C(0x815a22688cc1a91c)) return 0;
+    serial = program->serial;
+    rt_log("dlaa: using temporal AA in place of the scene edge blend");
+    return 1;
+}
+
 // DispatchComputeIndirect: vkCmdDispatchIndirect from the pool buffer. The shader reads the group counts from c0 0x200,
 // so they are copied there on the GPU, into a c0 range no other dispatch uses, before the dispatch.
 static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
     if (!ex->prog) return warn_once(W_PROGRAM, "a dispatch without a bound program is skipped");
+    // The game clears the edge weights before this indirect dispatch. Zero weights make
+    // the following packing pass preserve each pixel of the composited scene for DLSS.
+    if (vk_dlaa_replaces_edge_blend() && scene_edge_weights(ex->prog)) return;
     VkMemSpan ip;
     if (!vk_mem_resolve(d->ind, sizeof(VkDispatchIndirectCommand), &ip) || ip.offset % 4)
         return warn_once(W_INDIRECT, "indirect dispatch arguments at %#llx are not backed or not aligned: skipped", (unsigned long long)d->ind);

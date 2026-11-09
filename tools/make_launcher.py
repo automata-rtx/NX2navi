@@ -59,7 +59,7 @@ PINS = {
               'ac87609db3f715404dd41a989c2f1706ea1512f3d86217f938d11c63af8eb505'),
 }
 TOOLS = ('make_game.py', 'nup.py', 'romfs_index.py', 'check_content.py', 'hostmem.py', 'prepare_shaders.py',
-         'shader_census.py', 'shader_list.py', 'zstd_compat.py')
+         'shader_census.py', 'shader_passes.py', 'shader_list.py', 'zstd_compat.py')
 TOP = ('LICENSE', 'LICENSE-ADDITIONS', 'THIRD_PARTY_NOTICES.md', 'nx2navi.ini.example')
 SKIP_DIRS = {'__pycache__', '.pytest_cache', 'native'}
 SKIP_SUFFIXES = {'.o', '.obj', '.pyc', '.exe', '.dll', '.a', '.lib'}

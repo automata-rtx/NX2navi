@@ -5,6 +5,9 @@ import os
 import signal
 import subprocess
 import threading
+from pathlib import Path
+
+from .settings import Settings
 
 # Runs make_game.py with pydeps/ (zbic) and the script's folder first on sys.path; the embeddable Python's ._pth
 # file leaves both off.
@@ -20,12 +23,31 @@ def command(layout, args):
             '--events']
 
 
+def shared_install(dump, game_dir):
+    """Find the standard launcher's completed extraction for a side-by-side install of the same container."""
+    local = os.environ.get('LOCALAPPDATA')
+    if not local or not os.path.isfile(dump):
+        return None
+    path = Settings(Path(local) / 'Programs' / 'NX2navi' / 'data' / 'launcher.json')['game_dir']
+    if not path or Path(path).resolve() == Path(game_dir).resolve():
+        return None
+    st = os.stat(dump)
+    identity = f'nup {os.path.abspath(dump)} {st.st_size} {int(st.st_mtime)}'
+    state = build_state(path)
+    if state.get('input') == identity and all(name in state.get('steps', {}) for name in ('exefs', 'romfs')):
+        return path
+    return None
+
+
 def install_args(layout, dump, game_dir):
     dump = str(dump)
     if os.path.isdir(dump):
         src = ['--exefs', os.path.join(dump, 'exefs'), '--romfs', os.path.join(dump, 'romfs')]
     else:
         src = ['--nup', dump]
+        shared = shared_install(dump, game_dir)
+        if shared:
+            src.extend(['--reuse-from', shared])
     return [*src, '--out', str(game_dir), '--msys', str(layout.msys)]
 
 

@@ -52,6 +52,7 @@ extern "C" {
 #include "sysinfo.h"
 #include "ui/menu.h"
 #include "ui_text.h"
+#include "vk_dlssg.h"
 // host.h and vk.h pull in cpu.h, which is C only: the functions the menu needs from them, as declared there.
 void rt_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void vk_queue_lock(void);
@@ -867,13 +868,18 @@ static void row_framegen(void) {
     const char *names[] = {menu_text(UI_MENU_FRAMEGEN_OFF), "AMD FSR 3.1", "NVIDIA DLSS"};
     const char *v = cfg_value("NX2NAVI_FRAMEGEN");
     int cur = !strcmp(v, "fsr3") ? 1 : !strcmp(v, "dlss") ? 2 : 0;
-    // NVIDIA DLSS (vk_dlssg.c) is listed only while it is set: Streamline now starts and takes the swapchain, but presents
-    // no generated frames yet (one presented per frame, status OK)
-    int n = cur == 2 ? 3 : 2;
+    int n = dlss || cur == 2 ? 3 : 2;
     int nv = opt_choice_index("NX2NAVI_FRAMEGEN", UI_MENU_FRAMEGEN, names, n, cur, 0,
                               dlss ? UI_MENU_FRAMEGEN_DESC : UI_MENU_FRAMEGEN_DESC_FSR,
                               menu_text(dlss ? UI_MENU_FRAMEGEN_NOTE : UI_MENU_FRAMEGEN_NOTE_FSR));
     if (nv >= 0 && nv < n) opt_apply("NX2NAVI_FRAMEGEN", values[nv]);
+    int limit = vk_dlssg_max_multiplier();
+    if ((nv >= 0 ? nv : cur) == 2 && limit >= 2) {
+        static const char *const factors[] = {"2", "3", "4", "5", "6"};
+        static const char *const labels[] = {"2×", "3×", "4×", "5×", "6×"};
+        opt_choice_list("NX2NAVI_DLSSG_MULTIPLIER", UI_MENU_DLSSG_MULTIPLIER, factors, labels,
+                        limit - 1, UI_MENU_DLSSG_MULTIPLIER_DESC, vk_dlssg_multiplier() - 2);
+    }
 }
 
 // The picture's height (widescreen.c picture_height): the game's 1440 or more.
@@ -904,6 +910,9 @@ static void tab_screen(float scale) {
     if (wide_available()) row_game_res();
     row_upscaling();
     row_framegen();
+    static const UiTextId skip[] = {UI_MENU_PIPE_SKIP_STRICT, UI_MENU_PIPE_SKIP_ANY, UI_MENU_PIPE_SKIP_FULLSCREEN,
+                                    UI_MENU_PIPE_SKIP_EFFECTS};
+    opt_choice("NX2NAVI_PIPE_SKIP", UI_MENU_PIPE_SKIP, skip, 4, UI_MENU_PIPE_SKIP_DESC);
     row_hdr();
     // The sharpening runs under FSR 1 (vk_fsr.c vk_fsr_record, RCAS) and FSR 3.1 (vk_ffx.cpp, its own RCAS); with
     // bilinear or DLSS the slider would do nothing

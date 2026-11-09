@@ -799,7 +799,7 @@ static int put_picture(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat 
 static volatile double g_out_fps;
 static void output_rate(void) {
     static uint64_t t0, n0;
-    uint64_t n = vk_fg_presents(g_sc), t = plat_now_ns();
+    uint64_t n = vk_dlssg_active() ? vk_dlssg_output_frames() : vk_fg_presents(g_sc), t = plat_now_ns();
     if (!n) { g_out_fps = 0, t0 = 0; return; }
     if (!t0 || n < n0) { t0 = t, n0 = n; return; }
     if (t - t0 >= 500000000ull) g_out_fps = (double)(n - n0) * 1e9 / (double)(t - t0), t0 = t, n0 = n;
@@ -811,13 +811,16 @@ static VmaAllocation g_hl_mem;
 static VkImageView g_hl_view;
 static uint32_t g_hl_w, g_hl_h;
 static VkFormat g_hl_fmt;
+static const VkImageUsageFlags g_hl_usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
 
-static VkImage hudless_record(VkCommandBuffer cb, unsigned slot, int w, int h, const int rect[4], const int to[4], int general) {
+static VkImage hudless_record(VkCommandBuffer cb, unsigned slot, int w, int h, const int rect[4], const int to[4]) {
     VkImage pic;
     VkImageView pv;
     uint32_t pw, ph;
     VkFormat pf;
-    if (!vk_fg_active() || !vk_dlaa_fg_hudless(&pic, &pv, &pw, &ph, &pf) || (int)pw != w || (int)ph != h)
+    if ((!vk_fg_active() && !vk_dlssg_active()) || !vk_dlaa_fg_hudless(&pic, &pv, &pw, &ph, &pf) ||
+        (int)pw != w || (int)ph != h)
         return VK_NULL_HANDLE;
     VkCtx *c = vk_ctx();
     if (g_hl && (g_hl_w != g_sc_ext.width || g_hl_h != g_sc_ext.height || g_hl_fmt != g_sc_fmt)) {
@@ -830,8 +833,7 @@ static VkImage hudless_record(VkCommandBuffer cb, unsigned slot, int w, int h, c
         VkImageCreateInfo ii = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = g_sc_fmt,
                                 .extent = {g_sc_ext.width, g_sc_ext.height, 1}, .mipLevels = 1, .arrayLayers = 1,
                                 .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
-                                .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                                         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT};
+                                .usage = g_hl_usage};
         VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
         if (vmaCreateImage(c->vma, &ii, &ai, &g_hl, &g_hl_mem, NULL) != VK_SUCCESS) return g_hl = VK_NULL_HANDLE;
         VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = g_hl,
@@ -855,7 +857,7 @@ static VkImage hudless_record(VkCommandBuffer cb, unsigned slot, int w, int h, c
     }
     // the steps' per-slot views of their source: a slot of its own (the presented picture's views stay valid for this
     // command buffer); with HDR the PQ encode as for the presented float picture
-    put_picture(cb, slot + FRAMES, pic, pf, w, h, rect, g_hl, to, general);
+    put_picture(cb, slot + FRAMES, pic, pf, w, h, rect, g_hl, to, 1);   // vk_dlaa.c keeps pic in GENERAL
     sync_barrier(cb, g_hl, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                  VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                  VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
@@ -984,7 +986,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     // Frame generation without the HUD in its generated frames: the picture as it would be without the HUD (vk_dlaa.c,
     // DLSS's or FSR 3.1's output before the HUD was drawn over it) goes through the same steps into an image of the
     // swapchain's size, which frame generation compares with the presented one to find the HUD and leave it unwarped
-    VkImage hudless = src ? hudless_record(cb, slot, w, h, rect, to, general) : VK_NULL_HANDLE;
+    VkImage hudless = src ? hudless_record(cb, slot, w, h, rect, to) : VK_NULL_HANDLE;
     static int show_hl = -1;   // NX2NAVI_FG_HUDLESS_SHOW=1 (test): the HUD-less picture on screen instead
     if (show_hl < 0) show_hl = cfg_get("NX2NAVI_FG_HUDLESS_SHOW") && !strcmp(cfg_get("NX2NAVI_FG_HUDLESS_SHOW"), "1");
     if (hudless && show_hl) {
@@ -1043,7 +1045,11 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     }
     if (src) vk_fg_frame(cb, g_sc, g_sc_fmt, g_sc_ext, hudless, g_hl_view, to);   // frame generation: this frame's preparation
     if (src) output_rate();
-    if (src) vk_dlssg_frame(cb, g_sc_ext);                // DLSS Frame Generation: constants and tags (vk_dlssg.c)
+    if (vk_dlssg_active()) {
+        Nx2SlImage color = {hudless, g_hl_view, g_sc_fmt, g_sc_ext.width, g_sc_ext.height,
+                            VK_IMAGE_LAYOUT_GENERAL, g_hl_usage};
+        vk_dlssg_frame(cb, g_sc_ext, to, src != VK_NULL_HANDLE, hudless && g_hl_view ? &color : NULL);
+    }
     sync_barrier(cb, dst, last, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, last_stage, last_write, VK_PIPELINE_STAGE_2_NONE, 0);
     vk_crumb(cb, VK_CRUMB_PRESENT_END, crumb);
     vkEndCommandBuffer(cb);

@@ -52,8 +52,10 @@
 # Draws whose pipeline is still building: default waits on a reserved worker; draw is the previous scheduling.
 # pipe_wait = default
 # Which draws are dropped instead of waiting for their pipeline: strict (only draws into per-frame passes), any (also
-# draws into passes whose target the previous frame rendered) or fullscreen (those and full-screen draws).
-# pipe_skip = fullscreen
+# draws into passes whose target the previous frame rendered), fullscreen (those and full-screen draws), or effects
+# (also recurring lighting and effects passes with fresh colour targets). Effects leaves pipeline linking to the
+# background workers for skipped draws. A missing draw appears when the game issues it again after compilation.
+# pipe_skip = effects
 # Build shader stage libraries in the background ahead of time, and the threads for it (1 to 16; default: a quarter of
 # the CPU threads).
 # lib_prebuild = 1
@@ -204,6 +206,11 @@
 # to match). They apply only with dlaa = 1 and the DLSS model next to the executable; otherwise the scene follows
 # render_scale. Changes while the game runs take effect at once.
 # dlss = dlaa
+# Frame generation provider (off, fsr3 or dlss). Changing providers requires a restart.
+# framegen = off
+# DLSS output frames per rendered frame, including the original. Choose 2 through 6.
+# The Screen menu offers the multipliers supported by your GPU and driver. Changes apply live.
+# dlssg_multiplier = 2
 # The DLSS model: default (NVIDIA's advice per mode: K for dlaa, quality and balanced, M for performance, L for
 # ultra_performance), k (K in every mode) or j (the other transformer model: slightly less ghosting behind moving
 # characters, a little more flicker). Any other model by its letter, a to m: on slower RTX cards the older model e is

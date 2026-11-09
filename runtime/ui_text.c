@@ -37,6 +37,8 @@ typedef struct { const char *lang; const char *const *text; } Row;
 #endif
 
 static const char *const text_en[UI_TEXT_COUNT] = {
+    [UI_MENU_DLSSG_MULTIPLIER] = "DLSS frame multiplier",
+    [UI_MENU_DLSSG_MULTIPLIER_DESC] = "Output frames per rendered frame, including the original. Changes apply when you resume.",
     SWKBD("Text entry", "Enter a name", "Horse", "OK", "Cancel", "Controller: A = OK, B = Cancel"),
 
     [UI_MENU_TITLE] = "Settings",
@@ -372,7 +374,8 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_PIPE_WAIT_DESC] = "Default keeps the current scheduling with a reserved worker for waiting draws; Old (draw) uses the previous scheduling.",
     [UI_MENU_PIPE_WAIT_DEFAULT] = "Default", [UI_MENU_PIPE_WAIT_DRAW] = "Old (draw)",
     [UI_MENU_PIPE_SKIP] = "Draws skipped while a pipeline builds",
-    [UI_MENU_PIPE_SKIP_DESC] = "Which draws are dropped instead of waiting for their pipeline.",
+    [UI_MENU_PIPE_SKIP_DESC] = "Recurring scene effects can briefly disappear while their shaders and pipelines compile in the background. One-time passes still wait.",
+    [UI_MENU_PIPE_SKIP_EFFECTS] = "Recurring scene effects",
     [UI_MENU_PIPE_SKIP_STRICT] = "Strict", [UI_MENU_PIPE_SKIP_ANY] = "Any",
     [UI_MENU_PIPE_SKIP_FULLSCREEN] = "Fullscreen passes",
     [UI_MENU_LIB_PREBUILD] = "Stage library prebuild",
@@ -510,6 +513,8 @@ static const char *const text_en[UI_TEXT_COUNT] = {
 };
 
 static const char *const text_ru[UI_TEXT_COUNT] = {
+    [UI_MENU_DLSSG_MULTIPLIER] = "Множитель кадров DLSS",
+    [UI_MENU_DLSSG_MULTIPLIER_DESC] = "Число выводимых кадров на один отрисованный, включая исходный кадр. Изменения вступают в силу при возврате в игру.",
     SWKBD("Ввод текста", "Введите имя", "Лошадь", "ОК", "Отмена", "Контроллер: A — ОК, B — отмена"),
 
     [UI_MENU_TITLE] = "Настройки",
@@ -848,6 +853,7 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_PIPE_SKIP_DESC] = "Какие отрисовки отбрасываются, а не ждут свой конвейер.",
     [UI_MENU_PIPE_SKIP_STRICT] = "Строго", [UI_MENU_PIPE_SKIP_ANY] = "Любые",
     [UI_MENU_PIPE_SKIP_FULLSCREEN] = "Полноэкранные проходы",
+    [UI_MENU_PIPE_SKIP_EFFECTS] = "Повторяющиеся эффекты сцены",
     [UI_MENU_LIB_PREBUILD] = "Предсборка библиотек стадий",
     [UI_MENU_LIB_PREBUILD_DESC] = "Заранее собирает библиотеки стадий шейдеров в фоне.",
     [UI_MENU_LIB_PREBUILD_THREADS] = "Потоки предсборки библиотек",
@@ -965,6 +971,8 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
 };
 
 static const char *const text_pt_br[UI_TEXT_COUNT] = {
+    [UI_MENU_DLSSG_MULTIPLIER] = "Multiplicador de quadros DLSS",
+    [UI_MENU_DLSSG_MULTIPLIER_DESC] = "Quadros exibidos por quadro renderizado, incluindo o original. A mudança entra em vigor ao voltar ao jogo.",
     SWKBD("Inserir texto", "Insira um nome", "Cavalo", "OK", "Cancelar", "Controle: A = OK, B = Cancelar"),
 
     [UI_MENU_TITLE] = "Configurações",
@@ -1199,6 +1207,7 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_PIPE_SKIP_DESC] = "Quais desenhos são descartados em vez de esperar pelo seu pipeline.",
     [UI_MENU_PIPE_SKIP_STRICT] = "Estrito", [UI_MENU_PIPE_SKIP_ANY] = "Qualquer",
     [UI_MENU_PIPE_SKIP_FULLSCREEN] = "Passes de tela cheia",
+    [UI_MENU_PIPE_SKIP_EFFECTS] = "Efeitos recorrentes da cena",
     [UI_MENU_LIB_PREBUILD] = "Pré-montagem das bibliotecas de estágio",
     [UI_MENU_LIB_PREBUILD_DESC] = "Monta antes, em segundo plano, as bibliotecas de estágio dos shaders.",
     [UI_MENU_LIB_PREBUILD_THREADS] = "Threads da pré-montagem das bibliotecas",
@@ -1443,6 +1452,8 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
 // when the menu language is zh-Hans (ui_text.h menu_text). The rows are fixed width, so the strings stay close to the
 // English length; an id without a Chinese entry falls back to English.
 static const char *const text_zh_hans[UI_TEXT_COUNT] = {
+    [UI_MENU_DLSSG_MULTIPLIER] = "DLSS 帧生成倍率",
+    [UI_MENU_DLSSG_MULTIPLIER_DESC] = "每个渲染帧对应的输出帧数，包含原始帧。返回游戏后生效。",
     SWKBD("文字输入", "请输入名字", "马儿", "确定", "取消", "手柄：A 确定，B 取消"),
 
     [UI_MENU_TITLE] = "设置",
@@ -1774,6 +1785,7 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_PIPE_SKIP_STRICT] = "严格",
     [UI_MENU_PIPE_SKIP_ANY] = "任意",
     [UI_MENU_PIPE_SKIP_FULLSCREEN] = "全屏通道",
+    [UI_MENU_PIPE_SKIP_EFFECTS] = "重复绘制的场景效果",
     [UI_MENU_LIB_PREBUILD] = "阶段库预构建",
     [UI_MENU_LIB_PREBUILD_DESC] = "在后台提前构建着色器阶段库。",
     [UI_MENU_LIB_PREBUILD_THREADS] = "阶段库预构建线程数",

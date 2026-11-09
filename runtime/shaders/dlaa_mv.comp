@@ -15,9 +15,10 @@
 // Each pixel's view distance is also kept for the next frame (depth_out; depth_prev is last frame's, pc.zprev_ok 1 when
 // it holds one). With pc.zfit > 0 (a frame without object motion and without the class buffer: Ocarina's) the vector is
 // checked against it. The camera's motion predicts how far the surface was last frame at the place it came from; where
-// last frame's depth there disagrees, the surface moved on its own. The commonest such surface is the character the
-// camera follows, which stays where it is on screen: when last frame's depth at the same pixel agrees, the vector is
-// zero instead. Either way such a pixel gets the bias mask (pc.zmask), so DLSS takes this frame's colour where its
+// last frame's depth there disagrees, the history may hold a different surface. A nearer previous depth can simply
+// mean the background was hidden; its camera vector still describes the surface. A foreground surface in front of
+// the predicted history can be the character the camera follows. If its distance also matches at the same screen
+// position, use zero motion for it. Either mismatch gets the bias mask (pc.zmask), so DLSS takes this frame's colour where its
 // history holds something else (the trail behind a running Link). pc.dz: the projection's depth terms (rows 2 and 3,
 // columns 2 and 3) that take ndc depth back to view distance.
 layout(local_size_x = 8, local_size_y = 8) in;
@@ -40,6 +41,7 @@ layout(push_constant) uniform P {
     float zprev_ok;// 1: depth_prev holds last frame's view distances at this size
     vec4 dz;       // the projection's [2][2], [2][3], [3][2], [3][3] (row-major)
     float zmask;   // the depth check's mask value (0: the vectors are checked, no mask)
+    vec2 prev_jitter; // offset in the previous depth and character images
 } pc;
 
 // View distance from ndc depth; 0 for the sky and other points at or past the far plane.
@@ -50,7 +52,7 @@ float dist(float zn) {
     return abs(z) < 1e7 ? abs(z) : 0.0;
 }
 
-// How far last frame's distance near window position w is from the distance expected there, relative: the closest of
+// Signed relative difference (previous distance minus expected distance) of the closest match among
 // the 3x3 pixels around it, so a reprojection that lands a pixel across a silhouette (foliage, a roof's edge) is not
 // taken for motion. 0 off screen (nothing to compare: the surface just came into view, DLSS handles that), 1e9 where
 // last frame had only sky there.
@@ -61,7 +63,10 @@ float miss(vec2 w, float expect) {
     for (int dy = -1; dy <= 1; dy++)
         for (int dx = -1; dx <= 1; dx++) {
             float was = imageLoad(depth_prev, clamp(q + ivec2(dx, dy), ivec2(0), hi)).r;
-            if (was > 0.0) best = min(best, abs(was - expect) / expect);
+            if (was > 0.0) {
+                float error = (was - expect) / expect;
+                if (abs(error) < abs(best)) best = error;
+            }
         }
     return best;
 }
@@ -96,10 +101,11 @@ void main() {
         // (sub-pixel position and the depth buffer's precision); a character a step away from the wall behind it is
         // 10 % and more
         const float TOL = 0.04;
-        float cam = there > 0.0 ? miss(win + mv, there) : 1e9;
-        if (cam > TOL) {
+        vec2 previous = win + pc.prev_jitter;
+        float cam = there > 0.0 ? miss(previous + mv, there) : 0.0;
+        if (abs(cam) > TOL) {
             moved = 1.0;
-            if (miss(win, here) < TOL) mv = vec2(0.0);   // it kept its place on screen: the followed character
+            if (cam > TOL && abs(miss(previous, here)) < TOL) mv = vec2(0.0);
         }
     }
     imageStore(mv_out, p, vec4(mv, 0.0, 0.0));
@@ -109,7 +115,7 @@ void main() {
     imageStore(chars_out, p, vec4(ch));
     float was = 0.0;
     if (pc.prev_ok > 0.5) {
-        ivec2 q = ivec2(floor(win + mv)), hi = ivec2(pc.size) - 1;
+        ivec2 q = ivec2(floor(win + mv + pc.prev_jitter)), hi = ivec2(pc.size) - 1;
         for (int dy = -1; dy <= 1; dy++)
             for (int dx = -1; dx <= 1; dx++)
                 was = max(was, imageLoad(chars_prev, clamp(q + ivec2(dx, dy), ivec2(0), hi)).r);

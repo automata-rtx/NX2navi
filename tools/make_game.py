@@ -15,8 +15,8 @@ Steps, each skipped when a run before finished it for the same inputs (state in 
   4. lift     recomp/gen.py with recomp/patches-v111.txt -> <out>/build-cache/lift, plus the two SDK bring-up fixes
   5. compile  the lifted C and runtime/ with MSYS2's clang, linked into <out>/ocarina.exe; the MSYS2 DLLs it loads,
               the shader translator and romfs-index.bin beside it
-  6. shaders  every shader in the game files (tools/prepare_shaders.py, default bind state) translated, and each one's
-              GPU driver build done once, so play does not stop to compile them (`ocarina.exe --prepare-shaders`)
+  6. shaders  translates shader variants from the game files and warms stage libraries, compute pipelines and
+              complete graphics pipelines previously recorded by this install (`ocarina.exe --prepare-shaders`)
 
 The exefs and romfs steps depend only on the game files; lift and compile depend on this kit's code too. A newer kit
 therefore lifts and compiles again but keeps the unpacked game files, and --rebuild needs no game files at all. The
@@ -307,9 +307,16 @@ def flat_nso(raw, name):
     return bytes(out)
 
 
-def step_exefs(src, out):
-    dst = out / 'exefs'
+def extraction_dir(out, name):
+    dst = out / name
+    if dst.resolve() != out.resolve() / name:
+        fail(f'{dst} is shared with another install. Choose a fresh game folder to extract a different dump.')
     dst.mkdir(parents=True, exist_ok=True)
+    return dst
+
+
+def step_exefs(src, out):
+    dst = extraction_dir(out, 'exefs')
     for i, name in enumerate(EXEFS_FILES):
         raw = src.read_exefs(name)
         data = flat_nso(raw, name) if name in MODULES else raw
@@ -325,8 +332,7 @@ def exefs_digest(out):
 # ---------------------------------------------------------------- romfs
 
 def step_romfs(src, out, jobs):
-    dst = out / 'romfs'
-    dst.mkdir(parents=True, exist_ok=True)
+    dst = extraction_dir(out, 'romfs')
     files = sorted(src.romfs, key=lambda e: e[0].encode())
     total = sum(src.romfs_size(ref) for _, ref in files)
     free = shutil.disk_usage(dst).free
@@ -986,7 +992,7 @@ def step_shaders(out):
     if subprocess.run(cmd).returncode:
         fail('preparing the shaders failed (the lines above say why); the game still runs, compiling shaders as it '
              'meets them. Run the build again to retry this step')
-    for seed in ('seed-programs.bin', 'seed-answers.bin'):   # translated now: the shader cache holds them
+    for seed in ('seed-programs.bin', 'seed-answers.bin', 'seed-mesh.bin', 'seed-vertex.bin', 'seed-passes.bin'):
         (out / seed).unlink(missing_ok=True)
 
 
@@ -1034,7 +1040,7 @@ def cpu_tag():
 
 # Changes to these inputs can alter the seed, stored translations, or Vulkan pipelines built by preparation.
 # The install uses prepare_shaders.py --no-list. If it starts consuming a variant list, include that list here.
-SHADER_INPUTS = ('tools/prepare_shaders.py', 'tools/shader_census.py', 'tools/zstd_compat.py',
+SHADER_INPUTS = ('tools/prepare_shaders.py', 'tools/shader_census.py', 'tools/shader_passes.py', 'tools/zstd_compat.py',
                  'runtime/gfx_shader.c', 'runtime/gfx_shader_guess.c', 'runtime/gfx.h', 'runtime/vk_pipeline.c',
                  'runtime/vk_caps.c', 'runtime/vk_device.c', 'runtime/vk_formats.c', 'runtime/vk.h',
                  'runtime/vk_gpa.c', 'runtime/vk_gpa.h', 'runtime/nvn_hmap.h', 'runtime/nvn_obj.h', 'runtime/tex.h')
@@ -1066,6 +1072,11 @@ def shader_outputs_present(out, cache):
         size = manifest.stat().st_size
         if header != struct.pack('<8sII', b'NX2NSPRP', 1, 36) or size <= 16 or (size - 16) % 36:
             return False
+        for filename, magic in (('mesh-programs.bin', b'NX2NMSID'), ('vertex-programs.bin', b'NX2NVSID')):
+            groups = out / filename
+            with groups.open('rb') as f:
+                if f.read(16) != struct.pack('<8sII', magic, 1, 96) or (groups.stat().st_size - 16) % 96:
+                    return False
         pack = cache / 'shader-cache.pack'
         if pack.is_file() and pack.stat().st_size > 0:
             return True
@@ -1088,6 +1099,54 @@ def step_key(step, identity, out=None):
             f'|cpu {cpu_tag()}|{tree_digest(KIT / "bin", ("nx2navi_xlate.id",))}')
 
 
+def reuse_extracts(source, out, src, steps):
+    """Adopt the completed extraction of the same container before starting work in a second game folder."""
+    identity = src.identity
+    if not source or not identity.startswith('nup '):
+        return
+    source = Path(source).resolve()
+    if source == out:
+        return
+    keys = {name: step_key(name, identity) for name in ('exefs', 'romfs')}
+    if all(steps.get(name) == key for name, key in keys.items()):
+        return
+    previous = load_state(source / 'build-cache' / 'state.json')
+    if previous.get('version') != STATE_VERSION or previous.get('input') != identity or any(
+            previous.get('steps', {}).get(name) != key for name, key in keys.items()):
+        return
+    # Keep an interrupted extraction in its own folder. A junction created before a previous run stopped is safe
+    # to adopt if it already resolves to the expected source.
+    for name in keys:
+        dst = out / name
+        if os.path.lexists(dst) and dst.resolve() != (source / name).resolve():
+            return
+    try:
+        for name in EXEFS_FILES:
+            raw = src.read_exefs(name)
+            expected = flat_nso(raw, name) if name in MODULES else raw
+            if sha256_file(source / 'exefs' / name) != sha256_bytes(expected):
+                return
+        index = json.loads((source / 'romfs' / 'index.json').read_text(encoding='utf-8'))
+        image = source / 'romfs' / 'romfs.bin'
+        if index.get('status') != 'pass' or image.stat().st_size != index.get('romfs_size'):
+            return
+        if sha256_file(image) != index.get('romfs_sha256'):
+            return
+    except (OSError, ValueError):
+        return
+    for name, key in keys.items():
+        dst = out / name
+        target = (source / name).resolve()
+        if not os.path.lexists(dst):
+            if os.name == 'nt':
+                import _winapi
+                _winapi.CreateJunction(str(target), str(dst))
+            else:
+                dst.symlink_to(target, target_is_directory=True)
+        steps[name] = key
+        say(f'  reusing {name} from {target}')
+
+
 def main():
     global EVENTS
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -1097,6 +1156,7 @@ def main():
     ap.add_argument('--rebuild', action='store_true',
                     help='build again from the game files the last run unpacked into --out (after a kit update)')
     ap.add_argument('--out', help='the folder for the finished game')
+    ap.add_argument('--reuse-from', help='reuse a finished install\'s extracted data when it was built from the same .nup')
     ap.add_argument('--check', action='store_true', help='only check the game\'s version; builds nothing')
     ap.add_argument('--msys', default=r'C:\msys64\ucrt64', help='MSYS2 UCRT64 folder (default C:\\msys64\\ucrt64)')
     ap.add_argument('--jobs', type=int, default=os.cpu_count() or 4, help='parallel compiles')
@@ -1141,6 +1201,12 @@ def main():
     cache.mkdir(parents=True, exist_ok=True)
     if state.get('version') != STATE_VERSION or state.get('input') != src.identity:
         state = {'version': STATE_VERSION, 'input': src.identity, 'steps': {}}
+    if not a.rebuild:
+        reuse_extracts(a.reuse_from, out, src, state['steps'])
+    for name in ('exefs', 'romfs'):
+        dst = out / name
+        if dst.resolve() != out / name and (not dst.is_dir() or state['steps'].get(name) != step_key(name, src.identity)):
+            fail(f'{dst} is shared and unavailable for this dump. Restore its source or select another game folder.')
     state['kit'] = kit_version()
     keep_awake()
     t0 = time.time()
