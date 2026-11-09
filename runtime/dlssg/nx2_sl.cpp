@@ -200,6 +200,7 @@ extern "C" NX2SL_API void nx2sl_submit(void *handle, int end) {
 }
 
 static void turn_off() {
+    g_ready_frames = 0;
     if (g_available != 1 || g_multiplier <= 0) return;
     sl::DLSSGOptions off{};
     off.mode = sl::DLSSGMode::eOff;
@@ -242,13 +243,13 @@ extern "C" NX2SL_API int nx2sl_frame(void *handle, VkCommandBuffer cb, const Nx2
     // Recomposition is an NGX feature creation option. Changing it on a HUD
     // draw or menu transition can recreate a feature still servicing a present.
     // Select it for this swapchain on its first interpolated scene.
-    if (multiplier && g_recompose < 0) g_recompose = ui && hudless;
+    bool have_ui = ui && hudless;
     // A persistent overlay or a different scene layout can change the
     // available UI inputs. Switch feature configuration on a fresh swapchain.
-    bool change = multiplier && g_recompose != static_cast<int>(ui && hudless);
+    bool change = multiplier && g_recompose >= 0 && g_recompose != static_cast<int>(have_ui);
     g_mismatched_ui_frames = change ? g_mismatched_ui_frames + 1 : 0;
     bool rebuild = g_mismatched_ui_frames == 60;
-    if (rebuild || (g_recompose > 0 && (!ui || !hudless))) multiplier = 0;
+    if (rebuild || (g_recompose > 0 && !have_ui)) multiplier = 0;
     // Drop interpolation on the first invalid frame. Resume once the scene has
     // settled so a fade or loading overlay cannot repeatedly recreate the feature.
     if (!multiplier) g_ready_frames = 0;
@@ -295,7 +296,10 @@ extern "C" NX2SL_API int nx2sl_frame(void *handle, VkCommandBuffer cb, const Nx2
         if (constants != sl::Result::eOk || tagged != sl::Result::eOk) {
             static int warnings;
             if (warnings++ < 8) say("dlssg: frame rejected: constants %d, resources %d", (int)constants, (int)tagged);
+            g_ready_frames = 0;
             multiplier = 0;
+        } else if (g_recompose < 0) {
+            g_recompose = have_ui;
         }
     }
     if (!multiplier) {
