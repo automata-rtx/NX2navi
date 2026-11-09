@@ -783,6 +783,37 @@ class MakeGameTest(Tmp):
         self.assertEqual(st['steps']['exefs'], self.mg.step_key('exefs', st['input']))
         self.assertNotIn(self.mg.kit_version(), st['steps']['romfs'])
 
+    def test_replaced_folder_inputs(self):
+        exefs, romfs = self.tmp / 'exefs', self.tmp / 'romfs'
+        exefs.mkdir()
+        romfs.mkdir()
+        for name in self.mg.EXEFS_FILES:
+            data = nso(bytes.fromhex(self.mg.MAIN_BUILD_ID)) if name == 'main' else nso()
+            (exefs / name).write_bytes(b'META' + bytes(256) if name == 'main.npdm' else data)
+        asset = romfs / 'sdk'   # Same relative name as the executable module.
+        asset.write_bytes(b'first')
+
+        def install():
+            code, events, lines = self.run_mg('--exefs', exefs, '--romfs', romfs, '--out', self.out,
+                                               '--msys', self.msys, '--until', 'romfs')
+            self.assertEqual(code, 0, lines)
+            return [e['step'] for e in events if e['ev'] == 'step' and e['state'] == 'skip']
+
+        self.assertEqual(install(), [])
+        self.assertEqual(install(), ['exefs', 'romfs'])
+        stamp = asset.stat().st_mtime_ns
+        asset.write_bytes(b'later')
+        os.utime(asset, ns=(stamp, stamp + 2_000_000_000))
+        install()
+        self.assertEqual((self.out / 'romfs' / 'romfs.bin').read_bytes()[:5], b'later')
+
+        module = exefs / 'sdk'
+        data = nso(size=0x400)
+        module.write_bytes(data)
+        install()
+        self.assertEqual((self.out / 'exefs' / 'sdk').read_bytes(), self.mg.flat_nso(data, 'sdk'))
+        self.assertEqual(install(), ['exefs', 'romfs'])
+
     def test_rebuild_without_build(self):
         code, ev, lines = self.run_mg('--rebuild', '--out', self.tmp / 'empty', '--msys', self.msys)
         self.assertEqual(code, 1)
