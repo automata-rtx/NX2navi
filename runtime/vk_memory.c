@@ -2182,7 +2182,7 @@ typedef struct {
     int nstg, cap;
 } Batch;
 
-enum { DEAD_IMAGE = 1, DEAD_IMAGE_VMA, DEAD_VIEW, DEAD_BUFFER_VMA };
+enum { DEAD_IMAGE = 1, DEAD_IMAGE_VMA, DEAD_VIEW, DEAD_BUFFER_VMA, DEAD_HOST };
 typedef struct { int kind; uint64_t handle; VmaAllocation alloc; uint64_t seq, tl; } Dead;
 
 static PlatRMutex cmd_lock;
@@ -2240,6 +2240,10 @@ static void collect_locked(VkCtx *c) {
     for (int i = 0; i < ndead; i++) {
         Dead *d = &dead[i];
         if (d->seq > done_seq || d->tl > tl) { dead[k++] = *d; continue; }
+        if (d->kind == DEAD_HOST) {   // not a Vulkan object: nothing for the recorder's handle check
+            free((void *)(uintptr_t)d->handle);
+            continue;
+        }
         rec_check_handle(d->kind == DEAD_VIEW ? REC_VIEW : d->kind == DEAD_BUFFER_VMA ? REC_BUFFER : REC_IMAGE, d->handle, 1,
                          d->tl, tl);
         switch (d->kind) {
@@ -2390,8 +2394,9 @@ static void defer(int kind, uint64_t handle, VmaAllocation alloc) {
     if (stamp && !rf) rf = vk_sync_issued() + 1;
     if (rf > tl) tl = rf;
     dead[ndead++] = (Dead){kind, handle, alloc, open_active ? open_b.seq : next_seq, tl};
-    rec_check_handle(kind == DEAD_VIEW ? REC_VIEW : kind == DEAD_BUFFER_VMA ? REC_BUFFER : REC_IMAGE, handle, 0, tl,
-                     vk_sync_fence_done());
+    if (kind != DEAD_HOST)
+        rec_check_handle(kind == DEAD_VIEW ? REC_VIEW : kind == DEAD_BUFFER_VMA ? REC_BUFFER : REC_IMAGE, handle, 0, tl,
+                         vk_sync_fence_done());
     plat_rmutex_unlock(&cmd_lock);
 }
 
@@ -2407,6 +2412,7 @@ void vk_defer_image(VkImage img, VmaAllocation alloc) {
     if (img) defer(alloc ? DEAD_IMAGE_VMA : DEAD_IMAGE, (uint64_t)(uintptr_t)img, alloc);
 }
 void vk_defer_view(VkImageView view) { if (view) defer(DEAD_VIEW, (uint64_t)(uintptr_t)view, NULL); }
+void vk_defer_free(void *p) { if (p) defer(DEAD_HOST, (uint64_t)(uintptr_t)p, NULL); }
 void vk_defer_buffer(VkBuffer buf, VmaAllocation alloc) {
     if (buf) defer(DEAD_BUFFER_VMA, (uint64_t)(uintptr_t)buf, alloc);
 }

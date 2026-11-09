@@ -11,7 +11,7 @@
 #include "host.h"
 #include "nvn_api.h"
 #include "tex.h"
-#include "vk.h"
+#include "vk_exec.h"
 #include "platform/platform.h"
 
 static uint64_t g_rng = 0x9E3779B97F4A7C15ull;
@@ -539,12 +539,21 @@ static int test_textures(pool_t *tpool, pool_t *phys) {
     if (read_back(&g, 0, gl, 0, "physical-pool RGBA8 WriteTexels")) return 1;
 
     // a slot of a finalized texture follows the live texture at the same storage
+    const VkTexImage *old = vk_texture_get(&b);
+    VkImage old_image = old->image;
     vk_texture_register(5, &b, NULL);
     vk_texture_release(&b);
     tex_t b2 = make_tex(tpool, 0x40000, 0x25, 16, 12, 1, 4);
     vk_texture_gpu_written(&b2);   // the slot follows the replacement when its GPU image owns the content
     const VkTexImage *live = vk_texture_get(&b2);
     VkImage live_img = live ? live->image : VK_NULL_HANDLE;
+    GCHECK(live && old->gone && old->record_id != live->record_id, "retired texture record not available during replay");
+    VkImageView late = vk_exec_target_view(old, old->format, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1, 0);
+    GCHECK(late, "retired image inaccessible before submission completes");
+    vk_texture_lock();
+    int stale_views = vk_exec_image_gone(old_image);
+    vk_texture_unlock();
+    GCHECK(!stale_views, "retired image view entered the cache");
     const VkTexImage *slot = vk_texture_by_id(5, NULL, NULL);
     GCHECK(live && slot && slot->image == live_img, "slot 5 does not follow the live texture at its storage");
     samp_par sp;

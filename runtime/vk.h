@@ -335,7 +335,10 @@ uint64_t vk_upload_flush(int wait);
 // Deferred destruction: freed once the upload batches recorded so far and the timeline value last noted have completed.
 void vk_defer_image(VkImage img, VmaAllocation alloc);   // alloc NULL: vkDestroyImage only
 void vk_defer_view(VkImageView view);
-void vk_exec_image_gone(VkImage image);   // destroy_tex, texture lock held: the replay's views of image go with it
+// free(p) once the GPU is past the submission being recorded, as vk_defer_image: a host record other threads may still
+// read (a destroyed texture's, vk_texture.c destroy_tex).
+void vk_defer_free(void *p);
+int vk_exec_image_gone(VkImage image);   // texture lock held: the replay's views of image go with it; returns how many
 void vk_defer_buffer(VkBuffer buf, VmaAllocation alloc);
 // ---- ASTC (vk_astc.c). NX2NAVI_ASTC = auto | gpu | native | cpu | check; see vk_astc.c.
 enum { VK_ASTC_CPU, VK_ASTC_GPU, VK_ASTC_NATIVE, VK_ASTC_CHECK };
@@ -393,6 +396,9 @@ typedef struct {
     uint8_t scale;                 // 1, or NX2NAVI_SHADOW_SCALE for a shadow map made larger than the game's (vk_texture.c
                                    // shadow_scale_of): width and height above are the larger ones, the game's regions
                                    // are multiplied by it
+    uint8_t gone;                  // destroyed (vk_texture.c destroy_tex, texture lock held): the record stays readable until
+                                   // the GPU is past the submission being recorded (vk_defer_free), as the replay and DLSS
+                                   // keep pointers to render targets across a command buffer; no view of it is cached
 } VkTexImage;
 // The window texture the backend presents (vk_backend.c): *image and *format become the float picture the game copied
 // into it, when the last draw into it was that copy and the swapchain is HDR10.

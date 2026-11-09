@@ -665,7 +665,8 @@ static void destroy_tex(Tex *e) {
     vk_exec_image_gone(e->pub.image);
     vk_defer_image(e->pub.image, e->alloc);
     free(e->snap);
-    free(e);
+    e->pub.gone = 1;   // replay can still hold this record until its submission finishes
+    vk_defer_free(e);
 }
 
 // Released entries with another descriptor at the same address are replaced; past RELEASED_MAX released entries the

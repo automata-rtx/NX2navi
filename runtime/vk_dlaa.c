@@ -1682,23 +1682,21 @@ int vk_dlaa_scene_resolve(VkExec *ex, uint64_t source, uint64_t destination) {
                 src->samples == 1 && dst->samples == 1 && src->type == VK_IMAGE_TYPE_2D && dst->type == VK_IMAGE_TYPE_2D &&
                 dst->width >= src->width && dst->height >= src->height && (dst->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT);
     VkExecTarget output = {0};
-    VkTexImage input = {0}, graded = {0};
+    VkImage input = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE, grade_target = VK_NULL_HANDLE;
     if (valid) {
         output = (VkExecTarget){.image = dst->image, .width = dst->width, .height = dst->height};
-        input = *src;
+        input = src->image;
+        view = vk_exec_target_view(src, src->format, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1, 0);
         if (vk_scene_grade.fence == ex->fence && vk_scene_grade.graded == src->image &&
             vk_scene_grade.raw != dst->image && (dst->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
-            graded = *dst;
+            grade_target = vk_exec_target_view(dst, dst->format, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1, 0);
         vk_texture_storage_bound_locked(dst);
     }
     vk_texture_unlock();
-    if (!valid) return 0;
-    VkImageView view = vk_exec_target_view(&input, input.format, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1, 0);
     if (!view) return 0;
     D.ended = D.done = D.tensor_scene = 1;
-    VkImageView grade_target = graded.image ? vk_exec_target_view(&graded, graded.format, VK_IMAGE_VIEW_TYPE_2D,
-        VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1, 0) : VK_NULL_HANDLE;
-    evaluate(ex, &output, input.image, view, input.format, grade_target);
+    evaluate(ex, &output, input, view, VK_FORMAT_B10G11R11_UFLOAT_PACK32, grade_target);
     vk_scene_grade.graded = VK_NULL_HANDLE;
     if (D.failed) return 0;
     static int told;

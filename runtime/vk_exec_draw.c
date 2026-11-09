@@ -659,10 +659,14 @@ static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, 
 // selectors, each below 8). The texture lock guards the tables, as for get_view; vk_exec_pass_begin may already hold it.
 VkImageView vk_exec_target_view(const VkTexImage *img, VkFormat format, VkImageViewType type, uint32_t aspect,
                                 uint32_t level, uint32_t base, uint32_t layers, int blocks) {
+    vk_texture_lock();   // destroy_tex sets gone and purges the image's views with it held
     ViewKey k = {img->image, format, type, aspect, level, 1, base, layers, blocks ? 0xfffffffeu : 0xffffffffu};
-    vk_texture_lock();
     if (!view_of.klen) nvn_hm_init(&view_of, sizeof(ViewKey)), nvn_hm_init(&views_by_image, sizeof(VkImage));
-    VkImageView view = (VkImageView)nvn_hm_get(&view_of, &k);
+    // A texture destroyed while a command buffer or DLSS still held it (img->gone): its image lives on until the GPU is
+    // past the submission being recorded (vk_defer_image), so a view for this use is made, and goes the same way. Cached,
+    // it outlived the image: Vulkan hands the handle to a later image, which then got the view of the dead image's memory
+    // and the GPU faulted reading it at the start of a pass ("read invalid", a 128x128 scene capture, #177).
+    VkImageView view = img->gone ? VK_NULL_HANDLE : (VkImageView)nvn_hm_get(&view_of, &k);
     if (!view) {
         VkImageViewCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = img->image,
                                     .viewType = type, .format = format, .subresourceRange = {aspect, level, 1, base, layers}};
@@ -671,6 +675,11 @@ VkImageView vk_exec_target_view(const VkTexImage *img, VkFormat format, VkImageV
         if (blocks) ci.pNext = &use;   // not the BC image's sampling and transfer usages
         if (vkCreateImageView(vk_ctx()->device, &ci, NULL, &view) != VK_SUCCESS)
             rt_fatal("vk: render target view (format %d) could not be created", (int)format);
+        if (img->gone) {
+            vk_defer_view(view);
+            vk_texture_unlock();
+            return view;
+        }
         ViewNode *n = malloc(sizeof *n);
         if (!n) rt_fatal("vk: out of memory");
         *n = (ViewNode){nvn_hm_get(&views_by_image, &img->image), k, view};
@@ -681,16 +690,18 @@ VkImageView vk_exec_target_view(const VkTexImage *img, VkFormat format, VkImageV
     return view;
 }
 
-void vk_exec_image_gone(VkImage image) {
+int vk_exec_image_gone(VkImage image) {
     vk_exec_bc_gone(image);
     vk_hdr_image_gone(image);
-    if (!views_by_image.klen) return;
-    for (ViewNode *n = nvn_hm_del(&views_by_image, &image), *next; n; n = next) {
+    if (!views_by_image.klen) return 0;
+    int purged = 0;
+    for (ViewNode *n = nvn_hm_del(&views_by_image, &image), *next; n; n = next, purged++) {
         next = n->next;
         nvn_hm_del(&view_of, &n->k);
         vk_defer_view(n->view);
         free(n);
     }
+    return purged;
 }
 
 // ---- program to shaders
