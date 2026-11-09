@@ -28,7 +28,7 @@ static PFN_vkCmdSetCheckpointNV set_checkpoint;
 static void pass_marks_init(VkCtx *c);
 
 static void buffer_init(VkCtx *c) {
-    write_marker = (PFN_vkCmdWriteBufferMarkerAMD)vkGetDeviceProcAddr(c->device, "vkCmdWriteBufferMarkerAMD");
+    write_marker = (PFN_vkCmdWriteBufferMarkerAMD)vk_dpa(c->device, "vkCmdWriteBufferMarkerAMD");
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 16,
                              .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
@@ -102,7 +102,7 @@ static void pass_marks_init(VkCtx *c) {
     const char *e = cfg_get("NX2NAVI_PASS_CRUMBS");
     int off = e && !strcmp(e, "0");
     set_checkpoint = c->has_nv_checkpoints
-                         ? (PFN_vkCmdSetCheckpointNV)vkGetDeviceProcAddr(c->device, "vkCmdSetCheckpointNV") : NULL;
+                         ? (PFN_vkCmdSetCheckpointNV)vk_dpa(c->device, "vkCmdSetCheckpointNV") : NULL;
     pm_amd = !off && write_marker && words;
     vk_pass_marks_on = pm_amd || set_checkpoint;
     if (vk_pass_marks_on)
@@ -214,9 +214,9 @@ static void nv_report(void) {
     VkCtx *c = vk_ctx();
     if (!c || !set_checkpoint) return;
     PFN_vkGetQueueCheckpointData2NV get2 =
-        (PFN_vkGetQueueCheckpointData2NV)vkGetDeviceProcAddr(c->device, "vkGetQueueCheckpointData2NV");
+        (PFN_vkGetQueueCheckpointData2NV)vk_dpa(c->device, "vkGetQueueCheckpointData2NV");
     PFN_vkGetQueueCheckpointDataNV get1 =
-        (PFN_vkGetQueueCheckpointDataNV)vkGetDeviceProcAddr(c->device, "vkGetQueueCheckpointDataNV");
+        (PFN_vkGetQueueCheckpointDataNV)vk_dpa(c->device, "vkGetQueueCheckpointDataNV");
     enum { MAXN = 32 };
     uint64_t stage[MAXN], marker[MAXN];
     uint32_t n = 0;

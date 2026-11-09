@@ -16,6 +16,7 @@
 static uint32_t g_gfx_queues = 1;   // queues the graphics family offers (pick_device)
 
 static VkCtx g_vk;
+PFN_vkGetDeviceProcAddr vk_dpa = vkGetDeviceProcAddr;
 static int g_ready;
 static PlatMutex g_lock = PLAT_MUTEX_INIT;
 
@@ -437,6 +438,7 @@ static void destroy_all(void) {
     vk_headroom_stop();
     if (g_vk.vma) vmaDestroyAllocator(g_vk.vma);
     if (g_vk.device) vkDestroyDevice(g_vk.device, NULL);
+    vk_dpa = vkGetDeviceProcAddr;
     if (g_vk.messenger) {
         PFN_vkDestroyDebugUtilsMessengerEXT f =
             (PFN_vkDestroyDebugUtilsMessengerEXT)vkGetInstanceProcAddr(g_vk.instance, "vkDestroyDebugUtilsMessengerEXT");
@@ -495,7 +497,7 @@ void vk_device_fault_report(VkResult r) {
     vk_pass_marks_report();
     VkCtx *c = vk_ctx();
     PFN_vkGetDeviceFaultInfoEXT get =
-        c && c->has_device_fault ? (PFN_vkGetDeviceFaultInfoEXT)vkGetDeviceProcAddr(c->device, "vkGetDeviceFaultInfoEXT")
+        c && c->has_device_fault ? (PFN_vkGetDeviceFaultInfoEXT)vk_dpa(c->device, "vkGetDeviceFaultInfoEXT")
                                  : NULL;
     if (!get) {
         rt_log("vk: device lost; no fault report (VK_EXT_device_fault %s)", c && c->has_device_fault ? "has no entry point"

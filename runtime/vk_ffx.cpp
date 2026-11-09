@@ -78,7 +78,7 @@ Up *context_for(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh) {
     be.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
     be.vkDevice = c->device;
     be.vkPhysicalDevice = c->phys;
-    be.vkDeviceProcAddr = vkGetDeviceProcAddr;
+    be.vkDeviceProcAddr = vk_dpa;
     ffxCreateContextDescUpscale d = {};
     d.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
     d.header.pNext = &be.header;

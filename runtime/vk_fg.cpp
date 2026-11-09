@@ -188,7 +188,7 @@ extern "C" void vk_fg_frame(VkCommandBuffer cb, VkSwapchainKHR sc, VkFormat fmt,
         be.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
         be.vkDevice = c->device;
         be.vkPhysicalDevice = c->phys;
-        be.vkDeviceProcAddr = vkGetDeviceProcAddr;
+        be.vkDeviceProcAddr = vk_dpa;
         // the HUD-less picture has the swapchain's format (gfx_present.c hudless_record)
         ffxCreateContextDescFrameGenerationHudless hl = {};
         hl.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION_HUDLESS;

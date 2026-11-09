@@ -130,6 +130,7 @@ VkResult vk_dlssg_create_device(VkInstance inst, VkPhysicalDevice pd, const VkDe
 }
 
 void vk_dlssg_device_ready(VkDevice dev) {
+    if (S.loaded > 0 && S.gdpa) vk_dpa = S.gdpa();
     if (S.loaded <= 0 || !S.available()) return;
     PFN_vkGetDeviceProcAddr g = S.gdpa();
     S.create_sc = (PFN_vkCreateSwapchainKHR)g(dev, "vkCreateSwapchainKHR");

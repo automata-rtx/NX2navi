@@ -49,6 +49,9 @@ typedef struct VkCtx {
     int dynamic_feedback;
     int pipeline_cache_control;
 } VkCtx;
+
+// Device procedure lookup for the device that owns the command buffers.
+extern PFN_vkGetDeviceProcAddr vk_dpa;
 enum { VK_FEEDBACK_OFF, VK_FEEDBACK_RESTART, VK_FEEDBACK_LAYOUT };
 
 // vk_caps.c: fallbacks for GPUs other than the RX 9070, decided at device creation.

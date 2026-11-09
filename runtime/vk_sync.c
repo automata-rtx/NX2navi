@@ -101,7 +101,7 @@ typedef struct { uint32_t pair; } TsRead;
 static int cal_refresh(VkCtx *c) {
     if (!c->has_calibrated) return 0;
     if (!cal_fn) {
-        cal_fn = (PFN_vkGetCalibratedTimestampsKHR)vkGetDeviceProcAddr(c->device, c->has_calibrated == 2 ? "vkGetCalibratedTimestampsKHR"
+        cal_fn = (PFN_vkGetCalibratedTimestampsKHR)vk_dpa(c->device, c->has_calibrated == 2 ? "vkGetCalibratedTimestampsKHR"
                                                                                                         : "vkGetCalibratedTimestampsEXT");
         if (!cal_fn) { c->has_calibrated = 0; return 0; }
     }

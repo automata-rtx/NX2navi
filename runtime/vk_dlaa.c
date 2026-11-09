@@ -264,7 +264,7 @@ void vk_dlaa_init(void) {
     // 231313132: the application id NVIDIA's DLSS samples use for builds without an NVIDIA-issued id
     const VkCtx *c = vk_ctx();
     NgxResult r = N.init(231313132ull, wdir, c->instance, c->phys, c->device, vkGetInstanceProcAddr,
-                         vkGetDeviceProcAddr, NGX_VERSION_API, NULL);
+                         vk_dpa, NGX_VERSION_API, NULL);
     if (!NGX_OK(r)) {
         rt_log("dlaa: NGX init failed (%08x): DLAA off", (unsigned)r);
         return;
