@@ -906,10 +906,10 @@ class MakeGameTest(Tmp):
         def probe(*args, **kwargs):
             self.assertEqual((self.out / 'nx2navi_xlate.exe').read_bytes(), b'new')
             self.assertEqual((self.out / 'nx2navi_xlate.id').read_bytes(), b'new')
-            return subprocess.CompletedProcess(args, 0, 'shader-cache-id new\nshader-storage cache\nshader-driver-cache-ready 1\n', '')
+            return subprocess.CompletedProcess(args, 0, 'shader-cache-id new\nshader-storage cache\nshader-driver-cache-ready 1\nshader-translations-ready 1\n', '')
 
         with patch.object(self.mg, 'KIT', kit), patch.object(subprocess, 'run', probe):
-            self.assertEqual(self.mg.shader_device(self.out), ('new', self.out / 'cache', True))
+            self.assertEqual(self.mg.shader_device(self.out), ('new', self.out / 'cache', True, True))
 
     def test_independent_shader_cache(self):
         cache = self.out / 'shader-cache'
@@ -931,13 +931,39 @@ class MakeGameTest(Tmp):
         def build_game():
             self.assertEqual(self.main_with(self.mg.step_romfs, lambda *_: None, compile_, 'shaders'), 0)
 
-        with patch.object(self.mg, 'step_shaders', prepare), patch.object(self.mg, 'shader_device',
-                return_value=('driver A', cache, True)) as device:
+        translator = 'a' * 64
+        driver = ['0001']
+        cache_ready = [True]
+
+        def probe(_):
+            identity = f'10de:2b85:{driver[0]} {translator} 1 32 0 ' + '0' * 32 + '||||||'
+            return identity, cache, cache_ready[0], (cache / 'test.spv').is_file()
+
+        def warm(*args, **kwargs):
+            self.assertEqual(args[0][-1], '--warm-shaders')
+            launches.append('warm')
+            cache_ready[0] = True
+            return subprocess.CompletedProcess(args, 0)
+
+        with patch.object(self.mg, 'step_shaders', prepare), patch.object(self.mg, 'shader_device', probe):
             build_game()
             with patch.object(self.mg, 'kit_version', return_value='new native build'):
                 build_game()
                 self.assertEqual(launches, ['compile', 'shaders', 'compile'])
-                device.return_value = ('driver B', cache, True)
+                state_file = self.out / 'build-cache' / 'state.json'
+                state = json.loads(state_file.read_text())
+                del state['steps']['shaders']
+                state_file.write_text(json.dumps(state))
+                build_game()
+                self.assertEqual(launches.count('shaders'), 1)
+                driver[0] = '0002'
+                with patch.object(subprocess, 'run', warm):
+                    build_game()
+                    cache_ready[0] = False
+                    build_game()
+                    build_game()
+                self.assertEqual(launches.count('warm'), 2)
+                translator = 'b' * 64
                 build_game()
                 (cache / 'test.spv').unlink()
                 build_game()
@@ -945,23 +971,23 @@ class MakeGameTest(Tmp):
                 build_game()
                 (self.out / 'mesh-programs.bin').write_bytes(b'incomplete')
                 build_game()
-                build_game()
                 (self.out / 'vertex-programs.bin').unlink()
                 build_game()
-                self.assertEqual(launches[3:], ['shaders'] * 5)
-                device.return_value = ('driver B', cache, False)
+                with (self.out / 'vertex-programs.bin').open('ab') as f:
+                    f.write(bytes(96))
                 build_game()
-                self.assertEqual(launches[3:], ['shaders'] * 6)
+                build_game()
+                self.assertEqual(launches.count('shaders'), 7)
 
         kit = self.tmp / 'test kit'
         runtime = kit / 'runtime'
         runtime.mkdir(parents=True)
         with patch.object(self.mg, 'KIT', kit):
-            before = self.mg.shader_key(self.out, 'driver', cache)
+            before = self.mg.shader_keys(self.out, 'driver', cache)
             (runtime / 'input_map.c').write_text('/* controller changes */')
-            self.assertEqual(before, self.mg.shader_key(self.out, 'driver', cache))
+            self.assertEqual(before, self.mg.shader_keys(self.out, 'driver', cache))
             (runtime / 'gfx_shader_guess.c').write_text('/* shader variant changes */')
-            self.assertNotEqual(before, self.mg.shader_key(self.out, 'driver', cache))
+            self.assertNotEqual(before, self.mg.shader_keys(self.out, 'driver', cache))
 
     def test_romfs_beside_lift_and_compile(self):
         """A first build packs the RomFS image while the lift and the compile run; the compile gets the running step

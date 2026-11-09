@@ -1117,38 +1117,88 @@ def shader_device(out):
     device = re.search(r'^shader-cache-id (.+)$', probe.stdout, re.M)
     storage = re.search(r'^shader-storage (.+)$', probe.stdout, re.M)
     driver = re.search(r'^shader-driver-cache-ready ([01])$', probe.stdout, re.M)
+    translations = re.search(r'^shader-translations-ready ([01])$', probe.stdout, re.M)
     if probe.returncode or not device or not storage or not driver:
         fail(f'could not identify the shader translator and Vulkan device: {probe.stderr[-1000:]}')
-    return device[1].strip(), out / storage[1].strip(), driver[1] == '1'
+    return device[1].strip(), out / storage[1].strip(), driver[1] == '1', bool(translations and translations[1] == '1')
 
 
-def shader_key(out, device, storage):
+def shader_keys(out, device, storage):
     # The RomFS index includes the image's content digest.
-    inputs = [str(out.resolve()), exefs_digest(out), sha256_file(out / 'romfs' / 'index.json'),
-              tree_digest(KIT, SHADER_INPUTS), device, str(storage)]
-    return 'shaders-2|' + sha256_bytes(json.dumps(inputs).encode())
+    inputs = [str(out.resolve()), exefs_digest(out), sha256_file(out / 'romfs' / 'index.json'), tree_digest(KIT, SHADER_INPUTS)]
+    def key(identity):
+        return 'shaders-2|' + sha256_bytes(json.dumps([*inputs, identity, str(storage)]).encode())
+    # vk_shader_cache_id includes the translator with its effective host options. Device or driver changes can
+    # require new pipelines even when those options and every translated shader are identical.
+    fields = device.split(' ', 5)
+    inventory = None
+    if (len(fields) == 6 and re.fullmatch(r'[0-9a-f]+:[0-9a-f]+:[0-9a-f]+', fields[0])
+            and re.fullmatch(r'[0-9a-f]{64}', fields[1])):
+        uuid, separator, options = fields[5].partition('|')
+        if separator and re.fullmatch(r'[0-9a-f]{32}', uuid):
+            inventory = key([fields[0].rsplit(':', 1)[0], *fields[1:5], options])
+    return key(device), inventory
 
 
-def shader_outputs_present(out, cache):
+def shader_manifests(out):
     try:
         manifest = out / 'shader-prepared.bin'
-        with manifest.open('rb') as f:
-            header = f.read(16)
-        size = manifest.stat().st_size
-        if header != struct.pack('<8sII', b'NX2NSPRP', 1, 36) or size <= 16 or (size - 16) % 36:
-            return False
-        for filename, magic in (('mesh-programs.bin', b'NX2NMSID'), ('vertex-programs.bin', b'NX2NVSID')):
-            groups = out / filename
-            with groups.open('rb') as f:
-                if f.read(16) != struct.pack('<8sII', magic, 1, 96) or (groups.stat().st_size - 16) % 96:
-                    return False
-        pack = cache / 'shader-cache.pack'
-        if pack.is_file() and pack.stat().st_size > 0:
-            return True
-        with os.scandir(cache) as files:
-            return any(f.name.endswith('.spv') and f.is_file() for f in files)
+        result = {}
+        for path, magic, stride in ((manifest, b'NX2NSPRP', 36), (out / 'mesh-programs.bin', b'NX2NMSID', 96),
+                                    (out / 'vertex-programs.bin', b'NX2NVSID', 96)):
+            data = path.read_bytes()
+            if (data[:16] != struct.pack('<8sII', magic, 1, stride) or (len(data) - 16) % stride
+                    or (path == manifest and len(data) == 16)):
+                return None
+            result[path.name] = sha256_bytes(data)
+        return result
     except OSError:
-        return False
+        return None
+
+
+def update_shader_preparation(out, previous):
+    device, storage, driver_ready, translations_ready = shader_device(out)
+    key, inventory = shader_keys(out, device, storage)
+    receipt = out / 'shader-preparation.json'
+    try:
+        saved = json.loads(receipt.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        saved = None
+    if not isinstance(saved, dict):
+        saved = {}
+    manifests = shader_manifests(out)
+    compatible = bool(manifests and translations_ready and inventory and saved.get('inventory') == inventory
+                      and saved.get('manifests') == manifests)
+    # Before separate preparation records, the build state held the complete key only.
+    legacy = bool(not receipt.exists() and previous == key and manifests and translations_ready)
+    if driver_ready and ((compatible and saved.get('pipelines') == key) or legacy):
+        skipped = True
+    else:
+        skipped = False
+        emit('step', step='shaders', state='start')
+        # An interruption must not leave a success record for a partially rewritten driver cache.
+        receipt.unlink(missing_ok=True)
+        if compatible or legacy:
+            say('shaders: reusing translated shaders and archive passes, rebuilding the driver pipelines')
+            if subprocess.run([str(out / EXE_NAME), '--warm-shaders'], cwd=out).returncode:
+                step_shaders(out)   # includes driver crash journal recovery
+        else:
+            say('shaders: preparing shaders and driver pipelines')
+            step_shaders(out)
+        checked_device, checked_storage, driver_ready, translations_ready = shader_device(out)
+        manifests = shader_manifests(out)
+        if (device != checked_device or storage != checked_storage or not driver_ready or not translations_ready
+                or not manifests):
+            fail('shader preparation did not leave a compatible driver cache, archive manifests and translated shaders')
+    if not skipped or legacy:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=out, delete=False) as f:
+            temporary = Path(f.name)
+            json.dump(dict(inventory=inventory, pipelines=key, manifests=manifests), f)
+        try:
+            os.replace(temporary, receipt)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return key, skipped
 
 
 def step_key(step, identity, out=None):
@@ -1277,8 +1327,7 @@ def main():
     t0 = time.time()
     romfs_job = None
     runs = {'exefs': lambda: step_exefs(src, out), 'romfs': lambda: step_romfs(src, out, min(a.jobs, 8)),
-            'lift': lambda: step_lift(out, cache), 'compile': lambda: step_compile(out, cache, msys, a.jobs, romfs_job),
-            'shaders': lambda: step_shaders(out)}
+            'lift': lambda: step_lift(out, cache), 'compile': lambda: step_compile(out, cache, msys, a.jobs, romfs_job)}
     state_lock = threading.Lock()   # the RomFS step records itself from its own thread
 
     def save():
@@ -1301,11 +1350,17 @@ def main():
             if name == 'shaders':
                 if romfs_job:
                     romfs_job.join()
-                device, storage, driver_ready = shader_device(out)
-                key = shader_key(out, device, storage)
-            else:
-                key = step_key(name, src.identity, out)
-            if state['steps'].get(name) == key and (name != 'shaders' or (driver_ready and shader_outputs_present(out, storage))):
+                previous = state['steps'].pop(name, None)
+                save()
+                started = time.time()
+                key, skipped = update_shader_preparation(out, previous)
+                state['steps'][name] = key
+                save()
+                say('shaders: done before' if skipped else f'shaders: {time.time() - started:.0f} s')
+                emit('step', step=name, state='skip' if skipped else 'done', seconds=round(time.time() - started, 1))
+                break
+            key = step_key(name, src.identity, out)
+            if state['steps'].get(name) == key:
                 say(f'{name}: done before')
                 emit('step', step=name, state='skip')
             else:

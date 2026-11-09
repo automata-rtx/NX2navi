@@ -2447,6 +2447,31 @@ void gfx_shader_prepare_recorded(int threads, int procs) {
 #define PRP_VERSION 1
 #define PRP_REC 36
 
+// An update may reuse the archive inventory only if its translations exist under the active host and translator.
+// A compiled shader and its reflection are loaded from the same source by disk_load_from.
+int gfx_shader_prepared_present(const char *dir) {
+    char path[PATH_CAP + 80];
+    snprintf(path, sizeof path, "%s/shader-prepared.bin", dir);
+    uint8_t *records = NULL;
+    size_t bytes = 0;
+    if (!rec_read(path, "NX2NSPRP", PRP_VERSION, PRP_REC, &records, &bytes)) return 0;
+    int ok = bytes && bytes % PRP_REC == 0;
+    for (size_t i = 0; ok && i < bytes; i += PRP_REC) {
+        uint8_t key[32];
+        key_of_input(records + i + 4, key);
+        const PackEnt *spv = pack_find(PACK_SPV, key), *res = pack_find(PACK_RES, key);
+        if (spv && spv->size >= 20 && !(spv->size % 4) && res && res->size) continue;
+        char hex[65];
+        key_hex(key, hex);
+        snprintf(path, sizeof path, "%s/%s.spv", cache_dir, hex);
+        int64_t size = plat_file_size(path);
+        snprintf(path, sizeof path, "%s/%s.res.json", cache_dir, hex);
+        ok = size >= 20 && !(size % 4) && plat_file_size(path) > 0;
+    }
+    free(records);
+    return ok;
+}
+
 int gfx_archive_program_order(const void *a, const void *b) {
     return memcmp(a, b, sizeof(GfxArchiveProgram));
 }

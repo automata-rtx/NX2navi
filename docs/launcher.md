@@ -122,8 +122,12 @@ A path the Windows ANSI code page cannot hold breaks the MSYS2 tools, so the too
    take more. Raising it makes additional workers available immediately. Auto uses each phase's default.
    The launcher remembers the choice for the next build.
    Preparation has its own build key covering the installed game data, preparation code, translator, Vulkan
-   device and driver. A native-only rebuild can reuse prepared shaders. The first build from an older key format
-   runs preparation once and can reuse compatible translations already on disk.
+   device and driver. The game folder keeps this key and the hashes of the prepared shader, vertex and mesh
+   inventories in `shader-preparation.json`. An update checks the translations against the active translator
+   and host options. A compatible native rebuild reuses the preparation even after the native build cache
+   has been cleared. If just the driver cache needs rebuilding, setup warms the stages, archive passes and
+   recorded pipelines from the existing inventories. A changed translator or incomplete inventory runs the full
+   preparation before play.
 4. The game's Cetra Display is decoded for the window.
 
 ## Updating

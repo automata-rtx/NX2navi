@@ -1013,6 +1013,24 @@ ASPECT_SIZES = ('2560x1080', '3440x1440', '3840x1600', '5120x2160', '3840x1080',
 class Prepare(Step):
     id = 'prepare'
 
+    def cached_preparation(self, dest):
+        exe = dest / ('nx2navi' + EXE)
+        try:
+            result = subprocess.run([str(exe), '--shader-cache-id'], cwd=dest, capture_output=True,
+                                    encoding='utf-8', errors='replace')
+        except OSError:
+            return None
+        device = re.search(r'^shader-cache-id (.+)$', result.stdout, re.M)
+        storage = re.search(r'^shader-storage (.+)$', result.stdout, re.M)
+        lines = result.stdout.splitlines()
+        if (result.returncode or not device or not storage or 'shader-driver-cache-ready 1' not in lines
+                or 'shader-translations-ready 1' not in lines):
+            return None
+        groups = [dest / name for name in ('shader-prepared.bin', 'mesh-programs.bin', 'vertex-programs.bin')]
+        if not all(p.is_file() for p in groups):
+            return None
+        return fingerprint(device[1], storage[1], *groups)
+
     def key(self, ctx):
         layout = ctx.layout
         xlate_id = layout.xlate.with_suffix('.id')
@@ -1025,16 +1043,14 @@ class Prepare(Step):
     def current(self, ctx, record):
         dest = ctx.dest
         xlate = dest / ctx.layout.xlate.name
-        return ((dest / 'shader-prepared.bin').is_file() and (dest / 'romfs-patches' / 'manifest.tsv').is_file()
-                and xlate.is_file() and file_sha256(xlate) == record.get('xlate_sha256'))
+        return ((dest / 'romfs-patches' / 'manifest.tsv').is_file() and xlate.is_file()
+                and file_sha256(xlate) == record.get('xlate_sha256') and bool(record.get('prepared'))
+                and self.cached_preparation(dest) == record['prepared'])
 
     def run(self, ctx):
         layout, rep, dest = ctx.layout, ctx.reporter, ctx.dest
         xlate = dest / layout.xlate.name
-        if xlate.is_file() and file_sha256(xlate) != file_sha256(layout.xlate):
-            # Another translator: its cache keys differ, so the old translations would only take space.
-            for name in ('shader-cache', 'shader-prepared.bin'):
-                remove(dest / name)
+        # Stored game inputs can be translated again. Compiled outputs are already keyed by translator and host.
         # nx2navi.exe starts nx2navi_xlate.exe as a child while it prepares shaders; a preparation that was stopped from
         # outside leaves that child holding this file, and Windows then refuses to replace it (issue #174).
         try:
@@ -1118,7 +1134,10 @@ class Prepare(Step):
         code, log = run_tool(ctx, 'prepare', layout.tools / 'pack_shader_cache.py', [dest / 'shader-cache'])
         if code:
             raise InstallError('prepare.pack_failed', code=code, log=str(log))
-        return {'xlate_sha256': file_sha256(xlate)}
+        prepared = self.cached_preparation(dest)
+        if not prepared:
+            raise InstallError('prepare.shaders_failed', code=1, log=str(log))
+        return {'xlate_sha256': file_sha256(xlate), 'prepared': prepared}
 
 
 # ---- 7. NVIDIA DLSS
