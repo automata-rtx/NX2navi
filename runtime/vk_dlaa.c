@@ -26,6 +26,7 @@
 #include "platform/platform.h"
 #include "vk.h"
 #include "vk_dlaa.h"
+#include "vk_dlssg.h"
 #include "vk_exec.h"
 #include "vk_ffx.h"
 #include "vk_rec.h"
@@ -309,6 +310,15 @@ static struct {
     int ended, up;               // this frame: the scene is drawn (jitter over), DLSS wrote the scaled output
     struct Size {                // a DLSS feature and its work images per scene size (dynamic resolution flips it)
         uint32_t w, h, ow, oh;   // render size, output size
+        VkImage flow_color[2];
+        VkImageView flow_view[2];
+        VmaAllocation flow_mem[2];
+        float flow_jitter[2];
+        unsigned flow_slot;
+        uint64_t flow_frame;
+        VkImage ui;
+        VkImageView ui_view;
+        VmaAllocation ui_mem;
         VkImage out, mv;
         VmaAllocation out_mem, mv_mem;
         VkImageView out_view, mv_view;
@@ -375,6 +385,8 @@ static struct {
     // the picture without the HUD for frame generation (vk_dlaa_fg_hudless): DLSS's output encoded to sRGB as the game's
     // last pass encodes its picture, then copied bit for bit into an RGBA8 UNORM image, the format the present reads; with
     // HDR on, DLSS's output as RGBA16F, as the game's float picture the present encodes (hl_srgb unused)
+    VkImage ui_target;
+    int ui_valid;
     VkImage hl_srgb, hl;
     VmaAllocation hl_srgb_mem, hl_mem;
     VkImageView hl_view;
@@ -440,6 +452,8 @@ static int image2d(uint32_t w, uint32_t h, VkFormat f, VkImageUsageFlags usage, 
 static void free_size(struct Size *e) {
     const VkCtx *c = vk_ctx();
     vk_queue_lock(), vkDeviceWaitIdle(c->device), vk_queue_unlock();   // a third scene size: the evicted images may still be in flight
+    if (e->ui_view) vkDestroyImageView(c->device, e->ui_view, NULL);
+    if (e->ui) vmaDestroyImage(c->vma, e->ui, e->ui_mem);
     if (e->out_view) vkDestroyImageView(c->device, e->out_view, NULL);
     if (e->mv_view) vkDestroyImageView(c->device, e->mv_view, NULL);
     if (e->out) vmaDestroyImage(c->vma, e->out, e->out_mem);
@@ -447,6 +461,8 @@ static void free_size(struct Size *e) {
     if (e->mask_view) vkDestroyImageView(c->device, e->mask_view, NULL);
     if (e->mask) vmaDestroyImage(c->vma, e->mask, e->mask_mem);
     for (int i = 0; i < 2; i++) {
+        if (e->flow_view[i]) vkDestroyImageView(c->device, e->flow_view[i], NULL);
+        if (e->flow_color[i]) vmaDestroyImage(c->vma, e->flow_color[i], e->flow_mem[i]);
         if (e->chars_view[i]) vkDestroyImageView(c->device, e->chars_view[i], NULL);
         if (e->chars[i]) vmaDestroyImage(c->vma, e->chars[i], e->chars_mem[i]);
         if (e->dist_view[i]) vkDestroyImageView(c->device, e->dist_view[i], NULL);
@@ -1187,6 +1203,197 @@ static int perf_quality(uint32_t w, uint32_t ow) {
 // use the armed light target as input and may resolve in place (dst NULL).
 static void hudless(VkCommandBuffer cb, VkImage scene, uint32_t w, uint32_t h);
 
+#include "fg_motion_spv.h"
+static struct {
+    int ok;
+    VkPipeline pipe;
+    VkPipelineLayout layout;
+    VkDescriptorSetLayout dsl;
+    VkSampler sampler;
+} flow = {.ok = -1};
+
+static int flow_init(void) {
+    if (flow.ok >= 0) return flow.ok;
+    flow.ok = 0;
+    const VkCtx *c = vk_ctx();
+    VkDescriptorSetLayoutBinding b[5] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+                                         {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+                                         {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+                                         {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+                                         {4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}};
+    VkDescriptorSetLayoutCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                                           .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
+                                           .bindingCount = 5,
+                                           .pBindings = b};
+    VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
+    VkShaderModuleCreateInfo mi = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = sizeof fg_motion_spv, .pCode = fg_motion_spv};
+    VkShaderModule m = VK_NULL_HANDLE;
+    if (vkCreateDescriptorSetLayout(c->device, &dci, NULL, &flow.dsl) != VK_SUCCESS) goto fail;
+    VkPipelineLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                                     .setLayoutCount = 1,
+                                     .pSetLayouts = &flow.dsl,
+                                     .pushConstantRangeCount = 1,
+                                     .pPushConstantRanges = &pr};
+    if (vkCreatePipelineLayout(c->device, &li, NULL, &flow.layout) != VK_SUCCESS ||
+        vkCreateShaderModule(c->device, &mi, NULL, &m) != VK_SUCCESS)
+        goto fail;
+    VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                                      .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                                                .module = m,
+                                                .pName = "main"},
+                                      .layout = flow.layout};
+    VkResult r = vkCreateComputePipelines(c->device, VK_NULL_HANDLE, 1, &ci, NULL, &flow.pipe);
+    vkDestroyShaderModule(c->device, m, NULL);
+    if (r != VK_SUCCESS) goto fail;
+    VkSamplerCreateInfo si = {.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+                              .magFilter = VK_FILTER_LINEAR,
+                              .minFilter = VK_FILTER_LINEAR,
+                              .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                              .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                              .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE};
+    if (vkCreateSampler(c->device, &si, NULL, &flow.sampler) != VK_SUCCESS) goto fail;
+    return flow.ok = 1;
+fail:
+    rt_log("dlssg: motion refinement pipeline unavailable");
+    return 0;
+}
+
+static void discard_for_transfer(VkCommandBuffer cb, VkImage image) {
+    VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkImageMemoryBarrier2 b = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+                               .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                               .srcAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+                               .dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                               .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                               .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                               .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                               .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                               .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                               .image = image,
+                               .subresourceRange = range};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &b};
+    vkCmdPipelineBarrier2(cb, &di);
+}
+
+// The reconstructed scene already consumed its camera vectors. Correct the field
+// supplied to frame generation using two consecutive pre-reconstruction images.
+static void fg_motion(VkCommandBuffer cb, struct Size *e, VkImage linear, float jx, float jy) {
+    if (!e->dist_ok || !flow_init()) return;
+    uint32_t w = (e->w + 1) / 2, h = (e->h + 1) / 2, cur = e->flow_slot & 1;
+    const VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    if (!e->flow_color[cur] &&
+        !image2d(w, h, VK_FORMAT_R16G16B16A16_SFLOAT, usage, &e->flow_color[cur], &e->flow_mem[cur], &e->flow_view[cur]))
+        return;
+    if (!e->flow_view[cur]) return;
+    discard_for_transfer(cb, e->flow_color[cur]);
+    VkImageBlit blit = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                        .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                        .srcOffsets = {{0, 0, 0}, {(int)e->w, (int)e->h, 1}},
+                        .dstOffsets = {{0, 0, 0}, {(int)w, (int)h, 1}}};
+    vkCmdBlitImage(cb, linear, VK_IMAGE_LAYOUT_GENERAL, e->flow_color[cur], VK_IMAGE_LAYOUT_GENERAL, 1, &blit, VK_FILTER_LINEAR);
+    full_barrier(cb);
+    if (!D.reset && D.last == e && e->flow_frame == D.evals && e->flow_view[cur ^ 1] && e->flow_slot) {
+        VkDescriptorImageInfo images[5] = {{flow.sampler, e->flow_view[cur], VK_IMAGE_LAYOUT_GENERAL},
+                                           {flow.sampler, e->flow_view[cur ^ 1], VK_IMAGE_LAYOUT_GENERAL},
+                                           {0, e->mv_view, VK_IMAGE_LAYOUT_GENERAL},
+                                           {0, e->dist_view[e->dist_cur ^ 1], VK_IMAGE_LAYOUT_GENERAL},
+                                           {0, e->dist_view[e->dist_cur], VK_IMAGE_LAYOUT_GENERAL}};
+        VkWriteDescriptorSet wr[5];
+        for (unsigned i = 0; i < 5; i++)
+            wr[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                           .dstBinding = i,
+                                           .descriptorCount = 1,
+                                           .descriptorType = i < 2 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                                                                   : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                           .pImageInfo = &images[i]};
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, flow.pipe);
+        rec_push(vk_pipeline_push_fn(), cb, VK_PIPELINE_BIND_POINT_COMPUTE, flow.layout, 0, 5, wr);
+        float pc[4] = {(float)e->w, (float)e->h, e->flow_jitter[0] - jx, e->flow_jitter[1] - jy};
+        vkCmdPushConstants(cb, flow.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+        vkCmdDispatch(cb, (e->w + 31) / 32, (e->h + 31) / 32, 1);
+        full_barrier(cb);
+    }
+    ++e->flow_slot;
+    e->flow_frame = D.evals + 1;
+    e->flow_jitter[0] = jx;
+    e->flow_jitter[1] = jy;
+}
+
+static const VkImageUsageFlags ui_usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                          VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+
+static void ui_begin(VkCommandBuffer cb, struct Size *e, VkImage target) {
+    D.ui_target = target;
+    D.ui_valid = 0;
+    if (!target) return;
+    if (!e->ui && !image2d(e->ow, e->oh, VK_FORMAT_R8_UNORM, ui_usage, &e->ui, &e->ui_mem, &e->ui_view)) return;
+    if (!e->ui_view) return;
+    discard_for_transfer(cb, e->ui);
+    VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkClearColorValue zero = {0};
+    vkCmdClearColorImage(cb, e->ui, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+    full_barrier(cb);
+    D.ui_valid = 1;
+}
+
+VkImageView vk_dlaa_ui_attachment(const VkExec *ex) {
+    if (!D.ui_target || ex->color[0].image != D.ui_target || !D.last) return VK_NULL_HANDLE;
+    if (ex->pass_ncolor != 1 || ex->pass_samples != 1 || ex->pass_layers != 1 || ex->color[0].level || ex->color[0].base_layer)
+        D.ui_valid = 0;
+    return D.ui_valid ? D.last->ui_view : VK_NULL_HANDLE;
+}
+
+void vk_dlaa_ui_invalidate(VkImage image) {
+    if (image && image == D.ui_target) D.ui_valid = 0;
+}
+
+void vk_dlaa_ui_draw(VkPipeState *s) {
+    // The pass already has two attachments. Even a draw with unrepresentable blending
+    // needs a compatible pipeline. Its RGB output continues normally.
+    s->color_fmt[1] = NVN_FORMAT_R8;
+    s->chmask.mask &= ~0xf0u;
+    uint32_t write = vk_pipeline_target_wmask(s, 0) & 7;
+    if (!write) return;
+    if (write != 7 || s->color.logic_op != NVN_LOGIC_OP_COPY) {
+        D.ui_valid = 0;
+        return;
+    }
+    unsigned dst = s->color.blend_en & 1 ? s->blend[0].dst_rgb : NVN_BLEND_FUNC_ZERO;
+    // Additive glows transmit all of the background. They contribute light,
+    // while the opacity accumulated by the layers underneath stays intact.
+    if (dst == NVN_BLEND_FUNC_ONE && s->blend[0].eq_rgb == NVN_BLEND_EQUATION_ADD) return;
+    int multiply = dst == NVN_BLEND_FUNC_SRC_COLOR && s->blend[0].src_rgb == NVN_BLEND_FUNC_ZERO;
+    if (multiply) dst = NVN_BLEND_FUNC_SRC_ALPHA;
+    unsigned src = dst == NVN_BLEND_FUNC_ZERO                  ? NVN_BLEND_FUNC_ONE
+                   : dst == NVN_BLEND_FUNC_ONE_MINUS_SRC_ALPHA ? NVN_BLEND_FUNC_SRC_ALPHA
+                   : dst == NVN_BLEND_FUNC_SRC_ALPHA           ? NVN_BLEND_FUNC_ONE_MINUS_SRC_ALPHA
+                                                               : 0;
+    const GfxShader *fs = src ? gfx_shader_ui_coverage(s->fs, multiply) : NULL;
+    if (!fs || ((s->color.blend_en & 1) && s->blend[0].eq_rgb != NVN_BLEND_EQUATION_ADD)) {
+        static unsigned warnings;
+        if (warnings++ < 8)
+            rt_log("dlssg: HUD alpha unavailable for blend %u/%u equation %u, outputs %#x, variant %d",
+                   (unsigned)s->blend[0].src_rgb, dst, (unsigned)s->blend[0].eq_rgb, s->fs ? gfx_shader_outputs(s->fs, NULL) : 0,
+                   fs != NULL);
+        D.ui_valid = 0;
+        return;
+    }
+    s->fs = fs;
+    s->chmask.mask |= 0x10;
+    s->color.blend_en |= 2;
+    s->blend[1] = (blend_st){1, src, dst, NVN_BLEND_FUNC_ONE, NVN_BLEND_FUNC_ZERO,
+                             NVN_BLEND_EQUATION_ADD, NVN_BLEND_EQUATION_ADD};
+}
+
+int vk_dlaa_ui_image(Nx2SlImage *image) {
+    if (!D.ui_valid || !D.last) return 0;
+    *image = (Nx2SlImage){D.last->ui, D.last->ui_view, VK_FORMAT_R8_UNORM, D.last->ow, D.last->oh,
+                          VK_IMAGE_LAYOUT_GENERAL, ui_usage};
+    return 1;
+}
+
 static void evaluate(VkExec *ex, const VkExecTarget *dst, VkImage linear, VkImageView linear_view) {
     const VkExecTarget *t = &D.color, *z = &D.depth;
     if (!dst) dst = t;
@@ -1194,7 +1401,7 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst, VkImage linear, VkImag
     VkCommandBuffer cb = ex->cb;
     vk_exec_barrier(ex);   // what drew the scene is done (no pass is open here)
     if (D.preset_dirty) {   // another model: features are created with it, so every size gets a new one
-        for (int i = 0; i < 3; i++)
+        for (unsigned i = 0; i < sizeof D.sizes / sizeof D.sizes[0]; ++i)
             if (D.sizes[i].out) free_size(&D.sizes[i]);
         D.last = NULL, D.preset_dirty = 0;
     }
@@ -1309,6 +1516,10 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst, VkImage linear, VkImag
     if (!NGX_OK(r)) return dl_fail("DLSS evaluation", r);
 evaluated:
     if (timed) times_mark(cb, T_DL1);   // through the recorder, after NGX's own commands
+    if (vk_dlssg_active() && linear) {
+        full_barrier(cb);
+        fg_motion(cb, e, linear, jx, jy);
+    }
     D.fg_reset = D.reset;
     D.reset = 0;
     D.last = e, e->used = D.evals + 1;
@@ -1338,6 +1549,7 @@ evaluated:
     // so the HUD-less and presented images encode the same values under the UI.
     if (vk_dlaa_hudless_wanted)
         hudless(cb, linear && shown == e->out && !vk_hdr_wanted() ? dst->image : e->out, ow, oh);
+    ui_begin(cb, e, linear && vk_dlssg_active() ? dst->image : VK_NULL_HANDLE);
     ex->recorded += 4;
     vk_exec_draw_new_cb();   // NGX bound pipelines and descriptor sets of its own: the next draw binds everything again
     D.jdepth = z->image;
@@ -1572,6 +1784,7 @@ static void preset_check(void) {
 }
 
 void vk_dlaa_frame(void) {
+    D.ui_target = VK_NULL_HANDLE;
     D.depth_copies_n = 0;
     vk_dlaa_swap_img = NULL, vk_dlaa_swap_view = VK_NULL_HANDLE;
     dlss_mode();

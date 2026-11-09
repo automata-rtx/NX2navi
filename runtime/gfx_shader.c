@@ -75,6 +75,8 @@ typedef struct UseEnt {                                    // code hash -> use m
 
 struct GfxShader {
     struct GfxShader *next;
+    const struct GfxShader *ui_variant[2];
+    int ui_checked;
     uint8_t key[32];
     uint8_t iid[32];                                       // input id (see the keys at the top)
     uint32_t *spirv;
@@ -630,6 +632,110 @@ const GfxShader *gfx_shader_own(const uint32_t *spirv, uint64_t words, const cha
     s->words = words, s->reflection_size = rn;
     reflect(s);
     return s;
+}
+
+// Add a second output to a translated HUD fragment shader. Its red component is
+// one and its alpha is the exact alpha exported by the guest, including texture
+// sampling, alpha tests and discard. Fixed-function blending then accumulates
+// coverage independently of the RGB attachment.
+const GfxShader *gfx_shader_ui_coverage(const GfxShader *original, int multiply) {
+    if (!original || original->out_mask != 1 || original->out[0].type != GFX_TYPE_FLOAT || original->out[0].comps != 4 ||
+        original->out[0].packed)
+        return NULL;
+    GfxShader *s = (GfxShader *)original; // only the replay thread requests HUD variants
+    if (s->ui_checked & (1 << multiply)) return s->ui_variant[multiply];
+    s->ui_checked |= 1 << multiply;
+    const uint32_t *w = s->spirv;
+    uint32_t glsl = 0;
+    uint32_t bound = w[3], entry = 0, output = 0, ptr = 0, vec = 0, scalar = 0;
+    for (size_t i = 5; i < s->words; i += w[i] >> 16) {
+        unsigned op = w[i] & 65535;
+        if (op == 11 && w[i] >> 16 >= 6 && !memcmp(w + i + 2, "GLSL.std.450", 13)) glsl = w[i + 1];
+        if (op == 15 && w[i + 1] == 4) entry = w[i + 2]; // OpEntryPoint Fragment
+        if (op == 59 && w[i + 3] == 3) {                 // OpVariable Output
+            for (size_t j = 5; j < i; j += w[j] >> 16)
+                if ((w[j] & 65535) == 71 && w[j] >> 16 >= 4 && w[j + 1] == w[i + 2] && w[j + 2] == 30 && w[j + 3] == 0)
+                    output = w[i + 2], ptr = w[i + 1];
+        }
+    }
+    for (size_t i = 5; i < s->words; i += w[i] >> 16)
+        if ((w[i] & 65535) == 32 && w[i + 1] == ptr) vec = w[i + 3];
+    for (size_t i = 5; i < s->words; i += w[i] >> 16)
+        if ((w[i] & 65535) == 23 && w[i + 1] == vec && w[i + 3] == 4) scalar = w[i + 2];
+    if (!entry || !output || !scalar) return NULL;
+    size_t returns = 0;
+    for (size_t i = 5; i < s->words; i += w[i] >> 16)
+        returns += (w[i] & 65535) == 253;
+    uint32_t *code = malloc((s->words + returns * (multiply ? 48 : 13) + 20) * sizeof *code);
+    if (!code) return NULL;
+    uint32_t *d = code;
+    memcpy(d, w, 20);
+    d += 5;
+    uint32_t extra = bound++, one = bound++, function = 0;
+    int decorated = 0, declared = 0;
+    for (size_t i = 5; i < s->words; i += w[i] >> 16) {
+        unsigned op = w[i] & 65535, n = w[i] >> 16;
+        if (op == 14 && multiply && !glsl) { // imports precede the memory model
+            glsl = bound++;
+            *d++ = (6u << 16) | 11;
+            *d++ = glsl;
+            memset(d, 0, 16);
+            memcpy(d, "GLSL.std.450", 13);
+            d += 4;
+        }
+        if (op == 71 && !decorated) {
+            uint32_t loc[] = {(4u << 16) | 71, extra, 30, 1};
+            memcpy(d, loc, sizeof loc);
+            d += 4;
+            decorated = 1;
+        }
+        if (op == 54) {
+            function = w[i + 2];
+            if (!declared) {
+                uint32_t globals[] = {(4u << 16) | 43, scalar, one, 0x3f800000, (4u << 16) | 59, ptr, extra, 3};
+                memcpy(d, globals, sizeof globals);
+                d += 8;
+                declared = 1;
+            }
+        }
+        if (op == 253 && function == entry) {
+            uint32_t rgb = bound++, result = bound++;
+            uint32_t load[] = {(4u << 16) | 61, vec, rgb, output};
+            memcpy(d, load, sizeof load);
+            d += 4;
+            if (multiply) {
+                // A colored multiplier transmits different amounts of the
+                // backdrop in each channel. Its minimum is the common neutral
+                // transmission; the remaining tint belongs to the UI layer.
+                uint32_t channel[3], lo = bound++, transmission = bound++, color = bound++;
+                for (unsigned k = 0; k < 3; ++k) {
+                    channel[k] = bound++;
+                    uint32_t extract[] = {(5u << 16) | 81, scalar, channel[k], rgb, k};
+                    memcpy(d, extract, sizeof extract);
+                    d += 5;
+                }
+                uint32_t minimum[] = {(7u << 16) | 12, scalar, lo,           glsl,         37,  channel[0], channel[1],
+                                      (7u << 16) | 12, scalar, transmission, glsl,         37,  lo,         channel[2],
+                                      (6u << 16) | 82, vec,    color,        transmission, rgb, 3};
+                memcpy(d, minimum, sizeof minimum);
+                d += 20;
+                rgb = color;
+            }
+            uint32_t publish[] = {(6u << 16) | 82, vec, result, one, rgb, 0, (3u << 16) | 62, extra, result};
+            memcpy(d, publish, sizeof publish);
+            d += 9;
+        }
+        memcpy(d, w + i, n * 4);
+        if (op == 15 && w[i + 2] == entry) {
+            *d += 1u << 16;
+            d[n++] = extra;
+        }
+        d += n;
+    }
+    code[3] = bound;
+    s->ui_variant[multiply] = gfx_shader_own(code, (uint64_t)(d - code), s->reflection);
+    free(code);
+    return s->ui_variant[multiply];
 }
 
 // The pack, then the loose files (a newer translation of a key the pack holds a bad copy of); NULL when neither has a

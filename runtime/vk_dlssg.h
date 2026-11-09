@@ -13,6 +13,9 @@ PFN_vkVoidFunction vk_dlssg_instance_proc(VkInstance inst, const char *name);   
 VkResult vk_dlssg_create_device(VkInstance inst, VkPhysicalDevice pd, const VkDeviceCreateInfo *ci, VkDevice *out);
 void vk_dlssg_device_ready(VkDevice dev);   // after the device: checks DLSS-G and takes the swapchain hooks
 int vk_dlssg_active(void);
+void *vk_dlssg_begin(void);
+void vk_dlssg_submit(void *token, int end);
+void vk_dlssg_suspend(int suspend);
 int vk_dlssg_max_multiplier(void);   // 0 until Streamline reports the device limit
 int vk_dlssg_multiplier(void);       // saved choice limited to the device maximum
 // gfx_present.c's swapchain calls while active
@@ -22,5 +25,5 @@ VkResult vk_dlssg_get_images(VkDevice d, VkSwapchainKHR sc, uint32_t *n, VkImage
 VkResult vk_dlssg_acquire(VkDevice d, VkSwapchainKHR sc, uint64_t timeout, VkSemaphore sem, uint32_t *idx);
 VkResult vk_dlssg_present(VkQueue q, const VkPresentInfoKHR *pi);
 uint64_t vk_dlssg_output_frames(void);
-void vk_dlssg_frame(VkCommandBuffer cb, VkExtent2D ext, const int to[4], int scene, const Nx2SlImage *hudless);
+void vk_dlssg_frame(void *token, VkCommandBuffer cb, VkExtent2D ext, const int to[4], int scene, const Nx2SlImage *hudless, const Nx2SlImage *ui);
 void vk_dlssg_release(void);

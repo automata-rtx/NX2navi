@@ -5,8 +5,9 @@
 #include <stdint.h>
 #include <vulkan/vulkan.h>
 
-#define NX2SL_VERSION 3
+#define NX2SL_VERSION 4
 #define NX2SL_MAX_MULTIPLIER 6
+#define NX2SL_REBUILD_SWAPCHAIN 2
 
 typedef struct {
     VkImage image;
@@ -46,12 +47,15 @@ typedef PFN_vkGetInstanceProcAddr (*PFN_nx2sl_instance_proc)(void);
 typedef PFN_vkGetDeviceProcAddr (*PFN_nx2sl_device_proc)(void);
 // 1 when DLSS-G loaded and supports this GPU (after the device exists)
 typedef int (*PFN_nx2sl_available)(void);
-// Each present, before the present call: a new frame, its latency markers up to the render's end, its constants and
-// tags, and frame generation on or off. Then nx2sl_present_marker(0) before and (1) after the present.
-typedef int (*PFN_nx2sl_frame)(VkCommandBuffer cb, const Nx2SlImage *depth, const Nx2SlImage *mv, const Nx2SlImage *hudless,
+// The game thread starts simulation and marks its first render submission. The token
+// follows that frame through replay and the present worker.
+typedef void *(*PFN_nx2sl_begin)(void);
+typedef void (*PFN_nx2sl_submit)(void *token, int end);
+typedef void (*PFN_nx2sl_suspend)(int suspend);
+typedef int (*PFN_nx2sl_frame)(void *token, VkCommandBuffer cb, const Nx2SlImage *depth, const Nx2SlImage *mv, const Nx2SlImage *hudless, const Nx2SlImage *ui,
                                const Nx2SlCamera *cam, uint32_t out_w, uint32_t out_h, int multiplier);
 // The post-present state query also returns the highest supported total multiplier, or 0 if unknown.
-typedef int (*PFN_nx2sl_present_marker)(int after);
+typedef int (*PFN_nx2sl_present_marker)(int after, VkResult *error);
 typedef void (*PFN_nx2sl_stats)(uint64_t *presented, uint32_t *generated_per_frame);
 typedef uint64_t (*PFN_nx2sl_output_frames)(void);
 typedef void (*PFN_nx2sl_shutdown)(void);

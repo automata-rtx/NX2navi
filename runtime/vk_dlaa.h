@@ -2,6 +2,7 @@
 #pragma once
 #include "vk.h"
 #include "vk_ffx.h"
+#include "dlssg/nx2_sl.h"
 
 // The narrowest scene the DLSS pass and the motion passes recognise by its D32F depth: Ultra Performance at a 1080p
 // output renders 640 wide, smaller windows less.
@@ -38,6 +39,10 @@ int vk_dlaa_available(void);
 // scene's light target or, at the first quarter-width pass after it, runs DLAA on that target. Each present ends the
 // frame (vk_dlaa_frame).
 typedef struct VkExec VkExec;
+VkImageView vk_dlaa_ui_attachment(const VkExec *ex);
+void vk_dlaa_ui_invalidate(VkImage image);
+void vk_dlaa_ui_draw(VkPipeState *s);
+int vk_dlaa_ui_image(Nx2SlImage *image);
 void vk_dlaa_pass(VkExec *ex);
 void vk_dlaa_frame(void);
 // vk_exec_draw.c notes the scene camera and requests the viewport offset for each submitted draw.

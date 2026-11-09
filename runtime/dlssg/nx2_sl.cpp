@@ -11,6 +11,8 @@
 #define NX2SL_BUILD
 #include <windows.h>
 
+#include <mutex>
+#include <atomic>
 #include <stdio.h>
 #include <string.h>
 
@@ -38,13 +40,30 @@ PFun_slDLSSGGetState *p_dlssg_state;
 PFun_slPCLSetMarker *p_marker;
 PFun_slReflexSetOptions *p_reflex;
 PFun_slReflexSleep *p_sleep;
+PFun_slReflexGetState *p_reflex_state;
 PFN_vkGetInstanceProcAddr p_gipa;
 PFN_vkGetDeviceProcAddr p_gdpa;
 sl::FrameToken *g_frame;
 int g_available = -1, g_multiplier = -1;
+std::mutex g_options_lock;
+bool g_suspended, g_faulted, g_wait_for_present;
+unsigned g_mismatched_ui_frames;
+std::atomic<int> g_api_error{VK_SUCCESS};
+
+// The SDK may report this from its own presenter thread.
+void api_error(const sl::APIError &error) {
+    int result = static_cast<int>(error.vkRes);
+    if (result < 0 || result == VK_SUBOPTIMAL_KHR) {
+        int previous = g_api_error.load(std::memory_order_relaxed);
+        while ((previous == VK_SUCCESS || previous == VK_SUBOPTIMAL_KHR || result == VK_ERROR_DEVICE_LOST) &&
+               !g_api_error.compare_exchange_weak(previous, result, std::memory_order_relaxed)) {}
+    }
+}
+int g_recompose = -1;
+uint32_t g_min_size;
 uint64_t g_presented;
 uint32_t g_generated;
-uint64_t g_output_frames;
+std::atomic<uint64_t> g_output_frames{};
 uint64_t g_interval_start, g_interval_output;
 
 void say(const char *fmt, ...) {
@@ -138,6 +157,7 @@ extern "C" NX2SL_API int nx2sl_available(void) {
     if (p_feature(sl::kFeaturePCL, "slPCLSetMarker", f) == sl::Result::eOk) p_marker = (PFun_slPCLSetMarker *)f;
     if (p_feature(sl::kFeatureReflex, "slReflexSetOptions", f) == sl::Result::eOk) p_reflex = (PFun_slReflexSetOptions *)f;
     if (p_feature(sl::kFeatureReflex, "slReflexSleep", f) == sl::Result::eOk) p_sleep = (PFun_slReflexSleep *)f;
+    if (p_feature(sl::kFeatureReflex, "slReflexGetState", f) == sl::Result::eOk) p_reflex_state = (PFun_slReflexGetState *)f;
     if (!p_dlssg_options || !p_dlssg_state || !p_marker || !p_reflex || !p_sleep) g_available = 0;
     if (g_available) {
         sl::ReflexOptions o{};
@@ -152,15 +172,70 @@ extern "C" NX2SL_API int nx2sl_available(void) {
     return g_available;
 }
 
-extern "C" NX2SL_API int nx2sl_frame(VkCommandBuffer cb, const Nx2SlImage *depth, const Nx2SlImage *mv,
-                                     const Nx2SlImage *hudless, const Nx2SlCamera *cam, uint32_t out_w, uint32_t out_h,
-                                     int multiplier) {
+extern "C" NX2SL_API void *nx2sl_begin(void) {
+    sl::FrameToken *token = nullptr;
+    if (g_available != 1 || p_token(token, nullptr) != sl::Result::eOk || !token) return nullptr;
+    p_sleep(*token);
+    p_marker(sl::PCLMarker::eSimulationStart, *token);
+    return token;
+}
+
+extern "C" NX2SL_API void nx2sl_submit(void *handle, int end) {
+    auto *token = static_cast<sl::FrameToken *>(handle);
+    if (!token) return;
+    if (!end) p_marker(sl::PCLMarker::eSimulationEnd, *token);
+    p_marker(end ? sl::PCLMarker::eRenderSubmitEnd : sl::PCLMarker::eRenderSubmitStart, *token);
+}
+
+static void turn_off() {
+    if (g_available != 1 || g_multiplier <= 0) return;
+    sl::DLSSGOptions off{};
+    off.mode = sl::DLSSGMode::eOff;
+    off.onErrorCallback = api_error;
+    off.enableUserInterfaceRecomposition = g_recompose > 0 ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+    sl::Result result = p_dlssg_options(sl::ViewportHandle(0), off);
+    if (result == sl::Result::eOk) g_multiplier = 0;
+    say("dlssg: suspended before swapchain change or recovery (%d)", (int)result);
+}
+
+extern "C" NX2SL_API void nx2sl_suspend(int suspend) {
+    std::lock_guard<std::mutex> lock(g_options_lock);
+    g_suspended = suspend != 0;
+    if (suspend)
+        turn_off();
+    else {
+        g_wait_for_present = true;
+        g_mismatched_ui_frames = 0;
+        g_faulted = false;
+        g_recompose = -1;
+    }
+}
+
+extern "C" NX2SL_API int nx2sl_frame(void *handle, VkCommandBuffer cb, const Nx2SlImage *depth, const Nx2SlImage *mv,
+                                     const Nx2SlImage *hudless, const Nx2SlImage *ui, const Nx2SlCamera *cam, uint32_t out_w,
+                                     uint32_t out_h, int multiplier) {
     if (g_available != 1) return 0;
-    if (p_token(g_frame, nullptr) != sl::Result::eOk || !g_frame) return 0;
-    p_sleep(*g_frame);
-    p_marker(sl::PCLMarker::eSimulationStart, *g_frame);
-    p_marker(sl::PCLMarker::eSimulationEnd, *g_frame);
-    p_marker(sl::PCLMarker::eRenderSubmitStart, *g_frame);
+    std::lock_guard<std::mutex> lock(g_options_lock);
+    g_frame = static_cast<sl::FrameToken *>(handle);
+    if (!g_frame) {
+        multiplier = 0;
+        if (p_token(g_frame, nullptr) != sl::Result::eOk || !g_frame) {
+            turn_off();
+            return 0;
+        }
+    }
+    if (!depth || !mv || !cam || g_suspended || g_wait_for_present || g_faulted || out_w < g_min_size || out_h < g_min_size)
+        multiplier = 0;
+    // Recomposition is an NGX feature creation option. Changing it on a HUD
+    // draw or menu transition can recreate a feature still servicing a present.
+    // Select it for this swapchain on its first interpolated scene.
+    if (multiplier && g_recompose < 0) g_recompose = ui && hudless;
+    // A persistent overlay or a different scene layout can change the
+    // available UI inputs. Switch feature configuration on a fresh swapchain.
+    bool change = multiplier && g_recompose != static_cast<int>(ui && hudless);
+    g_mismatched_ui_frames = change ? g_mismatched_ui_frames + 1 : 0;
+    bool rebuild = g_mismatched_ui_frames == 60;
+    if (rebuild || (g_recompose > 0 && (!ui || !hudless))) multiplier = 0;
     sl::ViewportHandle vp(0);
     if (multiplier && depth && mv && cam) {
         sl::Constants c{};
@@ -186,15 +261,19 @@ extern "C" NX2SL_API int nx2sl_frame(VkCommandBuffer cb, const Nx2SlImage *depth
         sl::Result constants = p_constants(c, *g_frame, vp);
         sl::Resource rd = resource(depth), rm = resource(mv), rh = hudless ? resource(hudless) : sl::Resource{};
         sl::Extent ed{0, 0, depth->width, depth->height}, em{0, 0, mv->width, mv->height};
+        sl::Resource ru = ui ? resource(ui) : sl::Resource{};
+        sl::Extent eu{0, 0, ui ? ui->width : 0, ui ? ui->height : 0};
         const VkRect2D &rect = cam->output_rect;
         sl::Extent picture{(uint32_t)rect.offset.y, (uint32_t)rect.offset.x, rect.extent.width, rect.extent.height};
         // The present worker submits this command buffer before waiting for its flip time.
         // The replay can already be writing the next scene's depth and motion before that flip.
-        sl::ResourceTag tags[] = {sl::ResourceTag(&rd, sl::kBufferTypeDepth, sl::ResourceLifecycle::eOnlyValidNow, &ed),
-                                   sl::ResourceTag(&rm, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eOnlyValidNow, &em),
-                                   sl::ResourceTag(hudless ? &rh : nullptr, sl::kBufferTypeHUDLessColor,
-                                                   sl::ResourceLifecycle::eValidUntilPresent, hudless ? &picture : nullptr),
-                                   sl::ResourceTag(nullptr, sl::kBufferTypeBackbuffer, sl::ResourceLifecycle::eValidUntilPresent, &picture)};
+        sl::ResourceTag tags[] = {
+            sl::ResourceTag(&rd, sl::kBufferTypeDepth, sl::ResourceLifecycle::eOnlyValidNow, &ed),
+            sl::ResourceTag(&rm, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eOnlyValidNow, &em),
+            sl::ResourceTag(hudless ? &rh : nullptr, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent,
+                            hudless ? &picture : nullptr),
+            sl::ResourceTag(ui ? &ru : nullptr, sl::kBufferTypeUIAlpha, sl::ResourceLifecycle::eOnlyValidNow, ui ? &eu : nullptr),
+            sl::ResourceTag(nullptr, sl::kBufferTypeBackbuffer, sl::ResourceLifecycle::eValidUntilPresent, &picture)};
         sl::Result tagged = p_tag(*g_frame, vp, tags, sizeof tags / sizeof tags[0], (sl::CommandBuffer *)cb);
         if (constants != sl::Result::eOk || tagged != sl::Result::eOk) {
             static int warnings;
@@ -202,40 +281,83 @@ extern "C" NX2SL_API int nx2sl_frame(VkCommandBuffer cb, const Nx2SlImage *depth
             multiplier = 0;
         }
     }
+    if (!multiplier) {
+        sl::ResourceTag clear[] = {{nullptr, sl::kBufferTypeUIAlpha, sl::ResourceLifecycle::eValidUntilPresent},
+                                   {nullptr, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent},
+                                   {nullptr, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent},
+                                   {nullptr, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent},
+                                   {nullptr, sl::kBufferTypeBackbuffer, sl::ResourceLifecycle::eValidUntilPresent}};
+        p_tag(*g_frame, vp, clear, sizeof clear / sizeof clear[0], (sl::CommandBuffer *)cb);
+    }
+    bool recompose = g_recompose > 0;
     if (multiplier != g_multiplier) {
         sl::DLSSGOptions o{};
         // Menus and frames without camera inputs temporarily suspend interpolation.
         // Keep the NGX resources ready for the next gameplay frame.
         o.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
+        o.onErrorCallback = api_error;
         o.mode = multiplier ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
+        o.enableUserInterfaceRecomposition = recompose ? sl::Boolean::eTrue : sl::Boolean::eFalse;
         o.numFramesToGenerate = multiplier ? multiplier - 1 : 1;
         sl::Result r = p_dlssg_options(vp, o);
-        say("dlssg: set multiplier %d (%d), output %ux%u", multiplier, (int)r, out_w, out_h);
+        say("dlssg: set multiplier %d (%d), output %ux%u, HUD recomposition %s", multiplier, (int)r, out_w, out_h,
+            recompose ? "on" : "off");
         if (r == sl::Result::eOk) {
             g_multiplier = multiplier;
             g_interval_start = g_presented;
             g_interval_output = g_output_frames;
+        } else if (multiplier) {
+            g_faulted = true;
+            turn_off();
         }
     }
-    p_marker(sl::PCLMarker::eRenderSubmitEnd, *g_frame);
-    return 1;
+
+    return rebuild ? NX2SL_REBUILD_SWAPCHAIN : 1;
 }
 
-extern "C" NX2SL_API int nx2sl_present_marker(int after) {
+extern "C" NX2SL_API int nx2sl_present_marker(int after, VkResult *error) {
     if (g_available != 1 || !g_frame) return 0;
+    std::lock_guard<std::mutex> lock(g_options_lock);
     p_marker(after ? sl::PCLMarker::ePresentEnd : sl::PCLMarker::ePresentStart, *g_frame);
     if (after) {
+        g_wait_for_present = false;
+        VkResult async = static_cast<VkResult>(g_api_error.exchange(VK_SUCCESS));
+        if (error) *error = async;
+        if (async < 0 && async != VK_ERROR_OUT_OF_DATE_KHR && g_multiplier > 0) {
+            g_faulted = true;
+            turn_off();
+        }
         g_presented++;
         sl::DLSSGState s{};
         sl::Result result = p_dlssg_state(sl::ViewportHandle(0), s, nullptr);
         if (result == sl::Result::eOk) {
+            g_min_size = s.minWidthOrHeight;
+            if (s.status != sl::DLSSGStatus::eOk && g_multiplier > 0) {
+                say("dlssg: disabling interpolation after runtime status %#x", (unsigned)s.status);
+                g_faulted = true;
+                turn_off();
+            }
             g_generated = s.numFramesActuallyPresented;
             g_output_frames += g_generated;
             uint64_t count = g_presented - g_interval_start;
             if (count == 60 || count >= 300) {
                 say("dlssg: %llu game presents, %llu output frames in interval, last %u, multiplier %d, status %u",
-                    (unsigned long long)count, (unsigned long long)(g_output_frames - g_interval_output),
-                    g_generated, g_multiplier, (unsigned)s.status);
+                    (unsigned long long)count, (unsigned long long)(g_output_frames - g_interval_output), g_generated,
+                    g_multiplier, (unsigned)s.status);
+                if (count >= 300 && g_multiplier > 0 && p_reflex_state) {
+                    sl::ReflexState reflex{};
+                    if (p_reflex_state(reflex) == sl::Result::eOk && reflex.latencyReportAvailable) {
+                        for (int i = sl::kReflexFrameReportCount - 1; i >= 0; --i) {
+                            const auto &f = reflex.frameReport[i];
+                            if (!f.simStartTime || !f.presentEndTime || !f.renderSubmitEndTime || !f.simEndTime) continue;
+                            say("dlssg: Reflex frame %llu: simulation %lld us, render submit %lld us, present %lld us",
+                                (unsigned long long)f.frameID, (long long)(f.simEndTime - f.simStartTime),
+                                (long long)(f.renderSubmitEndTime - f.renderSubmitStartTime),
+                                (long long)(f.presentEndTime - f.presentStartTime));
+                            break;
+                        }
+                    }
+                }
                 if (count >= 300) {
                     g_interval_start = g_presented;
                     g_interval_output = g_output_frames;
@@ -243,8 +365,13 @@ extern "C" NX2SL_API int nx2sl_present_marker(int after) {
             }
             if (s.numFramesToGenerateMax >= NX2SL_MAX_MULTIPLIER - 1) return NX2SL_MAX_MULTIPLIER;
             if (s.numFramesToGenerateMax) return (int)s.numFramesToGenerateMax + 1;
-        } else if (g_presented == 1 || g_presented % 300 == 0) {
-            say("dlssg: could not read the presented frame count (%d)", (int)result);
+        } else {
+            if (g_multiplier > 0 || g_presented == 1 || g_presented % 300 == 0)
+                say("dlssg: could not read runtime state (%d)", (int)result);
+            if (g_multiplier > 0) {
+                g_faulted = true;
+                turn_off();
+            }
         }
     }
     return 0;

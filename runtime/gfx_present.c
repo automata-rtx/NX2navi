@@ -317,6 +317,7 @@ static void free_capture(void) {
 // then timed out frame after frame behind AMD's presenter (the picture stopped).
 static int create_swapchain(void) {
     flip_locked();   // the acquired image goes out before its swapchain is replaced
+    vk_dlssg_suspend(1);
     plat_xchg32(&g_dirty, 0);
     VkCtx *c = vk_ctx();
     VkSurfaceCapabilitiesKHR caps;
@@ -422,6 +423,7 @@ static int create_swapchain(void) {
     }
     free_capture();
     vk_queue_unlock();
+    if (!plat_cas32(&g_dirty, 0, 0)) vk_dlssg_suspend(0);
     return 1;
 }
 
@@ -864,7 +866,79 @@ static VkImage hudless_record(VkCommandBuffer cb, unsigned slot, int w, int h, c
     return g_hl;
 }
 
-static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int h, const int crop[4], int defer) {
+static Nx2SlImage g_ui_scaled;
+static VmaAllocation g_ui_memory;
+
+static void free_ui_scaled(void) {
+    VkCtx *c = vk_ctx();
+    if (g_ui_scaled.view) vkDestroyImageView(c->device, g_ui_scaled.view, NULL);
+    if (g_ui_scaled.image) vmaDestroyImage(c->vma, g_ui_scaled.image, g_ui_memory);
+    g_ui_scaled = (Nx2SlImage){0};
+}
+
+// The source mask lives in game output pixels. Streamline reads the mask
+// relative to the tagged backbuffer rectangle, whose origin excludes any bars.
+static int ui_picture(VkCommandBuffer cb, const int crop[4], const int to[4], Nx2SlImage *out) {
+    Nx2SlImage src;
+    if (!vk_dlaa_ui_image(&src) || crop[0] < 0 || crop[1] < 0 || crop[2] <= 0 || crop[3] <= 0 ||
+        crop[0] + crop[2] > (int)src.width || crop[1] + crop[3] > (int)src.height || to[2] <= 0 || to[3] <= 0)
+        return 0;
+    if (!crop[0] && !crop[1] && crop[2] == (int)src.width && crop[3] == (int)src.height && crop[2] == to[2] && crop[3] == to[3]) {
+        *out = src;
+        return 1;
+    }
+    VkCtx *c = vk_ctx();
+    uint32_t w = (uint32_t)to[2], h = (uint32_t)to[3];
+    if (g_ui_scaled.image && (g_ui_scaled.width != w || g_ui_scaled.height != h)) {
+        vk_queue_lock();
+        vkDeviceWaitIdle(c->device);
+        vk_queue_unlock();
+        free_ui_scaled();
+    }
+    if (!g_ui_scaled.image) {
+        VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                                .imageType = VK_IMAGE_TYPE_2D,
+                                .format = VK_FORMAT_R8_UNORM,
+                                .extent = {w, h, 1},
+                                .mipLevels = 1,
+                                .arrayLayers = 1,
+                                .samples = VK_SAMPLE_COUNT_1_BIT,
+                                .tiling = VK_IMAGE_TILING_OPTIMAL,
+                                .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        if (vmaCreateImage(c->vma, &ci, &ai, &g_ui_scaled.image, &g_ui_memory, NULL) != VK_SUCCESS) return 0;
+        VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                                    .image = g_ui_scaled.image,
+                                    .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                                    .format = ci.format,
+                                    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        if (vkCreateImageView(c->device, &vi, NULL, &g_ui_scaled.view) != VK_SUCCESS) {
+            free_ui_scaled();
+            return 0;
+        }
+        g_ui_scaled.width = w;
+        g_ui_scaled.height = h;
+        g_ui_scaled.format = ci.format;
+        g_ui_scaled.usage = ci.usage;
+        g_ui_scaled.layout = VK_IMAGE_LAYOUT_GENERAL;
+    }
+    sync_barrier(cb, g_ui_scaled.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                 VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                 VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    VkImageBlit b = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                     .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                     .srcOffsets = {{crop[0], crop[1], 0}, {crop[0] + crop[2], crop[1] + crop[3], 1}},
+                     .dstOffsets = {{0, 0, 0}, {to[2], to[3], 1}}};
+    vkCmdBlitImage(cb, src.image, src.layout, g_ui_scaled.image, VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_LINEAR);
+    sync_barrier(cb, g_ui_scaled.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                 VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT);
+    *out = g_ui_scaled;
+    return 1;
+}
+
+static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int h, const int crop[4], int defer,
+                          void *token) {
     int general = layout == VK_IMAGE_LAYOUT_GENERAL;
     {   // the presented image's format, when it changes (an HDR picture comes in another one)
         static VkFormat last = VK_FORMAT_UNDEFINED;
@@ -997,7 +1071,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
                      VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
                      VK_ACCESS_2_TRANSFER_WRITE_BIT);
     }
-    if (!g_sc_hdr && src) movie_overlay(cb, slot, dst);   // a movie frame over the game image (SDR swapchains)
+    int movie = !g_sc_hdr && src && movie_overlay(cb, slot, dst);   // a movie frame over the game image (SDR swapchains)
     // last: the image's layout, and the stage and access of its last write, as each step leaves it
     VkImageLayout last = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     VkPipelineStageFlags2 last_stage = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
@@ -1048,7 +1122,10 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     if (vk_dlssg_active()) {
         Nx2SlImage color = {hudless, g_hl_view, g_sc_fmt, g_sc_ext.width, g_sc_ext.height,
                             VK_IMAGE_LAYOUT_GENERAL, g_hl_usage};
-        vk_dlssg_frame(cb, g_sc_ext, to, src != VK_NULL_HANDLE, hudless && g_hl_view ? &color : NULL);
+        Nx2SlImage alpha;
+        int use_alpha = hudless && !overlay && !movie && !show_hl && ui_picture(cb, rect, to, &alpha);
+        vk_dlssg_frame(token, cb, g_sc_ext, to, src && !movie, hudless && g_hl_view ? &color : NULL,
+                       use_alpha ? &alpha : NULL);
     }
     sync_barrier(cb, dst, last, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, last_stage, last_write, VK_PIPELINE_STAGE_2_NONE, 0);
     vk_crumb(cb, VK_CRUMB_PRESENT_END, crumb);
@@ -1064,6 +1141,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
                         .pSignalSemaphoreInfos = &sig};
     vk_queue_lock();
     r = vkQueueSubmit2(c->gfx_queue, 1, &si, g_fence[slot]);
+    vk_dlssg_submit(token, 1);
     vk_queue_unlock();
     if (r == VK_SUCCESS) {
         g_flip_on = 1;
@@ -1087,16 +1165,16 @@ out:
 }
 
 void vk_present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int h, const int crop[4]) {
-    present_image(src, layout, fmt, w, h, crop, 0);
+    present_image(src, layout, fmt, w, h, crop, 0, NULL);
 }
 
-void vk_present_blit(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int h, const int crop[4]) {
-    present_image(src, layout, fmt, w, h, crop, 1);
+void vk_present_blit(void *token, VkImage src, VkImageLayout layout, VkFormat fmt, int w, int h, const int crop[4]) {
+    present_image(src, layout, fmt, w, h, crop, 1, token);
 }
 
 // The boot screen on a black frame (menu_boot_frame), without a game image: present_image's paths that read a source
 // are skipped. The size only places the picture rectangle, which a frame without a picture leaves as it was.
-void gfx_present_boot(void) { present_image(VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED, VK_FORMAT_UNDEFINED, 1920, 1080, NULL, 0); }
+void gfx_present_boot(void) { present_image(VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED, VK_FORMAT_UNDEFINED, 1920, 1080, NULL, 0, NULL); }
 
 void vk_present_flip(void) {
     plat_rmutex_lock(&g_pl);
@@ -1121,6 +1199,7 @@ void gfx_window_release_vk(void) {
         vk_queue_lock(), vkDeviceWaitIdle(c->device), vk_queue_unlock();
         vk_queue_unlock();
         g_flip_on = 0;   // its blit is done (device idle); the swapchain goes away unpresented
+        free_ui_scaled();
         menu_vk_release();
         vk_fsr_release();
         vk_color_release();

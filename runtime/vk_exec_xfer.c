@@ -539,7 +539,10 @@ static void copy_buffer_image(VkExec *ex, const p_copy_b2t *p, int to_image) {
     if (to_image) vkCmdCopyBufferToImage(ex->cb, m.buffer, s.img->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
     else vkCmdCopyImageToBuffer(ex->cb, s.img->image, VK_IMAGE_LAYOUT_GENERAL, m.buffer, 1, &c);
     ex->recorded++;
-    if (to_image) vk_texture_gpu_written(p->tex);
+    if (to_image) {
+        vk_dlaa_ui_invalidate(s.img->image);
+        vk_texture_gpu_written(p->tex);
+    }
     else vk_mem_gpu_wrote(&m, size), note_gpu_write(ex, p->src, size);
 }
 
@@ -579,6 +582,7 @@ static void copy_t2t(VkExec *ex, const p_copy_t2t *p) {
                        linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     }
     ex->recorded++;
+    vk_dlaa_ui_invalidate(d.img->image);
     vk_texture_gpu_written(p->dst);
     if (d.aspect == VK_IMAGE_ASPECT_DEPTH_BIT) {
         int whole = same_size && same_format && !s.x && !s.y && !d.x && !d.y && !sl.mipLevel && !dl.mipLevel &&
@@ -707,6 +711,7 @@ static void clear_tex(VkExec *ex, const p_clear_tex *p) {
         }
         vk_exec_pass_end(ex);
         vk_exec_barrier(ex);
+        vk_dlaa_ui_invalidate(img->image);
         vkCmdClearColorImage(ex->cb, img->image, VK_IMAGE_LAYOUT_GENERAL, &cv, 1, &rng);
     } else {
         int both = (img->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) && (img->aspect & VK_IMAGE_ASPECT_STENCIL_BIT);

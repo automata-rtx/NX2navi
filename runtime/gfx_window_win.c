@@ -91,11 +91,13 @@ static void toggle_fullscreen(HWND h) {
         MONITORINFO mi = {sizeof mi};
         if (!GetWindowPlacement(h, &g_saved_place) || !GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTOPRIMARY), &mi))
             return;
+        vk_dlssg_suspend(1);
         SetWindowLongW(h, GWL_STYLE, (style & ~WS_OVERLAPPEDWINDOW) | WS_POPUP);
         SetWindowPos(h, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
                      mi.rcMonitor.bottom - mi.rcMonitor.top,
                      SWP_NOOWNERZORDER | SWP_FRAMECHANGED | (g_background ? SWP_NOZORDER | SWP_NOACTIVATE : 0));
     } else {
+        vk_dlssg_suspend(1);
         SetWindowLongW(h, GWL_STYLE, (style & ~WS_POPUP) | WND_STYLE);
         if (g_background) g_saved_place.showCmd = SW_SHOWNOACTIVATE;
         SetWindowPlacement(h, &g_saved_place);
@@ -228,6 +230,18 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
             input_cursor_suspend(0);
         }
         return 0;
+    case WM_SYSCOMMAND:
+        if ((w & 0xfff0) == SC_MINIMIZE || (w & 0xfff0) == SC_MAXIMIZE || (w & 0xfff0) == SC_RESTORE)
+            vk_dlssg_suspend(1);
+        break;
+    case WM_WINDOWPOSCHANGING: {
+        const WINDOWPOS *pos = (const WINDOWPOS *)l;
+        RECT old;
+        if (!(pos->flags & SWP_NOSIZE) && GetWindowRect(h, &old) &&
+            (pos->cx != old.right - old.left || pos->cy != old.bottom - old.top))
+            vk_dlssg_suspend(1);
+        break;
+    }
     case WM_SIZE:
         keep_awake(w != SIZE_MINIMIZED);
         if (w != SIZE_MINIMIZED) gfx_window_mark_dirty();

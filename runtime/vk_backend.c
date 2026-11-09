@@ -30,10 +30,11 @@
 #include "vk_exec.h"
 #include "platform/platform.h"
 #include "vk_dlaa.h"
+#include "vk_dlssg.h"
 
 #define WEAK __attribute__((weak))
 
-typedef struct { VkImage image; VkFormat format; int w, h, has_crop, crop[4]; uint64_t frame, at, queued, value; } PresentJob;
+typedef struct { void *token; VkImage image; VkFormat format; int w, h, has_crop, crop[4]; uint64_t frame, at, queued, value; } PresentJob;
 
 static PlatMutex pl = PLAT_MUTEX_INIT;
 static PlatCond pcv = PLAT_COND_INIT;   // job queued, job taken, job submitted
@@ -59,7 +60,7 @@ static void present_main(void *arg) {
         plat_cond_broadcast(&pcv);
         plat_mutex_unlock(&pl);
         if (flight_on || vk_dump_white) vk_thumbs_frame(j.frame);   // NX2NAVI_DUMP_WHITE reads them too
-        vk_present_blit(j.image, VK_IMAGE_LAYOUT_GENERAL, j.format, j.w, j.h, j.has_crop ? j.crop : NULL);
+        vk_present_blit(j.token, j.image, VK_IMAGE_LAYOUT_GENERAL, j.format, j.w, j.h, j.has_crop ? j.crop : NULL);
         uint64_t f = vk_sync_submit(NULL, 0);   // a timeline value after the blit: deferred destruction waits for the blit too
         if (j.value && f != j.value)
             rt_fatal("vk: the present of frame %llu signalled %llu, queued as %llu", (unsigned long long)j.frame,
@@ -97,7 +98,7 @@ void vk_present_drain(void) {
 
 // The present after the frame count: resolves the image and hands the blit to the present thread. queued: when the game
 // presented; value: the timeline value queued for this present (asynchronous replay), 0 for the next one (synchronous).
-static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uint64_t queued, uint64_t frame,
+static void present_image(void *token, const tex_t *t, const int crop[4], uint64_t at_ns, uint64_t queued, uint64_t frame,
                           uint64_t value) {
     static volatile int32_t n_skipped;
     vk_exec_frame_log(t, frame);
@@ -118,7 +119,7 @@ static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uin
         }
         return;
     }
-    PresentJob j = {.image = img->image, .format = img->format, .w = (int)img->width, .h = (int)img->height, .frame = frame,
+    PresentJob j = {.token = token, .image = img->image, .format = img->format, .w = (int)img->width, .h = (int)img->height, .frame = frame,
                     .at = at_ns, .queued = queued, .value = value};
     vk_hdr_present_source(img, &j.image, &j.format);   // NX2NAVI_HDR: the float picture the game copied into it, same size
     if (crop) {
@@ -142,6 +143,7 @@ static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uin
 // ---- Asynchronous replay
 enum { RI_SUBMIT, RI_PRESENT, RI_RELEASE };
 typedef struct {
+    void *token;
     int kind, n, has_crop, crop[4];
     uint64_t value, submit_no, at, queued;
     uint64_t *h;
@@ -222,7 +224,7 @@ static void replay_main(void *arg) {
             free((void *)it.tex);
         } else {
             uint64_t frame = __atomic_add_fetch(&gfx_counters.frames, 1, __ATOMIC_RELAXED);
-            present_image(it.tex, it.has_crop ? it.crop : NULL, it.at, it.queued, frame, it.value);
+            present_image(it.token, it.tex, it.has_crop ? it.crop : NULL, it.at, it.queued, frame, it.value);
         }
         plat_mutex_lock(&rl);
         if (it.kind == RI_SUBMIT) r_submit_done = it.submit_no;
@@ -325,12 +327,12 @@ void gfx_exit_log(void) {
     if (gfx_replay_async() && r_started && !plat_xchg32(&done, 1)) replay_log(game_frames, 1);
 }
 
-static void vk_be_present(const tex_t *t, const int crop[4], uint64_t at_ns) {
+static void queue_game_present(void *token, const tex_t *t, const int crop[4], uint64_t at_ns) {
     vk_sync_start();
     if (!gfx_replay_async()) {
         uint64_t frame = __atomic_add_fetch(&gfx_counters.frames, 1, __ATOMIC_RELAXED);
         perf_present(frame);   // before vk_exec_frame_log, which resets the frame's exec counts the flight recorder reads
-        present_image(t, crop, at_ns, kern_now_ns(), frame, 0);
+        present_image(token, t, crop, at_ns, kern_now_ns(), frame, 0);
         return;
     }
     // Frame bound: the replay thread handled the previous present before this one is queued.
@@ -346,12 +348,46 @@ static void vk_be_present(const tex_t *t, const int crop[4], uint64_t at_ns) {
     uint64_t frame = ++game_frames;
     perf_present(frame);
     if (frame % 1800 == 0) replay_log(frame, 0);
-    ReplayItem it = {.kind = RI_PRESENT, .tex = t, .at = at_ns, .queued = kern_now_ns()};
+    ReplayItem it = {.token = token, .kind = RI_PRESENT, .tex = t, .at = at_ns, .queued = kern_now_ns()};
     if (crop) {
         it.has_crop = 1;
         for (int i = 0; i < 4; i++) it.crop[i] = crop[i];
     }
     replay_enqueue(&it);
+}
+
+// A guest present closes its render submissions. The next guest frame begins
+// before returning to simulation, independently of the delayed host flip.
+static void *game_token;
+static int submit_started;
+static PlatMutex token_lock = PLAT_MUTEX_INIT;
+
+static void first_render_submit(void) {
+    if (!vk_dlssg_active()) return;
+    plat_mutex_lock(&token_lock);
+    if (game_token && !submit_started) {
+        vk_dlssg_submit(game_token, 0);
+        submit_started = 1;
+    }
+    plat_mutex_unlock(&token_lock);
+}
+
+static void vk_be_present(const tex_t *t, const int crop[4], uint64_t at_ns) {
+    if (!vk_dlssg_active()) {
+        queue_game_present(NULL, t, crop, at_ns);
+        return;
+    }
+    first_render_submit();
+    plat_mutex_lock(&token_lock);
+    void *token = game_token;
+    game_token = NULL;
+    plat_mutex_unlock(&token_lock);
+    queue_game_present(token, t, crop, at_ns);
+    token = vk_dlssg_begin();
+    plat_mutex_lock(&token_lock);
+    submit_started = 0;
+    game_token = token;
+    plat_mutex_unlock(&token_lock);
 }
 
 // vk_pipeline.c drops a released program's pipelines here.
@@ -391,6 +427,7 @@ static void vk_be_program_release(const prog_t *p) { replay_drain(DR_PROG_RELEAS
 // Asynchronous: the handles (nvn_submit_prepare_async ran under the front end's submit lock) are copied and queued;
 // the value returned is the one the replay will signal.
 static uint64_t vk_be_submit(const uint64_t *handles, int n) {
+    first_render_submit();
     if (!gfx_replay_async()) return submit_sync(handles, n);
     vk_sync_start();
     ReplayItem it = {.kind = RI_SUBMIT, .n = n, .submit_no = nvn_submit_count()};
