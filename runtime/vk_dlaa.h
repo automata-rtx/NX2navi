@@ -49,6 +49,9 @@ void vk_dlaa_frame(void);
 void vk_dlaa_draw(VkExec *ex);
 void vk_dlaa_draw_jitter(const VkExec *ex, int mesh, float *x, float *y);
 void vk_dlaa_depth_copy(VkImage src, VkImage dst, int whole);
+// Replace the verified scene scaler as a unit. A zero return keeps the guest command list intact.
+int vk_dlaa_scene_wanted(void);
+int vk_dlaa_scene_resolve(VkExec *ex, uint64_t source, uint64_t destination);
 int vk_dlaa_replaces_edge_blend(void);
 int vk_dlaa_tensor_ready(uint32_t w, uint32_t h);
 int vk_dlaa_tensor_resolve(VkExec *ex, VkImage linear, VkImageView view, VkImage dst, uint32_t dw, uint32_t dh);

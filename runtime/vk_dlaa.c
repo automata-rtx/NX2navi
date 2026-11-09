@@ -306,6 +306,7 @@ int vk_dlaa_available(void) { return vk_dlaa_wanted() && N.available; }
 // (vk_dlaa_swap_img, applied by vk_exec_draw.c tex_info): whichever shader scales, it scales DLSS's picture.
 static struct {
     VkExecTarget color, depth;   // the armed pair, valid in the frame it was armed
+    int pre_tonemap;            // previous evaluation took place before the game's color grade
     int armed, done, gbuf;       // this frame: armed on the light target, DLAA ran, the G-buffer was drawn
     int ended, up;               // this frame: the scene is drawn (jitter over), DLSS wrote the scaled output
     struct Size {                // a DLSS feature and its work images per scene size (dynamic resolution flips it)
@@ -321,7 +322,7 @@ static struct {
         VmaAllocation ui_mem;
         VkImage out, mv;
         VmaAllocation out_mem, mv_mem;
-        VkImageView out_view, mv_view;
+        VkImageView out_view, grade_view, mv_view;
         VkImage mask, chars[2];  // the bias mask DLSS reads, the character class mask of this and last frame (R8)
         VmaAllocation mask_mem, chars_mem[2];
         VkImageView mask_view, chars_view[2];
@@ -454,6 +455,7 @@ static void free_size(struct Size *e) {
     vk_queue_lock(), vkDeviceWaitIdle(c->device), vk_queue_unlock();   // a third scene size: the evicted images may still be in flight
     if (e->ui_view) vkDestroyImageView(c->device, e->ui_view, NULL);
     if (e->ui) vmaDestroyImage(c->vma, e->ui, e->ui_mem);
+    if (e->grade_view) vkDestroyImageView(c->device, e->grade_view, NULL);
     if (e->out_view) vkDestroyImageView(c->device, e->out_view, NULL);
     if (e->mv_view) vkDestroyImageView(c->device, e->mv_view, NULL);
     if (e->out) vmaDestroyImage(c->vma, e->out, e->out_mem);
@@ -1394,7 +1396,7 @@ int vk_dlaa_ui_image(Nx2SlImage *image) {
     return 1;
 }
 
-static void evaluate(VkExec *ex, const VkExecTarget *dst, VkImage linear, VkImageView linear_view) {
+static void evaluate(VkExec *ex, const VkExecTarget *dst, VkImage linear, VkImageView linear_view, VkFormat linear_format, VkImageView grade_target) {
     const VkExecTarget *t = &D.color, *z = &D.depth;
     if (!dst) dst = t;
     uint32_t w = t->width, h = t->height, ow = dst->width, oh = dst->height;
@@ -1407,6 +1409,15 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst, VkImage linear, VkImag
     }
     struct Size *e = size_for(cb, w, h, ow, oh);
     if (!e) return dl_fail("work image creation", 0);
+    if (grade_target && !e->grade_view) {
+        // The original packed RGB input supplies one in the alpha channel.
+        VkImageViewCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = e->out,
+            .format = VK_FORMAT_R16G16B16A16_SFLOAT, .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .components = {.a = VK_COMPONENT_SWIZZLE_ONE}, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        if (vkCreateImageView(vk_ctx()->device, &ci, NULL, &e->grade_view) != VK_SUCCESS) grade_target = VK_NULL_HANDLE;
+    }
+    if (!!grade_target != D.pre_tonemap) D.reset = 1, D.pre_tonemap = !!grade_target;
+
     if (e != D.last) D.reset = 1, D.why[0]++, e->chars_ok = e->dist_ok = 0;   // another size's history is from another moment
     if (!fsr3() && !D.params && !NGX_OK(N.alloc_params(&D.params))) return dl_fail("parameter allocation", 0);
     NgxParam *p = D.params;
@@ -1478,8 +1489,11 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst, VkImage linear, VkImag
                "%d)", w, h, ow, oh, q, 'A' + pr - 1, (int)t->format, (int)z->format);
     }
     if (D.last_color != t->image) D.reset = 1, D.why[2]++, D.last_color = t->image;
-    NgxResourceVK rc = linear ? res_image(linear_view, linear, VK_FORMAT_R16G16B16A16_SFLOAT, w, h, VK_IMAGE_ASPECT_COLOR_BIT, 0)
+    NgxResourceVK rc = linear ? res_image(linear_view, linear, linear_format, w, h, VK_IMAGE_ASPECT_COLOR_BIT, 0)
                               : res_image(cv, t->image, t->format, w, h, VK_IMAGE_ASPECT_COLOR_BIT, 0);
+    if (grade_target)
+        rc = res_image(vk_scene_grade.scene.imageView, vk_scene_grade.raw, VK_FORMAT_B10G11R11_UFLOAT_PACK32,
+                       w, h, VK_IMAGE_ASPECT_COLOR_BIT, 0);
     NgxResourceVK ro = res_image(e->out_view, e->out, VK_FORMAT_R16G16B16A16_SFLOAT, ow, oh, VK_IMAGE_ASPECT_COLOR_BIT, 1);
     NgxResourceVK rz = res_image(zv, z->image, z->format, w, h, VK_IMAGE_ASPECT_DEPTH_BIT, 0);
     NgxResourceVK rm = res_image(e->mv_view, e->mv, VK_FORMAT_R16G16_SFLOAT, w, h, VK_IMAGE_ASPECT_COLOR_BIT, 0);
@@ -1539,7 +1553,16 @@ evaluated:
     // (NX2NAVI_DLAA_MASKDEBUG=1 shows whichever bias mask DLSS got: the reactive one, or the characters')
     VkImage shown = mvdebug ? e->mv : maskdebug && mk ? mk->mask : maskdebug && masked ? e->mask : e->out;
     if (shown != e->out) b.srcOffsets[1] = (VkOffset3D){(int32_t)w, (int32_t)h, 1};
-    vkCmdBlitImage(cb, shown, VK_IMAGE_LAYOUT_GENERAL, dst->image, VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_NEAREST);
+    if (grade_target && shown == e->out) {
+        vk_scene_grade_record(cb, &vk_scene_grade, e->grade_view, grade_target, ow, oh);
+        static int told;
+        if (!told) {
+            rt_log("dlaa: reconstructing pre-tonemap HDR; guest tonemap and bloom at %ux%u", ow, oh);
+            told = 1;
+        }
+    } else {
+        vkCmdBlitImage(cb, shown, VK_IMAGE_LAYOUT_GENERAL, dst->image, VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_NEAREST);
+    }
     full_barrier(cb);
     if (!linear && dst != t) {   // the guest scaling draw samples the reconstructed light target
         vk_dlaa_swap_img = t->img;
@@ -1548,7 +1571,7 @@ evaluated:
     // The tensor destination stores packed scene color. Capture it after that conversion
     // so the HUD-less and presented images encode the same values under the UI.
     if (vk_dlaa_hudless_wanted)
-        hudless(cb, linear && shown == e->out && !vk_hdr_wanted() ? dst->image : e->out, ow, oh);
+        hudless(cb, linear && shown == e->out && (grade_target || !vk_hdr_wanted()) ? dst->image : e->out, ow, oh);
     ui_begin(cb, e, linear && vk_dlssg_active() ? dst->image : VK_NULL_HANDLE);
     ex->recorded += 4;
     vk_exec_draw_new_cb();   // NGX bound pipelines and descriptor sets of its own: the next draw binds everything again
@@ -1637,15 +1660,54 @@ static int scene_color(VkFormat f) {
     return f == VK_FORMAT_B10G11R11_UFLOAT_PACK32 || f == VK_FORMAT_R16G16B16A16_SFLOAT;
 }
 
-// Two frame shapes. A deferred frame (the G-buffer, several colour targets at the scene size) arms on the light target
-// drawn after it and ends the scene at the first pass a quarter as wide (the bloom), as described above. Ocarina's
-// frame has no G-buffer: its light target (B10G11R11 at the scene size, with the D32F scene depth) is drawn into from the
-// first opaque pass on, half- and quarter-size effect passes come and go in between, and the scene ends at the pass
-// that tonemaps the light target into the 8-bit output target. So without a G-buffer the frame arms on the first
-// scene-size light pass and ends at that output pass: at the output size and without depth when DLSS scales up
-// (DLSS writes the output and the tonemap samples it through vk_dlaa_swap_img), an sRGB target of the scene size in
-// DLAA (DLSS's picture goes back into the light target, which the tonemap then reads).
+// Scene passes provide the depth and camera for temporal reconstruction. On 1.1.1 the
+// scaler supplies the output size, and the tonemapping draw identifies the HDR input.
+// Other frame layouts use the light and output pass tests in vk_dlaa_pass.
 static int srgb8(VkFormat f) { return f == VK_FORMAT_R8G8B8A8_SRGB || f == VK_FORMAT_B8G8R8A8_SRGB; }
+
+int vk_dlaa_scene_wanted(void) {
+    return rt_game_version == 111 && dl_active() && !fsr3() && D.armed && !D.done && D.cam_size == OCAM_BLOCK;
+}
+
+int vk_dlaa_scene_resolve(VkExec *ex, uint64_t source, uint64_t destination) {
+    view_t sv, dv;
+    int hs = 0, hd = 0;
+    vk_texture_lock();
+    const VkTexImage *src = vk_texture_by_id_locked(NVN_HANDLE_TEX(source), &sv, &hs);
+    const VkTexImage *dst = vk_texture_by_id_locked(NVN_HANDLE_TEX(destination), &dv, &hd);
+    int valid = src && dst && src->layers == 1 && src->levels == 1 && dst->layers == 1 && dst->levels == 1 &&
+                !(hs && sv.set_format && sv.format != NVN_FORMAT_R11G11B10F) &&
+                !(hd && dv.set_format && dv.format != NVN_FORMAT_R11G11B10F) && src->image != dst->image && src->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 &&
+                dst->format == src->format && src->width == D.color.width && src->height == D.color.height &&
+                src->samples == 1 && dst->samples == 1 && src->type == VK_IMAGE_TYPE_2D && dst->type == VK_IMAGE_TYPE_2D &&
+                dst->width >= src->width && dst->height >= src->height && (dst->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    VkExecTarget output = {0};
+    VkTexImage input = {0}, graded = {0};
+    if (valid) {
+        output = (VkExecTarget){.image = dst->image, .width = dst->width, .height = dst->height};
+        input = *src;
+        if (vk_scene_grade.fence == ex->fence && vk_scene_grade.graded == src->image &&
+            vk_scene_grade.raw != dst->image && (dst->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
+            graded = *dst;
+        vk_texture_storage_bound_locked(dst);
+    }
+    vk_texture_unlock();
+    if (!valid) return 0;
+    VkImageView view = vk_exec_target_view(&input, input.format, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1, 0);
+    if (!view) return 0;
+    D.ended = D.done = D.tensor_scene = 1;
+    VkImageView grade_target = graded.image ? vk_exec_target_view(&graded, graded.format, VK_IMAGE_VIEW_TYPE_2D,
+        VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1, 0) : VK_NULL_HANDLE;
+    evaluate(ex, &output, input.image, view, input.format, grade_target);
+    vk_scene_grade.graded = VK_NULL_HANDLE;
+    if (D.failed) return 0;
+    static int told;
+    if (!told) {
+        rt_log("dlaa: scene resolve bypasses the complete SMAA sequence");
+        told = 1;
+    }
+    return 1;
+}
 
 int vk_dlaa_replaces_edge_blend(void) {
     return dl_active() && D.tensor_scene && D.armed && !D.done && D.cam_size == OCAM_BLOCK;
@@ -1663,7 +1725,7 @@ int vk_dlaa_tensor_resolve(VkExec *ex, VkImage linear, VkImageView view, VkImage
     // input has render resolution, and its destination is the image later presented with the HUD.
     VkExecTarget output = {.image = dst, .width = dw, .height = dh};
     D.ended = D.done = 1;
-    evaluate(ex, &output, linear, view);
+    evaluate(ex, &output, linear, view, VK_FORMAT_R16G16B16A16_SFLOAT, VK_NULL_HANDLE);
     return !D.failed;
 }
 
@@ -1711,33 +1773,33 @@ void vk_dlaa_pass(VkExec *ex) {
         return;
     }
     if (!D.armed) return;
-    // Once the tensor dispatch is recognized it owns the resolve. A later fullscreen
-    // copy samples the composed HUD target and cannot substitute for that dispatch.
-    if (D.tensor_scene && !fsr3() && D.cam_size == OCAM_BLOCK) return;
+    // In 1.1.1 the tensor destination owns the scene from the first frame. An earlier
+    // fullscreen draw can be a small effect target even before the scaler is first recognized.
+    if (!fsr3() && (rt_game_version == 111 || (D.tensor_scene && D.cam_size == OCAM_BLOCK))) return;
     if (!deferred) {   // Ocarina's shape: the output pass ends the scene and runs DLSS
         int one = ex->pass_ncolor == 1 && c->image && !z->image && c->image != D.color.image && c->samples <= 1 &&
                   !c->is3d;
         if (one && c->width > D.color.width && c->height > D.color.height) {
             D.ended = D.done = D.up = 1;
-            evaluate(ex, c, VK_NULL_HANDLE, VK_NULL_HANDLE);
+            evaluate(ex, c, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_FORMAT_UNDEFINED, VK_NULL_HANDLE);
         } else if (one && srgb8(c->format) && c->width == D.color.width &&
                    c->height == D.color.height) {
             D.ended = D.done = 1;
-            evaluate(ex, NULL, VK_NULL_HANDLE, VK_NULL_HANDLE);
+            evaluate(ex, NULL, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_FORMAT_UNDEFINED, VK_NULL_HANDLE);
         }
         return;
     }
     if (!D.ended) {
         if (!ex->pass_w || ex->pass_w * 4 > D.color.width) return;
         D.ended = 1;
-        if (D.color.width >= o[0]) D.done = 1, evaluate(ex, NULL, VK_NULL_HANDLE, VK_NULL_HANDLE);
+        if (D.color.width >= o[0]) D.done = 1, evaluate(ex, NULL, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_FORMAT_UNDEFINED, VK_NULL_HANDLE);
         return;
     }
     // the game's scaling pass: one colour target of the output size, no depth
     if (ex->pass_ncolor == 1 && c->image && !z->image && scene_color(c->format) && c->width > D.color.width &&
         c->width == o[0] && c->height == o[1] && c->samples <= 1 && !c->is3d) {
         D.done = D.up = 1;
-        evaluate(ex, c, VK_NULL_HANDLE, VK_NULL_HANDLE);
+        evaluate(ex, c, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_FORMAT_UNDEFINED, VK_NULL_HANDLE);
     }
 }
 
@@ -1784,6 +1846,7 @@ static void preset_check(void) {
 }
 
 void vk_dlaa_frame(void) {
+    vk_scene_grade.graded = VK_NULL_HANDLE;
     D.ui_target = VK_NULL_HANDLE;
     D.depth_copies_n = 0;
     vk_dlaa_swap_img = NULL, vk_dlaa_swap_view = VK_NULL_HANDLE;

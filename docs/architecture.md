@@ -102,8 +102,13 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   Pending draws in these passes leave pipeline linking to the workers. A later draw can use the finished pipeline.
   One-time passes can still wait for their output. Compute pipelines
   are compiled outside the pipeline lock, and one compile serves every thread that needs it.
-- The game's tensor-core upscaler is replaced by a decode-and-scale pass (`vk_tonemap.c`); `vk_fsr.c` runs AMD FSR 1
-  (EASU, RCAS) on the present when the window is larger than the picture.
+- On 1.1.1 the NVIDIA scene resolve replaces the two SMAA texture clears and the edge, weight, packing and tensor
+  dispatches once the replay recognizes the complete sequence. When the immediately preceding draw is the known
+  scene tonemap, DLAA or DLSS reconstructs its linear HDR input. The original fragment shader applies bloom and
+  grading at output resolution before HUD composition. If the grade cannot be identified, the same resolve can use
+  the game's tonemapped image. Other scaler sequences follow the ordinary replay path.
+- The tensor fallback uses a decode-and-scale pass (`vk_tonemap.c`). At presentation, `vk_fsr.c` can run FSR 1 (EASU, RCAS)
+  when the window is larger than the picture.
 - ASTC textures are uploaded as they are where the device samples ASTC, and decoded by a compute shader everywhere
   else (`vk_astc.c`); under 20 GiB of video memory the decoder encodes them to BC3.
 - Occlusion queries never block the CPU; a result that is not ready counts as visible.
