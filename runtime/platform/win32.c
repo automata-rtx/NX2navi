@@ -1708,11 +1708,47 @@ struct PlatChild {
     HANDLE proc, in, out;                                  // in: our write end, out: our read end
 };
 
+// Called under the spawn lock. The game keeps the only job handle for its lifetime, so Windows
+// stops the translators even if the game exits during process creation or shader translation.
+static LPPROC_THREAD_ATTRIBUTE_LIST child_job_attributes(void) {
+    static HANDLE job;
+    static LPPROC_THREAD_ATTRIBUTE_LIST attrs;
+    static int initialized;
+    if (initialized) return attrs;
+    initialized = 1;
+    job = CreateJobObjectW(NULL, NULL);
+    if (!job) return NULL;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {0};
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof limits)) {
+        SIZE_T size = 0;
+        InitializeProcThreadAttributeList(NULL, 1, 0, &size);
+        attrs = size ? malloc(size) : NULL;
+        if (attrs && InitializeProcThreadAttributeList(attrs, 1, 0, &size)) {
+            if (UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST, &job, sizeof job, NULL, NULL))
+                return attrs;
+            DeleteProcThreadAttributeList(attrs);
+        }
+        free(attrs);
+        attrs = NULL;
+    }
+    CloseHandle(job);
+    return NULL;
+}
+
+static BOOL start_pipe_process(const wchar_t *exe, const wchar_t *arg, STARTUPINFOEXW *si, PROCESS_INFORMATION *pi) {
+    wchar_t cmd[WPATH + 300];
+    swprintf(cmd, WPATH + 300, arg[0] ? L"\"%ls\" %ls" : L"\"%ls\"", exe, arg);
+    DWORD flags = CREATE_NO_WINDOW;
+    if (si->lpAttributeList) flags |= EXTENDED_STARTUPINFO_PRESENT;
+    si->StartupInfo.cb = si->lpAttributeList ? sizeof *si : sizeof si->StartupInfo;
+    return CreateProcessW(NULL, cmd, NULL, NULL, TRUE, flags, NULL, NULL, &si->StartupInfo, pi);
+}
+
 PlatChild *plat_child_start(const char *exe, const char *arg, uint32_t *err) {
-    wchar_t we[WPATH], wa[256] = L"", cmd[WPATH + 300];
+    wchar_t we[WPATH], wa[256] = L"";
     if (err) *err = 0;
     if (!widen(exe, we, WPATH) || (arg && !widen(arg, wa, 256))) return NULL;
-    swprintf(cmd, WPATH + 300, arg ? L"\"%ls\" %ls" : L"\"%ls\"", we, wa);
     SECURITY_ATTRIBUTES sa = {sizeof sa, NULL, TRUE};
     HANDLE in_r, in_w, out_r, out_w;
     // Pipes are created and handed out one child at a time: a child started meanwhile would inherit the other pipe
@@ -1727,11 +1763,18 @@ PlatChild *plat_child_start(const char *exe, const char *arg, uint32_t *err) {
     SetHandleInformation(in_w, HANDLE_FLAG_INHERIT, 0);
     SetHandleInformation(out_r, HANDLE_FLAG_INHERIT, 0);
     HANDLE nul = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, NULL);
-    STARTUPINFOW si = {.cb = sizeof si, .dwFlags = STARTF_USESTDHANDLES, .hStdInput = in_r, .hStdOutput = out_w,
-                       .hStdError = nul != INVALID_HANDLE_VALUE ? nul : out_w};
+    STARTUPINFOEXW si = {.StartupInfo = {.dwFlags = STARTF_USESTDHANDLES, .hStdInput = in_r, .hStdOutput = out_w,
+                                         .hStdError = nul != INVALID_HANDLE_VALUE ? nul : out_w},
+                         .lpAttributeList = child_job_attributes()};
     PROCESS_INFORMATION pi;
-    BOOL ok = CreateProcessW(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+    BOOL ok = start_pipe_process(we, wa, &si, &pi);
     DWORD e = GetLastError();
+    // Some enclosing jobs forbid nested jobs. Keep shader translation available in that environment.
+    if (!ok && si.lpAttributeList && (e == ERROR_ACCESS_DENIED || e == ERROR_NOT_SUPPORTED || e == ERROR_INVALID_PARAMETER)) {
+        si.lpAttributeList = NULL;
+        ok = start_pipe_process(we, wa, &si, &pi);
+        e = GetLastError();
+    }
     CloseHandle(in_r);
     CloseHandle(out_w);
     if (nul != INVALID_HANDLE_VALUE) CloseHandle(nul);

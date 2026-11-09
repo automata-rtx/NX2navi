@@ -1202,6 +1202,15 @@ ev(ev='end', exe='x')
 class JobTest(Tmp):
     @unittest.skipUnless(os.name == 'nt' and shutil.which('clang') and shutil.which('ld.lld'),
                          'needs Windows and the MSYS2 clang and lld on PATH')
+    def test_translator_lifetime(self):
+        exe = self.tmp / 'child job.exe'
+        subprocess.run(['clang', '-std=gnu11', '-O1', '-Iruntime', '-ffunction-sections', '-fdata-sections',
+                        'tests/child_job_check.c', 'runtime/platform/win32.c', '-fuse-ld=lld', '-Wl,--gc-sections',
+                        '-lwinmm', '-lbcrypt', '-o', str(exe)], cwd=ROOT, check=True)
+        subprocess.run([str(exe)], check=True, timeout=15)
+
+    @unittest.skipUnless(os.name == 'nt' and shutil.which('clang') and shutil.which('ld.lld'),
+                         'needs Windows and the MSYS2 clang and lld on PATH')
     def test_live_shader_worker_limit(self):
         exe = self.tmp / 'queue.exe'
         subprocess.run(['clang', '-std=gnu11', '-O1', '-Iruntime', '-ffunction-sections', '-fdata-sections',
