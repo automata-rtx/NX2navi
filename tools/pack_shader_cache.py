@@ -6,30 +6,33 @@ nx2navi.exe reads the pack first and the loose files after it, and keeps writing
 this tool can run again at any time the game is closed: it merges the existing pack with the loose files (a loose file
 wins over a packed one of the same name) and writes the pack anew. The installer runs it after preparing the shaders.
 
-Layout, little-endian (gfx_shader.c, section "cache pack"): b'TKSPACK1', u32 count, u32 flags, then count entries of 48
+Layout, little-endian (gfx_shader.c, section "cache pack"): b'TKSPACK1', u32 count, u32 0, then count entries of 48
 bytes sorted by (kind, name): name (the 32 bytes the file name's 64 hex digits spell), u32 kind (1 .spv, 2 .res.json,
-3 .use, 4 in/*.in), u32 size, u64 offset; then the data. Flag bit 0 marks packs written with shared payloads.
-Each key keeps its own index entry. Byte-identical payloads of the same kind can share an offset.
+3 .use, 4 in/*.in), u32 size, u64 offset; then the data.
 
     python tools\\pack_shader_cache.py <install folder>\\shader-cache [--keep]
 
 --keep leaves the loose files in place. Close the game first: a running nx2navi.exe has read the old pack's index.
 """
 import argparse
-import hashlib
 import os
 import re
 import struct
 import sys
-from contextlib import nullcontext
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 MAGIC = b'TKSPACK1'
 PACK = 'shader-cache.pack'
-SHARED_PAYLOADS = 1
 KINDS = {'.spv': 1, '.res.json': 2, '.use': 3, '.in': 4}
 NAME = re.compile(r'([0-9a-f]{64})(\.spv|\.res\.json|\.use|\.in)')
 USE_SIZE = 20   # gfx_shader.c use_store: magic, version, three masks
+# Loose files are read on READERS threads, at most WINDOW ahead of the one being written. On Windows the time goes into
+# opening each file (about 3 ms the first time, against 0.04 ms once the system has seen it), which threads overlap:
+# read one at a time, the 175,000 files of a launcher's cache took minutes.
+READERS = 16
+WINDOW = 1024
 
 
 def loose_files(cache):
@@ -50,7 +53,7 @@ def loose_files(cache):
 
 
 def read_pack(path):
-    """Read {(kind, name): (offset, size)}. Refuse a damaged index before replacing an existing archive."""
+    """{(kind, name): (offset, size)} of an existing pack; {} when there is none or it fails a check."""
     try:
         f = open(path, 'rb')
     except FileNotFoundError:
@@ -62,17 +65,15 @@ def read_pack(path):
             print(f'{path}: not a cache pack, rebuilt from the loose files only', flush=True)
             return {}
         count = struct.unpack_from('<I', head, 8)[0]
-        if 16 + 48 * count > size:
-            raise ValueError(f'{path}: truncated shader cache index')
         raw = f.read(48 * count)
         if len(raw) != 48 * count:
-            raise ValueError(f'{path}: truncated shader cache index')
+            print(f'{path}: truncated index, rebuilt from the loose files only', flush=True)
+            return {}
         out = {}
         for i in range(count):
             name, kind, length, offset = struct.unpack_from('<32sIIQ', raw, 48 * i)
-            if offset < 16 + 48 * count or offset + length > size or (kind, name) in out:
-                raise ValueError(f'{path}: invalid shader cache entry')
-            out[(kind, name)] = (offset, length)
+            if offset + length <= size:
+                out[(kind, name)] = (offset, length)
         return out
 
 
@@ -80,68 +81,45 @@ def valid(kind, data):
     return len(data) == USE_SIZE if kind == 3 else len(data) > 0
 
 
-def shared_pack(path):
+def read_loose(path):
     try:
-        with path.open('rb') as f:
-            header = f.read(16)
-    except FileNotFoundError:
-        return False
-    return len(header) == 16 and header[:8] == MAGIC and bool(struct.unpack_from('<I', header, 12)[0] & SHARED_PAYLOADS)
-
-
-def store_payload(f, locations, kind, data, end):
-    # Keep small masks in the key itself. For larger entries the digest locates candidates, and an exact read
-    # from the output distinguishes even colliding digests without keeping the shader archive in memory.
-    small = len(data) <= 64
-    key = (kind, len(data), data if small else hashlib.sha256(data).digest())
-    candidates = locations.setdefault(key, [])
-    for offset in candidates:
-        if small:
-            return offset, end
-        f.seek(offset)
-        if f.read(len(data)) == data:
-            return offset, end
-    f.seek(end)
-    f.write(data)
-    candidates.append(end)
-    return end, end + len(data)
+        return path.read_bytes()
+    except OSError:
+        return None
 
 
 def pack(cache, keep=False):
     cache = Path(cache)
-    # Serialize the snapshot, replacement and removal of loose files across installers using the same cache.
-    # Closing the file releases the OS lock, including when the process is interrupted.
-    with (cache / '.pack.lock').open('a+b') as lock:
-        if os.name == 'nt':
-            import msvcrt
-            lock.seek(0)
-            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
-        else:
-            import fcntl
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return _pack(cache, keep)
-
-
-def _pack(cache, keep):
     out = cache / PACK
     packed = read_pack(out)
     loose = loose_files(cache)
-    if not loose and (not packed or shared_pack(out)):
+    if not loose:
+        # Nothing to fold in: every file of the cache is already in the pack, so writing it again copies the same
+        # bytes over the same entries (1.37 GiB here, 2.6 s, and a file system that then has the old pack's blocks to
+        # release as well). The installer runs this after every prepare.
         return len(packed), 0, 0, out.stat().st_size if out.is_file() else 0
     keys = sorted(set(packed) | set(loose))
     tmp = out.with_name(PACK + '.tmp')
     index, written, skipped, offset = [], [], 0, 16 + 48 * len(keys)
-    locations = {}
+    old = open(out, 'rb') if packed else None
     try:
-        with (out.open('rb') if packed else nullcontext()) as old, tmp.open('w+b') as f:
+        with open(tmp, 'wb') as f, ThreadPoolExecutor(READERS) as pool:
             f.write(bytes(offset))   # header and index, written once the offsets are known
-            for key in keys:
+            ahead, todo = deque(), iter(keys)
+
+            def submit():
+                key = next(todo, None)
+                if key is not None:
+                    ahead.append((key, pool.submit(read_loose, loose[key]) if key in loose else None))
+
+            for _ in range(WINDOW):
+                submit()
+            while ahead:
+                key, reading = ahead.popleft()
+                submit()
                 data = None
-                if key in loose:   # a valid loose file, else the packed copy, else nothing
-                    try:
-                        data = loose[key].read_bytes()
-                    except OSError:
-                        pass
+                if reading:   # a valid loose file, else the packed copy, else nothing
+                    data = reading.result()
                     if data is not None and valid(key[0], data):
                         written.append(loose[key])
                     else:
@@ -149,20 +127,20 @@ def _pack(cache, keep):
                 if data is None and key in packed:
                     old.seek(packed[key][0])
                     data = old.read(packed[key][1])
-                    if len(data) != packed[key][1]:
-                        raise OSError(f'{out}: incomplete read of a packed shader')
                 if data is None or not valid(key[0], data):
                     skipped += 1
                     continue
-                start, offset = store_payload(f, locations, key[0], data, offset)
-                index.append(struct.pack('<32sIIQ', key[1], key[0], len(data), start))
+                f.write(data)
+                index.append(struct.pack('<32sIIQ', key[1], key[0], len(data), offset))
+                offset += len(data)
             f.seek(0)
-            f.write(MAGIC + struct.pack('<II', len(index), SHARED_PAYLOADS) + b''.join(index))
+            f.write(MAGIC + struct.pack('<II', len(index), 0) + b''.join(index))
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, out)
     finally:
-        tmp.unlink(missing_ok=True)
+        if old:
+            old.close()
+    os.replace(tmp, out)
     if not keep:
         for p in written:
             p.unlink(missing_ok=True)

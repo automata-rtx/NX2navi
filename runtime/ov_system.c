@@ -37,20 +37,25 @@ static void need(int ok, const char *what) {
 static const char *caller(Cpu *c, char *buf, int n) { return ldr_describe(c->x[30] - 4, buf, n); }
 
 // ==== nn::oe (services.c)
-// NX2NAVI_OPERATION_MODE, read once: 1 handheld (OperationMode 0, PerformanceMode Normal 0), 0 docked (1, Boost 1).
+// NX2NAVI_OPERATION_MODE: 1 handheld (OperationMode 0, PerformanceMode Normal 0), 0 docked (1, Boost 1). It follows the
+// setting; the game is told of a change as the console tells it (ov_operation_mode_live).
 int ov_handheld(void) {
-    static volatile int32_t v = -1;
-    int32_t h = v;
-    if (h < 0) {
-        const char *e = cfg_value("NX2NAVI_OPERATION_MODE");
-        if (!strcmp(e, "docked")) h = 0;
-        else if (!strcmp(e, "handheld")) h = 1;
-        else rt_fatal("NX2NAVI_OPERATION_MODE must be docked or handheld, not '%s'", e);
-        if (plat_cas32(&v, h, -1) == -1)
-            rt_log("oe: operation mode reported to the game: %s", h ? "handheld (performance normal)"
-                                                                  : "docked (performance boost)");
+    const char *e = cfg_value("NX2NAVI_OPERATION_MODE");
+    if (!strcmp(e, "docked")) return 0;
+    if (!strcmp(e, "handheld")) return 1;
+    rt_fatal("NX2NAVI_OPERATION_MODE must be docked or handheld, not '%s'", e);
+}
+
+// After a settings change (gfx_present.c window_settings_live): a new mode reaches the game through the applet messages
+// OperationModeChanged and PerformanceModeChanged, which make it read the mode again.
+void ov_operation_mode_live(void) {
+    static int was = -1;
+    int h = ov_handheld();
+    if (h != was) {
+        rt_log("oe: operation mode reported to the game: %s", h ? "handheld (performance normal)" : "docked (performance boost)");
+        if (was >= 0) oe_push_message(0x1e), oe_push_message(0x1f);
+        was = h;
     }
-    return (int)h;
 }
 
 // The Switch language for a BCP 47 tag; en-US for a language the game does not ship.
@@ -500,6 +505,34 @@ static void make_dirs(const char *dir) {
     if (!plat_dir_exists(dir)) rt_fatal("account: cannot create %s", dir);
 }
 
+// Holding account_lock. 1 when <profile>/save holds exactly one folder named as fs_host.c names an account's
+// (<uid hi><uid lo>, 32 hex digits); local is then that account.
+static int local_adopted;
+typedef struct { int n; uint64_t hi, lo; } AdoptScan;
+static int adopt_cb(const char *name, int kind, uint64_t size, void *ctx) {
+    (void)size;
+    AdoptScan *a = ctx;
+    if (kind != PLAT_FS_DIR && kind != PLAT_FS_LINK) return 1;
+    if (strlen(name) != 32 || strspn(name, "0123456789abcdefABCDEF") != 32) return 1;
+    char half[17];
+    memcpy(half, name, 16), half[16] = 0;
+    a->hi = strtoull(half, NULL, 16);
+    a->lo = strtoull(name + 16, NULL, 16);
+    a->n++;
+    return 1;
+}
+static int adopt_save_uid(const char *profile) {
+    char save[1100];
+    AdoptScan a = {0};
+    if (snprintf(save, sizeof save, "%s/save", profile) >= (int)sizeof save || !plat_dir_exists(save)) return 0;
+    plat_fs_list(save, adopt_cb, &a);
+    if (a.n != 1 || (!a.hi && !a.lo)) return 0;
+    local.lo = a.lo;
+    local.hi = a.hi;
+    local_adopted = 1;
+    return 1;
+}
+
 // Holding account_lock.
 static void load_uid(void) {
     if (local.lo || local.hi) return;
@@ -508,11 +541,17 @@ static void load_uid(void) {
     make_dirs(dir);
     need(snprintf(path, sizeof path, "%s/account.uid", dir) < (int)sizeof path, "account: path too long");
     int64_t size = plat_file_size(path);
+    // a file that is there but cannot be asked for its size is no reason for a new account: its saves would vanish
+    if (size < 0 && plat_fs_kind(path) != PLAT_FS_MISSING) rt_fatal("account: cannot read %s", path);
     if (size <= 0) {
-        do need(plat_random(&local, sizeof local), "account: random uid");
-        while (!local.lo && !local.hi);
+        // account.uid lost (a profile copied without it, or the save folder alone put in place): the one account
+        // folder in save/ is the player's, and taking its name keeps that save; otherwise a new account
+        if (!adopt_save_uid(dir)) {
+            do need(plat_random(&local, sizeof local), "account: random uid");
+            while (!local.lo && !local.hi);
+        }
         need(plat_file_write_atomic(path, &local, sizeof local), "account: persist the local account identity");
-        rt_log("account: new local account in %s", path);
+        rt_log("account: %s local account in %s", local_adopted ? "the save folder's" : "new", path);
     } else {
         uint64_t got = 0;
         uint8_t *b = plat_file_read(path, &got);

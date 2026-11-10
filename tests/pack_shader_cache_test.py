@@ -10,7 +10,6 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools'))
@@ -68,7 +67,7 @@ class PackTest(unittest.TestCase):
         self.assertEqual(got[(3, name('use3'))], USE)
         self.assertEqual(got[(4, name('in3'))], b'TKSI3')
         left = sorted(p.name for p in self.cache.iterdir())
-        self.assertEqual(left, sorted([psc.PACK, '.pack.lock', 'notes.txt', f'{keys[0]}.code']))
+        self.assertEqual(left, sorted([psc.PACK, 'notes.txt', f'{keys[0]}.code']))   # in/ removed when empty
 
     def test_second_run_merges_new_loose_files_and_loose_wins(self):
         a = self.shader('a')
@@ -100,47 +99,6 @@ class PackTest(unittest.TestCase):
         psc.pack(self.cache, keep=True)
         self.assertTrue((self.cache / f'{k}.spv').exists())
         self.assertEqual(len(read_pack(self.cache / psc.PACK)), 4)
-
-    def test_existing_pack_without_loose_files_is_compacted_once(self):
-        path = self.cache / psc.PACK
-        keys = sorted(bytes.fromhex(name(s)) for s in ('a', 'b'))
-        data = b'shader' * 50
-        start = 16 + 48 * len(keys)
-        entries = [struct.pack('<32sIIQ', key, 1, len(data), start + i * len(data)) for i, key in enumerate(keys)]
-        path.write_bytes(psc.MAGIC + struct.pack('<II', 2, 0) + b''.join(entries) + data * 2)
-        self.assertEqual(psc.pack(self.cache), (2, 0, 0, start + len(data)))
-        self.assertEqual(len(set(psc.read_pack(path).values())), 1)
-        self.assertEqual(list(read_pack(path).values()), [data, data])
-        with patch.object(psc.os, 'replace', side_effect=AssertionError('rewrote a compact pack')):
-            psc.pack(self.cache)
-
-        # Overriding one alias must leave its neighbour's bytes in the pack.
-        (self.cache / (keys[0].hex() + '.spv')).write_bytes(data[::-1])
-        psc.pack(self.cache)
-        self.assertEqual(list(read_pack(path).values()), [data[::-1], data])
-
-    def test_digest_collision_requires_identical_bytes(self):
-        expected = {(1, name(s)): data for s, data in [('a', b'A' * 200), ('b', b'B' * 200), ('c', b'A' * 200)]}
-        for (_, key), data in expected.items():
-            (self.cache / (key + '.spv')).write_bytes(data)
-        with patch.object(psc.hashlib, 'sha256') as digest:
-            digest.return_value.digest.return_value = bytes(32)
-            psc.pack(self.cache)
-        self.assertEqual(read_pack(self.cache / psc.PACK), expected)
-        self.assertEqual(len(set(psc.read_pack(self.cache / psc.PACK).values())), 2)
-
-    def test_interrupted_repack_preserves_pack_and_loose_inputs(self):
-        self.shader('a')
-        psc.pack(self.cache)
-        path = self.cache / psc.PACK
-        original = path.read_bytes()
-        key = self.shader('b')
-        with patch.object(psc.os, 'replace', side_effect=PermissionError), self.assertRaises(PermissionError):
-            psc.pack(self.cache)
-        self.assertEqual(path.read_bytes(), original)
-        self.assertTrue((self.cache / (key + '.spv')).exists())
-        self.assertFalse(path.with_suffix('.pack.tmp').exists())
-        self.assertEqual(psc.pack(self.cache)[:3], (8, 4, 0))
 
     def test_a_broken_pack_is_rebuilt_from_the_loose_files(self):
         self.shader('a')

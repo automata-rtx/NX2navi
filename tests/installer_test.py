@@ -211,35 +211,6 @@ class ReleaseFilesTest(unittest.TestCase):
         self.assertEqual(used - set(make_release.TOOLS_FILES), set())
 
 
-class PreparedCacheTest(unittest.TestCase):
-    def test_current_uses_device_translations_and_archive_groups(self):
-        with tempfile.TemporaryDirectory() as directory:
-            dest = Path(directory)
-            ctx = SimpleNamespace(dest=dest, layout=SimpleNamespace(xlate=dest / 'xlate.exe'))
-            ctx.layout.xlate.write_bytes(b'translator')
-            (dest / 'romfs-patches').mkdir()
-            (dest / 'romfs-patches/manifest.tsv').touch()
-            for name in ('shader-prepared.bin', 'mesh-programs.bin', 'vertex-programs.bin'):
-                (dest / name).write_bytes(b'prepared')
-            step = steps.Prepare()
-            ready = ('shader-cache-id device A\nshader-storage cache\nshader-driver-cache-ready 1\n'
-                     'shader-driver-cache-bytes 16384\nshader-translations-ready 1\n')
-            result = SimpleNamespace(returncode=0, stdout=ready)
-            with mock.patch.object(steps.subprocess, 'run', return_value=result):
-                prepared, size = step.cached_preparation(dest)
-                record = dict(xlate_sha256=steps.file_sha256(ctx.layout.xlate), prepared=prepared, driver_bytes=size)
-                self.assertTrue(step.current(ctx, record))
-                for change in ('device A', 'shader-driver-cache-ready 1', 'shader-translations-ready 1'):
-                    result.stdout = ready.replace(change, 'changed')
-                    self.assertFalse(step.current(ctx, record))
-                result.stdout = ready.replace('16384', '36')
-                self.assertFalse(step.current(ctx, record))
-                result.stdout = ready.replace('16384', '32768')
-                self.assertTrue(step.current(ctx, record))
-                (dest / 'vertex-programs.bin').write_bytes(b'different')
-                self.assertFalse(step.current(ctx, record))
-
-
 class RenamedVersionTest(unittest.TestCase):
     """An install the setup before 0.3.1 recorded as 1.1.1 is the 1.1.0 update (#332)."""
 
@@ -306,7 +277,7 @@ class LiftKeyTest(unittest.TestCase):
         self.add_cheats('277178B7DBA1B6D4.txt', '[b]')
         edited = self.key()
         self.assertNotEqual(edited, added)
-        self.add_cheats('277178B7DBA1B6D4.txt', '[c]', mod='Other', where='atmosphere/contents/0100F2C0115B6000/cheats')
+        self.add_cheats('277178B7DBA1B6D4.txt', '[c]', mod='Other', where='atmosphere/contents/0400486024DEC000/cheats')
         self.assertNotEqual(self.key(), edited)
 
     def test_exefs_patch_files_change_the_key(self):

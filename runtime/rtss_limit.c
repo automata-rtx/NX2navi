@@ -6,10 +6,11 @@
 // HKLM\SOFTWARE\WOW6432Node\Unwinder\RTSS, InstallDir) exports the profile calls, loaded here at run time:
 // LoadProfile(name) reads a profile (the global one for a name without its own), Get/SetProfileProperty read and change
 // the loaded copy, SaveProfile(name) writes it to Profiles\<name>.cfg, UpdateProfiles makes every hooked process
-// read its profile again, EnumProfiles lists the profiles that exist, DeleteProfile removes one. "FramerateLimit" is
-// the limit in frames per second (0: none); "FramerateLimitDenominator" divides it, so 59940 over 1000 limits to
-// 59.94 (a monitor's measured rate). SaveProfile reports nothing: RTSS's Profiles folder sits under Program Files, which
-// a process without administrator rights cannot write, and the save then fails silently. So every change is read back
+// read its profile again, EnumProfiles lists the profiles that exist (profile_exists says why it is not called),
+// DeleteProfile removes one. "FramerateLimit" is the limit in frames per second (0: none); "FramerateLimitDenominator"
+// divides it, so 59940 over 1000 limits to 59.94 (a monitor's measured rate). SaveProfile reports nothing: RTSS's
+// Profiles folder sits under Program Files, which a process without administrator rights cannot write, and the save
+// then fails silently. So every change is read back
 // from the saved profile, and a limit that did not stick leaves the game's own limiter in charge for the session.
 //
 // RTSS runs when its shared memory "RTSSSharedMemoryV2" carries the signature 'RTSS'; it limits this process once the
@@ -53,7 +54,7 @@ static _Atomic int64_t want = -2;          // millihertz from the pacer: >0 a li
 static _Atomic int active;                 // RTSS limits this process now
 static _Atomic int failed;                 // FAIL_*: RTSS is out of it for the rest of the run
 static int started;
-static char dll_path[MAX_PATH], profile[MAX_PATH];
+static char dll_path[MAX_PATH], profile[MAX_PATH], rtss_dir[MAX_PATH];
 static HMODULE dll;
 static EnumProfilesFn enum_profiles;
 static ProfileFn load_profile, save_profile, delete_profile;
@@ -122,8 +123,17 @@ static int load_hooks(void) {
     return 0;
 }
 
-// The profile exists on its own (EnumProfiles: a comma-separated list of names).
+// The profile exists on its own: RTSS keeps it as Profiles\<name>.cfg in its folder. EnumProfiles would say the same
+// (a comma-separated list of names) but crashes this process: it walks Profiles\*.cfg with _findfirst and _findnext and
+// keeps the find handle in 32 bits. The handle points into the process heap, which here lies above 4 GB (the guest
+// address space takes the low part, memory.c mem_init), so _findnext gets a cut pointer and faults in ntdll writing to
+// it. NX2NAVI_RTSS_ENUM=1 calls EnumProfiles anyway, to test an RTSS that keeps the whole handle.
 static int profile_exists(void) {
+    if (!rt_knob("RTSS_ENUM", "0")) {
+        char path[MAX_PATH * 2];
+        snprintf(path, sizeof path, "%s\\Profiles\\%s.cfg", rtss_dir, profile);
+        return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+    }
     char list[8192];
     DWORD need = enum_profiles(list, sizeof list);
     list[sizeof list - 1] = 0;
@@ -265,8 +275,8 @@ static void worker(void *arg) {
             over = 0;
             if (r < 0) atomic_store(&failed, FAIL_READONLY), set_active(0, fail_reason(FAIL_READONLY));
             else if (r == 0) set_active(0, "RivaTuner Statistics Server refused this limit");
-            else set_active(hooked, "RivaTuner Statistics Server has not hooked the game yet");
-        } else {
+            else if (atomic_load(&want) == w) set_active(hooked, "RivaTuner Statistics Server has not hooked the game yet");
+        } else if (atomic_load(&want) == w) {   // a newer limit waits for the next poll (rtss_limit_want)
             set_active(hooked, "RivaTuner Statistics Server has not hooked the game yet");
             // RTSS's own count of the game's frames while the game's limiter stands aside: well above the limit for
             // three seconds means RTSS does not hold the game to it, and the game takes the limiting back for the run
@@ -293,6 +303,7 @@ static void start(void) {
         return;
     }
     snprintf(dll_path, sizeof dll_path, "%s\\RTSSHooks64.dll", dir);
+    snprintf(rtss_dir, sizeof rtss_dir, "%s", dir);
     if (GetFileAttributesA(dll_path) == INVALID_FILE_ATTRIBUTES) {
         rt_log("frame rate: RivaTuner Statistics Server's folder %s has no RTSSHooks64.dll; the game's own limiter", dir);
         return;
@@ -311,7 +322,9 @@ static void start(void) {
 void rtss_limit_want(int64_t mhz) {
     if (!started && mhz < 0) return;   // kept out from the start, for the whole run (both reasons need a restart)
     if (!started) start();
-    atomic_store(&want, mhz);
+    // a new limit: the game's own limiter holds it until the worker had RTSS apply it, up to POLL_MS later (a movie's
+    // cap that waited for that ran the movie's 60 Hz count fast for half a second)
+    if (atomic_exchange(&want, mhz) != mhz) atomic_store(&active, 0);
 }
 
 int rtss_limit_active(void) { return atomic_load_explicit(&active, memory_order_relaxed); }

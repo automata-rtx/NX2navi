@@ -156,7 +156,7 @@ def load_lock(layout, version='dev'):
         if lock.get('format') != LOCK_FORMAT:
             raise ToolchainError(f'{layout.lock_file}: unknown format {lock.get("format")}')
         return lock
-    return make_lock(version=version, fast_repo=FAST_REPO)
+    return make_lock(version=version)
 
 
 # ---------------------------------------------------------------- install
@@ -175,8 +175,6 @@ def missing_files(msys):
 
 def is_current(layout, lock):
     inst = installed(layout)
-    if lock.get('fast_repo') and not (layout.msys_root / 'clang64/bin/clang.exe').is_file():
-        return False
     return bool(inst) and inst.get('digest') == lock_digest(lock) and not missing_files(layout.msys)
 
 
@@ -333,7 +331,7 @@ def ensure_zbic(layout, progress=None, cancel=None, log=print, version='dev'):
     with zipfile.ZipFile(dest) as z:
         for m in z.infolist():
             target = (layout.pydeps / m.filename).resolve()
-            if not str(target).startswith(str(layout.pydeps.resolve())):
+            if not target.is_relative_to(layout.pydeps.resolve()):   # not a sibling such as pydeps2 either
                 raise ToolchainError(f'{pick["filename"]}: unsafe path {m.filename}')
         z.extractall(layout.pydeps)
     dest.unlink(missing_ok=True)

@@ -26,15 +26,17 @@
 #include "gfx.h"
 #include "host.h"
 #include "nvn_api.h"
+#include "perfmon.h"
 #include "vk.h"
 #include "vk_exec.h"
 #include "platform/platform.h"
 #include "vk_dlaa.h"
 #include "vk_dlssg.h"
+#include "vk_fg.h"
 
 #define WEAK __attribute__((weak))
 
-typedef struct { void *token; VkImage image; VkFormat format; int w, h, has_crop, crop[4]; uint64_t frame, at, queued, value, ticket; } PresentJob;
+typedef struct { VkImage image; VkFormat format; int w, h, has_crop, crop[4]; uint64_t frame, at, queued, value; } PresentJob;
 
 static PlatMutex pl = PLAT_MUTEX_INIT;
 static PlatCond pcv = PLAT_COND_INIT;   // job queued, job taken, job submitted
@@ -46,6 +48,28 @@ static void wait_until(uint64_t at) {
     uint64_t now = kern_now_ns();
     if (at > now + 1500000) plat_wait_ns(at - now - 1000000);
     while (kern_now_ns() < at) plat_yield();
+}
+
+// NX2NAVI_PACE_SMOOTH (default 1; 0 = off): a picture goes out no sooner than seven eighths of the recent interval
+// after the one before it. The game's frames reach the present thread in uneven steps although each costs about the
+// same: with the replay on the submitting thread, work held for an event is replayed with the next frame, so pictures
+// came 13 to 31 ms apart around a mean of 22 ms in a village (5th to 95th percentile), which shows as judder at a
+// frame rate that would look even. Only the early ones wait, a few milliseconds each, so the rate stays what it was;
+// the recent interval is a moving average over about four pictures of intervals under 100 ms, so the floor follows
+// a scene that gets lighter within a second. Not with frame generation, which paces its own presents.
+static uint64_t pace_avg_ns;   // the present thread's
+
+static uint64_t pace_smooth(uint64_t at, uint64_t last, uint64_t now) {
+    static int on = -1;
+    if (on < 0) on = cfg_bool("NX2NAVI_PACE_SMOOTH");
+    if (!on || !last || !pace_avg_ns || vk_fg_active() || vk_dlssg_active()) return at;
+    uint64_t floor = last + pace_avg_ns / 8 * 7;
+    return floor > at && floor < now + 50000000ull ? floor : at;
+}
+
+static void pace_shown(uint64_t interval_ns) {
+    if (interval_ns >= 100000000ull) return;   // a load or a hitch is not the rate
+    pace_avg_ns = pace_avg_ns ? pace_avg_ns + (uint64_t)(((int64_t)interval_ns - (int64_t)pace_avg_ns) / 4) : interval_ns;
 }
 
 static void present_main(void *arg) {
@@ -60,9 +84,9 @@ static void present_main(void *arg) {
         plat_cond_broadcast(&pcv);
         plat_mutex_unlock(&pl);
         if (flight_on || vk_dump_white) vk_thumbs_frame(j.frame);   // NX2NAVI_DUMP_WHITE reads them too
-        vk_present_blit(j.token, j.image, VK_IMAGE_LAYOUT_GENERAL, j.format, j.w, j.h, j.has_crop ? j.crop : NULL);
+        vk_dlssg_present_frame(j.frame);
+        vk_present_blit(j.image, VK_IMAGE_LAYOUT_GENERAL, j.format, j.w, j.h, j.has_crop ? j.crop : NULL);
         uint64_t f = vk_sync_submit(NULL, 0);   // a timeline value after the blit: deferred destruction waits for the blit too
-        if (j.ticket) vk_guest_recorded(j.ticket, f);
         if (j.value && f != j.value)
             rt_fatal("vk: the present of frame %llu signalled %llu, queued as %llu", (unsigned long long)j.frame,
                      (unsigned long long)f, (unsigned long long)j.value);
@@ -71,9 +95,11 @@ static void present_main(void *arg) {
         plat_cond_broadcast(&pcv);
         plat_mutex_unlock(&pl);
         uint64_t t0 = kern_now_ns();
-        wait_until(j.at);
+        wait_until(pace_smooth(j.at, last, t0));
         uint64_t t1 = kern_now_ns();
+        if (last) pace_shown(t1 - last);
         vk_present_flip();
+        perfmon_shown(t1);   // the overlay's frame times: the pictures as shown
         // NX2NAVI_TRACE=present: one line per present: the host present's interval, the interval of the game's present
         // calls (when the host present went out before back-edge pacing), the wait and how far past its target it went
         if (rt_trace & RT_TRACE_PRESENT)
@@ -97,32 +123,124 @@ void vk_present_drain(void) {
     perf_end(PERF_DRAIN, p0);
 }
 
+// NX2NAVI_FRAME_HOLD_MS (default 120; 0 = off): a frame whose draws were skipped because a shader or pipeline was
+// still building (vk_exec_draw.c pending_draws) is not shown: the previous picture stays on screen until a frame is
+// complete again. Such a frame lacks what was skipped, which showed for a frame or two as a black or unlit picture with
+// the interface intact (a lighting pass), a light going out, or ground and walls missing and then back. The game runs
+// on meanwhile, so nothing waits. The hold comes from an allowance of this many milliseconds, used up by the time
+// held and filled again at an eighth of the clock's rate: a pipeline that takes longer, or a run of them on a first
+// visit with nothing recorded, shows its incomplete frames as before and does not freeze the picture. Not with DLSS
+// Frame Generation, which is told about every frame.
+// The same hold covers a change of the scene's size (a DLSS or FSR 3.1 mode picked in the menu, vk_dlaa.c
+// vk_dlaa_resized_take): the first frames drawn into the game's new, empty scene targets come out dark or black, so the
+// previous picture stays for RESIZE_HOLD presents from the first frame of the new size. That is once per change of a
+// setting and does not use the allowance. It holds with DLSS Frame Generation too: a present left out is a longer gap
+// between two rendered frames to it (its constants and tags are set at the host present, gfx_present.c), and a dark
+// frame it is given comes out as several generated ones.
+// And it covers an area load (vk_exec_draw.c vk_exec_pool_loading): while the texture pool still makes the area's
+// textures, the frames show the ground and the walls as black stand-ins, so the picture before the load stays for up
+// to LOAD_HOLD_NS, also beside the allowance.
+#define RESIZE_HOLD 6
+#define LOAD_HOLD_NS 2000000000ull
+static struct {
+    int64_t limit_ns, left_ns;
+    uint64_t last_ns, held, runs, shown, load_t0, load_held;
+    int holding, resize_left;
+} FH = {.limit_ns = -1};
+
+static void frame_hold_refill(uint64_t now) {
+    if (FH.limit_ns < 0) {
+        long long ms = cfg_int("NX2NAVI_FRAME_HOLD_MS");
+        FH.limit_ns = (int64_t)(ms < 0 ? 0 : ms > 500 ? 500 : ms) * 1000000;
+        FH.left_ns = FH.limit_ns, FH.last_ns = now;
+        if (FH.limit_ns)
+            rt_log("vk: a frame with draws skipped for a pipeline is not shown, the previous picture stays up to %lld ms "
+                   "(NX2NAVI_FRAME_HOLD_MS)", (long long)(FH.limit_ns / 1000000));
+    }
+    if (!FH.holding) FH.left_ns += (int64_t)(now - FH.last_ns) / 8;
+    else FH.left_ns -= (int64_t)(now - FH.last_ns);
+    if (FH.left_ns > FH.limit_ns) FH.left_ns = FH.limit_ns;
+    FH.last_ns = now;
+}
+
+// Whether a frame that skipped draws now would be held (vk_exec_draw.c: a full-screen draw is skipped only then).
+int vk_frame_hold_left(void) {
+    frame_hold_refill(kern_now_ns());
+    return FH.left_ns > 0 && !vk_dlssg_active();
+}
+
+// 1: this frame is not shown. skipped: the draws it lacks; resized: its scene is the first of a new size.
+static int frame_hold(uint32_t skipped, int resized, uint64_t frame) {
+    frame_hold_refill(kern_now_ns());
+    if (resized && FH.limit_ns > 0) {
+        FH.resize_left = RESIZE_HOLD;
+        rt_log("vk: frame %llu: the scene has a new size after a setting changed; the previous picture stays for %d "
+               "frames", (unsigned long long)frame, RESIZE_HOLD);
+    }
+    if (FH.resize_left) {   // beside the allowance: nothing below counts these frames
+        FH.resize_left--;
+        return 1;
+    }
+    if (FH.limit_ns > 0 && vk_exec_pool_loading()) {
+        uint64_t now = kern_now_ns();
+        if (!FH.load_t0) FH.load_t0 = now, FH.load_held = 0;
+        if (now - FH.load_t0 < LOAD_HOLD_NS) {
+            FH.load_held++;
+            return 1;
+        }
+    } else if (FH.load_t0) {
+        rt_log("vk: frame %llu: the previous picture stayed for %llu frames, %.0f ms, while an area's textures were made",
+               (unsigned long long)frame, (unsigned long long)FH.load_held, (double)(kern_now_ns() - FH.load_t0) / 1e6);
+        FH.load_t0 = 0;
+    }
+    int hold = skipped && FH.left_ns > 0 && !vk_dlssg_active();
+    if (hold && !FH.holding) FH.runs++;
+    if (skipped && !hold) FH.shown++;
+    FH.holding = hold;
+    if (hold) FH.held++;
+    static uint64_t logged_at, logged_held, logged_shown;
+    if (!hold && FH.held + FH.shown != logged_held + logged_shown && frame - logged_at >= 600) {
+        rt_log("vk: frame %llu: %llu frames with skipped draws held back so far in %llu runs, %llu shown incomplete "
+               "(allowance used up)", (unsigned long long)frame, (unsigned long long)FH.held,
+               (unsigned long long)FH.runs, (unsigned long long)FH.shown);
+        logged_at = frame, logged_held = FH.held, logged_shown = FH.shown;
+    }
+    if (hold && (rt_trace & RT_TRACE_PRESENT))
+        rt_log("present: frame %llu held back, %u draws skipped", (unsigned long long)frame, skipped);
+    return hold;
+}
+
 // The present after the frame count: resolves the image and hands the blit to the present thread. queued: when the game
 // presented; value: the timeline value queued for this present (asynchronous replay), 0 for the next one (synchronous).
-static void present_image(void *token, const tex_t *t, const int crop[4], uint64_t at_ns, uint64_t queued, uint64_t frame,
-                          uint64_t value, uint64_t ticket) {
+static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uint64_t queued, uint64_t frame,
+                          uint64_t value) {
     static volatile int32_t n_skipped;
+    static int vram_probe;
+    if (!vram_probe) vram_probe = 1, perfmon_set_vram_game(vk_mem_device_used_mb);   // the overlay's "game" beside VRAM
     vk_exec_frame_log(t, frame);
+    dynres_frame();   // before vk_dlaa_frame reads the DLSS mode it may override
     vk_dlaa_frame();
+    vk_sampler_aniso_live();   // NX2NAVI_ANISO changed in the menu: the surface textures' samplers take the new level
     vk_mvsurvey_frame();
     vk_mvprev_frame();
     vk_mem_census(frame);
+    vk_gpu_passes_frame(frame);
     if (vk_dump_armed) vk_dump_present(frame);
     __atomic_store_n(&gfx_counters.validation_errors, (uint64_t)vk_validation_errors_total(), __ATOMIC_RELAXED);
     const VkTexImage *img = vk_texture_get(t);
-    if (!img || !(img->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) {
-        if (plat_inc32(&n_skipped) <= 8)
+    int held = frame_hold(vk_exec_pending_draws_take(), vk_dlaa_resized_take(), frame);
+    if (held || !img || !(img->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) {
+        if (!held && plat_inc32(&n_skipped) <= 8)
             rt_log("vk: present of texture %p (format %#x) skipped: no colour image", (const void *)t, t ? t->d.format : 0);
-        if (value || ticket) {   // the queued value is still signalled, in order
+        if (value) {   // the queued value is still signalled, in order
             vk_present_drain();
             uint64_t f = vk_sync_submit(NULL, 0);
-            if (ticket) vk_guest_recorded(ticket, f);
-            if (value && f != value) rt_fatal("vk: skipped present signalled %llu, queued as %llu", (unsigned long long)f, (unsigned long long)value);
+            if (f != value) rt_fatal("vk: skipped present signalled %llu, queued as %llu", (unsigned long long)f, (unsigned long long)value);
         }
         return;
     }
-    PresentJob j = {.token = token, .image = img->image, .format = img->format, .w = (int)img->width, .h = (int)img->height, .frame = frame,
-                    .at = at_ns, .queued = queued, .value = value, .ticket = ticket};
+    PresentJob j = {.image = img->image, .format = img->format, .w = (int)img->width, .h = (int)img->height, .frame = frame,
+                    .at = at_ns, .queued = queued, .value = value};
     vk_hdr_present_source(img, &j.image, &j.format);   // NX2NAVI_HDR: the float picture the game copied into it, same size
     if (crop) {
         j.has_crop = 1;
@@ -145,7 +263,6 @@ static void present_image(void *token, const tex_t *t, const int crop[4], uint64
 // ---- Asynchronous replay
 enum { RI_SUBMIT, RI_PRESENT, RI_RELEASE };
 typedef struct {
-    void *token;
     int kind, n, has_crop, crop[4];
     uint64_t value, submit_no, at, queued;
     uint64_t *h;
@@ -183,8 +300,19 @@ int vk_replay_async(void) {
     return on;
 }
 
+// With the replay on its own thread a submission's value covers its replay too, and the wait stays the fence's.
+static int vk_be_exec_wait(uint64_t value, uint64_t timeout_ns) {
+    return vk_replay_async() ? vk_sync_fence_wait(value, timeout_ns) : vk_sync_exec_wait(value, timeout_ns);
+}
+
 // The front end's view (nvn_api_core.c, nvn_api_cmd.c): replay is asynchronous only on this back end.
 int gfx_replay_async(void) { return gfx_backend() == &gfx_vulkan_backend && vk_replay_async(); }
+
+// The front end's nvnEventSignal, before it writes (vk_exec_xfer.c "events the CPU signals").
+void gfx_event_signalling(const void *value, uint32_t to) {
+    vk_exec_event_cpu(value);
+    vk_exec_evt('c', value, to);
+}
 
 // The newest submit number (nvn_submit_count) whose replay is done: recording copies it used may be freed.
 uint64_t gfx_replayed_submits(void) {
@@ -195,194 +323,87 @@ uint64_t gfx_replayed_submits(void) {
     return v;
 }
 
-// Ticket IDs name guest submissions (including queue wait and present commands). A ticket with no
-// physical fence is still recording. Once sealed, its physical fence includes the last fragment and
-// its completion callbacks. Retired tickets need no storage and unrelated queues retire independently.
-typedef struct GuestTicket { uint64_t id, physical; struct GuestTicket *next; } GuestTicket;
-static GuestTicket *tickets;
-static uint64_t newest_ticket = GFX_GUEST_TICKET;
-static PlatMutex ticket_lock = PLAT_MUTEX_INIT;
-static PlatCond ticket_changed = PLAT_COND_INIT;
+// ---- a present that waits for held work (event order, vk_exec.c)
+// On the console a present is queued behind its queue's work and goes out once the GPU has run the frame, including
+// work that waited for an event. The replay holds such work (vk_exec.c, "event order across the game's queues") until
+// the wait holds, and the present went out at once: in Kokiri Forest dialogue (Saria), several presents a second came
+// with the frame's whole submission held (4 held submissions, nothing drawn since the last present) and showed the
+// picture from before, a flash of the whole picture; the frame was then drawn after its present, in the present
+// thread's empty submission, next to the following frame. So with work held at a present, what can go on now goes
+// first, in a submission of its own (held_resume); if work is still held, the present waits and goes out right after
+// the submission that replays the last of it, at the next present, or after PH_MAX submissions at the latest. Only with
+// the replay on the submitting thread, as the event order. NX2NAVI_PRESENT_HELD=0: every present goes out at once.
+#define PH_MAX 8
+static struct {
+    int on;                      // a present waits
+    const tex_t *t;
+    int crop[4], has_crop;
+    uint64_t at_ns, queued, frame, since;   // since: vk_exec_submit_seq when it began to wait
+    uint64_t waited, ran, after, capped, next, logged;   // presents that waited; held work run first at a present;
+                                                         // presents out after the held work, at PH_MAX, at the next present
+} PH;
 
-static uint64_t ticket_new(void) {
-    GuestTicket *t = malloc(sizeof *t);
-    if (!t) rt_fatal("vk: out of memory (guest fence)");
-    plat_mutex_lock(&ticket_lock);
-    uint64_t done = vk_sync_fence_done();
-    for (GuestTicket **it = &tickets; *it;) {
-        GuestTicket *old = *it;
-        if (old->physical && old->physical <= done) { *it = old->next; free(old); }
-        else it = &old->next;
-    }
-    uint64_t id = ++newest_ticket;
-    *t = (GuestTicket){id, 0, tickets};
-    tickets = t;
-    plat_mutex_unlock(&ticket_lock);
-    return id;
+static int present_held_on(void) {
+    static int on = -1;
+    if (on < 0) on = !gfx_replay_async() && rt_knob("PRESENT_HELD", "1");
+    return on;
 }
 
-void vk_guest_recorded(uint64_t id, uint64_t physical) {
-    plat_mutex_lock(&ticket_lock);
-    GuestTicket *t = tickets;
-    while (t && t->id != id) t = t->next;
-    if (!t || t->physical || !physical) rt_fatal("vk: invalid guest fence transition");
-    t->physical = physical;
-    plat_cond_broadcast(&ticket_changed);
-    plat_mutex_unlock(&ticket_lock);
+static uint64_t submit_sync(const uint64_t *handles, int n);
+
+// The held work that can go on now, in a submission of its own (vk_exec_record syncs it like any other: held_sync).
+// The present thread first finishes what it was handed: its empty submission replays held work and frees what it
+// replayed (vk_exec_record), which this walk reads. A present ph_flush handed it a moment ago is such a case.
+static int held_resume(void) {
+    vk_present_drain();
+    if (!vk_exec_held() || !vk_exec_held_ready()) return 0;
+    submit_sync(NULL, 0);
+    PH.ran++;
+    return 1;
 }
 
-static int guest_wait(uint64_t id, uint64_t timeout) {
-    if (!id) return 1;
-    uint64_t start = kern_now_ns();
-    plat_mutex_lock(&ticket_lock);
-    for (;;) {
-        GuestTicket *t = tickets;
-        while (t && t->id != id) t = t->next;
-        if (!t) {
-            int retired = (id & GFX_GUEST_TICKET) && id <= newest_ticket;
-            plat_mutex_unlock(&ticket_lock);
-            return retired;
-        }
-        uint64_t physical = t->physical, elapsed = kern_now_ns() - start;
-        uint64_t left = timeout == UINT64_MAX ? timeout : elapsed < timeout ? timeout-elapsed : 0;
-        if (physical && physical <= vk_sync_issued()) {
-            plat_mutex_unlock(&ticket_lock);
-            if (vk_sync_fence_done() >= physical) return 1;
-            return left && vk_sync_fence_wait(physical, left);
-        }
-        if (!left) { plat_mutex_unlock(&ticket_lock); return 0; }
-        if (left == UINT64_MAX) plat_cond_wait(&ticket_changed, &ticket_lock);
-        else plat_cond_wait_ns(&ticket_changed, &ticket_lock, left);
-    }
+static void ph_flush(uint64_t *why) {
+    if (!PH.on) return;
+    PH.on = 0, (*why)++;
+    if (PH.logged < 16)
+        PH.logged++, rt_log("vk: the present of frame %llu went out %llu submission(s) after the game's present call, %d "
+                            "held submissions left (%s)", (unsigned long long)PH.frame,
+                            (unsigned long long)(vk_exec_submit_seq - PH.since), vk_exec_held(),
+                            why == &PH.after ? "the held work was replayed" : why == &PH.capped ? "PH_MAX reached"
+                                                                                         : "the next present came");
+    present_image(PH.t, PH.has_crop ? PH.crop : NULL, PH.at_ns, PH.queued, PH.frame, 0);
+    if (PH.waited % 600 == 0)
+        rt_log("vk: presents that waited for held work: %llu (held work run at the present %llu times; out after it %llu, "
+               "at %d submissions %llu, at the next present %llu)", (unsigned long long)PH.waited,
+               (unsigned long long)PH.ran, (unsigned long long)PH.after, PH_MAX, (unsigned long long)PH.capped,
+               (unsigned long long)PH.next);
 }
-
-typedef struct HostCommand {
-    uintptr_t queue;
-    uint64_t ticket, dependency;
-    int present, has_image, has_crop, crop[4];
-    tex_t image;
-    void *token;
-    uint64_t frame, at, queued;
-    struct HostCommand *next;
-} HostCommand;
-static HostCommand *host_commands, **host_tail = &host_commands;
-static PlatMutex queue_order_lock = PLAT_MUTEX_INIT;
-static PlatCond order_changed = PLAT_COND_INIT;
-static int worker_started, worker_stop, worker_done;
-_Thread_local int vk_guest_pumping;
 
 static uint64_t submit_sync(const uint64_t *handles, int n) {
     vk_sync_start();
+    if (PH.on && n) {   // a present waits: what can go on goes first, then the present, then this submission
+        held_resume();
+        if (!vk_exec_held()) ph_flush(&PH.after);
+    }
     vk_present_drain();
     vk_texture_new_submit();
-    uint64_t physical = vk_sync_submit(handles, n);
-    // A continuation seals its ticket inside vk_exec_record, before vk_sync_submit publishes the
-    // physical value. Only now can a waiter hand that value to vk_sync_fence_wait.
-    if (gfx_guest_ticket || vk_guest_pumping) {
-        plat_mutex_lock(&ticket_lock);
-        plat_cond_broadcast(&ticket_changed);
-        plat_mutex_unlock(&ticket_lock);
+    uint64_t f = vk_sync_submit(handles, n);
+    // The submission stopped at a wait whose signal the CPU gave while it was being replayed (vk_exec_xfer.c "events
+    // the CPU signals"): it goes on now, in a submission of its own with copies taken after the signal, and that
+    // submission's value is the one the game's fence stands for.
+    if (n && vk_exec_event_at_sync() && vk_exec_held() && vk_exec_held_ready()) f = submit_sync(NULL, 0);
+    if (PH.on && n) {
+        if (!vk_exec_held()) ph_flush(&PH.after);
+        else if (vk_exec_submit_seq - PH.since >= PH_MAX) ph_flush(&PH.capped);
     }
-    return physical;
+    return f;
 }
 
-// Only guest-facing submit paths and this service own the scheduler. The present thread records an
-// empty physical submission after its blit, but never resumes another frame inside it.
-static void service_order(void) {
-    if (!vk_exec_held()) return;
-    uintptr_t saved_queue = gfx_submit_queue;
-    uint64_t saved_ticket = gfx_guest_ticket;
-    gfx_submit_queue = 0;
-    gfx_guest_ticket = 0;
-    vk_present_drain();
-    for (;;) {
-        if (vk_exec_held_ready()) {
-            vk_guest_pumping = 1;
-            submit_sync(NULL, 0);
-            vk_guest_pumping = 0;
-            continue;
-        }
-        HostCommand **it = &host_commands;
-        while (*it && (!vk_exec_marker_first((*it)->queue, (*it)->ticket) ||
-                       ((*it)->dependency && !guest_wait((*it)->dependency, 0)))) it = &(*it)->next;
-        HostCommand *h = *it;
-        if (!h) break;
-        if (h->present) {
-            present_image(h->token, h->has_image ? &h->image : NULL, h->has_crop ? h->crop : NULL,
-                          h->at, h->queued, h->frame, 0, h->ticket);
-            vk_present_drain();   // the blit and its physical completion fence precede later work on this queue
-        } else vk_guest_recorded(h->ticket, submit_sync(NULL, 0));
-        vk_exec_pop_marker(h->queue, h->ticket);
-        *it = h->next;
-        if (!*it) host_tail = it;
-        free(h);
-    }
-    gfx_guest_ticket = saved_ticket;
-    gfx_submit_queue = saved_queue;
-}
-
-// Pool-backed events can also be changed by an ordinary CPU store. Poll only while a queue is
-// blocked, so a lone final present or a CPU waiting on a fence can progress without another submit.
-static void order_worker(void *unused) {
-    (void)unused;
-    plat_mutex_lock(&queue_order_lock);
-    while (!worker_stop) {
-        if (!vk_exec_held()) plat_cond_wait(&order_changed, &queue_order_lock);
-        else {
-            service_order();
-            if (vk_exec_held()) plat_cond_wait_ns(&order_changed, &queue_order_lock, 1000000);
-        }
-    }
-    worker_done = 1;
-    plat_cond_broadcast(&order_changed);
-    plat_mutex_unlock(&queue_order_lock);
-}
-
-static void start_order_worker(void) {
-    if (!vk_exec_held()) return;
-    if (!worker_started) {
-        if (!plat_thread_spawn(order_worker, NULL, "vk queue events", 0)) rt_fatal("vk: cannot start event service");
-        worker_started = 1;
-    }
-    plat_cond_broadcast(&order_changed);
-}
-
-static void event_changed(void) {
-    // The worker's timed wait also covers a signal arriving before it starts sleeping.
-    plat_cond_broadcast(&order_changed);
-}
-
-static HostCommand *host_command(uintptr_t queue) {
-    HostCommand *h = calloc(1, sizeof *h);
-    if (!h) rt_fatal("vk: out of memory (queue command)");
-    h->queue = queue;
-    h->ticket = ticket_new();
-    vk_exec_queue_marker(queue, h->ticket);
-    *host_tail = h;
-    host_tail = &h->next;
-    return h;
-}
-
-static uint64_t queue_dependency(uintptr_t queue, uint64_t dependency) {
-    plat_mutex_lock(&queue_order_lock);
-    HostCommand *h = host_command(queue);
-    uint64_t id = h->ticket;
-    h->dependency = dependency;
-    service_order();
-    start_order_worker();
-    plat_mutex_unlock(&queue_order_lock);
-    return id;
-}
-
-static void queue_release(uintptr_t queue) {
-    plat_mutex_lock(&queue_order_lock);
-    vk_present_drain();
-    vk_exec_queue_release(queue);
-    plat_mutex_unlock(&queue_order_lock);
-}
+int vk_sub_in_frame;
 
 static void replay_main(void *arg) {
     (void)arg;
+    int sub_idx = 0;   // submissions since the last present, in queue order
     perf_replay_thread();
     plat_mutex_lock(&rl);
     for (;;) {
@@ -394,6 +415,7 @@ static void replay_main(void *arg) {
         plat_cond_broadcast(&rcv);
         plat_mutex_unlock(&rl);
         if (it.kind == RI_SUBMIT) {
+            vk_sub_in_frame = sub_idx++;
             uint64_t f = submit_sync(it.h, it.n);
             if (f != it.value)
                 rt_fatal("vk: replayed submission signalled %llu, queued as %llu", (unsigned long long)f,
@@ -405,7 +427,9 @@ static void replay_main(void *arg) {
             free((void *)it.tex);
         } else {
             uint64_t frame = __atomic_add_fetch(&gfx_counters.frames, 1, __ATOMIC_RELAXED);
-            present_image(it.token, it.tex, it.has_crop ? it.crop : NULL, it.at, it.queued, frame, it.value, 0);
+            vk_dlssg_submitted(frame);   // the frame's submissions were replayed before its present
+            present_image(it.tex, it.has_crop ? it.crop : NULL, it.at, it.queued, frame, it.value);
+            sub_idx = 0;
         }
         plat_mutex_lock(&rl);
         if (it.kind == RI_SUBMIT) r_submit_done = it.submit_no;
@@ -508,28 +532,27 @@ void gfx_exit_log(void) {
     if (gfx_replay_async() && r_started && !plat_xchg32(&done, 1)) replay_log(game_frames, 1);
 }
 
-static void queue_game_present(void *token, const tex_t *t, const int crop[4], uint64_t at_ns) {
+static void vk_be_present(const tex_t *t, const int crop[4], uint64_t at_ns) {
     vk_sync_start();
+    vk_dlssg_game_present();
     if (!gfx_replay_async()) {
-        int ordered = gfx_submit_queue && vk_exec_event_order();
-        if (ordered) plat_mutex_lock(&queue_order_lock);
         uint64_t frame = __atomic_add_fetch(&gfx_counters.frames, 1, __ATOMIC_RELAXED);
-        perf_present(frame);
+        vk_dlssg_submitted(frame);
+        vk_exec_evt_frame(frame);
+        perf_present(frame);   // before vk_exec_frame_log, which resets the frame's exec counts the flight recorder reads
         uint64_t queued = kern_now_ns();
-        if (ordered) {
-            HostCommand *h = host_command(gfx_submit_queue);
-            gfx_guest_ticket = h->ticket;
-            h->present = 1;
-            h->token = token;
-            h->at = at_ns;
-            h->queued = queued;
-            h->frame = frame;
-            if (t) { h->has_image = 1; h->image = *t; }
-            if (crop) { h->has_crop = 1; memcpy(h->crop, crop, sizeof h->crop); }
-            service_order();
-            start_order_worker();
-            plat_mutex_unlock(&queue_order_lock);
-        } else present_image(token, t, crop, at_ns, queued, frame, 0, 0);
+        if (present_held_on()) {   // present_held
+            vk_present_drain();    // the present thread's empty submission may run held work: done before it is read
+            if (PH.on) held_resume(), ph_flush(&PH.next);   // the last present still waits: out now
+            if (vk_exec_held()) held_resume();
+            if (vk_exec_held()) {
+                PH.on = 1, PH.t = t, PH.has_crop = crop != NULL, PH.at_ns = at_ns, PH.queued = queued, PH.frame = frame;
+                if (crop) memcpy(PH.crop, crop, sizeof PH.crop);
+                PH.since = vk_exec_submit_seq, PH.waited++;
+                return;
+            }
+        }
+        present_image(t, crop, at_ns, queued, frame, 0);
         return;
     }
     // Frame bound: the replay thread handled the previous present before this one is queued.
@@ -545,51 +568,12 @@ static void queue_game_present(void *token, const tex_t *t, const int crop[4], u
     uint64_t frame = ++game_frames;
     perf_present(frame);
     if (frame % 1800 == 0) replay_log(frame, 0);
-    ReplayItem it = {.token = token, .kind = RI_PRESENT, .tex = t, .at = at_ns, .queued = kern_now_ns()};
+    ReplayItem it = {.kind = RI_PRESENT, .tex = t, .at = at_ns, .queued = kern_now_ns()};
     if (crop) {
         it.has_crop = 1;
         for (int i = 0; i < 4; i++) it.crop[i] = crop[i];
     }
     replay_enqueue(&it);
-}
-
-// The acquire after the game's pacing wait starts the frame. The token follows
-// its submissions through the later host present, including when replay runs asynchronously.
-static void *game_token;
-static int submit_started;
-static PlatMutex token_lock = PLAT_MUTEX_INIT;
-
-static void vk_be_frame_start(void) {
-    if (!vk_dlssg_active()) return;
-    plat_mutex_lock(&token_lock);
-    if (!game_token) game_token = vk_dlssg_begin();
-    plat_mutex_unlock(&token_lock);
-}
-
-static void first_render_submit(void) {
-    if (!vk_dlssg_active()) return;
-    plat_mutex_lock(&token_lock);
-    // Some startup frames submit before their first window acquire.
-    if (!game_token) game_token = vk_dlssg_begin();
-    if (game_token && !submit_started) {
-        vk_dlssg_submit(game_token, 0);
-        submit_started = 1;
-    }
-    plat_mutex_unlock(&token_lock);
-}
-
-static void vk_be_present(const tex_t *t, const int crop[4], uint64_t at_ns) {
-    if (!vk_dlssg_active()) {
-        queue_game_present(NULL, t, crop, at_ns);
-        return;
-    }
-    first_render_submit();
-    plat_mutex_lock(&token_lock);
-    void *token = game_token;
-    game_token = NULL;
-    submit_started = 0;
-    plat_mutex_unlock(&token_lock);
-    queue_game_present(token, t, crop, at_ns);
 }
 
 // vk_pipeline.c drops a released program's pipelines here.
@@ -629,16 +613,9 @@ static void vk_be_program_release(const prog_t *p) { replay_drain(DR_PROG_RELEAS
 // Asynchronous: the handles (nvn_submit_prepare_async ran under the front end's submit lock) are copied and queued;
 // the value returned is the one the replay will signal.
 static uint64_t vk_be_submit(const uint64_t *handles, int n) {
-    first_render_submit();
     if (!gfx_replay_async()) {
-        if (!gfx_submit_queue || !vk_exec_event_order()) return submit_sync(handles, n);
-        plat_mutex_lock(&queue_order_lock);
-        gfx_guest_ticket = ticket_new();
-        uint64_t fence = submit_sync(handles, n);
-        service_order();
-        start_order_worker();
-        plat_mutex_unlock(&queue_order_lock);
-        return fence;
+        vk_sub_in_frame = nvn_submits_in_frame;   // the front end counts it up after the submit returns
+        return submit_sync(handles, n);
     }
     vk_sync_start();
     ReplayItem it = {.kind = RI_SUBMIT, .n = n, .submit_no = nvn_submit_count()};
@@ -647,6 +624,7 @@ static uint64_t vk_be_submit(const uint64_t *handles, int n) {
         if (!it.h) rt_fatal("vk: out of memory (replay queue)");
         memcpy(it.h, handles, sizeof *it.h * (size_t)n);
     }
+    vk_usnap_take(handles, n);   // the uniform blocks as they are now: the game writes on once this returns
     return replay_enqueue(&it);
 }
 static void vk_be_finish(void) { vk_sync_start(); replay_drain(DR_FINISH); vk_present_drain(); vk_sync_finish(); }
@@ -770,29 +748,19 @@ const GfxBackend gfx_vulkan_backend = {
     .program_release = vk_be_program_release,
     .submit = vk_be_submit,
     .fence_wait = vk_sync_fence_wait,
+    .exec_wait = vk_be_exec_wait,
     .fence_done = vk_sync_fence_done,
     .present = vk_be_present,
-    .frame_start = vk_be_frame_start,
-    .event_order = vk_exec_event_order,
-    .guest_wait = guest_wait,
-    .queue_dependency = queue_dependency,
-    .queue_release = queue_release,
-    .event_changed = event_changed,
+    .frame_start = vk_dlssg_frame_start,
     .finish = vk_be_finish,
     .read_texels = vk_be_read_texels,
     .write_texels = vk_be_write_texels,
     .guest_written = vk_be_guest_written,
-    .publish_movie_buffer = vk_mem_publish_movie_buffer,
     .guest_read = vk_be_guest_read,
     .cpu_synced = vk_be_cpu_synced,
 };
 
 void vk_backend_shutdown(void) {
-    plat_mutex_lock(&queue_order_lock);
-    worker_stop = 1;
-    plat_cond_broadcast(&order_changed);
-    while (worker_started && !worker_done) plat_cond_wait(&order_changed, &queue_order_lock);
-    plat_mutex_unlock(&queue_order_lock);
     replay_drain(DR_FINISH);
     gfx_exit_log();
     vk_present_drain();

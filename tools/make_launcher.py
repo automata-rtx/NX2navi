@@ -1,7 +1,7 @@
 """Build a release of the NX2navi launcher (docs/launcher.md, "Releases").
 
     python tools/make_launcher.py --xlate build/xlate [--ffx amd_fidelityfx_vk.dll] [--dlss nvngx_dlss.dll | --no-dlss]
-                                  [--out build/launcher-release]
+                                  [--prompt-art FOLDER [FOLDER ...]] [--out build/launcher-release]
                                   [--feed owner/name]
                                   [--notes notes.md] [--publish]
 
@@ -21,7 +21,13 @@ The release folder (--out) holds:
                                   bin/nvngx_dlss.dll and its notice (NVIDIA DLSS at the version tools/dlss_pin.py
                                   pins, downloaded from NVIDIA's DLSS SDK repository and checked, or --dlss; not with
                                   --no-dlss),
+                                  bin/dlssg/ with --dlssg (DLSS Frame Generation: nx2navi_dlssg.dll, Streamline's
+                                  runtime DLLs and nvngx_dlssg.dll at the version tools/streamline_pin.py pins,
+                                  downloaded from NVIDIA's Streamline SDK release and checked, or --streamline; their
+                                  licences and a notice),
                                   lib/libnx2navirt.a (the runtime, prebuilt with the release's compiler),
+                                  prompt-art/ with --prompt-art (the button art make_game.py draws the Xbox,
+                                  PlayStation, Steam Deck and keyboard and mouse prompts from, tools/prompt_art.py art_files),
                                   toolchain.lock.json (the MSYS2 packages of today, pinned), feed.json, VERSION, the
                                   licence files
     NX2navi-Setup-<version>.exe   launcher/native/setup.c with the folder above appended as a zip: the one file
@@ -29,6 +35,10 @@ The release folder (--out) holds:
     NX2navi-app-<version>.zip     app/<version> alone: what the launcher downloads to update itself
     NX2navi-runtime-<id>.zip      python/ alone: downloaded only when a release changes the Python
     NX2navi-update.json           the manifest the launcher reads (launcher/feed.py)
+
+--prompt-art names the button art: folders that hold XGamepad, P5Gamepad and Keyboard_Mouse, or those three folders
+themselves. Only the pictures tools/pad_prompts.py reads are copied; the art stays out of the repository. Without it
+the release has no prompt-art folder and builds the game with the game's own prompts only.
 
 --publish uploads the four files as GitHub release v<version> of the --feed repository with the gh CLI (a draft
 first is wiser: add --draft). check_content runs over everything before it is packed: the release holds no game data.
@@ -47,9 +57,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / 'tools'))
+import build_shaders  # noqa: E402
 import check_content  # noqa: E402
-import dlssg_kit  # noqa: E402
 import dlss_pin  # noqa: E402
+import prompt_art  # noqa: E402
+import streamline_pin  # noqa: E402
 from launcher import toolchain  # noqa: E402
 from launcher.paths import Layout  # noqa: E402
 
@@ -65,7 +77,8 @@ PINS = {
               'ac87609db3f715404dd41a989c2f1706ea1512f3d86217f938d11c63af8eb505'),
 }
 TOOLS = ('make_game.py', 'nup.py', 'romfs_index.py', 'check_content.py', 'hostmem.py', 'prepare_shaders.py',
-         'dlssg_kit.py', 'shader_census.py', 'shader_passes.py', 'shader_list.py', 'zstd_compat.py')
+         'shader_census.py', 'shader_list.py', 'zstd_compat.py', 'pad_prompts.py', 'prompt_art.py', 'button_icons.py', 'romfs_check.py',
+         'pack_shader_cache.py')
 TOP = ('LICENSE', 'LICENSE-ADDITIONS', 'THIRD_PARTY_NOTICES.md', 'nx2navi.ini.example')
 SKIP_DIRS = {'__pycache__', '.pytest_cache', 'native'}
 SKIP_SUFFIXES = {'.o', '.obj', '.pyc', '.exe', '.dll', '.a', '.lib'}
@@ -119,10 +132,13 @@ def version():
 # ---------------------------------------------------------------- python/
 
 def tcltk_files():
+    """The Tcl/Tk files of the pinned msi, unpacked into WORK/tcltk once. The stamp names the msi they came from and
+    is written last: an unpack from an older pin, or one stopped after _tkinter.pyd was written, is done again."""
     dest = WORK / 'tcltk'
-    if (dest / 'DLLs' / '_tkinter.pyd').is_file():
-        return dest
     msi = fetch('tcltk')
+    stamp, want = dest / '.unpacked-from', f'{msi.name} {msi.stat().st_size}'
+    if (dest / 'DLLs' / '_tkinter.pyd').is_file() and stamp.is_file() and stamp.read_text() == want:
+        return dest
     shutil.rmtree(dest, ignore_errors=True)
     dest.mkdir(parents=True)
     if os.name == 'nt':   # an administrative image: copies the files, installs nothing
@@ -131,6 +147,7 @@ def tcltk_files():
         run(['msiextract', '-C', dest, msi], stdout=subprocess.DEVNULL)
     if not (dest / 'DLLs' / '_tkinter.pyd').is_file():
         sys.exit(f'{dest}: no _tkinter.pyd in {msi.name}')
+    stamp.write_text(want)
     return dest
 
 
@@ -160,7 +177,10 @@ def build_python(py):
 
 # ---------------------------------------------------------------- app/<version>/
 
-def build_app(app, ver, xlate, feed_repo, lock, ffx=None, dlss=None, dlssg=None, streamline=None):
+def build_app(app, ver, xlate, feed_repo, lock, ffx=None, dlss=None, art=None, dlssg=None):
+    # The runtime's own shaders are source in the repository and SPIR-V headers in a release: a player's PC compiles
+    # runtime/ (make_game.py) and has no shader compiler. Build the missing and the stale ones before the copy.
+    build_shaders.build(ROOT / 'runtime')
     copy_tree(ROOT / 'launcher', app / 'launcher')
     for d in ('runtime', 'recomp'):
         copy_tree(ROOT / d, app / d)
@@ -180,7 +200,11 @@ def build_app(app, ver, xlate, feed_repo, lock, ffx=None, dlss=None, dlssg=None,
         shutil.copy2(ffx, app / 'bin' / 'amd_fidelityfx_vk.dll')
     if dlss:   # DLSS: NGX loads it from beside the game (runtime/vk_dlaa.c); make_game.py copies it there
         dlss_pin.place(dlss, app / 'bin')
-    dlssg_kit.assemble(dlssg, streamline, app / 'bin' / 'dlssg')
+    if dlssg:   # DLSS Frame Generation (runtime/vk_dlssg.c): make_game.py place_dlssg copies it beside the game
+        streamline_pin.place(dlssg[0], dlssg[1], app / 'bin' / 'dlssg')
+    if art:   # make_game.py draws the button prompts from it (its prompts step)
+        n, size = prompt_art.copy_art(art, app / prompt_art.FOLDER)
+        say(f'button art: {n} pictures, {size / 1e6:.1f} MB')
     (app / 'toolchain.lock.json').write_text(json.dumps(lock, indent=1), encoding='utf-8')
     (app / 'feed.json').write_text(json.dumps({'type': 'github', 'repo': feed_repo}, indent=1), encoding='utf-8')
 
@@ -292,9 +316,14 @@ def main():
     ap.add_argument('--ffx', type=Path, help="AMD's signed amd_fidelityfx_vk.dll (FidelityFX SDK 1.1.4, MIT) for FSR 3.1")
     ap.add_argument('--dlss', type=Path, help=f"NVIDIA's nvngx_dlss.dll (DLSS {dlss_pin.VERSION}) from disk instead of "
                                                "downloading it from NVIDIA's DLSS SDK repository")
-    ap.add_argument('--dlssg', type=Path, metavar='DLL', help='frame generation bridge built by tools/build_dlssg.py')
-    ap.add_argument('--streamline', type=Path, metavar='SDK', help='matching Streamline SDK folder for --dlssg')
     ap.add_argument('--no-dlss', action='store_true', help='leave NVIDIA DLSS out of the release')
+    ap.add_argument('--dlssg', type=Path, metavar='DLL',
+                    help='nx2navi_dlssg.dll (tools/build_dlssg.py) for DLSS Frame Generation')
+    ap.add_argument('--streamline', type=Path, metavar='SDK',
+                    help=f'the Streamline {streamline_pin.VERSION} SDK folder whose bin/x64 gives the Streamline and '
+                         'nvngx_dlssg.dll files, instead of downloading the SDK release with --dlssg')
+    ap.add_argument('--prompt-art', type=Path, nargs='+', metavar='FOLDER',
+                    help='the button art: folders holding XGamepad, P5Gamepad and Keyboard_Mouse, or those folders')
     ap.add_argument('--out', type=Path, default=MAIN_ROOT / 'build' / 'launcher-release')
     ap.add_argument('--feed', default=DEFAULT_FEED, help='the GitHub repository the launcher looks for releases in')
     ap.add_argument('--notes', type=Path, help='release notes (markdown) for the manifest and the GitHub release')
@@ -310,6 +339,8 @@ def main():
     ver, build = version()
     if a.version:
         ver, build = a.version, a.version + build[len(ver):]
+    if a.prompt_art:
+        prompt_art.art_files(a.prompt_art)   # the art is all there before anything is downloaded or built
     out = a.out
     shutil.rmtree(out, ignore_errors=True)
     folder = out / 'NX2navi'
@@ -320,7 +351,12 @@ def main():
         + (f' (CLANG64 clang left out: {lock["fast_skipped"]})' if lock.get('fast_skipped') else ''))
     dlss = None if a.no_dlss else dlss_pin.resolve(a.dlss, DL)
     say(f'NVIDIA DLSS {dlss_pin.VERSION}: {dlss}' if dlss else 'NVIDIA DLSS left out (--no-dlss)')
-    build_app(folder / 'app' / ver, ver, a.xlate, a.feed, lock, a.ffx, dlss, a.dlssg, a.streamline)
+    if a.streamline and not a.dlssg:
+        sys.exit('--streamline goes with --dlssg')
+    dlssg = (a.dlssg, streamline_pin.resolve(a.streamline, DL)) if a.dlssg else None
+    say(f'DLSS Frame Generation: {a.dlssg}, Streamline {streamline_pin.VERSION}: {dlssg[1]}' if dlssg
+        else 'DLSS Frame Generation left out (no --dlssg)')
+    build_app(folder / 'app' / ver, ver, a.xlate, a.feed, lock, a.ffx, dlss, a.prompt_art, dlssg)
     (folder / 'app' / 'current.txt').write_text(ver + '\n', encoding='utf-8')
     build_python(folder / 'python')
     cc, windres = native_compiler(lock)

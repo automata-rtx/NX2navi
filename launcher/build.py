@@ -3,11 +3,9 @@ and cancelling it with every compiler it started."""
 import json
 import os
 import signal
+import stat
 import subprocess
 import threading
-from pathlib import Path
-
-from .settings import Settings
 
 # Runs make_game.py with pydeps/ (zbic) and the script's folder first on sys.path; the embeddable Python's ._pth
 # file leaves both off.
@@ -23,20 +21,10 @@ def command(layout, args):
             '--events']
 
 
-def shared_install(dump, game_dir):
-    """Find the standard launcher's completed extraction for a side-by-side install of the same container."""
-    local = os.environ.get('LOCALAPPDATA')
-    if not local or not os.path.isfile(dump):
-        return None
-    path = Settings(Path(local) / 'Programs' / 'NX2navi' / 'data' / 'launcher.json')['game_dir']
-    if not path or Path(path).resolve() == Path(game_dir).resolve():
-        return None
-    st = os.stat(dump)
-    identity = f'nup {os.path.abspath(dump)} {st.st_size} {int(st.st_mtime)}'
-    state = build_state(path)
-    if state.get('input') == identity and all(name in state.get('steps', {}) for name in ('exefs', 'romfs')):
-        return path
-    return None
+def has_prompt_art(layout):
+    """True when this version holds button art (app/<version>/prompt-art, tools/prompt_art.py FOLDER): make_game.py
+    then draws the button prompts in a step of its own, and the jobs show a row for it."""
+    return (layout.app / 'prompt-art').is_dir()
 
 
 def install_args(layout, dump, game_dir):
@@ -45,14 +33,13 @@ def install_args(layout, dump, game_dir):
         src = ['--exefs', os.path.join(dump, 'exefs'), '--romfs', os.path.join(dump, 'romfs')]
     else:
         src = ['--nup', dump]
-        shared = shared_install(dump, game_dir)
-        if shared:
-            src.extend(['--reuse-from', shared])
     return [*src, '--out', str(game_dir), '--msys', str(layout.msys)]
 
 
-def rebuild_args(layout, game_dir):
-    return ['--rebuild', '--out', str(game_dir), '--msys', str(layout.msys)]
+def rebuild_args(layout, game_dir, retune=False):
+    """retune: Rebuild the Game, which compiles the game's code for this processor's level; an update keeps the level
+    its objects were compiled for, so that it compiles only what changed (tools/make_game.py lifted_level)."""
+    return ['--rebuild', *(['--retune'] if retune else []), '--out', str(game_dir), '--msys', str(layout.msys)]
 
 
 def check_args(dump):
@@ -70,7 +57,7 @@ class Run:
     """One make_game.py process. on_event(dict) for each "@@" line, on_line(str) for every other line; wait()
     returns the exit code. cancel() ends the process and its children."""
 
-    def __init__(self, cmd, on_event, on_line, cwd=None, shader_control=None):
+    def __init__(self, cmd, on_event, on_line, cwd=None):
         self.error = None
         kw = {}
         if os.name == 'nt':
@@ -78,8 +65,6 @@ class Run:
         else:
             kw['start_new_session'] = True
         env = dict(os.environ, PYTHONUNBUFFERED='1', PYTHONIOENCODING='utf-8')
-        if shader_control is not None:
-            env['NX2NAVI_SHADER_WORKER_FILE'] = str(shader_control)
         self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                      cwd=cwd, env=env, text=True, encoding='utf-8', errors='replace', bufsize=1, **kw)
         self.cancelled = False
@@ -124,17 +109,26 @@ class Run:
 
 
 def game_running(game_dir, exe='ocarina.exe'):
-    """True when the built game runs from game_dir: Windows refuses to open a running exe for writing."""
+    """True when the built game runs from game_dir: Windows refuses to open a running exe for writing. A read-only
+    exe (a copy restored from a backup or read-only media) is refused too, though nothing runs it: its read-only
+    attribute is cleared and the open tried again, as the next build replaces the file anyway."""
     path = os.path.join(str(game_dir), exe)
     if os.name != 'nt' or not os.path.isfile(path):
         return False
-    try:
-        with open(path, 'r+b'):
+    for attempt in range(2):
+        try:
+            with open(path, 'r+b'):
+                return False
+        except PermissionError:
+            if attempt or not os.stat(path).st_file_attributes & stat.FILE_ATTRIBUTE_READONLY:
+                return True
+            try:
+                os.chmod(path, stat.S_IREAD | stat.S_IWRITE)
+            except OSError:
+                return True
+        except OSError:
             return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
+    return True
 
 
 def build_state(game_dir):

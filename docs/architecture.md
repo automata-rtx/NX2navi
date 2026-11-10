@@ -35,12 +35,16 @@ from other projects, with its license, is listed in [THIRD_PARTY_NOTICES.md](../
 - The SDK boundary is at the `nn::*` function level: threads and synchronisation, IPC, memory, fs/RomFS, time,
   account, applet, hid, audio renderer and effects run as host code. Only `audren:u` and `sm:` are real IPC services.
 - Window, keyboard and mouse: Win32 (`gfx_window_win.c`, `input_win.c`). Gamepads and audio output: SDL3 (every
-  connected gamepad is open; the game reads the one pressed last, `input.c`). Voice: libopus. Switch 2 movies use
-  a host AV1 decoder (`runtime/ov_movie2.c`, `ov_initialize`). The separate VP9 decoder implements the
-  `movie::Decoder` interface in `runtime/ov_movie.c`. See the [movie playback research notes](movie-playback.md).
+  connected gamepad is open; the game reads the one pressed last, `input.c`). Voice: libopus. Movies: a host VP9
+  decoder over libvpx replaces the SDK's `movie::Decoder` (`runtime/ov_movie.c`).
 - Settings and menu: every key with its default is in one table (`cfg.c`), read from `nx2navi.ini` and `NX2NAVI_*`
   variables and written back when the in-game menu changes it. The menu and the performance overlay are Dear ImGui,
   drawn into the swapchain image (`runtime/ui/`); their text is in `ui_text.c`.
+- Log: in a game run the lines go through a queue to a thread that writes them (`runtime/logq.c`), so a stalled
+  write to the log file or the console does not hold the thread that logged. A thread's lines reach the log in the
+  order it logged them: a line waits for the queue's lock, and one that finds the queue full is written after
+  everything queued before it. A fatal error, the crash report and the end of the process write the queue out first
+  (`rt_log_sync`). `NX2NAVI_LOG_ASYNC=0` writes each line where it is logged.
 - OS calls the host makes go through `runtime/platform/` (`platform.h`, `win32.c`).
 
 #### Threads and cores
@@ -58,6 +62,9 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   and, if its host rip is in lifted code at host depth 0, moves it to `kern_ap_stub`, which saves the volatile
   registers and gives the core up there. A holder of a guest mutex counts at the priority of its best waiter, and one
   inside an SDK spin lock is not preempted.
+- Wakes. A signalled event or a thread that ends wakes only the `WaitSynchronization` waits that hold a handle of it
+  (`wake_sync_waiters`): a woken thread takes a core before it looks, so waking the others cost running threads
+  their cores for nothing (`NX2NAVI_SYNC_WAKE_ALL=1` wakes them all).
 - Host work gives the core back. Queue submits, presents, GPU waits, shader translation, `nn::fs` calls and NVN memory
   pool setup run without a core (`NVN_BLOCKING`, `kern_core_away`).
 - Spin waits. Loops that only another thread can end send their back-edges through `rt_spin_gate`, which pauses the
@@ -71,46 +78,95 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   the submitting thread (`vk_exec*.c`); a recorder thread makes the `vkCmd*` calls from a ring of packets
   (`vk_rec.c`).
 - Memory pools are imported as host memory (`VK_EXT_external_memory_host`). On a discrete GPU, pools bound as buffers
-  are mirrored in device-local memory. Before replay, the renderer uploads pages changed by the CPU or another GPU
-  buffer. A guest flush refreshes write tracking for its range. Shadow-backed pools and ranges where tracking is
-  unavailable use explicit flush copies. GPU-rendered textures are written back when the CPU reads them.
+  are mirrored in device-local memory and the pages the CPU wrote (write watch) plus the ranges the game flushes are
+  uploaded before a replay (`vk_memory.c`); without the mirrors the GPU reads them over PCIe and Kokiri Forest runs at
+  7 fps. GPU-rendered textures are written back when the CPU reads them.
 - Uniform snapshot. The game rewrites per-object uniform blocks soon after it submits the frame that reads them; at
   the start of a submission's replay every uniform range it binds from CPU-written pools is copied, and the draws bind
   the copy (`vk_usnap.c`).
+- Event order. Ocarina's queues hand work to each other with events, and its main queue waits each frame for a
+  signal the game gives from the CPU once it has written the frame's data. The replay stops a submission at a wait
+  whose signal has not been replayed and lets it go on after the signal (`vk_exec.c`, "event order across the game's
+  queues"); a CPU signal counts for a submission only when it came before the copies above were taken, and a
+  submission it comes too late for goes on at once in one of its own (`vk_exec_xfer.c`, "events the CPU signals").
+  `NX2NAVI_EVO_TRACE=1` logs the order every frame was replayed in.
 - Driver data. The NVN driver keeps a per-stage constant bank (c0). The back end fills it as the driver does: storage
   and uniform tables, push constants and, for NVN 2 compute, the dispatch's group counts in bytes 0-0xb.
 - Storage buffers the shaders reach through pointer tables in memory are bound at the address the table holds
   (`GfxShaderRes.ptr`, `vk_exec_draw.c ptr_addr`).
 - Bindless textures: the texture and sampler pools are descriptor arrays kept in step with the game's pool writes
   (`vk_exec_draw.c pool_sync`); slots that resolve alike share one lookup.
+  Finalization is retained on registered slots independently of image-cache eviction: a stale CPU-backed descriptor
+  cannot recreate an image from freed storage or follow newly reused CPU bytes. Registration makes it current again;
+  finalized descriptors may still follow live GPU-owned content.
 - Shaders: Ampere (SM86) code is lowered to Maxwell (`tools/xlate/AmpereLowering.cs`) and translated to SPIR-V by the
   pinned shader translator (`tools/vendor/ryujinx`, 1.3.2) with our patches (`tools/xlate/patches/`), built with .NET 10 NativeAOT as
   `nx2navi_xlate.exe` and run as separate processes. Translations are cached on disk; shaders and pipelines seen in
   play are prepared at the next boot. The game waits for it (`runtime/boot.c` `boot_wait`): about half a second
-  when warm; after a translator, GPU or driver change a "Preparing shaders" screen shows the progress (`ui/menu.cpp`
+  when warm; after a GPU or driver change, or a translator change with nothing to carry (below), a "Preparing
+  shaders" screen shows the progress (`ui/menu.cpp`
   `menu_boot_frame`). With the graphics pipeline library the boot builds recorded pipelines in record order for at
   most 20 s after the shaders are ready and leaves the rest to the pipeline workers below normal priority; a draw
   that meets one before it is built gets a fast-linked pipeline (`vk_pipeline.c` `PREWARM_PIPE_MS`).
   `NX2NAVI_PREWARM_FULL=1`, and drivers without the library, wait for every pipeline. `NX2NAVI_PREWARM_WAIT_MS` caps
   the whole wait, after which the rest finishes in the background.
+- Translator updates: every cache key names the translator, so a new one has no translations. The cache carries the
+  previous translator's (`NX2NAVI_SHADER_CARRY`, `runtime/gfx_shader.c` "Carry"): `shader-cache/identities.txt`
+  lists the translators it holds translations of, and a shader the new translator has not translated yet uses the
+  previous one's for the whole session, so neither the start nor play waits for a translation the update caused.
+  After the boot prewarm a background pass on its own translator process at idle priority, which waits while the game
+  translates, translates every stored program again for the next start, then deletes the old translations (a pruned
+  copy of `shader-cache.pack` replaces the pack at the next start). A program the new translator refuses keeps its
+  old translation. `--prepare-shaders` still translates everything with the current translator.
+- Shader disk reads in play: a draw's shader that is in the disk cache but not in memory is read on the render thread
+  within a budget of 1/8 of the wall time (2 ms at once), and past it by three loader threads while its draws are
+  skipped as for a translation (`runtime/gfx_shader.c` `load_budget`). Opening a loose file is what costs (5.6 ms a
+  pair the first time on Windows), so an update that carries the shaders over packs the cache once it holds 1,000
+  loose translations (`tools/make_game.py` `PACK_LOOSE_MIN`).
+- Texture pool streaming: the bindless pool's refresh before each draw creates at most `pool_create_budget` entries,
+  and once a frame's refreshes have taken `pool_create_ms` (6 ms) none more until the next frame; the slots left keep
+  their stand-in, and the frame's later refreshes skip them (`runtime/vk_exec_draw.c` `pool_refill`). An area load
+  spreads over several frames instead of holding one for 200-400 ms.
 - Mesh and task shaders run as `VK_EXT_mesh_shader`; indirect mesh draws read NVN's `{count, first}` record through a
   ring of Vulkan `{x, y, z}` records filled on the GPU.
 - Pipelines: `VK_EXT_graphics_pipeline_library` where the driver has it: stage libraries compiled ahead, a fast link
   at a new state, an optimised pipeline replacing it from a background thread. A draw whose pipeline is not ready is
-  skipped in recurring passes. The default also recognizes the scene lighting and two-target effects passes when
-  their colour images change and the previous frame used the same depth subresource for the same pass shape.
-  Pending draws in these passes leave pipeline linking to the workers. A later draw can use the finished pipeline.
-  One-time passes can still wait for their output. Compute pipelines
-  are compiled outside the pipeline lock, and one compile serves every thread that needs it.
-- On 1.1.1 the NVIDIA scene resolve replaces the two SMAA texture clears and the edge, weight, packing and tensor
-  dispatches once the replay recognizes the complete sequence. When the immediately preceding draw is the known
-  scene tonemap, DLAA or DLSS reconstructs its linear HDR input. The original fragment shader applies bloom and
-  grading at output resolution before HUD composition. If the grade cannot be identified, the same resolve can use
-  the game's tonemapped image. Other scaler sequences follow the ordinary replay path.
-- The tensor fallback uses a decode-and-scale pass (`vk_tonemap.c`). At presentation, `vk_fsr.c` can run FSR 1 (EASU, RCAS)
-  when the window is larger than the picture.
+  skipped when one of its pass's targets was rendered in the previous frame, and waits otherwise. Three things keep
+  that short on a first visit (`runtime/vk_pipeline.c`): a pipeline whose fragment shader reads a target of its own
+  pass is fast-linked like any other, the feedback loop flags being part of the fragment output library alone
+  (`gpl_feedback`); the library workers also link the pipelines of skipped draws, so a burst of new materials is
+  linked on several threads while the pool is inside optimised builds (`lib_worker`, `fast_take`); and the first
+  draw of a submission that misses has the rest of the submission read ahead, which queues the stage libraries of
+  every pipeline the later draws need before the replay reaches them (`runtime/vk_exec.c` `vk_exec_ahead`,
+  `vk_pipeline_hint`). Mesh pipelines have no libraries and are built whole. Compute pipelines
+  are compiled outside the pipeline lock, and one compile serves every thread that needs it. The boot builds the
+  pipeline of every compute shader play recorded or the shader preparation listed, but keeps only those of the shaders
+  dispatched most recently (`compute-used.bin`, `compute_keep`): the others go into the pipeline cache and are
+  destroyed, and their first dispatch creates them from it. A compute shader of more than half a million SPIR-V words
+  is built ahead only when a run has dispatched it: a pipeline of one holds about 100 MiB of device memory whether it
+  is used or not, also after it is destroyed, and the list has about twenty of them that the game never dispatches
+  (`runtime/vk_pipeline.c`, "compute pipelines the boot keeps").
+- The game's tensor-core upscaler is replaced by a decode-and-scale pass (`vk_tonemap.c`); `vk_fsr.c` runs AMD FSR 1
+  (EASU, RCAS) on the present when the window is larger than the picture.
+- On game 1.1.1 the replacement scene scaler skips both SMAA clears and its three dispatches. DLSS and DLAA jitter camera geometry, reconstruct the original HDR lighting and apply the game's bloom and tonemap at output resolution when the grade inputs match.
+- HDR (`vk_hdr.c`): the game tonemaps its scene into a float target, upscales it, draws the HUD into a second float
+  target and copies that into the 8-bit sRGB window texture it presents. With `NX2NAVI_HDR=1` the tonemap shader gets
+  the function of `shaders/hdr_tonemap.frag` spliced in where its SDR curve clamps each channel, so the float picture
+  holds the HDR picture relative to the HUD's white; the game's FSR 1 pass loses its output clamp; the present reads
+  the float picture in place of the window texture and `shaders/hdr_encode.comp` writes PQ for an HDR10 swapchain.
+  `NX2NAVI_HDR=native` reports an HDR10 display to the game, which then renders and presents its own PQ picture.
+  The menu switches between off and `1` during a run: the splice, the HDR extensions and the settings in the support
+  buffer are there from the start whatever is set (`vk_hdr_armed`), the spliced tonemap returns the game's SDR result
+  while the swapchain is SDR, and a change of the setting makes the swapchain again in the other format
+  (`gfx_present.c` `window_settings_live`). Only `native` waits for a restart, as the game asks about the display
+  once. `NX2NAVI_HDR_LIVE=0` leaves the HDR path out of a run that starts with HDR off.
 - ASTC textures are uploaded as they are where the device samples ASTC, and decoded by a compute shader everywhere
   else (`vk_astc.c`); under 20 GiB of video memory the decoder encodes them to BC3.
+- Texture detail (`texture_detail`, `vk_texture.c` "texture detail"): on a card with little video memory the large
+  mipmapped ASTC textures the CPU fills are made without their largest mip level (reduced) or their two largest (low),
+  which is three quarters and fifteen sixteenths of their memory. The image holds the game's levels from the one it
+  starts at, and uploads, views and sampler LOD clamps count from there. A texture a shader reads by texel position, or
+  whose size it uses, is made whole (`gfx_shader.c` `reflect_exact`). `auto` picks by the device-local budget.
 - Occlusion queries never block the CPU; a result that is not ready counts as visible.
 - Allocation: Vulkan Memory Allocator. Debugging: Vulkan validation layers, per-pass frame dumps (`NX2NAVI_DUMP`,
   `vk_dump.c`), a sampling profiler (`NX2NAVI_PROFILE`, `tools/prof_report.py`) and a flight recorder

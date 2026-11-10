@@ -54,6 +54,8 @@ const GfxShader *gfx_shader_await(int stage, const uint8_t *control, const uint8
                                   const GfxShaderAnswers *a);
 uint64_t gfx_shader_async_done(void);                      // translations finished by the background worker
 void gfx_shader_counts(uint64_t *keys, uint64_t *translated);   // distinct keys in memory, translations done (NX2NAVI_TRACE=perf)
+void gfx_shader_disk_counts(uint64_t *sync, uint64_t *sync_ns, uint64_t *bg);   // disk cache reads on the render
+                                                     // thread (count, ns) and by the loaders (gfx_shader.c load_budget)
 // Translator answers for this device (vk_caps.c): shaderFloat64, storage offset rounding, subgroup size per vs/fs/cs.
 void gfx_shader_set_host(int float64, uint32_t sbuf_align, const uint32_t subgroup[3], uint32_t gather_bits, int zero_locals,
                          int bda);
@@ -62,8 +64,13 @@ const uint8_t *gfx_shader_input_id(const GfxShader *s);     // the 32-byte input
 // By input id from memory or disk; xlate 1 also translates it from its stored inputs. NULL if absent.
 const GfxShader *gfx_shader_load_input(const uint8_t iid[32], int xlate);
 // Boot prewarm: out[i] = gfx_shader_load_input(iids[i], 1) on `threads` threads with up to `procs` translators, then
-// every other stored input not cached under this translator is translated. Logs progress and the total.
+// every other stored input not cached under this translator is translated (one a previous translator's translation
+// serves is left to gfx_shader_carry_start's pass). Logs progress and the total.
 void gfx_shader_prewarm(const uint8_t (*iids)[32], size_t n, const GfxShader **out, int threads, int procs);
+// After the boot prewarm of a game run (boot.c): when the shader cache holds translations of a previous translator
+// (NX2NAVI_SHADER_CARRY), starts the background pass that translates them again under the current one for the next
+// start and then drops the old ones (gfx_shader.c, "Carry").
+void gfx_shader_carry_start(void);
 // How far the running (or last) gfx_shader_prewarm is: shaders done of total, and how many of them it translated (the
 // rest were cached). Any thread; the numbers lag the workers by at most 100 ms.
 void gfx_shader_prewarm_progress(int64_t *done, int64_t *total, int64_t *translated);
@@ -79,14 +86,12 @@ void gfx_shader_prepare_recorded(int threads, int procs);
 // nx2navi.exe --prepare-shaders: translates <dir>/seed-answers.bin + seed-programs.bin (tools/prepare_shaders.py) and
 // writes <dir>/shader-prepared.bin (stage, priority, input id per variant). 0 on success.
 int gfx_shader_prepare_seed(const char *dir, int threads, int procs);
-void gfx_shader_cache_identity(char translator[65], const char **storage);   // after gfx_shader_set_host
-int gfx_shader_prepared_present(const char *dir);
 // gfx_shader_guess.c: the answers of a prepared default variant, read from its first translation s: vertex inputs the
 // shader reads as integers become uint, a compute shader's textures and images take the types its translation
 // declares. 1 when *out differs from *a (translate again with *out).
 int gfx_shader_guess_refine(const GfxShader *s, int stage, const GfxShaderAnswers *a, GfxShaderAnswers *out);
 typedef struct { uint8_t iid[32]; uint8_t stage, prio; } GfxWarmEnt;   // prio 0: met in play; 1..3: prepared
-size_t gfx_shader_warm_list(const char *dir, int include_prepared, GfxWarmEnt **out, int *manifest_ok);
+size_t gfx_shader_warm_list(GfxWarmEnt **out);              // malloc'd; recorded first, then prepared; needs recording on
 // Disk-cache load the caller owns (*owned 1: release it), or the memory cache's entry (*owned 0). NULL if not cached.
 const GfxShader *gfx_shader_load_private(const uint8_t iid[32], int *owned);
 void gfx_shader_release_private(const GfxShader *s);
@@ -95,10 +100,9 @@ int gfx_shader_write_code(const GfxShader *s, const char *path);   // the guest 
 // A shader of the runtime's own (SPIR-V and a .res.json text as the translator writes them), outside the cache and
 // never freed; its key is the sha256 of both. NULL when the SPIR-V is malformed.
 const GfxShader *gfx_shader_own(const uint32_t *spirv, uint64_t words, const char *res_json);
-// vk_hdr.c: with NX2NAVI_HDR=1, replaces a fragment shader's SPIR-V (malloc'd, *words long) by the HDR tonemap when it is
-// the game's tonemap; gfx_shader.c calls it for every fragment shader entering the cache.
+// vk_hdr.c: with NX2NAVI_HDR=1, splices the HDR tonemap into a fragment shader's SPIR-V (malloc'd, *words long) when it
+// is the game's tonemap, and unclamps the game's FSR pass; gfx_shader.c calls it for every fragment shader entering the cache.
 void vk_hdr_shader_swap(uint32_t **spirv, uint64_t *words);
-const GfxShader *gfx_shader_ui_coverage(const GfxShader *original, int multiply);
 uint64_t gfx_shader_failures(void);                         // failed translations; feeds GfxStats.shader_failures
 // Reflection: parsed once per shader from the translator's .res.json and the SPIR-V before it enters the cache.
 enum { GFX_RES_UBO, GFX_RES_SSBO, GFX_RES_TEX, GFX_RES_IMG, GFX_RES_KINDS };
@@ -117,17 +121,13 @@ typedef struct {
     uint8_t pool;               // TEX: 1 the texture pool, 2 the sampler pool, indexed by bindless handles (set 2)
     uint16_t ptr;               // SSBO: 0, or 1 + the byte offset of this buffer's address inside the storage buffer that
                                 // cbuf_slot and handle name (a pointer table; the translator's patch 0022, res.json "ptr")
+    uint8_t exact;              // TEX: the module fetches its texels by position or uses its size or level count, so it
+                                // needs every level of the texture as the game made it (gfx_shader.c reflect_exact)
 } GfxShaderRes;
 typedef struct { uint8_t type, comps, packed; } GfxShaderIo;   // GFX_TYPE_*, components, 1 with a Component decoration
-typedef struct { uint8_t tag, color[8], depth, points, reserved; } GfxArchivePass;
-typedef struct {
-    uint8_t first[32], fs[32];
-    union { uint8_t ts[32]; GfxArchivePass pass; };  // task ID for mesh, attachment layout for vertex (tag 0: default)
-} GfxArchiveProgram;
-int gfx_archive_program_order(const void *a, const void *b);
-int gfx_shader_archive_programs(const char *dir, int mesh, GfxArchiveProgram **programs, size_t *count);
 int gfx_shader_stage(const GfxShader *s);                   // GFX_STAGE_VS, GFX_STAGE_FS or GFX_STAGE_CS
 int gfx_shader_resources(const GfxShader *s, int kind, const GfxShaderRes **res);   // count of GFX_RES_* kind; array in *res
+uint32_t gfx_shader_exact_seen(void);   // shaders loaded so far with a GfxShaderRes.exact texture (the texture census line)
 uint32_t gfx_shader_slot_mask(const GfxShader *s);                    // texture/image slots whose type its translation read
 uint32_t gfx_shader_inputs(const GfxShader *s, GfxShaderIo io[32]);    // Input Locations (VS attributes, FS varyings) as a mask
 uint32_t gfx_shader_outputs(const GfxShader *s, GfxShaderIo io[32]);
@@ -146,11 +146,19 @@ typedef struct {
     void (*texture_release)(const tex_t *t);
     void (*program_release)(const prog_t *p);
     uint64_t (*submit)(const uint64_t *handles, int n);    // replays; returns this submission's fence value
+                                                           // (gfx_submit_queue names the game's queue)
     int  (*fence_wait)(uint64_t value, uint64_t timeout_ns);   // 1 reached; caller has given its core up
+    // As fence_wait, but only until the GPU has executed the submission's own commands: its write-backs to guest
+    // memory and its fence's side effects may follow (vk_sync.c exec_tl). The same as fence_wait where there is no split.
+    int  (*exec_wait)(uint64_t value, uint64_t timeout_ns);
     uint64_t (*fence_done)(void);                          // highest value whose side effects are written
     // Queues the present and returns at once; the host present goes out at at_ns (kern_now_ns clock), at once when that
     // has passed or at_ns is 0.
     void (*present)(const tex_t *t, const int crop[4], uint64_t at_ns);
+    // The game starts a frame (nvn_api_obj.c nvnWindowAcquireTexture), after the image's own waits (the pacer's hold
+    // and the GPU's): the back end may hold it longer (vk_dlssg.c vk_dlssg_frame_start, Reflex's sleep for DLSS Frame
+    // Generation). NULL: nothing to do.
+    void (*frame_start)(void);
     void (*finish)(void);
     void (*read_texels)(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uint8_t *dst, uint64_t row, uint64_t img);
     void (*write_texels)(const tex_t *t, const view_t *v, const NVNcopyRegion *r, const uint8_t *src, uint64_t row, uint64_t img);
@@ -159,13 +167,6 @@ typedef struct {
     // The CPU waited for fence: small render targets written by work up to it go to their storage (vk_texture.c
     // vk_texture_write_back_small).
     void (*cpu_synced)(uint64_t fence);
-    void (*publish_movie_buffer)(uint64_t addr, uint64_t size);
-    void (*frame_start)(void);   // guest acquired the render image and can start work on this frame
-    int (*event_order)(void);
-    int (*guest_wait)(uint64_t ticket, uint64_t timeout_ns);
-    uint64_t (*queue_dependency)(uintptr_t queue, uint64_t ticket);
-    void (*queue_release)(uintptr_t queue);
-    void (*event_changed)(void);
 } GfxBackend;
 extern const GfxBackend gfx_null_backend, gfx_vulkan_backend;
 const GfxBackend *gfx_backend(void);                       // NX2NAVI_GPU=null|vulkan (default vulkan)
@@ -186,9 +187,7 @@ void rt_frame_presented(const tex_t *t, uint64_t n);       // boot.c: --frames N
 void gfx_movie_frame(const uint8_t *rgba, int w, int h);
 void gfx_movie_frame_own(uint8_t *rgba, int w, int h);   // the same, taking the malloc'd buffer (freed later)
 void gfx_movie_stop(void);
-int gfx_movie_copy_source(uint64_t addr, uint64_t size);
 
-// Queue identity on the guest thread issuing a submission.
+// The game's queue (NVNqueue address) of the submission this thread is handing to GfxBackend.submit, 0 when none
+// (probes). Set by nvnQueueSubmitCommands around the call; vk_exec.c orders queues by their events with it.
 extern _Thread_local uintptr_t gfx_submit_queue;
-extern _Thread_local uint64_t gfx_guest_ticket;
-#define GFX_GUEST_TICKET (UINT64_C(1) << 63)

@@ -42,6 +42,7 @@ typedef struct {                                           // NVNmappingRequest 
 _Static_assert(sizeof(nvn_mapping_t) == 0x28, "NVNmappingRequest stride");
 
 const pool_t *nvn_pool_find(uint64_t addr, uint64_t len);  // GPU-visible pool holding [addr, addr+len], NULL if none
+uint64_t nvn_prog_made_ns(uint64_t serial);                    // NX2NAVI_PROG_LEAD: when the program was made, 0 unknown
 uint64_t nvn_new_serial(void);                             // next tex_t / prog_t serial, from 1
 uint64_t nvn_fence_last(void);                             // fence value of the newest submit (0 before the first)
 int nvn_depth_minus_w(void);                               // 1 after DeviceSetDepthMode(NEAR_IS_MINUS_W), else 0
@@ -56,6 +57,7 @@ void nvn_submit_prepare(const uint64_t *handles, int n);   // weak no-op; the co
 void nvn_submit_prepare_async(const uint64_t *handles, uint64_t *out, int n);
 int gfx_replay_async(void);                                // 1: the back end replays submissions on its own thread
 uint64_t gfx_replayed_submits(void);                       // newest submit number (nvn_submit_count) replayed
+void gfx_event_signalling(const void *value, uint32_t to); // nvnEventSignal is about to write `to` into the event's value
 #define NVN_HANDLE_TEX(h) ((int)((h) & 0xfffff))           // combined texture handle = texture id | sampler id << 20
 #define NVN_HANDLE_SAMP(h) ((int)(((h) >> 20) & 0xfff))
 extern GfxStats gfx_counters;                              // behind gfx_stats(); add with __atomic_fetch_add. frames:
@@ -80,8 +82,7 @@ uint64_t nvn_tex_view_offset(const tex_t *t, const view_t *v);
 // (nvn_pins_sweep). Deferred binds (p_bind_handles.src != 0) hold the
 // handles read at submit (nvn_submit_prepare). Payloads of the ops nvn_obj.h does not define:
 typedef struct { volatile uint32_t *val; uint32_t mode, value; } p_signal_event;   // OP_SIGNAL_EVENT; mode: NVNeventSignalMode
-typedef p_signal_event p_wait_event;   // OP_WAIT_EVENT; mode: NVNeventWaitMode
-void nvn_queue_publish(queue_t *q, uint64_t ticket);
+typedef struct { volatile uint32_t *val; uint32_t mode, value; } p_wait_event;     // OP_WAIT_EVENT; mode: NVNeventWaitMode
 typedef struct { uint64_t type, addr; } p_report_counter;  // OP_REPORT_COUNTER: NVNcounterType, NVNcounterData address
 typedef struct { uint64_t type; } p_reset_counter;         // OP_RESET_COUNTER
 typedef struct { uint64_t src, dst, size; } p_copy_b2b;    // OP_COPY_B2B: GPU addresses
@@ -109,8 +110,6 @@ uint64_t nvn_submit_count(void);                           // QueueSubmitCommand
 // Frees the texture pins no recording copy has named for NVN_PIN_AGE submits (nvn_api_cmd.c, "texture pins"), except keep[0..nkeep):
 // the replay's current render targets, which carry over to the next submission. Called between submissions by the
 // thread that replays them; now = nvn_submit_count().
-void nvn_record_refs(const uint8_t *copy, int delta);
-void nvn_target_refs(const p_set_rt *rt, int delta);
 void nvn_pins_sweep(uint64_t now, const tex_t *const *keep, int nkeep);
 void nvn_pins_stats(uint64_t *live, uint64_t *freed);      // pins that exist, pins freed so far
 const char *nvn_op_name(uint32_t op);                      // "DRAW_IDX", ...; "?" past OP_COUNT_

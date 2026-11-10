@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "cfg.h"
 #include "platform/platform.h"
 #include "host.h"
 #include "tex.h"
@@ -116,24 +117,23 @@ static void to_general(VkCommandBuffer cb, VkImage img) {
 
 static double now_ms(void) { return (double)plat_now_ns() / 1e6; }
 
-// Decodes regions (w0 x h0 at level 0, w1 x h1 at level 1) of blk on the GPU; out_rb: the decoder's texels, out_img:
-// the image's two levels read back. 0 on a Vulkan failure.
-static int gpu_decode(VkCtx *c, const uint8_t *blk, size_t n0, size_t n1, uint32_t w0, uint32_t h0, uint32_t w1,
-                      uint32_t h1, uint32_t bw, uint32_t bh, int srgb, uint8_t *out_rb, uint8_t *out_img, double *ms) {
+// Decodes the two regions ar (w0 x h0 at level 0, w1 x h1 at level 1) of the src_bytes at src on the GPU; out_rb: the
+// decoder's texels, out_img: the image's two levels read back. 0 on a Vulkan failure.
+static int gpu_decode_ar(VkCtx *c, const uint8_t *src, size_t src_bytes, const VkAstcRegion ar[2], uint32_t bw,
+                         uint32_t bh, int srgb, uint8_t *out_rb, uint8_t *out_img, double *ms) {
+    uint32_t w0 = ar[0].w, h0 = ar[0].h, w1 = ar[1].w, h1 = ar[1].h;
     Img im;
     if (!make_image(c, w0, h0, 2, srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM, &im)) return 0;
     size_t t0 = (size_t)w0 * h0 * 4, t1 = (size_t)w1 * h1 * 4;
     VkCommandBuffer cb = vk_upload_begin();
     VkBuffer sb, rb, ib;
     VmaAllocation ra, ia;
-    uint8_t *stg = vk_staging((n0 + n1) * 16, &sb, NULL);
+    uint8_t *stg = vk_staging(src_bytes, &sb, NULL);
     uint8_t *rmap = vk_staging(t0 + t1, &rb, &ra), *imap = vk_staging(t0 + t1, &ib, &ia);
-    memcpy(stg, blk, (n0 + n1) * 16);
+    memcpy(stg, src, src_bytes);
     to_general(cb, im.img);
-    VkAstcRegion ar[2] = {{.src = 0, .w = w0, .h = h0, .slices = 1, .level = 0},
-                          {.src = n0 * 16, .w = w1, .h = h1, .slices = 1, .level = 1}};
     barrier(cb, ALL_RW, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-    int ok = vk_astc_record(cb, sb, (n0 + n1) * 16, ar, 2, bw, bh, srgb, 0, im.img, VK_IMAGE_ASPECT_COLOR_BIT, rb);
+    int ok = vk_astc_record(cb, sb, src_bytes, ar, 2, bw, bh, srgb, 0, im.img, VK_IMAGE_ASPECT_COLOR_BIT, rb);
     barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
     VkBufferImageCopy cp[2] = {{.bufferOffset = 0, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {w0, h0, 1}},
                                {.bufferOffset = t0, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 1, 0, 1}, .imageExtent = {w1, h1, 1}}};
@@ -151,6 +151,54 @@ static int gpu_decode(VkCtx *c, const uint8_t *blk, size_t n0, size_t n1, uint32
     vk_defer_image(im.img, im.alloc);
     vk_upload_flush(1);
     return ok;
+}
+
+// The two regions as tight blocks: n0 blocks of level 0, then n1 of level 1.
+static int gpu_decode(VkCtx *c, const uint8_t *blk, size_t n0, size_t n1, uint32_t w0, uint32_t h0, uint32_t w1,
+                      uint32_t h1, uint32_t bw, uint32_t bh, int srgb, uint8_t *out_rb, uint8_t *out_img, double *ms) {
+    VkAstcRegion ar[2] = {{.src = 0, .w = w0, .h = h0, .slices = 1, .level = 0},
+                          {.src = n0 * 16, .w = w1, .h = h1, .slices = 1, .level = 1}};
+    return gpu_decode_ar(c, blk, (n0 + n1) * 16, ar, bw, bh, srgb, out_rb, out_img, ms);
+}
+
+static int first_diff(const uint8_t *a, const uint8_t *b, size_t texels, size_t *at);
+
+// The same blocks tiled as the game stores them (tex_bl_copy, the CPU deswizzle's own copy), level 0 in blocks of 4 GOBs
+// and level 1 in blocks of 2, decoded in place (VkAstcRegion.bl, astc_decode.comp bl_block): the decoder's texels must be
+// want's. Checks the GPU's block-linear addressing against the CPU's.
+static int test_bl(VkCtx *c, const uint8_t *blk, size_t n0, uint32_t w0, uint32_t h0, uint32_t w1, uint32_t h1,
+                   uint32_t bw, uint32_t bh, int srgb, const uint8_t *want) {
+    const unsigned th[2] = {2, 1};
+    uint32_t bx[2] = {(w0 + bw - 1) / bw, (w1 + bw - 1) / bw}, by[2] = {(h0 + bh - 1) / bh, (h1 + bh - 1) / bh};
+    uint64_t sz[2];
+    for (int lv = 0; lv < 2; lv++) {
+        uint64_t gh = 8ull << th[lv];
+        sz[lv] = ((uint64_t)bx[lv] * 16 + 63) / 64 * ((by[lv] + gh - 1) / gh) * (512ull << th[lv]);
+    }
+    uint8_t *bl = calloc(1, sz[0] + sz[1]);
+    tex_bl_copy(bl, (uint8_t *)blk, (size_t)bx[0] * 16, bx[0] * 16, by[0], 1, th[0], 0, 0);
+    tex_bl_copy(bl + sz[0], (uint8_t *)blk + n0 * 16, (size_t)bx[1] * 16, bx[1] * 16, by[1], 1, th[1], 0, 0);
+    VkAstcRegion ar[2] = {{.src = 0, .w = w0, .h = h0, .slices = 1, .level = 0, .bl = 1, .th = (uint8_t)th[0]},
+                          {.src = sz[0], .w = w1, .h = h1, .slices = 1, .level = 1, .bl = 1, .th = (uint8_t)th[1]}};
+    size_t t0 = (size_t)w0 * h0, t1 = (size_t)w1 * h1, at;
+    uint8_t *rb = malloc((t0 + t1) * 4);
+    memset(rb, 0x5A, (t0 + t1) * 4);
+    int bad = 0;
+    if (!gpu_decode_ar(c, bl, sz[0] + sz[1], ar, bw, bh, srgb, rb, NULL, NULL)) {
+        printf("probe-astc: FAIL %ux%u %s block-linear: the GPU decode was not recorded\n", bw, bh, srgb ? "sRGB" : "linear");
+        bad = 1;
+    }
+    for (int lv = 0; lv < 2 && !bad; lv++) {
+        size_t off = lv ? t0 * 4 : 0;
+        uint32_t w = lv ? w1 : w0;
+        if (first_diff(want + off, rb + off, lv ? t1 : t0, &at)) {
+            printf("probe-astc: FAIL %ux%u %s block-linear level %d: texel (%zu,%zu) differs from the tight decode\n", bw, bh,
+                   srgb ? "sRGB" : "linear", lv, at % w, at / w);
+            bad = 1;
+        }
+    }
+    free(bl), free(rb);
+    return bad;
 }
 
 enum { MAX_LEVELS = 13 };   // a mip chain of up to 4096 texels a side
@@ -317,6 +365,7 @@ static int test_case(VkCtx *c, uint32_t bw, uint32_t bh, int srgb) {
             }
         }
     }
+    if (!bad) bad = test_bl(c, blk, n0, w0, h0, w1, h1, bw, bh, srgb, want);
     if (!bad && vk_astc_bc()) {
         size_t b0 = bc_bytes(w0, h0), b1 = bc_bytes(w1, h1);
         uint8_t *bc = malloc(b0 + b1);
@@ -512,7 +561,7 @@ static void timing(VkCtx *c, uint32_t bw, uint32_t bh) {
 }
 
 int probe_astc(void) {
-    plat_setenv("NX2NAVI_ASTC_BC", "1");   // also builds the BC3 encoder; the RGBA8 cases pass bc 0 and do not use it
+    cfg_setenv("NX2NAVI_ASTC_BC", "1");   // also builds the BC3 encoder; the RGBA8 cases pass bc 0 and do not use it
     if (!vk_init()) { printf("probe-astc: FAIL vk_init\n"); return 1; }
     VkCtx *c = vk_ctx();
     printf("probe-astc: GPU %s, textureCompressionASTC_LDR %d, mode %d\n", c->props.deviceName, c->has_astc_ldr,
@@ -555,7 +604,8 @@ int probe_astc(void) {
         printf("probe-astc: FAILED (%s, %ld validation errors)\n", bad ? "a check failed" : "checks passed", errors);
         return 1;
     }
-    printf("probe-astc: passed (14 footprints x linear/sRGB, %llu blocks, %llu texels bit-exact with astc_decode_ldr; "
+    printf("probe-astc: passed (14 footprints x linear/sRGB, tight and block-linear, %llu blocks, %llu texels bit-exact "
+           "with astc_decode_ldr; "
            "valid blocks by kind: 1p %llu, 2p %llu, 3p %llu, 4p %llu, dual 1p %llu, dual 2p %llu, dual 3p %llu; "
            "%llu void extents, %llu random error blocks; 0 validation errors)\n",
            (unsigned long long)g_blocks, (unsigned long long)g_texels, (unsigned long long)g_bucket[0],

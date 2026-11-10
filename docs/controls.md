@@ -8,17 +8,40 @@ disables both (automated runs). `NX2NAVI_*` settings can also be set in `nx2navi
 `motion = 0`, `rumble = 0`); the environment overrides the file. `NX2NAVI_RUMBLE_STRENGTH` is the rumble strength in
 percent (0 to 300, default 130; 0 is the same as `rumble = 0`). `NX2NAVI_RUMBLE_CURVE` is the exponent applied to the
 amplitude before the strength (0.2 to 1.5, default 0.6; lower makes weak pulses stronger, 1 is linear).
-`NX2NAVI_RUMBLE_TRIGGERS=1` also drives the impulse triggers of an Xbox pad.
+`NX2NAVI_RUMBLE_TRIGGERS=1` also drives the impulse triggers of an Xbox pad. `NX2NAVI_DS3=1` turns on the direct reader for a DualShock 3 (see PlayStation 3 controllers).
 
 `NX2NAVI_PAD_LAYOUT` (`pad_layout`, the *Button layout* row on the Controls tab, live) picks which face button is Switch A:
 
 - `nintendo` (default): by position, as on a Switch (the table below).
 - `xbox`: south A, east B, west X, north Y, as an Xbox pad labels them; on a PlayStation pad cross is A, circle B, square X, triangle Y.
+- `playstation`: the same buttons as `xbox` under the PlayStation name: cross A, circle B, square X, triangle Y.
 - `auto`: `nintendo` for a pad whose east button SDL reports labelled A (Switch Pro Controller, Nintendo-layout pads), `xbox` for the others.
 
 The log names the layout in effect (`input: gamepad layout ...`) and each gamepad's first press
 (`input: gamepad "...": first press`); the menu shows the layout under *Automatic*. The game's prompts show the Switch
-letters.
+letters unless *Button prompts* says otherwise (below).
+
+## Button prompts
+
+`NX2NAVI_PROMPTS` (`prompts`, the *Button prompts* row on the Controls tab) picks the buttons the game's prompts show: `nintendo` (default, the game's own), `xbox`, `playstation`, `steamdeck` or `pc` (*Keyboard and mouse*). It changes three things the game draws:
+
+- the button font every prompt in text uses (dialogue, the button guides, the controls screen): A B X Y, L R ZL ZR, Plus and Minus, the d-pad and the sticks with their directions become that pad's buttons (LB RB LT RT, Menu and View; L1 R1 L2 R2, Options and Create; its d-pad and sticks), or the keys. Power, Home and the console stay;
+- the letter in the action prompt (top right);
+- the ocarina's note buttons.
+
+A, B, X and Y show the button the *Button layout* presses: with `nintendo` (by position) Switch A is the right face button, so its prompts show B or circle, B shows A or cross, X shows Y or triangle and Y shows X or square; with `xbox`, `playstation` and `automatic` (by label) A shows A or cross, B shows B or circle, X shows X or square and Y shows Y or triangle.
+
+`pc` shows the first key each Switch button has (the table above, or the `bind_` lines of `nx2navi.ini` when the tool runs): E, Ctrl, Space, the mouse with its left button for Y, Q, R, the mouse with its right button for ZL, F, Tab, M, V and C for the stick clicks, 1 to 4 for the d-pad, and W A S D for moving, the directions the prompt means set out as on the keyboard. The camera's prompts show the mouse moving. It follows no *Button layout*.
+
+The game reads the font and the interface textures once at start, so a change shows after a restart (the row says so; the menu's Restart button restarts). A button or key remapped on this tab keeps its old prompt until the folders are made again.
+
+The prompts live in overlay folders next to the exe, `romfs-patches-xbox`, `romfs-patches-xbox-label`, `romfs-patches-playstation`, `romfs-patches-playstation-label`, `romfs-patches-steamdeck` and `romfs-patches-steamdeck-label` (by position and by label) and `romfs-patches-pc`, which `runtime/romfs.c` loads in place of the game's files. `tools/pad_prompts.py` draws them on the player's machine from the player's own RomFS and a folder of button art, which the repository does not hold. A launcher release or build kit made with `--prompt-art` carries that art (`prompt-art`, `tools/prompt_art.py`), and `tools/make_game.py` draws every folder in its last step, again whenever the art, the tools or the `bind_` lines change (so a rebuild after rebinding keys brings the keyboard prompts up to date). By hand:
+
+```
+python tools\pad_prompts.py --art <art pack>\Source --game <install folder>
+```
+
+`--style xbox|playstation|steamdeck|pc` makes one style; `steamdeck` shows the Deck's own labels (A B X Y where an Xbox pad has them, L1 R1 L2 R2 and L3 R3, Menu and View) and is drawn from the Xbox and PlayStation pictures, as the art has no Deck style; the keys come from `<install folder>\nx2navi.ini` (`--binds` names another). The art folder holds `XGamepad/Default`, `XGamepad/Light`, `P5Gamepad/Default`, `P5Gamepad/Light`, `Keyboard_Mouse/Dark` and `Keyboard_Mouse/White` with the file names of `STYLES` and `KEY_ART` in the tool; a key it has no picture of is written on `Keyboard_Mouse/Blanks`. Without the folders the row says *prompt files missing* and the Switch prompts stay; so they do when a RomFS mod replaces one of the same files (*off: a RomFS mod replaces their files*). The log has a `RomFS overlay: ... button prompts` line for the folder in use. The tool needs fontTools, Pillow and zstandard (`tools/requirements-py314.txt`).
 
 The actions are the game's own, as its *Basic Controls* screen (Plus menu, System) names them:
 
@@ -53,7 +76,13 @@ The game's *Swap Jump Controls* option trades B and X (jump on B, put away on X)
 | F10 | L3 + R3 (both stick clicks) | performance overlay: off, frame rate, full panel |
 | F11 | | borderless fullscreen on or off, saved to `nx2navi.ini` |
 
-The Minus+Plus combo never reaches the game. In the menu the arrow keys, the D-pad or the left stick move, Enter or A selects, Q and E or L and R switch tabs, Esc or B goes back (Switch button names, as in the table above).
+The window opens on the monitor `NX2NAVI_MONITOR` (`monitor` in `nx2navi.ini`) names, and F11 fullscreen covers the monitor the window is on. `nx2navi.exe --list-monitors` prints each monitor's index, name (on Windows its device name too), desktop rectangle, primary flag and DPI without game files; `nx2navi.exe --monitor <value>` sets `NX2NAVI_MONITOR` for one run and wins over the file. The value is `auto` (default), `primary`, an index from the list (counting from 1), or part of a monitor name (on Windows also a device name such as `display3`; on Linux the name carries the connector, such as `dp-2`); when nothing matches, the log lists the monitors and the window is placed as with `auto`. On Wayland a window cannot place itself: only fullscreen (`fullscreen = 1`) opens on the chosen monitor, and a windowed window opens where the compositor puts it.
+
+The Minus+Plus combo never reaches the game. In the menu the arrow keys, the D-pad or the left stick move, Enter or A selects, Q and E or L and R switch tabs, Esc or B goes back (Switch button names, as in the table above). With the mouse, a click on a row selects it and a setting changes on the two framed arrows beside its value (held, an arrow repeats); a click anywhere else on the row changes nothing.
+
+## Audio output
+
+The sound plays on the system default device, and follows it when the Windows default changes. `NX2NAVI_AUDIO_DEVICE` (`audio_device` in `nx2navi.ini`, section `[audio]`) names another one: a number counting from 1 in the order `nx2navi.exe --list-audio-devices` prints, or part of the device's name, ignoring case. `--list-audio-devices` prints each playback device's index, name, channels and frequency without game files, marks the system default, and shows which device the setting picks; `nx2navi.exe --audio-device <value>` sets `NX2NAVI_AUDIO_DEVICE` for one run and wins over the file. When nothing matches or the device will not open, the log lists the playback devices and the game plays on the system default; a chosen device that disappears while the game runs (a virtual sink removed, a headset unplugged) also moves the sound to the system default. `audio_channels = auto` asks the chosen device how many channels it has.
 
 ## Remapping
 
@@ -91,6 +120,21 @@ The stick direction bits (`StickLLeft` to `StickRDown`) are derived from the sti
 
 Windows does not present the Switch 2 Pro Controller as a gamepad SDL can open (the log says `input: no gamepad`), so it needs a bridge program that wakes it and creates a virtual gamepad, for example one that emulates a DualSense: that gives buttons, rumble, gyro and accelerometer. The log then shows `input: gamepad "DualSense Wireless Controller" ... (rumble, gyro and accelerometer, ...)` and `input: motion sensors on`. Bridges that output a DualShock 4 whose gyro and accelerometer never change give buttons and rumble but no motion. Run one bridge at a time; Steam Input can also claim the controller, so close Steam if the bridge does not find it. With several virtual and real gamepads connected the game follows whichever one is pressed.
 
+## PlayStation 3 controllers
+
+With `ds3 = 1` in `nx2navi.ini` (off by default), a DualShock 3 on Windows is read directly (`runtime/input_ds3_win.c`) when no driver presents it to SDL or XInput as a gamepad. Plug it in by USB, or pair it with a Bluetooth driver that exposes it as a HID device with its own name, "PLAYSTATION(R)3 Controller"; the log then shows `input: DualShock 3 opened`, the controller's first player light turns on and `input: DualShock 3 is reporting` follows. The reader sends the controller the command that makes it start reporting, which it does not do on its own. It looks for a controller every three seconds while none is open, so one plugged in or switched on later is found without a restart.
+
+| Switch | DualShock 3 by position |
+|---|---|
+| A, B, X, Y | circle, cross, triangle, square (east, south, north, west: the button layout setting applies as for any pad) |
+| ZL, ZR | L2, R2 (over 50% pressure) |
+| L, R | L1, R1 |
+| Left, right stick click | L3, R3 |
+| Plus, Minus | Start, Select |
+| D-pad | D-pad |
+
+The PS button is not used. The Controls tab binds and remaps its buttons like any other pad's, with the same pad names. Vibration works through the strength, curve and *Vibration* settings: the controller's light motor can only be on or off, so it comes on from a sixteenth of the amplitude the game asks of it. The accelerometer and the single gyro axis are not used: the game's motion controls need all three gyro axes, so a DualShock 3 gives no motion. `ds3 = 0` in `nx2navi.ini` (the default, live) turns the reader off. A controller that a driver presents in a generic gamepad mode, with another name or report layout, is not recognised by the reader and goes through SDL or XInput instead, as before.
+
 ## Scripted input
 
 `NX2NAVI_INPUT_SCRIPT=<file>` replays presses. It is ORed with real input and still applies under `NX2NAVI_INPUT=none`. One event per line, `#` starts a comment:
@@ -103,6 +147,8 @@ Windows does not present the Switch 2 Pro Controller as a gamepad SDL can open (
 `<frame>` counts 60 Hz ticks of game time since the first frame (presented frames at 60 fps). Each event logs once (`input: script frame N tick T: A`).
 
 `NX2NAVI_INPUT_RECORD=<file>` (`input_record` in `nx2navi.ini`) writes the merged input in the same format, one line per button press and per stick segment. The file replays as a script, which makes it the repro to attach to a bug report.
+
+`tools/run_game.py <game folder> --save <save> --seconds <s> --wall <w> [--script <file>] [--shot <png>]` runs the game on a copy of its profile with a save swapped in, under the script (default `tools/input/load_save.txt`: title screen to the first save slot). `<save>` names one of the game's save backups (`profile/save-backup/<time>`; the game keeps the last three) or is a save folder or `.zip` from elsewhere, such as the zipped profile folder of a crash report; a single slot (`slot_NN`) replaces only that slot. The run ends once `<s>` seconds of game time passed after the save loaded, `--shot` saving that frame as a PNG and `--env NX2NAVI_SHOTS=w<from>-<to>:<step>` one every `<step>` seconds of game time along the way (480x270, full size with `NX2NAVI_SHOTS_FULL=1`), or after `<w>` seconds of wall time. `--env NX2NAVI_SHOT_DIR=<dir> --env NX2NAVI_SHOT_AFTER=<s> --env NX2NAVI_SHOT_EVERY=<s>` takes pictures by wall time instead, for a script that never reaches a place where game time counts. On Windows it also takes `build\<ver>` folders and the saves in `build\save-backup`.
 
 `NX2NAVI_TEST_PAD=<lx>,<ly>,<rx>,<ry>` attaches an SDL virtual gamepad at start whose sticks rest at these raw SDL axis values (-32768 to 32767, down is +y), so a drifting or held stick can be tested without a controller: the values go through the gamepad mapping and `NX2NAVI_STICK_DEADZONE` like a real pad's, and `NX2NAVI_INPUT_RECORD` shows what reached the game. `NX2NAVI_TEST_PAD_AT=<ms>` attaches it that long after input starts instead and presses its south button a second later, which tests a controller switched on in play.
 

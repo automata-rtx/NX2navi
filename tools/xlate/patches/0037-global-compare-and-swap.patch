@@ -1,0 +1,43 @@
+--- a/src/Ryujinx.Graphics.Shader/Instructions/InstEmit.cs
++++ b/src/Ryujinx.Graphics.Shader/Instructions/InstEmit.cs
+@@ -5,13 +5,6 @@
+ {
+     static partial class InstEmit
+     {
+-        public static void AtomCas(EmitterContext context)
+-        {
+-            context.GetOp<InstAtomCas>();
+-
+-            context.TranslatorContext.GpuAccessor.Log("Shader instruction AtomCas is not implemented.");
+-        }
+-
+         public static void AtomsCas(EmitterContext context)
+         {
+             context.GetOp<InstAtomsCas>();
+--- a/src/Ryujinx.Graphics.Shader/Instructions/InstEmitMemory.cs
++++ b/src/Ryujinx.Graphics.Shader/Instructions/InstEmitMemory.cs
+@@ -24,6 +24,24 @@
+             context.Copy(GetDest(op.Dest), res);
+         }
+ 
++        // NX2NAVI: ATOM.E.CAS Rd, [Ra], Rb, Rb + 1 (32-bit): the word at the address is replaced by Rb + 1 where it
++        // equals Rb, and Rd gets its old value. tools/xlate/AmpereLowering.cs AtomgCas lowers SM86 ATOMG.CAS to it.
++        // BcRz 1 and 2 read the compare and the new value as zero.
++        public static void AtomCas(EmitterContext context)
++        {
++            InstAtomCas op = context.GetOp<InstAtomCas>();
++
++            (Operand addrLow, Operand addrHigh) = Get40BitsAddress(context, new Register(op.SrcA, RegisterType.Gpr), op.E, 0);
++
++            bool rz = op.SrcB == RegisterConsts.RegisterZeroIndex;
++            Operand compare = rz || op.BcRz == 1 ? Const(0) : GetSrcReg(context, op.SrcB);
++            Operand value = rz || op.BcRz == 2 ? Const(0) : GetSrcReg(context, op.SrcB + 1);
++
++            Operand res = context.AtomicCompareAndSwap(StorageKind.GlobalMemory, addrLow, addrHigh, compare, value);
++
++            context.Copy(GetDest(op.Dest), res);
++        }
++
+         public static void Atoms(EmitterContext context)
+         {
+             if (context.TranslatorContext.Definitions.Stage != ShaderStage.Compute)

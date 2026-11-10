@@ -33,8 +33,6 @@ from pathlib import Path
 
 import lz4.block
 
-from shader_passes import PASS_TARGETS, bfsha_passes
-
 ROOT = Path(__file__).resolve().parent.parent
 XLATE = ROOT / 'build' / 'xlate' / ('nx2navi_xlate.exe' if os.name == 'nt' else 'nx2navi_xlate')
 SPIRV_VAL = Path(r'C:\msys64\ucrt64\bin\spirv-val.exe') if os.name == 'nt' else Path(shutil.which('spirv-val') or '/usr/bin/spirv-val')
@@ -124,7 +122,7 @@ def nvn2_stages(data, program):
         yield digest(control + code[:length]), stage, control, code[:length]
 
 
-def bnsh_shaders(data, programs=None, pass_names=None, roles=None, base=0):
+def bnsh_shaders(data):
     """BNSH absolute offsets are relative to each embedded BNSH, not BFSHA."""
     if data[:4] != b'BNSH' or checked(data, 12, 2) != b'\xff\xfe' or checked(data, 96, 4) != b'grsc':
         raise ValueError('unsupported BNSH header')
@@ -136,18 +134,7 @@ def bnsh_shaders(data, programs=None, pass_names=None, roles=None, base=0):
         program = struct.unpack_from('<Q', data, variations + i * 64 + 16)[0]
         checked(data, program, 56)
         if nvn2_program(data, program):
-            stages = list(nvn2_stages(data, program))
-            if programs is not None:
-                group = {stage: key for key, stage, _, _ in stages}
-                if len(group) == len(stages) and 'ms' in group and group.keys() <= {'ms', 'ps', 'ts'}:
-                    programs.add((group['ms'], group.get('ps', ''), group.get('ts', '')))
-                elif len(group) == len(stages) and 'vs' in group and group.keys() <= {'vs', 'ps'}:
-                    pair = (group['vs'], group.get('ps', ''), '')
-                    programs.add(pair)
-                    if pass_names is not None and roles:
-                        for role in roles.get(base + variations + i * 64, ()):
-                            pass_names.setdefault(pair, set()).add(role)
-            yield from stages
+            yield from nvn2_stages(data, program)
             continue
         for stage, relative in [('vs', 8), ('ps', 40), ('cs', 48)]:
             offset = struct.unpack_from('<Q', data, program + relative)[0]
@@ -168,69 +155,7 @@ def bnsh_shaders(data, programs=None, pass_names=None, roles=None, base=0):
             yield digest(control + code[:length]), stage, control, code[:length]
 
 
-def sharcb_graphics_programs(data, first, pool, records, uint_programs=None, pass_names=None):
-    """A v11 program's stage mask and binary indices group its variations. In a task/mesh
-    program the fragment binary comes first. Validate both arrays before using those indices."""
-    header = first - 24   # array size/count, then the first binary's 16-byte header
-    if header < 32 or struct.unpack_from('<I', data, 4)[0] != 11:
-        return
-    size, count = struct.unpack_from('<II', data, header)
-    end = header + size
-    if size < 8 or end + 8 > pool or not 0 < count <= (size - 8) // 16:
-        return
-    bins = []
-    pos = header + 8
-    for _ in range(count):
-        if pos + 16 > end:
-            return
-        width, stage, _, payload = struct.unpack_from('<4I', data, pos)
-        if width < 16 or payload != width - 16 or pos + width > end:
-            return
-        bins.append((stage, pos + 16))
-        pos += width
-    if pos != end:
-        return
-    size, count = struct.unpack_from('<II', data, pos)
-    end, pos = pos + size, pos + 8
-    if end > pool or not 0 < count <= (size - 8) // 16:
-        return
-    programs = []
-    for _ in range(count):
-        if pos + 16 > end:
-            return
-        width, name_size, mask, base = struct.unpack_from('<4I', data, pos)
-        if width < 16 + name_size or pos + width > end or base >= len(bins) or (programs and base < programs[-1][0]):
-            return
-        name = data[pos + 16:pos + 16 + name_size].rstrip(b'\0')
-        uint_output = name in (b'shading_rate_image', b'texture_compress', b'texture_compress_hq')
-        programs.append((base, mask, uint_output, name.decode('ascii', errors='replace')))
-        pos += width
-    if pos != end:
-        return
-    for (base, mask, uint_output, program_name), (limit, *_) in zip(programs, programs[1:] + [(len(bins), 0, False, '')]):
-        if mask not in (1, 3) and (not mask & 32 or mask & ~0x32):
-            continue
-        stages = [(s, name) for s, name in ((0, 'vs'), (1, 'ps'), (4, 'ts'), (5, 'ms')) if mask & (1 << s)]
-        if (limit - base) % len(stages):
-            continue
-        for i in range(base, limit, len(stages)):
-            group = {}
-            for j, (stage, name) in enumerate(stages):
-                actual, offset = bins[i + j]
-                entry = records.get(offset)
-                if actual != stage or not entry or entry[0] != name:
-                    break
-                group[name] = entry[1]
-            else:
-                stages_key = (group.get('ms') or group['vs'], group.get('ps', ''), group.get('ts', ''))
-                if uint_programs is not None and uint_output and 'vs' in group and 'ps' in group:
-                    uint_programs.add(stages_key)
-                if pass_names is not None and program_name in PASS_TARGETS and 'vs' in group:
-                    pass_names.setdefault(stages_key, set()).add(program_name)
-                yield stages_key
-
-
-def sharcb_shaders(data, rejected, programs=None, uint_programs=None, pass_names=None):
+def sharcb_shaders(data, rejected):
     """agl shader packages (.sharcb, magic BAHS): records <u64 code offset in the pool, u32 control size (0x880 or
     0x88c), i32 offset of the control from the record>; a record may reuse an earlier record's control.
 
@@ -248,8 +173,6 @@ def sharcb_shaders(data, rejected, programs=None, uint_programs=None, pass_names
     if not 32 <= start <= pool or pool + pool_size > len(data):
         raise ValueError('agl shader package layout outside the file')
     seen = set()
-    records = {}
-    first = pool
     for size in (b'\x80\x08\x00\x00', b'\x8c\x08\x00\x00', b'\xe0\x00\x00\x00'):
         at = start
         while (at := data.find(size, at, pool)) >= 0:
@@ -260,10 +183,6 @@ def sharcb_shaders(data, rejected, programs=None, uint_programs=None, pass_names
             control_at = record + struct.unpack_from('<i', data, record + 12)[0]
             if size[0] == NVN2_CONTROL:   # NVN2 (Switch 2) packages: the same records with a 0xe0-byte control section
                 found = nvn2_sharcb_record(data, start, pool, pool_size, code_off, control_at)
-                if found and programs is not None:
-                    first = min(first, record)
-                    if found[1] in ('vs', 'ms', 'ps', 'ts'):
-                        records[record] = (found[1], found[0])
                 if found and found[0] not in seen:
                     seen.add(found[0])
                     yield found
@@ -283,9 +202,6 @@ def sharcb_shaders(data, rejected, programs=None, uint_programs=None, pass_names
             if key not in seen:
                 seen.add(key)
                 yield key, stage, control, code
-
-    if programs is not None and first != pool:
-        programs.update(sharcb_graphics_programs(data, first, pool, records, uint_programs, pass_names))
 
 
 def ndsr_shaders(data):
@@ -362,7 +278,7 @@ def startup_package(name):
 SHADER_DIRS = ('Shader/', 'Effect/', 'Lib/agl/', 'Lib/Terrain/', 'Lib/gsys/', 'UI/LayoutArchive/', 'Layout2Shader/')
 
 
-def inventory(romfs, exefs, everything=True, programs=None, uint_programs=None, pass_names=None):
+def inventory(romfs, exefs, everything=True):
     """Every unique shader: key -> dict(stage, control, code, source, origin, startup). As in the shared shader list, a shader is a
     startup shader when it comes from an agl package, a game module, or a startup_package() RomFS file; the others come
     from effect and UI layout resources, which the list covers only for bind states players have met. Also returns the number
@@ -403,7 +319,7 @@ def inventory(romfs, exefs, everything=True, programs=None, uint_programs=None, 
 
         def visit(origin, name, data, startup, depth=0):
             if data[:4] == b'BAHS':
-                add('sharcb', name, sharcb_shaders(data, rejected, programs, uint_programs, pass_names), True)
+                add('sharcb', name, sharcb_shaders(data, rejected), True)
                 return
             if data[:4] == b'NDSR':
                 add('ndsr', name, ndsr_shaders(data), True)
@@ -414,11 +330,10 @@ def inventory(romfs, exefs, everything=True, programs=None, uint_programs=None, 
                 for member, raw in sarc(data).items():
                     visit(origin, name + '/' + member, decode(raw) if raw[:4] == ZSTD else raw, startup, depth + 1)
                 return
-            roles = bfsha_passes(data) if pass_names is not None else None
             pos = 0   # BFSHA and BNSH files, effect and layout resources: complete, independently addressed BNSH files
             while (pos := data.find(b'BNSH\0\0\0\0', pos)) >= 0:
                 size = struct.unpack_from('<I', checked(data, pos + 28, 4))[0]
-                add(origin, name, bnsh_shaders(checked(data, pos, size), programs, pass_names, roles, pos), startup)
+                add(origin, name, bnsh_shaders(checked(data, pos, size)), startup)
                 pos += max(size, 8)
 
         for name in sorted(entries):

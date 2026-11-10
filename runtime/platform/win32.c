@@ -95,6 +95,32 @@ int plat_cpu_cores(uint64_t *all, uint64_t *first) {
     return cores;
 }
 
+uint64_t plat_cpu_cache_die(uint32_t *l3_kb) {
+    DWORD_PTR proc, sys;
+    *l3_kb = 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys)) return 0;
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationCache, NULL, &len);
+    SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *buf = len ? malloc(len) : NULL;
+    uint64_t die = 0;
+    DWORD big = 0, small = ~0u;
+    if (buf && GetLogicalProcessorInformationEx(RelationCache, buf, &len))
+        for (DWORD off = 0; off < len;) {
+            SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *e = (void *)((char *)buf + off);
+            const CACHE_RELATIONSHIP *c = &e->Cache;
+            if (c->Level == 3 && c->GroupMask.Group == 0) {   // every L3, also those outside the process's set
+                if (c->CacheSize > big) big = c->CacheSize, die = 0;
+                if (c->CacheSize == big) die |= c->GroupMask.Mask;
+                if (c->CacheSize < small) small = c->CacheSize;
+            }
+            off += e->Size;
+        }
+    free(buf);
+    if (!die || big == small) return 0;
+    *l3_kb = big >> 10;
+    return die & proc;
+}
+
 int plat_process_affinity(uint64_t mask) { return SetProcessAffinityMask(GetCurrentProcess(), (DWORD_PTR)mask) != 0; }
 
 uint64_t plat_thread_cpu_ns(uint32_t tid) {
@@ -300,6 +326,76 @@ uint64_t plat_thread_affinity(PlatThread *t, uint64_t mask) {
     return (uint64_t)SetThreadAffinityMask(t ? t->h : GetCurrentThread(), (DWORD_PTR)mask);
 }
 
+// The calling thread gets a core of its own through CPU sets: the process's default sets, which every thread without
+// sets of its own runs on (those started later too), leave the core out, and the caller's selected sets are that
+// core. The core is the highest-numbered one of the fastest efficiency class (a performance core on a hybrid CPU),
+// with both its logical processors when it has two; only processors in group 0 and in the process's affinity mask
+// count. CPU sets are soft: the scheduler may still use the core when nothing else wants it. Returns the logical
+// processors reserved, 0 when Windows has no CPU sets (before Windows 10) or fewer than two cores qualify; *which
+// (when not NULL, size bytes) receives their numbers, such as "10,11".
+int plat_cpu_reserve(char *which, size_t size) {
+    typedef BOOL(WINAPI * GetInfoFn)(PSYSTEM_CPU_SET_INFORMATION, ULONG, PULONG, HANDLE, ULONG);
+    typedef BOOL(WINAPI * SetProcFn)(HANDLE, const ULONG *, ULONG);
+    typedef BOOL(WINAPI * SetThreadFn)(HANDLE, const ULONG *, ULONG);
+    HMODULE k = GetModuleHandleW(L"kernel32.dll");
+    GetInfoFn get = (GetInfoFn)(void *)GetProcAddress(k, "GetSystemCpuSetInformation");
+    SetProcFn set_proc = (SetProcFn)(void *)GetProcAddress(k, "SetProcessDefaultCpuSets");
+    SetThreadFn set_thread = (SetThreadFn)(void *)GetProcAddress(k, "SetThreadSelectedCpuSets");
+    if (!get || !set_proc || !set_thread) return 0;
+    ULONG len = 0;
+    get(NULL, 0, &len, GetCurrentProcess(), 0);
+    uint8_t *buf = len ? malloc(len) : NULL;
+    if (!buf || !get((PSYSTEM_CPU_SET_INFORMATION)buf, len, &len, GetCurrentProcess(), 0)) {
+        free(buf);
+        return 0;
+    }
+    DWORD_PTR proc = 0, sys = 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys) || !proc) proc = ~(DWORD_PTR)0;
+    int best_class = -1, best_core = -1;
+    for (ULONG o = 0; o + sizeof(DWORD) * 2 <= len;) {   // the core: fastest class, then highest index
+        const SYSTEM_CPU_SET_INFORMATION *s = (const void *)(buf + o);
+        if (!s->Size) break;
+        if (s->Type == CpuSetInformation && s->CpuSet.Group == 0 && s->CpuSet.LogicalProcessorIndex < 64 &&
+            (proc >> s->CpuSet.LogicalProcessorIndex & 1)) {
+            int cls = s->CpuSet.EfficiencyClass, core = s->CpuSet.CoreIndex;
+            if (cls > best_class || (cls == best_class && core > best_core)) best_class = cls, best_core = core;
+        }
+        o += s->Size;
+    }
+    ULONG rest[64], mine[8];
+    unsigned mine_cpu[8];   // the logical processor numbers of mine
+    int nrest = 0, nmine = 0;
+    for (ULONG o = 0; o + sizeof(DWORD) * 2 <= len;) {
+        const SYSTEM_CPU_SET_INFORMATION *s = (const void *)(buf + o);
+        if (!s->Size) break;
+        if (s->Type == CpuSetInformation && s->CpuSet.Group == 0 && s->CpuSet.LogicalProcessorIndex < 64 &&
+            (proc >> s->CpuSet.LogicalProcessorIndex & 1)) {
+            if (s->CpuSet.EfficiencyClass == best_class && s->CpuSet.CoreIndex == best_core) {
+                if (nmine < 8) mine_cpu[nmine] = s->CpuSet.LogicalProcessorIndex, mine[nmine++] = s->CpuSet.Id;
+            } else if (nrest < 64) {
+                rest[nrest++] = s->CpuSet.Id;
+            }
+        }
+        o += s->Size;
+    }
+    free(buf);
+    if (!nmine || nrest < 2) return 0;
+    if (!set_proc(GetCurrentProcess(), rest, (ULONG)nrest)) return 0;
+    if (!set_thread(GetCurrentThread(), mine, (ULONG)nmine)) {
+        set_proc(GetCurrentProcess(), NULL, 0);   // back to every processor
+        return 0;
+    }
+    if (which && size) {
+        size_t n = 0;
+        which[0] = 0;
+        for (int i = 0; i < nmine && n < size; i++)
+            n += (size_t)snprintf(which + n, size - n, "%s%u", n ? "," : "", mine_cpu[i]);
+    }
+    return nmine;
+}
+
+int plat_cpu_reserve_sweep(void) { return 0; }
+
 uint32_t plat_cpu_count(void) {
     DWORD n = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
     return n ? (uint32_t)n : 1;
@@ -405,11 +501,35 @@ void plat_sleep_ms(uint32_t ms) { Sleep(ms); }
 // ---- locks and condition variables
 
 void plat_mutex_init(PlatMutex *m) { InitializeSRWLock((PSRWLOCK)m); }
-void plat_mutex_lock(PlatMutex *m) { AcquireSRWLockExclusive((PSRWLOCK)m); }
+static _Thread_local PlatLockNote lock_note;   // plat_lock_timing
+void plat_lock_timing(PlatLockNote fn) { lock_note = fn; }
+
+void plat_mutex_lock_at(PlatMutex *m, void *site) {
+    if (!lock_note || TryAcquireSRWLockExclusive((PSRWLOCK)m)) {
+        if (!lock_note) AcquireSRWLockExclusive((PSRWLOCK)m);
+        return;
+    }
+    uint64_t t0 = plat_now_ns();
+    AcquireSRWLockExclusive((PSRWLOCK)m);
+    lock_note(site, plat_now_ns() - t0);
+}
+
+void plat_mutex_lock(PlatMutex *m) {
+    if (!lock_note) { AcquireSRWLockExclusive((PSRWLOCK)m); return; }
+    plat_mutex_lock_at(m, __builtin_return_address(0));
+}
 int plat_mutex_trylock(PlatMutex *m) { return TryAcquireSRWLockExclusive((PSRWLOCK)m) != 0; }
 void plat_mutex_unlock(PlatMutex *m) { ReleaseSRWLockExclusive((PSRWLOCK)m); }
 
-void plat_mutex_lock_shared(PlatMutex *m) { AcquireSRWLockShared((PSRWLOCK)m); }
+void plat_mutex_lock_shared(PlatMutex *m) {
+    if (!lock_note || TryAcquireSRWLockShared((PSRWLOCK)m)) {
+        if (!lock_note) AcquireSRWLockShared((PSRWLOCK)m);
+        return;
+    }
+    uint64_t t0 = plat_now_ns();
+    AcquireSRWLockShared((PSRWLOCK)m);
+    lock_note(__builtin_return_address(0), plat_now_ns() - t0);
+}
 int plat_mutex_trylock_shared(PlatMutex *m) { return TryAcquireSRWLockShared((PSRWLOCK)m) != 0; }
 void plat_mutex_unlock_shared(PlatMutex *m) { ReleaseSRWLockShared((PSRWLOCK)m); }
 
@@ -527,6 +647,50 @@ int plat_file_replace(const char *from, const char *to, int durable) {
     return MoveFileExW(a, b, MOVEFILE_REPLACE_EXISTING | (durable ? MOVEFILE_WRITE_THROUGH : 0)) != 0;
 }
 
+static char lock_held[4][1100];
+static HANDLE lock_handle[4];
+static int lock_n;
+static PlatMutex lock_lock = PLAT_MUTEX_INIT;
+
+int plat_lock_file(const char *path) {
+    plat_mutex_lock(&lock_lock);
+    int r = 1, nheld = lock_n;
+    for (int i = 0; i < nheld; i++)
+        if (!strcmp(lock_held[i], path)) goto done;
+    wchar_t w[WPATH];
+    // no sharing at all: a second process's open fails with a sharing violation; the handle stays open until
+    // plat_unlock_file or the process ends
+    HANDLE h = widen(path, w, WPATH) ? CreateFileW(w, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_ALWAYS,
+                                                   FILE_ATTRIBUTE_NORMAL, NULL)
+                                     : INVALID_HANDLE_VALUE;
+    if (h == INVALID_HANDLE_VALUE) {
+        r = GetLastError() == ERROR_SHARING_VIOLATION ? 0 : -1;
+        goto done;
+    }
+    if (nheld < 4) {
+        snprintf(lock_held[nheld], sizeof lock_held[0], "%s", path);
+        lock_handle[nheld] = h;
+        lock_n = nheld + 1;
+    }
+done:
+    plat_mutex_unlock(&lock_lock);
+    return r;
+}
+
+void plat_unlock_file(const char *path) {
+    plat_mutex_lock(&lock_lock);
+    for (int i = 0; i < lock_n; i++)
+        if (!strcmp(lock_held[i], path)) {
+            CloseHandle(lock_handle[i]);
+            lock_n--;
+            memmove(&lock_held[i], &lock_held[i + 1], sizeof lock_held[0] * (size_t)(lock_n - i));
+            memmove(&lock_handle[i], &lock_handle[i + 1], sizeof lock_handle[0] * (size_t)(lock_n - i));
+            break;
+        }
+    plat_mutex_unlock(&lock_lock);
+}
+
+// path.<pid>.<tid>.tmp renamed over path; durable: flushed to the disk before the rename, which is written through.
 static int write_swap(const char *path, const void *data, size_t n, int durable) {
     char tmp[WPATH + 48];
     wchar_t a[WPATH], b[WPATH];
@@ -534,14 +698,8 @@ static int write_swap(const char *path, const void *data, size_t n, int durable)
     if (len < 0 || len >= (int)sizeof tmp || !widen(tmp, a, WPATH) || !widen(path, b, WPATH)) return 0;
     HANDLE h = CreateFileW(a, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return 0;
-    const unsigned char *bytes = data;
-    size_t written = 0;
-    while (written < n) {
-        DWORD chunk = n - written > (1u << 30) ? (1u << 30) : (DWORD)(n - written), put = 0;
-        if (!WriteFile(h, bytes + written, chunk, &put, NULL) || !put) break;
-        written += put;
-    }
-    int ok = written == n && (!durable || FlushFileBuffers(h));
+    DWORD put = 0;
+    int ok = WriteFile(h, data, (DWORD)n, &put, NULL) && put == n && (!durable || FlushFileBuffers(h));
     CloseHandle(h);
     if (ok && MoveFileExW(a, b, MOVEFILE_REPLACE_EXISTING | (durable ? MOVEFILE_WRITE_THROUGH : 0))) return 1;
     DeleteFileW(a);
@@ -651,6 +809,31 @@ int plat_mem_state(uint64_t addr, uint64_t limit, uint64_t *end) {
     return p == PAGE_READWRITE ? PLAT_PROT_RW : p == PAGE_READONLY ? PLAT_PROT_READ : PLAT_PROT_NONE;
 }
 
+int plat_mem_census(uint64_t *priv, uint64_t *wc, uint64_t *wc_allocs) {
+    *priv = *wc = *wc_allocs = 0;
+    MEMORY_BASIC_INFORMATION mbi;
+    uintptr_t a = 0;
+    void *last = NULL;
+    while (VirtualQuery((void *)a, &mbi, sizeof mbi) == sizeof mbi) {
+        if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE) {
+            *priv += mbi.RegionSize;
+            if (mbi.Protect & PAGE_WRITECOMBINE) {
+                *wc += mbi.RegionSize;
+                if (mbi.AllocationBase != last) (*wc_allocs)++, last = mbi.AllocationBase;
+            }
+        }
+        uintptr_t next = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        if (next <= a) break;
+        a = next;
+    }
+    return 1;
+}
+
+int plat_mem_prepare_write(uint64_t addr, uint64_t n) {
+    (void)addr; (void)n;
+    return 0;
+}
+
 // Contains code Copyright (c) 2026 Peiikai (MIT; see THIRD_PARTY_NOTICES.md).
 // GetWriteWatch with the reset flag.
 uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t max, int reset) {
@@ -665,14 +848,22 @@ uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t m
 }
 
 static int (*fault_hook)(uint64_t addr);
+static int (*access_hook)(uint64_t addr, int write, uint64_t ip);
 
-// A write access violation (ExceptionInformation[0] == 1) goes to the hook; registered first, before the crash handler.
+// A read or write access violation (ExceptionInformation[0] 0 or 1) goes to the access hook when there is one, then a
+// write to the write-fault hook; registered first, before the crash handler.
 static LONG CALLBACK fault_veh(EXCEPTION_POINTERS *ep) {
     const EXCEPTION_RECORD *er = ep->ExceptionRecord;
-    if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2 || er->ExceptionInformation[0] != 1)
+    if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2 || er->ExceptionInformation[0] > 1)
         return EXCEPTION_CONTINUE_SEARCH;
-    return fault_hook((uint64_t)er->ExceptionInformation[1]) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+    int write = er->ExceptionInformation[0] == 1;
+    uint64_t addr = (uint64_t)er->ExceptionInformation[1];
+    if (access_hook && access_hook(addr, write, (uint64_t)(uintptr_t)er->ExceptionAddress)) return EXCEPTION_CONTINUE_EXECUTION;
+    if (!write) return EXCEPTION_CONTINUE_SEARCH;
+    return fault_hook(addr) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
 }
+
+void plat_mem_access_hook(int (*fn)(uint64_t addr, int write, uint64_t ip)) { access_hook = fn; }
 
 void plat_mem_fault_hook(int (*fn)(uint64_t addr)) {
     fault_hook = fn;
@@ -865,6 +1056,21 @@ void plat_crash_hook(void (*fn)(const PlatCrash *c)) {
     _set_invalid_parameter_handler(invalid_parameter);
 }
 
+// The last-chance filter is set once, at the start, before the GPU driver, the window and audio libraries and the
+// movie decoder load. A DLL that sets its own filter later takes the place of crash_filter, and a fault outside this
+// executable then ends the process with no line in the log. This puts crash_filter back; when another filter had
+// taken its place, `who` gets the module and offset of that filter and the call returns 1.
+int plat_crash_filter_reassert(char *who, size_t n) {
+    LPTOP_LEVEL_EXCEPTION_FILTER prev = SetUnhandledExceptionFilter(crash_filter);
+    if (prev == crash_filter) return 0;
+    void *base = NULL;
+    if (prev) RtlPcToFileHeader((void *)prev, &base);
+    if (!prev) snprintf(who, n, "no filter (removed)");
+    else if (!base) snprintf(who, n, "%p, outside every module", (void *)prev);
+    else snprintf(who, n, "%s+%#llx", image_name(base), (unsigned long long)((uintptr_t)prev - (uintptr_t)base));
+    return 1;
+}
+
 // A fresh process gets a fresh layout: Windows places DLLs, heaps and thread stacks at random addresses. The parent
 // waits and exits with the child's code.
 void plat_reexec(void) {
@@ -929,13 +1135,23 @@ __attribute__((constructor)) static void pgo_flush_start(void) {
 }
 #endif
 
+void (*plat_exit_hook)(void);
+
 void plat_exit(int code) {
+    if (plat_exit_hook) plat_exit_hook();
 #ifdef NX2NAVI_PGO_GEN
     __llvm_profile_dump();
 #endif
-    fflush(stdout);
-    fflush(stderr);
-    ExitProcess((UINT)code);
+    fflush(NULL);   // every open stream: nothing below runs the C runtime's own exit
+    // The process ends here, without the libraries' detach calls that ExitProcess makes. The callers have saved what
+    // is to be kept (gfx_present.c gfx_window_closed: settings, pipeline cache, profile, saves), and the game's other
+    // threads are still running when this is called. ExitProcess stops them wherever they are and then runs every
+    // library's detach on this thread: NVIDIA's NGX core, which still held the device and the DLSS features, read a
+    // dead pointer in its detach on the window thread after the window was closed (an access violation in
+    // _nvngx.dll after the last save, once in 5 scripted runs that had freed and made a DLSS feature again), and the
+    // crash handler wrote a FATAL for a run that had ended cleanly.
+    TerminateProcess(GetCurrentProcess(), (UINT)code);
+    ExitProcess((UINT)code);   // not reached
 }
 
 // _putenv_s, not SetEnvironmentVariableA: getenv reads the C runtime's copy of the environment, which only the CRT's
@@ -1076,11 +1292,6 @@ const void *plat_file_map(PlatFile *f) {
     const void *v = map ? MapViewOfFile(map, FILE_MAP_READ, 0, 0, 0) : NULL;
     if (map) CloseHandle(map);   // the view keeps the mapping alive
     return v;
-}
-
-void plat_file_unmap(const void *view, size_t size) {
-    (void)size;
-    UnmapViewOfFile(view);
 }
 
 static __thread DWORD fs_last_error;
@@ -1695,6 +1906,15 @@ void plat_commit_info(double *proc_mb, double *used_mb, double *limit_mb) {
 
 int plat_commit_enforced(void) { return 1; }
 
+// The numbers name the one limit there is, the system's commit.
+int plat_commit_note(char *out, size_t cap) {
+    if (cap) out[0] = 0;
+    return 0;
+}
+
+// The driver charges the device memory it allocates to the system's commit.
+int plat_commit_counts_vram(void) { return 1; }
+
 void plat_process_memory(uint64_t *resident, uint64_t *private_bytes) {
     PROCESS_MEMORY_COUNTERS_EX pm = {.cb = sizeof pm};
     *resident = *private_bytes = 0;
@@ -1708,47 +1928,11 @@ struct PlatChild {
     HANDLE proc, in, out;                                  // in: our write end, out: our read end
 };
 
-// Called under the spawn lock. The game keeps the only job handle for its lifetime, so Windows
-// stops the translators even if the game exits during process creation or shader translation.
-static LPPROC_THREAD_ATTRIBUTE_LIST child_job_attributes(void) {
-    static HANDLE job;
-    static LPPROC_THREAD_ATTRIBUTE_LIST attrs;
-    static int initialized;
-    if (initialized) return attrs;
-    initialized = 1;
-    job = CreateJobObjectW(NULL, NULL);
-    if (!job) return NULL;
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {0};
-    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    if (SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof limits)) {
-        SIZE_T size = 0;
-        InitializeProcThreadAttributeList(NULL, 1, 0, &size);
-        attrs = size ? malloc(size) : NULL;
-        if (attrs && InitializeProcThreadAttributeList(attrs, 1, 0, &size)) {
-            if (UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST, &job, sizeof job, NULL, NULL))
-                return attrs;
-            DeleteProcThreadAttributeList(attrs);
-        }
-        free(attrs);
-        attrs = NULL;
-    }
-    CloseHandle(job);
-    return NULL;
-}
-
-static BOOL start_pipe_process(const wchar_t *exe, const wchar_t *arg, STARTUPINFOEXW *si, PROCESS_INFORMATION *pi) {
-    wchar_t cmd[WPATH + 300];
-    swprintf(cmd, WPATH + 300, arg[0] ? L"\"%ls\" %ls" : L"\"%ls\"", exe, arg);
-    DWORD flags = CREATE_NO_WINDOW;
-    if (si->lpAttributeList) flags |= EXTENDED_STARTUPINFO_PRESENT;
-    si->StartupInfo.cb = si->lpAttributeList ? sizeof *si : sizeof si->StartupInfo;
-    return CreateProcessW(NULL, cmd, NULL, NULL, TRUE, flags, NULL, NULL, &si->StartupInfo, pi);
-}
-
 PlatChild *plat_child_start(const char *exe, const char *arg, uint32_t *err) {
-    wchar_t we[WPATH], wa[256] = L"";
+    wchar_t we[WPATH], wa[256] = L"", cmd[WPATH + 300];
     if (err) *err = 0;
     if (!widen(exe, we, WPATH) || (arg && !widen(arg, wa, 256))) return NULL;
+    swprintf(cmd, WPATH + 300, arg ? L"\"%ls\" %ls" : L"\"%ls\"", we, wa);
     SECURITY_ATTRIBUTES sa = {sizeof sa, NULL, TRUE};
     HANDLE in_r, in_w, out_r, out_w;
     // Pipes are created and handed out one child at a time: a child started meanwhile would inherit the other pipe
@@ -1763,18 +1947,11 @@ PlatChild *plat_child_start(const char *exe, const char *arg, uint32_t *err) {
     SetHandleInformation(in_w, HANDLE_FLAG_INHERIT, 0);
     SetHandleInformation(out_r, HANDLE_FLAG_INHERIT, 0);
     HANDLE nul = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, NULL);
-    STARTUPINFOEXW si = {.StartupInfo = {.dwFlags = STARTF_USESTDHANDLES, .hStdInput = in_r, .hStdOutput = out_w,
-                                         .hStdError = nul != INVALID_HANDLE_VALUE ? nul : out_w},
-                         .lpAttributeList = child_job_attributes()};
+    STARTUPINFOW si = {.cb = sizeof si, .dwFlags = STARTF_USESTDHANDLES, .hStdInput = in_r, .hStdOutput = out_w,
+                       .hStdError = nul != INVALID_HANDLE_VALUE ? nul : out_w};
     PROCESS_INFORMATION pi;
-    BOOL ok = start_pipe_process(we, wa, &si, &pi);
+    BOOL ok = CreateProcessW(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
     DWORD e = GetLastError();
-    // Some enclosing jobs forbid nested jobs. Keep shader translation available in that environment.
-    if (!ok && si.lpAttributeList && (e == ERROR_ACCESS_DENIED || e == ERROR_NOT_SUPPORTED || e == ERROR_INVALID_PARAMETER)) {
-        si.lpAttributeList = NULL;
-        ok = start_pipe_process(we, wa, &si, &pi);
-        e = GetLastError();
-    }
     CloseHandle(in_r);
     CloseHandle(out_w);
     if (nul != INVALID_HANDLE_VALUE) CloseHandle(nul);
@@ -1785,6 +1962,21 @@ PlatChild *plat_child_start(const char *exe, const char *arg, uint32_t *err) {
         return NULL;
     }
     CloseHandle(pi.hThread);
+    // Every child goes into one job that ends its processes when its last handle closes, which is when this process
+    // ends: a translator stuck on a program would otherwise outlive a game that exited or crashed before stopping it.
+    // The handle is never closed by hand. A failure leaves the child as it was before.
+    static HANDLE job;
+    static INIT_ONCE job_once = INIT_ONCE_STATIC_INIT;
+    BOOL pending;
+    if (InitOnceBeginInitialize(&job_once, 0, &pending, NULL) && pending) {
+        HANDLE j = CreateJobObjectW(NULL, NULL);
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION li = {0};
+        li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (j && !SetInformationJobObject(j, JobObjectExtendedLimitInformation, &li, sizeof li)) CloseHandle(j), j = NULL;
+        job = j;
+        InitOnceComplete(&job_once, 0, NULL);
+    }
+    if (job) AssignProcessToJobObject(job, pi.hProcess);
     PlatChild *c = malloc(sizeof *c);
     if (!c) {
         TerminateProcess(pi.hProcess, 1);
@@ -1802,6 +1994,10 @@ void plat_child_stop(PlatChild *c) {
     TerminateProcess(c->proc, 1);
     CloseHandle(c->proc);
     free(c);
+}
+
+void plat_child_lower(PlatChild *c) {
+    if (c) SetPriorityClass(c->proc, IDLE_PRIORITY_CLASS);
 }
 
 int plat_child_write(PlatChild *c, const void *data, size_t n) {

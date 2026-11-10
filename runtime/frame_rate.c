@@ -33,9 +33,9 @@
 // and in range whichever store it sees.
 //
 // The world clock (frame_step_world_us) sums the steps from the first present that finds the player actor away from
-// the origin, where the title screen keeps it: the end of the first save load. Recorded and scripted input
-// (input.c) runs on it, so a replay presses at the same game time at any frame rate and after a first load of any
-// length; a later load (fast travel) still shifts what follows by its length.
+// the origin, where the title screen keeps it (1.1.1 has no player actor until the save has loaded): the end of the
+// first save load. Recorded and scripted input (input.c) runs on it, so a replay presses at the same game time at any
+// frame rate and after a first load of any length; a later load (fast travel) still shifts what follows by its length.
 //
 // NX2NAVI_TRACE=perf adds a line per 120 presents: fps, the game seconds stepped against wall seconds, and with
 // NX2NAVI_SPEED_PROBE=1 the player's position and ground speed (an independent check: Link runs at the same speed at
@@ -115,7 +115,8 @@ int frame_step_realtime(void) { return step_word != NULL; }
 
 // The frame limit (menu, NX2NAVI_FPS_LIMIT, live): 30, 60, 90, 120, 144, any whole rate from 30 to 240, or display (the
 // refresh rate of the window's monitor, at most 240). A higher number gives 240, the rate of the shortest step the
-// game survives (STEP_MIN_S). Unset, the older NX2NAVI_FPS60=0 still means 30. A limit of 30 switches the set
+// game survives (STEP_MIN_S). Unset, the older NX2NAVI_FPS60=0 still means 30, and frame generation in use means display
+// (frame_limit_follows_display). A limit of 30 switches the set
 // fps60 off (the shipping minimum interval 2), every other limit switches it on; the controller reads its minimum
 // interval from the patched sites each frame. With the real-time step the pacer holds frames to the limit; above 60
 // only the pacer changes, as the step's floor is the limit's ceiling. Without it the game steps whole 60 Hz vsyncs and the pacer
@@ -125,25 +126,29 @@ int frame_step_realtime(void) { return step_word != NULL; }
 static int fps60_set = -2;
 static int game_interval = 1;   // the present interval of the newest frame (frame_step_present)
 
-// Assume 60 Hz until the window measures its display. Real TV refresh rates can fall below the game's 30 Hz floor.
-static double shown_hz(double hz) {
-    if (hz <= 0) return 60;
-    return hz < LIMIT_MIN_HZ ? LIMIT_MIN_HZ : hz;
-}
+// The rate "display" paces at: 0 is a monitor rate not known yet (no window), taken as 60; a real one below the
+// lowest limit (a 24 or 25 Hz TV) is held at that limit rather than read as unknown and doubled to 60.
+static double shown_hz(double hz) { return hz <= 0 ? 60 : hz < LIMIT_MIN_HZ ? LIMIT_MIN_HZ : hz; }
 
 // A build without the fps60 and realtime patch sets (Ocarina) steps its game by the clock itself: walked by the same
 // frame-numbered input script, Link covered half the distance at 120 fps that he covers at 60. There the pacer holds
 // frames to the limit alone (nvn_api_obj.c present_period), the game's own 60 Hz interval aside, and the limit may be
-// any rate or none (LIMIT_FREE_MAX_HZ, "unlimited"); LIMIT_MAX_HZ is for builds whose physics fail past it, Ocarina has no such floor.
-#define LIMIT_FREE_MAX_HZ 1000
+// any rate up to LIMIT_FREE_MAX_HZ, or "unlimited", which paces the game at that rate too. Ocarina's code does fail
+// past some rate: on the quick menu, where a frame costs the GPU almost nothing, it ran at 640 to 700 fps and after
+// about two seconds read address 0 in its own draw code (main+0x175b2a0, the same call stack twice), while 92 to 255
+// fps ran on. 240 keeps every common monitor's rate; with frame generation it counts the game's own frames, so the
+// screen still shows the generated ones above it.
+#define LIMIT_FREE_MAX_HZ 240
 int frame_free_running(void) { return rt_patch_set("fps60") < 0 && rt_patch_set("realtime") < 0; }
 int frame_limit_adjustable(void) { return 1; }
 static unsigned limit_seen;
 static int limit_read;
 static int limit_hz = -1;   // 0: display; -2: unlimited (free-running builds); -1 before the first read
+static int limit_unset;     // neither NX2NAVI_FPS_LIMIT nor the older NX2NAVI_FPS60=0 is set: the default 60
 
 static int limit_parse(void) {
     const char *e = cfg_get("NX2NAVI_FPS_LIMIT"), *old = cfg_get("NX2NAVI_FPS60");
+    limit_unset = (!e || !*e) && !(old && !strcmp(old, "0"));
     if (!e || !*e) return old && !strcmp(old, "0") ? 30 : 60;
     if (!strcmp(e, "display")) return 0;
     int free_run = frame_free_running();
@@ -174,7 +179,8 @@ static void frame_limit_live(void) {
     if (hz == limit_hz) return;
     limit_hz = hz;
     if (frame_free_running()) {
-        if (hz == -2) rt_log("frame rate: unlimited (the game steps by the clock)");
+        if (hz == -2) rt_log("frame rate: unlimited (the game steps by the clock), at most %d game frames a second",
+                             LIMIT_FREE_MAX_HZ);
         else if (hz) rt_log("frame rate: limit %d fps (the game steps by the clock)", hz);
         else rt_log("frame rate: limit at the monitor's refresh rate (the game steps by the clock)");
         return;
@@ -188,27 +194,93 @@ static void frame_limit_live(void) {
     else rt_log("frame rate: limit at the monitor's refresh rate (60 until the window measures it)");
 }
 
+// NX2NAVI_MOVIE_FPS (default 60; 0 = off): the game's frame rate while a movie plays (ov_movie2.c ov_movie_live). A
+// movie's event counts the game's updates as 60 Hz frames whatever the step: at 144 fps the intro's narration lines
+// started 2.4 times too early, each over the one before, and its closing fade to black came at 65 s of the movie's
+// 154, hiding the whole dream. The movies are 60 fps, so the cap shows the same pictures. It is the rate in both
+// directions: under a lower limit (40 fps, or 60 shown with frame generation, which is 30 of the game's) the movie ran
+// at that fraction of its speed and ended many seconds behind its sound, so the game is paced at the movie's rate
+// while one plays, above the limit too.
+static int movie_cap_hz(void) {
+    static int hz = -1;
+    if (hz < 0) {
+        const char *e = cfg_get("NX2NAVI_MOVIE_FPS");
+        hz = e && *e ? atoi(e) : 60;
+        if (hz && hz < LIMIT_MIN_HZ) hz = 60;
+    }
+    return hz && ov_movie_live() ? hz : 0;
+}
+
+// Frames on screen per game frame while frame generation runs: 2 with AMD's (vk_fg.cpp, one generated frame), the
+// multiplier with NVIDIA's (vk_dlssg.c, one to three); 1 while neither generates (off, or paused for the menu).
+static int generated_factor(void) { return vk_fg_generating() ? 2 : vk_dlssg_multiplier(); }
+
+// The limit in effect, as limit_hz counts it (0 display, -2 unlimited, else the rate). With frame generation's
+// swapchain in use and no limit chosen it is the display's rate: the pacer divides the limit by generated_factor, so
+// the default 60 held the game to 30, 20 or 15 rendered frames a second on any monitor, 15 at DLSS 4x on a 165 Hz one,
+// where the display rate gives 41 rendered and 165 shown. "In use" rather than generating keeps the limit still while
+// the menu pauses generation. A limit the player set is kept as it is.
+int frame_limit_follows_display(void) { return limit_unset && limit_hz > 0 && (vk_fg_active() || vk_dlssg_active()); }
+static int limit_effective(void) { return frame_limit_follows_display() ? 0 : limit_hz; }
+
+// The rate the game renders at under the limit: frame_step_limit_hz over the frames shown per game frame (mouse_direct.c,
+// whose camera input follows the game's own frame time); 0 unknown.
+double frame_step_game_hz(void) {
+    double hz = frame_step_limit_hz();
+    int gen = generated_factor();
+    return gen > 1 ? hz / gen : hz;
+}
+
 // RivaTuner Statistics Server (rtss_limit.c) gets the same limit; while it limits this process the pacer holds no
 // frames, so the two never stack. NX2NAVI_RTSS=0 and frame generation (RTSS would count the generated frames) keep it out.
+static double paced_hz;   // the game frames a second the newest frame_step_cap_ns paces at (ocarina_step); 0: none
 uint64_t frame_step_cap_ns(void) {
     frame_limit_live();
-    static int rtss = -1;
-    if (rtss < 0) {
+    static int rtss_allowed = -1;
+    if (rtss_allowed < 0) {
         const char *e = cfg_get("NX2NAVI_RTSS");
-        rtss = !(e && !strcmp(e, "0")) && !vk_fg_wanted() && !vk_dlssg_wanted();
+        rtss_allowed = !(e && !strcmp(e, "0"));
     }
-    if (limit_hz == -2) {   // unlimited: the pacer does not hold frames, and RTSS's limit is cleared
-        rtss_limit_want(rtss ? 0 : -1);
+    int rtss = rtss_allowed && !vk_fg_wanted() && !vk_dlssg_active();
+    int gen = generated_factor();
+    int movie_hz = movie_cap_hz();
+    static int movie_was, movie_logs;
+    if (!!movie_hz != movie_was) {
+        movie_was = !!movie_hz;
+        if (movie_logs++ < 40) {   // the first 20 movies
+            if (movie_hz) rt_log("frame rate: a movie plays: %d fps until it ends (NX2NAVI_MOVIE_FPS)", movie_hz);
+            else rt_log("frame rate: the movie ended: the frame limit again");
+        }
+    }
+    if (limit_hz == -2 && !movie_hz && !frame_free_running()) {   // unlimited: the pacer does not hold frames, and
+        rtss_limit_want(rtss ? 0 : -1);                              // RTSS's limit is cleared
+        paced_hz = 0;
         return 0;
     }
-    double hz = shown_hz(limit_hz ? limit_hz : gfx_window_refresh_hz());
+    // unlimited in a build that steps by the clock: LIMIT_FREE_MAX_HZ game frames; during a movie, the movie's rate.
+    // Both times frame generation's factor for the division below.
+    int follow = frame_limit_follows_display(), limit = follow ? 0 : limit_hz;
+    static int follow_was, follow_logs;
+    if (follow != follow_was) {
+        follow_was = follow;
+        if (follow_logs++ < 20) {
+            if (follow) rt_log("frame rate: frame generation with no limit set: the limit is the monitor's refresh rate");
+            else rt_log("frame rate: limit %d fps again", limit_hz);
+        }
+    }
+    double hz = limit == -2 ? (double)(movie_hz ? movie_hz : LIMIT_FREE_MAX_HZ) * gen
+                            : shown_hz(limit ? limit : gfx_window_refresh_hz());
     double max = frame_free_running() ? LIMIT_FREE_MAX_HZ : LIMIT_MAX_HZ;
+    if (limit == -2) max *= gen;   // the cap is on the game's frames there, not the ones shown
     if (hz > max) hz = max;
-    // Frame generation presents a generated frame between each two of the game's (vk_fg.cpp): the game is paced at
-    // half the limit then, so the screen shows the limit
-    if (vk_fg_generating()) hz /= 2;
+    // Frame generation presents one to three generated frames between each two of the game's: the game is paced at the
+    // limit over that factor (half, a third, a quarter), so the screen shows the limit. With VSync and the limit at the
+    // display's rate, the generated frames then fill the display's refreshes and none is dropped.
+    if (gen > 1) hz /= gen;
+    if (movie_hz) hz = movie_hz;
+    paced_hz = hz;
     rtss_limit_want(rtss ? (int64_t)(hz * 1000 + 0.5) : -1);
-    if (rtss && rtss_limit_active()) return 0;
+    if (rtss_limit_active()) return 0;
     return (uint64_t)(1e9 / hz + 0.5);
 }
 
@@ -218,10 +290,11 @@ uint64_t frame_step_cap_ns(void) {
 double frame_step_limit_hz(void) {
     if (frame_free_running()) {   // 0 for unlimited, as before the first read
         frame_limit_live();
-        if (limit_hz == -2 || limit_hz == -1) return 0;
-        return shown_hz(limit_hz ? limit_hz : gfx_window_refresh_hz());
+        int limit = limit_effective();
+        if (limit == -2 || limit == -1) return 0;
+        return shown_hz(limit ? limit : gfx_window_refresh_hz());
     }
-    int hz = limit_hz;
+    int hz = limit_effective();
     if (hz < 0) return 0;
     double r = shown_hz(hz ? hz : gfx_window_refresh_hz());
     return !step_word && r > 60 ? 60 : r > LIMIT_MAX_HZ ? LIMIT_MAX_HZ : r;
@@ -239,12 +312,24 @@ static uint64_t read_ptr(uint64_t a) {
     uint64_t p = 0;
     return read_guest(a, &p, 8) ? p : 0;
 }
-// 1.2.1: [main+0x4728538] (1.1.0: [main+0x4630a68], 1.4.3: [main+0x3add238]) +0x1e8 scene, its component 13 lists the
-// resident actors; the one named "Player" has its position at +0x2b4.
+// 1.1.1: [[main+0x4e371d0] + 0x480] is the Player actor, its name pointer at +0x20 reads "Player" and its position, in
+// metres, is the float triplet at +0x31c. The slot is empty until the first save has loaded and then holds the actor.
+// The other builds: [main+0x4728538] (1.1.0: [main+0x4630a68], 1.4.3: [main+0x3add238]) +0x1e8 scene, its component 13
+// lists the resident actors; the one named "Player" has its position at +0x2b4.
 // The 1.1.0 slot was measured from its own dereference chain: 181 scene accesses in that build
 // read it, and one of them reproduces this walk (the 14-component check, component 13, the 0x70 stride and the name
 // compare) instruction for instruction.
+static int player_name(uint64_t name) {
+    char text[7];
+    return name && read_guest(name, text, 7) && !memcmp(text, "Player", 7);
+}
+
 static int player_pos(float xyz[3]) {
+    if (RT_V111) {
+        uint64_t manager = read_ptr(MOD_MAIN_BASE + 0x4e371d0), actor = manager ? read_ptr(manager + 0x480) : 0;
+        return actor && player_name(read_ptr(actor + 0x20)) && read_guest(actor + 0x31c, xyz, 12) && isfinite(xyz[0]) &&
+               isfinite(xyz[2]);
+    }
     uint64_t module = read_ptr(MOD_MAIN_BASE + (RT_V143 ? 0x3add238 : RT_V110 ? 0x4630a68 : 0x4728538)),
              scene = module ? read_ptr(module + 0x1e8) : 0;
     int32_t count = 0;
@@ -254,9 +339,7 @@ static int player_pos(float xyz[3]) {
     uint64_t links = read_ptr(resident + 0x28);
     for (int i = 0; links && i < count; i++) {
         uint64_t data = read_ptr(links + (uint64_t)i * 0x70 + 8), actor = data ? read_ptr(data + 0x40) : 0;
-        uint64_t name = actor ? read_ptr(actor + 0x218) : 0;
-        char text[7];
-        if (name && read_guest(name, text, 7) && !memcmp(text, "Player", 7))
+        if (actor && player_name(read_ptr(actor + 0x218)))
             return read_guest(actor + 0x2b4, xyz, 12) && isfinite(xyz[0]) && isfinite(xyz[2]);
     }
     return 0;
@@ -273,13 +356,87 @@ static double ocarina_step_s(void) {
     return base * speed / 60.0;
 }
 
-// Free-running builds (Ocarina): the time manager's base step follows the display interval (5-frame average, 1/1000 to
-// 1/15 s, in 60 Hz frames), written at each present. The game left it at one 60 Hz frame whatever the frame rate, so at
-// 144 fps it ran 2.4 times too fast. NX2NAVI_OCARINA_STEP=0 leaves it. Counts how often the game itself had changed
-// the value since the last write (diagnosis).
+// Free-running builds (Ocarina): the game's step follows the display interval (ocarina_step, in 60 Hz frames), written
+// at each present: frames per update on the patch page with the set ostep, else the time manager's base step. The
+// game left it at one 60 Hz frame whatever the frame rate, so at 144 fps it ran 2.4 times too fast.
+// NX2NAVI_OCARINA_STEP=0 leaves it. Counts how often the game itself had changed the value since the last write
+// (diagnosis).
 static uint64_t ostep_writes, ostep_changed;
 static float ostep_last = -1;
 
+// The step Ocarina is given for a display interval dt, in seconds. The game ships with a step of one 60 Hz frame (two
+// at 30 fps) that never changes in play, so nothing in it was written for a step that differs from frame to frame: its
+// physics takes the step as the length of the next solve while the bodies' velocities come from the step before
+// (the physics system keeps both, main+0x38af1f0), and it derives whole numbers from it (the solver step count,
+// patches-v111.txt osolver). The mean of the last 5 intervals, which stood here, moved with every one of them: display
+// intervals of 5 and 30 ms in turn gave steps of 15 and 20 ms in turn, and one 60 ms frame at 200 fps took the step
+// from 5 to 16 ms for five frames and back. So the step is kept steady and the clock is kept by a slow correction:
+//   - the base is the mean of the last 12 intervals without their longest and shortest: one late frame and the short
+//     one after it (nvn_api_obj.c pace keeps the phase) leave it alone, intervals alternating in a period of 2, 3 or 4
+//     frames give one value, and a real change of frame rate arrives within 12 frames;
+//   - a base within 3% of the pacer's period is that period: at a frame limit the game holds, the step is the same
+//     number every frame, at 60 fps exactly the one frame the game ships with;
+//   - what the display showed and the game was not given is owed (the late frame cut from the base, the 3% of the
+//     snap). Past half a step of it the step repays a 64th a frame, 10% of the step at most, so the game still follows
+//     the clock and a hitch is paid back over the next second rather than in five frames. More than STEP_RESET_S owed
+//     is dropped: the game runs slower than the clock, as it does for a frame longer than STEP_MAX_S.
+// The step is at least OSTEP_MIN_S: the solver step count of the set osolver reaches 0 under a 16th of a frame.
+// NX2NAVI_STEP_STEADY=0 gives the mean of the last 5 intervals again (comparison runs).
+#define OSTEP_WINDOW 12
+#define OSTEP_SNAP 0.03
+#define OSTEP_REPAY_MAX 0.10
+#define OSTEP_MIN_S (1.0 / 480.0)
+static double os_ring[OSTEP_WINDOW], os_owed;
+static unsigned os_count, os_next;
+static double os_step_lo, os_step_hi;   // the steps given since the last speed line (speed_report)
+
+static void ocarina_step_reset(void) {
+    os_count = os_next = 0;
+    os_owed = 0;
+}
+
+static double ocarina_step(double dt) {
+    static int steady = -1;
+    if (steady < 0) {
+        const char *e = cfg_get("NX2NAVI_STEP_STEADY");
+        steady = !(e && !strcmp(e, "0"));
+    }
+    if (dt > STEP_MAX_S) dt = STEP_MAX_S;
+    os_ring[os_next++ % OSTEP_WINDOW] = dt;
+    if (os_count < OSTEP_WINDOW) os_count++;
+    double step;
+    if (!steady) {
+        unsigned n = os_count < STEP_SAMPLES ? os_count : STEP_SAMPLES;
+        double sum = 0;
+        for (unsigned i = 1; i <= n; i++) sum += os_ring[(os_next - i) % OSTEP_WINDOW];
+        step = sum / n;
+        if (step < 1.0 / 1000) step = 1.0 / 1000;
+    } else {
+        double sum = 0, lo = os_ring[0], hi = os_ring[0];
+        for (unsigned i = 0; i < os_count; i++) {
+            sum += os_ring[i];
+            if (os_ring[i] < lo) lo = os_ring[i];
+            if (os_ring[i] > hi) hi = os_ring[i];
+        }
+        double base = os_count >= 4 ? (sum - lo - hi) / (os_count - 2) : sum / os_count;
+        double period = paced_hz > 0 ? 1.0 / paced_hz : 0;
+        if (period > 0 && fabs(base - period) <= OSTEP_SNAP * period) base = period;
+        double over = fabs(os_owed) - base * 0.5, repay = 0;
+        if (over > 0) {
+            repay = over / 64 < OSTEP_REPAY_MAX * base ? over / 64 : OSTEP_REPAY_MAX * base;
+            if (os_owed < 0) repay = -repay;
+        }
+        step = base + repay;
+        if (step < OSTEP_MIN_S) step = OSTEP_MIN_S;
+        if (step > STEP_MAX_S) step = STEP_MAX_S;
+        os_owed += dt - step;
+        if (os_owed > STEP_RESET_S) os_owed = STEP_RESET_S;
+        if (os_owed < -STEP_RESET_S) os_owed = -STEP_RESET_S;
+    }
+    if (os_step_lo <= 0 || step < os_step_lo) os_step_lo = step;
+    if (step > os_step_hi) os_step_hi = step;
+    return step;
+}
 
 static void ocarina_step_write(double dt) {
     static int on = -1;
@@ -353,7 +510,7 @@ static void speed_report(uint64_t now, double step, int interval) {
         probe = e && !strcmp(e, "1");
     }
     double wall = (double)(now - win_t0) * 1e-9;
-    char pos[160] = "";
+    char pos[240] = "";
     float p[3];
     if (probe && player_pos(p)) {
         double d = last_pos_ns ? hypot(p[0] - last_pos[0], p[2] - last_pos[2]) : 0,
@@ -362,6 +519,12 @@ static void speed_report(uint64_t now, double step, int interval) {
                  s > 0 ? d / s : 0);
         memcpy(last_pos, p, sizeof p);
         last_pos_ns = now;
+    }
+    if (os_step_hi > 0) {   // Ocarina: the shortest and longest step given in these frames, and the time still owed
+        size_t o = strlen(pos);
+        snprintf(pos + o, sizeof pos - o, "; step %.3f..%.3f frames, %.1f ms owed", os_step_lo * 60, os_step_hi * 60,
+                 os_owed * 1000);
+        os_step_lo = os_step_hi = 0;
     }
     if (step_word || win_game > 0)
         rt_log("fps: %llu frames in %.3f s (%.1f fps), %.3f s game stepped, speed %.3f; interval 1/2/3+ %llu/%llu/%llu%s",
@@ -418,14 +581,9 @@ void frame_step_present(uint64_t display_ns, int interval) {
             step_store((float)step);
         }
     }
-    if (frame_free_running() && last_ns && dt > 0 && dt < STEP_RESET_S) {
-        static double os[STEP_SAMPLES];
-        static unsigned on_, ox;
-        os[ox++ % STEP_SAMPLES] = dt;
-        if (on_ < STEP_SAMPLES) on_++;
-        double sum = 0;
-        for (unsigned i = 0; i < on_; i++) sum += os[i];
-        ocarina_step_write(sum / on_);
+    if (frame_free_running() && last_ns) {
+        if (dt > 0 && dt < STEP_RESET_S) ocarina_step_write(ocarina_step(dt));
+        else ocarina_step_reset();   // a load or a debugger stop: the intervals before it say nothing about the next
     }
     last_ns = display_ns;
     // The game clock of untimed script lines: what the game stepped this frame, the patch page's step with the

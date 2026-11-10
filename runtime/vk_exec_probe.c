@@ -16,7 +16,6 @@
 #include "nvn_tex.h"
 #include "vk.h"
 #include "vk_exec.h"
-#include "vk_gpa.h"
 #include "platform/platform.h"
 
 #define SUBMITS 100
@@ -104,8 +103,6 @@ static int test_sync(const GfxBackend *b, uint8_t *guest, uint64_t *first, uint6
 
 static uint8_t to_byte(float f) { return (uint8_t)(f * 255.0f + 0.5f); }
 
-static int present_behind_wait(const GfxBackend *b, tex_t *image, const int crop[4]);
-
 static int test_present(const GfxBackend *b, uint8_t *guest, int *w_out, int *h_out) {
     pool_t pool = {.magic = NVN_POOL_MAGIC, .flags = 0x22, .mem = guest + 0x100000, .size = 0x100000,
                    .game_mem = guest + 0x100000};
@@ -131,12 +128,10 @@ static int test_present(const GfxBackend *b, uint8_t *guest, int *w_out, int *h_
 
     uint64_t frames = gfx_stats().frames;
     // the exact colour check needs the bilinear blit: FSR's approximate reciprocals move a flat colour by 1/255
-    plat_setenv("NX2NAVI_UPSCALER", "bilinear");
+    cfg_setenv("NX2NAVI_UPSCALER", "bilinear");
     vk_present_capture(1);
     const int crop[4] = {0, 0, TEX_W, TEX_H};
-    if (vk_exec_event_order()) {
-        CHECK(!present_behind_wait(b, &t, crop), "present before producer");
-    } else b->present(&t, crop, 0);
+    b->present(&t, crop, 0);
     b->finish();   // the queued present is submitted and, with capture on, read back
     const uint8_t *px;
     int w, h;
@@ -159,8 +154,6 @@ static int test_present(const GfxBackend *b, uint8_t *guest, int *w_out, int *h_
         CHECK(p[k] == e, "presented pixel %ld (%d, %d) is %08x, expected %08x", k, x, y, p[k], e);
     }
     vk_present_capture(0);
-    if (vk_exec_event_order())
-        puts("probe-vkexec: delayed present retained its texture and crop; output pixels exact");
     b->texture_release(&t);
     b->pool_fini(&pool);
     *w_out = w, *h_out = h;
@@ -639,95 +632,6 @@ static int xf_submit(const GfxBackend *b, uint8_t *stream, uint8_t *end) {
     return b->fence_wait(f, 5000000000ull);
 }
 
-static int present_behind_wait(const GfxBackend *b, tex_t *image, const int crop[4]) {
-    volatile uint32_t gate = 0;
-    uint64_t words[16];
-    uint8_t *buf = (uint8_t *)words, *at = put(buf, OP_BEGIN, NULL, 0);
-    p_wait_event wait = {&gate, NVN_EVENT_WAIT_MODE_EQUAL, 1};
-    at = put(at, OP_WAIT_EVENT, &wait, sizeof wait);
-    gfx_submit_queue = 1;
-    CHECK(xf_submit(b, buf, at) && vk_exec_held() == 1, "present test did not hold");
-    tex_t descriptor = *image;
-    int rectangle[4];
-    memcpy(rectangle, crop, sizeof rectangle);
-    b->present(&descriptor, rectangle, 0);
-    uint64_t display_ticket = gfx_guest_ticket;
-    CHECK((display_ticket & GFX_GUEST_TICKET) && !b->guest_wait(display_ticket, 0), "image returned before producer");
-    vk_present_drain();
-    const uint8_t *px;
-    int w, h;
-    VkFormat fmt;
-    CHECK(!vk_present_captured(&px, &w, &h, &fmt), "image already presented before signal");
-    memset(&descriptor, 0, sizeof descriptor);
-    memset(rectangle, 0, sizeof rectangle);
-    // This is the last present. An ordinary guest memory write, without another submit or notification,
-    // must release both the held work and the image reacquisition fence.
-    CHECK(!probe_nvn_window_reacquire(display_ticket, &gate), "window acquired its image prematurely");
-    CHECK(b->guest_wait(display_ticket, 5000000000ull), "final present missed CPU-only signal");
-    gfx_submit_queue = 0;
-    return 0;
-}
-
-// A producer signals twice. The consumer must run between the signals,
-// keep its second wait, and finish before the next submission from the same queue.
-static int test_queue_events(const GfxBackend *b) {
-    if (!vk_exec_event_order()) return 0;
-    volatile uint32_t gate = 0, observed = 0;
-    uint64_t words[64];
-    uint8_t *buf = (uint8_t *)words, *at = put(buf, OP_BEGIN, NULL, 0);
-    p_wait_event wait = {&gate, NVN_EVENT_WAIT_MODE_EQUAL, 1};
-    p_signal_event add = {&observed, NVN_EVENT_SIGNAL_MODE_ADD, 2};
-    at = put(at, OP_WAIT_EVENT, &wait, sizeof wait);
-    at = put(at, OP_SIGNAL_EVENT, &add, sizeof add);
-    wait.value = 2;
-    at = put(at, OP_WAIT_EVENT, &wait, sizeof wait);
-    add.value = 4;
-    at = put(at, OP_SIGNAL_EVENT, &add, sizeof add);
-    gfx_submit_queue = 1;
-    CHECK(xf_submit(b, buf, at), "consumer's initial physical submission");
-    uint64_t consumer = gfx_guest_ticket;
-    CHECK((consumer & GFX_GUEST_TICKET) && !b->guest_wait(consumer, 0) && observed == 0, "early consumer fence");
-    CHECK(!b->guest_wait(consumer, 1000000), "finite wait for unsignalled event");
-    gfx_submit_queue = 3;
-    uint64_t dependency = b->queue_dependency(3, consumer);
-    b->submit(NULL, 0);
-    uint64_t empty = gfx_guest_ticket;
-    CHECK(!b->guest_wait(empty, 0) && !b->guest_wait(dependency, 0), "empty submission passed dependency");
-    gfx_submit_queue = 2;
-    for (int i = 0; i < 40; ++i) b->submit(NULL, 0);
-    CHECK(b->guest_wait(gfx_guest_ticket, 5000000000ull) && !b->guest_wait(consumer, 0),
-          "unrelated queue blocked or consumer passed an unsignalled wait");
-    gfx_submit_queue = 1;
-    at = put(buf, OP_BEGIN, NULL, 0);
-    add.value = 8;
-    at = put(at, OP_SIGNAL_EVENT, &add, sizeof add);
-    CHECK(xf_submit(b, buf, at) && observed == 0 && !b->guest_wait(gfx_guest_ticket, 0), "same queue overtook its wait");
-    uint64_t follower = gfx_guest_ticket;
-    // Reuse the original recording storage. Both waiting submissions have to own their commands.
-    gfx_submit_queue = 2;
-    at = put(buf, OP_BEGIN, NULL, 0);
-    p_signal_event write = {&gate, NVN_EVENT_SIGNAL_MODE_WRITE, 1};
-    at = put(at, OP_SIGNAL_EVENT, &write, sizeof write);
-    CHECK(xf_submit(b, buf, at) && observed == 2 && !b->guest_wait(consumer, 0), "consumer missed second wait");
-    at = put(buf, OP_BEGIN, NULL, 0);
-    write.value = 2;
-    at = put(at, OP_SIGNAL_EVENT, &write, sizeof write);
-    CHECK(xf_submit(b, buf, at) && b->guest_wait(follower, 5000000000ull) && b->guest_wait(consumer, 0) &&
-          b->guest_wait(empty, 5000000000ull) && b->guest_wait(dependency, 0) && observed == 14,
-          "queue, dependent fence or completion callbacks out of order");
-    // The frame's recorded WRITE 2 is complete. A new CPU value at the same address must take precedence.
-    __atomic_store_n(&gate, UINT32_MAX, __ATOMIC_RELEASE);
-    CHECK(!vk_exec_event_met(&wait), "completed signal hid CPU reset");
-    wait.mode = NVN_EVENT_WAIT_MODE_GEQUAL_WRAP;
-    wait.value = UINT32_MAX - 1;
-    CHECK(vk_exec_event_met(&wait), "wrap comparison just before zero");
-    wait.value = 0;
-    CHECK(!vk_exec_event_met(&wait), "wrap comparison passed too early");
-    gfx_submit_queue = 0;
-    puts("probe-vkexec: event waits, queue ordering, recording reuse and event reset passed");
-    return 0;
-}
-
 static int test_xfer(const GfxBackend *b, uint8_t *guest, int *bytes) {
     pool_t pool = {.magic = NVN_POOL_MAGIC, .flags = 0x22, .mem = guest + 0x800000, .size = 0x100000,
                    .game_mem = guest + 0x800000};
@@ -978,8 +882,7 @@ static int test_mirror(const GfxBackend *b, uint8_t *guest, int *bytes) {
     uint8_t *m = pool.mem;
     for (int i = 0; i < 4096; i++) m[i] = (uint8_t)(i * 13 + 1);
     memset(m + 0x1000, 0xEE, 0x5000);
-    int direct;
-    CHECK(vk_mem_mirror_probe((uint64_t)(uintptr_t)m, &direct), "the pool got no VRAM mirror");
+    CHECK(vk_mem_mirror_probe((uint64_t)(uintptr_t)m), "the pool got no VRAM mirror");
     static _Alignas(8) uint8_t stream[1024];
     uint64_t a = (uint64_t)(uintptr_t)m;
     // 1: B2B in the mirror after its first-use copy, and a fill; both written back.
@@ -1009,8 +912,7 @@ static int test_mirror(const GfxBackend *b, uint8_t *guest, int *bytes) {
     CHECK(xf_submit(b, stream, p), "fence_wait of the third mirror submission timed out");
     for (int i = 0; i < 0x800; i++) CHECK(m[0x4000 + i] == 0x11, "CPU byte %#x beside a fill is %02x", i, m[0x4000 + i]);
     for (int i = 0; i < 0x800; i++) CHECK(m[0x4800 + i] == 0x77, "fill byte %#x is %02x", i, m[0x4800 + i]);
-    // Flushing untouched bytes leaves the mirror alone. CPU changes at opposite ends of a
-    // flushed pool, including one on a page previously filled by the GPU, still reach it.
+    // 4: two small flushes at the ends of the pool copy their own pages, not what lies between them.
     int fl_bad = vk_mem_flush_add_probe();
     CHECK(!fl_bad, "flush range list check %d failed", fl_bad);
     p = put(stream, OP_BEGIN, NULL, 0);
@@ -1023,52 +925,12 @@ static int test_mirror(const GfxBackend *b, uint8_t *guest, int *bytes) {
     p = put(stream, OP_BEGIN, NULL, 0);
     p = put(p, OP_COPY_B2B, &c4, sizeof c4);
     CHECK(xf_submit(b, stream, p), "fence_wait of the mirror submission after the flushes timed out");
-    // The next submission publishes the copy counters.
+    // A submission's copies reach the counter with the next one, and c4's own write-back adds its destination page.
     CHECK(xf_submit(b, stream, p), "fence_wait of the mirror submission that counts the flushes timed out");
     uint64_t up = vk_mem_mirror_uploaded() - up0;
-    if (direct)
-        CHECK(up == 0, "unchanged flushes or GPU write-back uploaded %#llx bytes", (unsigned long long)up);
-    m[0x4800] = 0x31;
-    m[0xf0000] = 0xcb;
-    nvn_pool_flushed(&pool, 0, pool.size);
-    const p_copy_b2b low = {a + 0x4000, a + 0x7000, 4096}, high = {a + 0xf0000, a + 0x8000, 4096};
-    p = put(stream, OP_BEGIN, NULL, 0);
-    p = put(p, OP_COPY_B2B, &low, sizeof low);
-    p = put(p, OP_COPY_B2B, &high, sizeof high);
-    CHECK(xf_submit(b, stream, p), "dirty flush readback timed out");
-    CHECK(m[0x7800] == 0x31 && m[0x7801] == 0x77 && m[0x8000] == 0xcb,
-          "flushed CPU edits or adjacent GPU data changed");
-    if (direct && vk_gpa_on() && !rt_knob("GPA_EMPTY", "0")) {
-        const uint32_t stale[4] = {0, 0, 182, 1}, expected[4] = {182, 42, 0, 2};
-        uint32_t *counts = (uint32_t *)(m + 0xa000), *readback = (uint32_t *)(m + 0xb000);
-        memcpy(counts, stale, sizeof stale);
-        const p_copy_b2b copy = {a + 0xa000, a + 0xb000, sizeof stale};
-        p = put(stream, OP_BEGIN, NULL, 0);
-        p = put(p, OP_COPY_B2B, &copy, sizeof copy);
-        CHECK(xf_submit(b, stream, p) && !memcmp(readback, stale, sizeof stale), "initial indirect records differ");
-        // A shader that already holds a GPU pointer writes the mirror directly. Save that backing before
-        // the CPU edits another word on its page; looking up a binding after the flush would hide the bug.
-        VkMemSpan sp;
-        CHECK(vk_mem_resolve(copy.src, sizeof stale, &sp), "indirect records are unbacked");
-        VK_MEM_USE(sp);
-        counts[3] = expected[3];
-        nvn_pool_flushed(&pool, 0xa00c, 4);
-        p = put(stream, OP_BEGIN, NULL, 0);
-        CHECK(xf_submit(b, stream, p), "unbound producer submission timed out");
-        // Four-byte GPU writes stand in for the culling shader's counter updates, with no explicit binding
-        // and no write-back to the imported copy. The final count represents a genuinely culled draw.
-        VkCommandBuffer cb = vk_upload_begin();
-        for (uint32_t i = 0; i < 3; i++)
-            vkCmdFillBuffer(cb, sp.buffer, sp.offset + 4 * i, 4, expected[i]);
-        vk_upload_end();
-        vk_upload_flush(1);
-        p = put(stream, OP_BEGIN, NULL, 0);
-        p = put(p, OP_COPY_B2B, &copy, sizeof copy);
-        CHECK(xf_submit(b, stream, p), "indirect record readback timed out");
-        CHECK(!memcmp(readback, expected, sizeof expected),
-              "GPU-produced counts %u/%u/%u, neighbor %u; expected 182/42/0 and 2",
-              readback[0], readback[1], readback[2], readback[3]);
-    }
+    if (!rt_knob("FLUSH_SPAN", "0"))
+        CHECK(up >= 0x2000 && up < 0x10000, "two flushed pages copied %#llx bytes, 0xeb000 would be the span",
+              (unsigned long long)up);
     b->pool_fini(&pool);
     *bytes = 4096 + 0x1000 + 4096 + 0x1000;
     return 0;
@@ -1099,118 +961,6 @@ static int test_empty_pool(const GfxBackend *b, uint8_t *guest) {
     return 0;
 }
 
-static int test_held_program(void) {
-    uint32_t ctl[0xe0 / 4] = {0x98761234};
-    ctl[0x38 / 4] = 48;
-    ctl[0x40 / 4] = 64;
-    ctl[0x44 / 4] = 80;
-    ctl[0x54 / 4] = NVN_SHADER_STAGE_COMPUTE << 16;
-    uint8_t code[80];
-    memset(code, 0x47, sizeof code);
-    prog_t program = {.magic = NVN_PROG_MAGIC, .nstage = 1, .serial = nvn_new_serial()};
-    program.sd[0] = (NVNshaderData){(uintptr_t)code, ctl};
-    uint64_t words[16];
-    uint8_t *record = (uint8_t *)words;
-    p_bind_program bind = {&program, 1 << NVN_SHADER_STAGE_COMPUTE};
-    uint8_t *at = put(record, OP_BIND_PROGRAM, &bind, sizeof bind);
-    put(at, OP_END, NULL, 0);
-    vk_exec_record_programs(record, 1);
-    const prog_t *old = vk_exec_program_hold(((p_bind_program *)(record + sizeof(op_hdr)))->prog);
-    program.serial = nvn_new_serial();
-    memset(code, 0xba, sizeof code);
-    const prog_t *recent = vk_exec_program_hold(&program);
-    memset(ctl, 0, sizeof ctl);
-    memset(code, 0, sizeof code);
-    vk_exec_record_programs(record, -1);
-    CHECK(old->serial != recent->serial && ((const uint32_t *)old->sd[0].control)[0] == 0x98761234 &&
-          ((const uint8_t *)(uintptr_t)old->sd[0].data)[79] == 0x47 &&
-          ((const uint8_t *)(uintptr_t)recent->sd[0].data)[79] == 0xba, "held program or its constants changed after reuse");
-    vk_exec_program_drop(old);
-    vk_exec_program_drop(recent);
-    return 0;
-}
-
-static int test_held_uniforms(const GfxBackend *b, uint8_t *guest) {
-    pool_t pool = {.magic = NVN_POOL_MAGIC, .flags = 0x22, .mem = guest, .size = 0x100000, .game_mem = guest};
-    CHECK(b->pool_init(&pool), "held-uniform pool");
-    p_bind_buf table[8][18] = {0};
-    p_bind_buf bind = {NVN_SHADER_STAGE_COMPUTE, 3, (uintptr_t)guest, 32};
-    uint64_t words[16];
-    uint8_t *at = put((uint8_t *)words, OP_BIND_UBO, &bind, sizeof bind);
-    put(at, OP_END, NULL, 0);
-    uint64_t handle = (uintptr_t)words, fence = vk_sync_issued() + 1;
-    guest[0] = 0x47;
-    vk_usnap_begin(&handle, 1, fence, table);
-    VkUniformSnapshot *older = vk_usnap_hold();
-    vk_usnap_end(fence);
-    CHECK(b->submit(NULL, 0) == fence && b->fence_wait(fence, UINT64_MAX), "original physical uniform snapshot fence");
-    guest[0] = 0xba;
-    fence = vk_sync_issued() + 1;
-    vk_usnap_begin(NULL, 0, fence, table);   // no bind op in the second submission
-    VkUniformSnapshot *newer = vk_usnap_hold();
-    vk_usnap_end(fence);
-    CHECK(b->submit(NULL, 0) == fence && b->fence_wait(fence, UINT64_MAX), "inherited uniform snapshot fence");
-    guest[0] = 0;
-    fence = vk_sync_issued() + 1;
-    vk_usnap_begin(NULL, 0, fence, NULL);
-    vk_usnap_use(older);
-    const uint8_t *p = vk_usnap_bytes(bind.addr, bind.size);
-    CHECK(p && *p == 0x47, "original uniforms lost after physical completion and CPU overwrite");
-    vk_usnap_use(newer);
-    p = vk_usnap_bytes(bind.addr, bind.size);
-    CHECK(p && *p == 0xba, "second submission lost its inherited uniform version");
-    vk_usnap_drop(bind.addr, 1);
-    CHECK(!vk_usnap_bytes(bind.addr, bind.size), "GPU write kept current stale uniforms");
-    vk_usnap_use(older);
-    CHECK(!vk_usnap_bytes(bind.addr, bind.size), "GPU write kept another queue's stale uniforms");
-    vk_usnap_use(NULL);
-    vk_usnap_release(older, fence);
-    vk_usnap_release(newer, fence);
-    vk_usnap_end(fence);
-    CHECK(b->submit(NULL, 0) == fence && b->fence_wait(fence, UINT64_MAX), "held uniform retirement");
-    b->pool_fini(&pool);
-    puts("probe-vkqueues: retained program, compiler constants and two versions of inherited uniforms passed");
-    return 0;
-}
-
-int probe_vkmirror(void) {
-    uint64_t heap = 0;
-    CHECK(!mem_set_heap_size(16ull << 20, &heap) && heap, "mirror probe heap");
-    vk_sync_start();
-    CHECK(vk_mirror_on, "mirror probe requires device-local mirrors");
-    const GfxBackend *b = &gfx_vulkan_backend;
-    int bytes = 0;
-    int bad = test_mirror(b, (uint8_t *)(uintptr_t)heap, &bytes);
-    b->finish();
-    vk_exec_draw_shutdown();
-    vk_exec_xfer_shutdown();
-    vk_backend_shutdown();
-    if (bad || vk_validation_errors_total()) return 1;
-    printf("probe-vkmirror: GPU write-back, CPU edits and flush checks passed\n");
-    return 0;
-}
-
-int probe_vkqueues(void) {
-    vk_hdr_off();
-    CHECK(vk_exec_event_order(), "queue probe requires event ordering on synchronous replay");
-    uint64_t heap = 0;
-    CHECK(!mem_set_heap_size(16ull << 20, &heap) && heap, "queue probe heap");
-    const GfxBackend *b = &gfx_vulkan_backend;
-    int w, h;
-    int bad = test_held_program() || test_queue_events(b) || test_held_uniforms(b, (uint8_t *)(uintptr_t)heap) ||
-              test_present(b, (uint8_t *)(uintptr_t)heap, &w, &h);
-    if (!bad) {
-        for (int q = 1; q <= 3; ++q) b->queue_release(q);
-        bad = probe_nvn_queue_fences();
-    }
-    b->finish();
-    vk_pipeline_shutdown();
-    vk_exec_draw_shutdown();
-    vk_exec_xfer_shutdown();
-    vk_backend_shutdown();
-    return bad || vk_validation_errors_total();
-}
-
 int probe_vkexec(void) {
     vk_hdr_off();   // the present checks read 8-bit swapchain pixels
     layouts_equal = 0;
@@ -1221,7 +971,7 @@ int probe_vkexec(void) {
     uint8_t *guest = (uint8_t *)(uintptr_t)heap;
     uint64_t first = 0, last = 0;
     int w = 0, h = 0, inside = 0, xfer_bytes = 0;
-    int bad = test_queue_events(b) || test_sync(b, guest, &first, &last) || test_present(b, guest, &w, &h);
+    int bad = test_sync(b, guest, &first, &last) || test_present(b, guest, &w, &h);
     int sync_bad = bad;
     if (!bad) bad = test_clear(b, guest, &inside);
     int draw_bad = 0, drawn = 0, tries = 0, dispatched = 0;

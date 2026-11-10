@@ -363,67 +363,6 @@ static void probe_sync_events(void) {
     n_objects += 11;
 }
 
-// Exercise the same NVN entry points used by the game. The queue holding the wait is
-// fenced after an independent queue publishes newer work on the physical timeline.
-static void release_window_wait(void *word) {
-    plat_sleep_ms(30);
-    __atomic_store_n((volatile uint32_t *)word, 1, __ATOMIC_RELEASE);
-}
-
-int probe_nvn_window_reacquire(uint64_t ticket, volatile uint32_t *gate) {
-    win_t window = {.active = 2, .ntex = 2};
-    window.ticket[1] = ticket;
-    int idx = -1;
-    CALL(nvnWindowAcquireTexture, U(&window), 0, U(&idx));
-    if (idx != 0 || gfx_backend()->guest_wait(ticket, 0)) return 1;
-    if (!plat_thread_spawn(release_window_wait, (void *)gate, "probe event signal", 0)) return 1;
-    CALL(nvnWindowAcquireTexture, U(&window), 0, U(&idx));
-    int ok = idx == 1 && gfx_backend()->guest_wait(ticket, 0);
-    while (!__atomic_load_n(gate, __ATOMIC_ACQUIRE)) plat_yield();
-    if (ok) puts("probe-vkqueues: free image acquired immediately, held image acquired after its blit");
-    return !ok;
-}
-
-int probe_nvn_queue_fences(void) {
-    int prior = failures;
-    queue_t a = {0}, b = {0};
-    queue_builder_t builder = {0};
-    sync_t blocked = {0}, independent = {0}, dependent = {0};
-    uint32_t gate = 0, result = 0;
-    ev_t input = {.val = &gate}, output = {.val = &result};
-    NVNcommandBuffer recording = {0};
-    CALL(nvnQueueInitialize, U(&a), U(&builder));
-    CALL(nvnQueueInitialize, U(&b), U(&builder));
-    uint64_t first_id = a.identity;
-    CALL(nvnCommandBufferInitialize, U(&recording), U(&dev));
-    CALL(nvnCommandBufferBeginRecording, U(&recording));
-    CALL(nvnCommandBufferWaitEvent, U(&recording), U(&input), NVN_EVENT_WAIT_MODE_EQUAL, 7);
-    CALL(nvnCommandBufferSignalEvent, U(&recording), U(&output), NVN_EVENT_SIGNAL_MODE_WRITE,
-         NVN_EVENT_SIGNAL_LOCATION_BOTTOM, 0, 9);
-    uint64_t handle = CALL(nvnCommandBufferEndRecording, U(&recording));
-    CALL(nvnQueueSubmitCommands, U(&a), 1, U(&handle));
-    CALL(nvnQueueSubmitCommands, U(&b), 0, 0);
-    CALL(nvnQueueFinish, U(&b));
-    CALL(nvnQueueFenceSync, U(&a), U(&blocked), 0, 0);
-    CALL(nvnQueueFenceSync, U(&b), U(&independent), 0, 0);
-    CHECK(CALL(nvnSyncWait, U(&blocked), 0) == NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED, "consumer inherits foreign fence");
-    CHECK(CALL(nvnSyncWait, U(&independent), 0) == NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED, "independent finish");
-    CALL(nvnQueueWaitSync, U(&b), U(&blocked));
-    CALL(nvnQueueFenceSync, U(&b), U(&dependent), 0, 0);
-    CHECK(CALL(nvnSyncWait, U(&dependent), 1000000) == NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED, "dependent finite wait");
-    CALL(nvnEventSignal, U(&input), NVN_EVENT_SIGNAL_MODE_WRITE, 7);
-    CHECK(CALL(nvnSyncWait, U(&dependent), 5000000000ull) != NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED &&
-          __atomic_load_n(&result, __ATOMIC_ACQUIRE) == 9, "completion effects after CPU signal");
-    CALL(nvnQueueFinalize, U(&a));
-    CALL(nvnQueueInitialize, U(&a), U(&builder));
-    CHECK(a.identity != first_id && !a.ticket, "reinitialized queue reused its former identity or fence");
-    CALL(nvnQueueFinalize, U(&a));
-    CALL(nvnQueueFinalize, U(&b));
-    CALL(nvnCommandBufferFinalize, U(&recording));
-    if (prior == failures) puts("probe-vkqueues: guest FenceSync, SyncWait, QueueWaitSync, QueueFinish and queue reuse passed");
-    return failures != prior;
-}
-
 // ---- recording every op kind and parsing it back
 OBJ(NVNcommandBuffer, cmd);
 OBJ(NVNcommandBuffer, cmd2);

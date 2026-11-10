@@ -11,7 +11,6 @@ build's nx2navi.exe in the record layouts of runtime/gfx_shader.c ("answers met 
 
     seed-programs.bin  "NX2NSPRG": stage, length, c1 length, runtime code hash, control section, code, c1
     seed-answers.bin   "NX2NSANS": stage, code hash, input id (zero: the runtime computes it), answers, priority
-    seed-mesh.bin / seed-vertex.bin: three answer row indices per archived graphics program
 
 Priority (the pad byte): 0 shaders the list's warm rows flag as title/menu (t), 1 other warm rows (S, C, R), 2 the
 rest; a default variant takes its shader's priority and sets DEFAULT_FLAG (bit 7). The runtime reads a flagged
@@ -49,7 +48,6 @@ while not (ROOT / 'tools' / 'shader_census.py').is_file() and ROOT != ROOT.paren
     ROOT = ROOT.parent
 sys.path.insert(0, str(ROOT / 'tools'))
 import shader_list  # noqa: E402
-from shader_passes import PASS_TARGETS
 from shader_census import inventory  # noqa: E402
 
 STAGES = {'vs': 0, 'ps': 4, 'cs': 5, 'ts': 6, 'ms': 7}     # runtime/gfx.h GFX_STAGE_*
@@ -201,36 +199,18 @@ def main():
     variants, prio = parse_list('' if a.no_list else read_list(a.list))
     extracted = ROOT / 'build' / 'extracted' / a.version
     listed = len(variants)
-    graphics_programs = set()
-    uint_programs = set()
-    pass_names = {}
-    shaders, _ = inventory(a.romfs or extracted / 'romfs', a.exefs or extracted / 'exefs', everything=False,
-                           programs=graphics_programs, uint_programs=uint_programs, pass_names=pass_names)
+    shaders, _ = inventory(a.romfs or extracted / 'romfs', a.exefs or extracted / 'exefs', everything=False)
     # A missing list row says nothing about the walk: the list covers several versions, and 1.1.0 holds 17,587 of its
     # 41,414 rows, so most rows are absent because the game does not have them, not because the walk missed them. A walk
     # that found next to nothing does say something: the shader directories have moved.
     if len(shaders) < max(64, listed // 20):
         print(f'only {len(shaders)} shaders found of the {listed} listed variants: reading every RomFS file instead',
               flush=True)
-        shaders, _ = inventory(a.romfs or extracted / 'romfs', a.exefs or extracted / 'exefs', programs=graphics_programs, uint_programs=uint_programs, pass_names=pass_names)
-    mesh_programs = {group for group in graphics_programs if shaders[group[0]]['stage'] == 'ms'}
-    vertex_programs = graphics_programs - mesh_programs
+        shaders, _ = inventory(a.romfs or extracted / 'romfs', a.exefs or extracted / 'exefs')
     t1 = time.monotonic()
-    progs, recs, seen, defaults, skipped = {}, [], set(), {}, {'not in this version': 0, 'stage': 0}
+    progs, recs, seen, skipped = {}, [], set(), {'not in this version': 0, 'stage': 0}
     left_out = 0 if a.all_shaders else sum(1 for s in shaders.values() if slow_unused(s))
     variants += [(key, DEFAULT) for key in sorted(shaders) if a.all_shaders or not slow_unused(shaders[key])]
-    # A mesh pass can write IDs to an R8_UINT target. Its fragment output type is a binding
-    # answer. The SPH colour-output map at 0x48 selects just the first component for this pass.
-    uint_output = {**DEFAULT, 'fout': {'0': 'uint'}}
-    mesh_uint_keys = {fs for _, fs, _ in mesh_programs if fs and len(shaders[fs]['code']) >= 0x50
-                      and struct.unpack_from('<I', shaders[fs]['code'], 0x48)[0] == 1}
-    # Shading-rate images and compressed texture blocks have integer attachment variants.
-    # Limit these answers to the stage pairs that the archive assigns to those programs.
-    uint_programs = {group for group in uint_programs if len(shaders[group[1]]['code']) >= 0x50
-                     and struct.unpack_from('<I', shaders[group[1]]['code'], 0x48)[0] in (1, 0xf)}
-    uint_keys = mesh_uint_keys | {fs for _, fs, _ in uint_programs}
-    variants += [(key, uint_output) for key in sorted(uint_keys)]
-    uint_states = {}
     for key, deps in variants:
         s = shaders.get(key)
         if not s:
@@ -249,10 +229,6 @@ def main():
         h = progs[key][0]
         default = deps is DEFAULT
         packed = answers({} if default and stage == STAGES['cs'] else deps, stage, control)
-        if default:
-            defaults[key] = (h, packed)
-        elif deps is uint_output:
-            uint_states[key] = (h, packed)
         if (h, packed) in seen:   # a list row of the default bind state
             continue
         seen.add((h, packed))
@@ -269,36 +245,6 @@ def main():
         f.write(b'NX2NSANS' + struct.pack('<II', 1, ANS_REC))
         for _, rec in recs:
             f.write(rec)
-    # The translator resolves the final input IDs after refining the seed answers for this device.
-    rows = {(r[4:36], r[68:-1]): i for i, (_, r) in enumerate(recs)}
-    with (out / 'seed-mesh.bin').open('wb') as f:
-        f.write(struct.pack('<8sII', b'NX2NMSIX', 1, 12))
-        for group in sorted(mesh_programs):
-            indices = [rows[defaults[key]] if key else 0xffffffff for key in group]
-            f.write(struct.pack('<3I', *indices))
-            if group[1] in mesh_uint_keys:
-                indices[1] = rows[uint_states[group[1]]]
-                f.write(struct.pack('<3I', *indices))
-    with (out / 'seed-vertex.bin').open('wb') as f:
-        f.write(struct.pack('<8sII', b'NX2NVSIX', 1, 12))
-        for group in sorted(vertex_programs):
-            vs, fs, _ = group
-            vs_row = rows[defaults[vs]]
-            f.write(struct.pack('<3I', vs_row, rows[defaults[fs]] if fs else 0xffffffff, 0xffffffff))
-            if group in uint_programs:
-                f.write(struct.pack('<3I', vs_row, rows[uint_states[fs]], 0xffffffff))
-    pass_rows = set()
-    for (vs, fs, _), names in pass_names.items():
-        v = rows[defaults[vs]]
-        f = rows[defaults[fs]] if fs else 0xffffffff
-        for name in names:
-            pass_rows.update((v, f, recipe) for recipe in PASS_TARGETS[name])
-    with (out / 'seed-passes.bin').open('wb') as f:
-        f.write(struct.pack('<8sII', b'NX2NPSIX', 1, 20))
-        for v, frag, recipe in sorted(pass_rows):
-            f.write(struct.pack('<II', v, frag) + recipe)
-    print(f'{len(pass_rows)} attachment layouts paired with archive shader variations', flush=True)
-    print(f'{len(vertex_programs)} archive vertex programs for graphics pipeline preparation', flush=True)
     by = [sum(1 for p, _ in recs if p == i) for i in range(3)]
     print(f'{listed} listed variants and {len(shaders)} default ones: {len(recs)} of {len(progs)} shaders in {a.version} '
           f'(priority t {by[0]}, warm {by[1]}, rest {by[2]}), skipped {skipped}, {left_out} slow unused default variants '

@@ -67,28 +67,8 @@ void tex_bl_copy(uint8_t *bl, uint8_t *lin, size_t pitch, uint32_t row_bytes, ui
     static const uint32_t seg_x1[4] = {0, 32, 256, 288}, seg_nvn2[4] = {0, 64, 256, 320};
     const uint32_t *seg = gob_nvn2() ? seg_nvn2 : seg_x1;
     uint64_t block = 512ull << th << td;
-    uint32_t row_off[8];
-    int whole_gobs = to_linear && row_bytes >= 64 && !(row_bytes % 64) && rows >= 8;
-    if (whole_gobs)
-        for (unsigned r = 0; r < 8; r++) row_off[r] = gob_off(0, r);
-    for (uint32_t z = 0; z < slices; z++) {
-        uint32_t y = 0;
-        // Read all eight rows in a GOB while its cache lines are hot. Each output row receives
-        // 64 consecutive bytes, including when the destination is mapped staging memory.
-        if (whole_gobs) for (; rows - y >= 8; y += 8) {
-            const uint8_t *g = bl + nvn_bl_offset(0, y, z, row_bytes, rows, th, td);
-            uint8_t *out = lin + ((size_t)z * rows + y) * pitch;
-            for (uint32_t x = 0; x < row_bytes; x += 64, g += block)
-                for (unsigned r = 0; r < 8; r++) {
-                    const uint8_t *src = g + row_off[r];
-                    uint8_t *dst = out + r * pitch + x;
-                    memcpy(dst, src, 16);
-                    memcpy(dst + 16, src + seg[1], 16);
-                    memcpy(dst + 32, src + 256, 16);
-                    memcpy(dst + 48, src + seg[3], 16);
-                }
-        }
-        for (; y < rows; y++) {
+    for (uint32_t z = 0; z < slices; z++)
+        for (uint32_t y = 0; y < rows; y++) {
             uint8_t *row = lin + ((size_t)z * rows + y) * pitch, *g = bl + nvn_bl_offset(0, y, z, row_bytes, rows, th, td);
             uint32_t x = 0;
             if (to_linear)
@@ -102,7 +82,6 @@ void tex_bl_copy(uint8_t *bl, uint8_t *lin, size_t pitch, uint32_t row_bytes, ui
                 if (to_linear) memcpy(row + x, g + seg[s], n); else memcpy(g + seg[s], row + x, n);
             }
         }
-    }
 }
 
 static int move(const nvn_texdesc *d, unsigned level, unsigned layer, uint8_t *bl, uint8_t *lin, size_t pitch, int to_linear) {

@@ -99,19 +99,22 @@ def prepare_sources() -> Path:
     for junk in list(src.glob("src/*/obj")) + list(src.glob("src/*/bin")):
         shutil.rmtree(junk)
     patches = sorted((XLATE / "patches").glob("*.patch"))
-    if len(patches) != 35:
-        sys.exit(f"expected 35 patches, found {len(patches)}")
-    # Treat the private source copy as a standalone tree even when BUILD is inside a checkout.
-    # Otherwise git can skip paths outside its current prefix and still report success.
+    if len(patches) != 37:
+        sys.exit(f"expected 37 patches, found {len(patches)}")
+    # build/xlate is inside this checkout, and git inside a repository reads a "diff --git" patch's paths from the
+    # repository's top: those hunks fall outside the directory handed to --directory, git skips every file of the patch
+    # and still exits 0. GIT_CEILING_DIRECTORIES stops git from walking up to the checkout, so it reads each patch as it
+    # would outside a repository, and a "Skipped patch" line fails the build (including 0021's PRMT implementation).
     env = dict(os.environ, GIT_CEILING_DIRECTORIES=str(BUILD.parent), LC_ALL="C")
     for patch in patches:
-        # git apply works outside a repository when given a directory; --check first so a failure names the patch.
         for extra in (["--check"], []):
             r = subprocess.run(
-                ["git", "apply", *extra, "--verbose", "--whitespace=nowarn", "--directory", str(src.relative_to(BUILD)), str(patch)],
+                ["git", "apply", *extra, "--verbose", "--whitespace=nowarn",
+                 "--directory", str(src.relative_to(BUILD)), str(patch)],
                 cwd=BUILD, capture_output=True, text=True, env=env,
             )
-            if r.returncode != 0 or "Skipped patch" in r.stderr or "Skipped patch" in r.stdout:
+            skipped = "Skipped patch" in r.stdout or "Skipped patch" in r.stderr
+            if r.returncode != 0 or skipped:
                 sys.exit(f"patch does not apply: {patch.name}\n{r.stdout}{r.stderr}")
         print(f"applied {patch.name}")
     return src

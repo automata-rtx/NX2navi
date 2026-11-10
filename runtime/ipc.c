@@ -11,6 +11,7 @@
 #include "audren.h"
 #include "host.h"
 #include "ipc.h"
+#include "ov.h"
 #include "nfp.h"
 #include "platform/platform.h"
 
@@ -117,14 +118,14 @@ static void applet_stub_handler(IpcSession *s, const IpcRequest *rq, IpcResponse
         rs->result = AM_R_NO_MESSAGES;
         return;
     }
-    if (common && rq->cmd == 5) {              // GetOperationMode: docked (matches the oe override)
-        uint8_t mode = 1;
+    if (common && rq->cmd == 5) {              // GetOperationMode (matches the oe override)
+        uint8_t mode = !ov_handheld();
         IPC_OUT(rs, mode);
         rs->result = 0;
         return;
     }
-    if (common && rq->cmd == 6) {              // GetPerformanceMode: boost (docked)
-        uint32_t mode = 1;
+    if (common && rq->cmd == 6) {              // GetPerformanceMode: boost when docked
+        uint32_t mode = !ov_handheld();
         IPC_OUT(rs, mode);
         rs->result = 0;
         return;
@@ -694,7 +695,7 @@ static void update_build(Update *u, int first) {
     memcpy(w, &h, sizeof h);
     w += sizeof h + h.behavior + h.memory_pools + h.voice_resources;
     for (int i = 0; i < p->voice_count; i++) {
-        AudrenVoiceIn v = {.id = (uint32_t)i};
+        AudrenVoiceIn v = {0};   // the client leaves the id of an unused slot zero
         if (i == 0) {   // one PCM16 voice with a 100 ms buffer: consumed after 20 frames
             v = (AudrenVoiceIn){.id = 0, .is_new = (uint8_t)first, .in_use = 1, .play_state = PLAY_STARTED,
                                 .sample_format = FMT_PCM16, .sample_rate = 48000, .channel_count = 1, .pitch = 1,

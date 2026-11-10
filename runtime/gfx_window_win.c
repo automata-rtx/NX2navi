@@ -1,5 +1,5 @@
 // The Win32 back end of the window (gfx_wsys.h): the window and its message loop on a thread of their own, F11
-// fullscreen, the settings NX2NAVI_WINDOW_SIZE and NX2NAVI_FULLSCREEN, the monitor's refresh rate, focus, the Vulkan surface.
+// fullscreen, the settings NX2NAVI_WINDOW_SIZE, NX2NAVI_FULLSCREEN and NX2NAVI_MONITOR, the monitor's refresh rate, focus, the Vulkan surface.
 // The swapchain and the present are gfx_present.c's. The in-game menu's keyboard and mouse come from the window
 // procedure (ui/menu_win.cpp), and so do the game's (input_win.c).
 //
@@ -31,7 +31,7 @@ static HWND g_hwnd;
 static PlatEvent g_wnd_ready;   // manual-reset: the window thread made the window or gave up
 static int g_wnd_failed;
 static int g_background;                   // NX2NAVI_BACKGROUND_WINDOW: the window stays behind the user's windows
-static int g_fs_pending;                   // window thread: NX2NAVI_FULLSCREEN waits for the first activation
+static int g_fs_pending;                   // window thread: NX2NAVI_FULLSCREEN did not apply before the first show; retried at the first activation
 static volatile int32_t g_dpi = USER_DEFAULT_SCREEN_DPI;   // the window's DPI, set by the window thread
 
 HWND gfx_window_handle(void) { return g_hwnd; }
@@ -51,7 +51,7 @@ int gfx_window_vk_presentable(VkInstance inst, VkPhysicalDevice pd, uint32_t fam
 // ---- window thread
 #define WND_STYLE WS_OVERLAPPEDWINDOW
 #define WM_APP_SETTINGS (WM_APP + 1)
-#define WM_APP_FULLSCREEN (WM_APP + 2)   // the fullscreen setting, held back until the window is first activated
+#define WM_APP_FULLSCREEN (WM_APP + 2)   // the fullscreen setting, retried at the first activation
 
 static WINDOWPLACEMENT g_saved_place = {sizeof g_saved_place};   // the window behind fullscreen (window thread)
 
@@ -62,14 +62,40 @@ static int is_fullscreen(HWND h) { return !(GetWindowLongW(h, GWL_STYLE) & WS_OV
 
 unsigned gfx_window_dpi(void) { return (unsigned)plat_cas32(&g_dpi, 0, 0); }
 
-// The outer size of a framed window whose client area is cw x ch. The frame is measured at the window's DPI, or the
-// system DPI before the window exists: plain AdjustWindowRect always takes the system DPI, which is wrong on a monitor
-// at another display scale.
-static void outer_size(HWND h, int cw, int ch, int *ow, int *oh) {
+// The outer size of a framed window whose client area is cw x ch, with the frame measured at dpi.
+static void outer_size_at(int cw, int ch, UINT dpi, int *ow, int *oh) {
     RECT r = {0, 0, cw, ch};
-    AdjustWindowRectExForDpi(&r, WND_STYLE, FALSE, 0, h ? GetDpiForWindow(h) : GetDpiForSystem());
+    AdjustWindowRectExForDpi(&r, WND_STYLE, FALSE, 0, dpi);
     *ow = r.right - r.left;
     *oh = r.bottom - r.top;
+}
+
+// The same at the window's DPI, or the system DPI before the window exists: plain AdjustWindowRect always takes the
+// system DPI, which is wrong on a monitor at another display scale.
+static void outer_size(HWND h, int cw, int ch, int *ow, int *oh) {
+    outer_size_at(cw, ch, h ? GetDpiForWindow(h) : GetDpiForSystem(), ow, oh);
+}
+
+// The client size cw x ch scaled down, in its own proportions, so the whole window fits a work area: the chosen
+// monitor's (work, with the frame measured at dpi) or, with work NULL, the primary monitor's, where CW_USEDEFAULT opens
+// it. The default 1920x1080 on a 1080p laptop put the bottom of the picture (the HUD) under the taskbar and past the
+// screen. The setting itself stays; the menu's size list offers what fits.
+static void fit_work_area(int *cw, int *ch, const RECT *work, UINT dpi) {
+    RECT prim;
+    int ow, oh;
+    if (!work) {
+        if (!SystemParametersInfoW(SPI_GETWORKAREA, 0, &prim, 0)) return;
+        work = &prim;
+    }
+    outer_size_at(*cw, *ch, dpi, &ow, &oh);
+    int aw = (work->right - work->left) - (ow - *cw), ah = (work->bottom - work->top) - (oh - *ch);
+    if (aw <= 0 || ah <= 0 || (*cw <= aw && *ch <= ah)) return;
+    double k = (double)aw / *cw < (double)ah / *ch ? (double)aw / *cw : (double)ah / *ch;
+    int w = (int)(*cw * k) & ~1, hh = (int)(*ch * k) & ~1;
+    if (w < 640 || hh < 360) return;
+    rt_log("gfx: window %dx%d does not fit the screen's work area; opening at %dx%d", *cw, *ch, w, hh);
+    *cw = w;
+    *ch = hh;
 }
 
 // Windows turns the display off and sleeps after the idle timeout, and gamepad input does not count as activity. While
@@ -91,13 +117,11 @@ static void toggle_fullscreen(HWND h) {
         MONITORINFO mi = {sizeof mi};
         if (!GetWindowPlacement(h, &g_saved_place) || !GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTOPRIMARY), &mi))
             return;
-        vk_dlssg_suspend(1);
         SetWindowLongW(h, GWL_STYLE, (style & ~WS_OVERLAPPEDWINDOW) | WS_POPUP);
         SetWindowPos(h, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
                      mi.rcMonitor.bottom - mi.rcMonitor.top,
                      SWP_NOOWNERZORDER | SWP_FRAMECHANGED | (g_background ? SWP_NOZORDER | SWP_NOACTIVATE : 0));
     } else {
-        vk_dlssg_suspend(1);
         SetWindowLongW(h, GWL_STYLE, (style & ~WS_POPUP) | WND_STYLE);
         if (g_background) g_saved_place.showCmd = SW_SHOWNOACTIVATE;
         SetWindowPlacement(h, &g_saved_place);
@@ -105,6 +129,17 @@ static void toggle_fullscreen(HWND h) {
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED |
                          (g_background ? SWP_NOACTIVATE : 0));
     }
+}
+
+// Window thread, before the window is first shown: gives it the outer size ow x oh (the windowed size F11 returns to)
+// and then makes it fullscreen on the monitor it was created on, so the first thing on screen is the fullscreen window.
+// toggle_fullscreen saves the placement of a window that was never visible, which is its normal rectangle as just set.
+// The window stays hidden here; the caller shows it. Returns whether the window is fullscreen now.
+static int fullscreen_before_show(HWND h, int ow, int oh) {
+    SetWindowPos(h, NULL, 0, 0, ow, oh, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    toggle_fullscreen(h);
+    g_saved_place.showCmd = SW_SHOWNORMAL;   // a hidden window may report SW_HIDE, which F11 would restore as hidden
+    return is_fullscreen(h);
 }
 
 // The window size and fullscreen state last taken from the settings (window thread). apply_settings acts on a change of
@@ -195,10 +230,241 @@ static void refresh_rate_update(HWND h, int force) {
     gfx_window_set_refresh(monitor_rate_hz(mon));
 }
 
-// Before the window exists (widescreen.c wide_init at start), the primary monitor: the one a fullscreen window opens on.
+// ---- monitor choice (NX2NAVI_MONITOR, --monitor, --list-monitors)
+// The monitors in EnumDisplayMonitors order, which is the index the setting counts in (1-based) and --list-monitors
+// prints. The order follows the display driver's adapter and output order, so it holds while the same monitors stay
+// attached and enabled, but a monitor that appears or goes away (a virtual display) can move the ones after it: the GDI
+// device name or the monitor's name pins one monitor more firmly than its index.
+#define MON_MAX 32
+
+typedef struct {
+    HMONITOR h;
+    RECT rc, work;                  // the monitor's rectangle and its work area (without the taskbar), desktop pixels
+    int primary;
+    UINT dpi;                       // effective DPI of the monitor, 96 at 100% display scale
+    wchar_t device[CCHDEVICENAME];  // GDI device name, such as \\.\DISPLAY3
+    wchar_t name[64];               // the monitor's friendly name from the display configuration; empty when it has none
+} MonInfo;
+
+typedef struct { MonInfo m[MON_MAX]; int n; } MonList;
+
+static void to_utf8(const wchar_t *w, char *out, size_t n) {
+    if (!WideCharToMultiByte(CP_UTF8, 0, w, -1, out, (int)n, NULL, NULL)) out[0] = 0;
+}
+
+// GetDpiForMonitor lives in shcore.dll, which the build does not link; 0 when it is missing. The library is loaded once
+// and kept: the monitor list asks for every monitor's DPI each time it is built.
+static UINT monitor_dpi(HMONITOR mon) {
+    typedef HRESULT(WINAPI * GetDpiForMonitorFn)(HMONITOR, int, UINT *, UINT *);
+    static GetDpiForMonitorFn fn;
+    static int looked;
+    if (!looked) {
+        HMODULE lib = LoadLibraryExW(L"shcore.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        fn = lib ? (GetDpiForMonitorFn)(void *)GetProcAddress(lib, "GetDpiForMonitor") : NULL;
+        looked = 1;
+    }
+    UINT x = 0, y = 0;
+    if (!fn || fn(mon, 0 /* MDT_EFFECTIVE_DPI */, &x, &y) != S_OK) x = 0;
+    return x;
+}
+
+static BOOL CALLBACK enum_monitor(HMONITOR h, HDC dc, LPRECT rc, LPARAM lp) {
+    (void)dc, (void)rc;
+    MonList *l = (MonList *)lp;
+    MONITORINFOEXW mi = {.cbSize = sizeof mi};
+    if (l->n >= MON_MAX) return FALSE;
+    if (!GetMonitorInfoW(h, (MONITORINFO *)&mi)) return TRUE;
+    MonInfo *m = &l->m[l->n++];
+    *m = (MonInfo){.h = h, .rc = mi.rcMonitor, .work = mi.rcWork, .primary = (mi.dwFlags & MONITORINFOF_PRIMARY) != 0,
+                   .dpi = monitor_dpi(h)};
+    wcsncpy(m->device, mi.szDevice, CCHDEVICENAME - 1);
+    return TRUE;
+}
+
+// Fills MonInfo.name: an active display path ties a GDI device (the source) to the monitor attached to it (the target),
+// and the target knows the monitor's name. Cloned monitors share a source, and the first path with a name wins.
+static void fill_monitor_names(MonList *l) {
+    DISPLAYCONFIG_PATH_INFO *paths = NULL;
+    DISPLAYCONFIG_MODE_INFO *modes = NULL;
+    for (int attempt = 0; attempt < 3; attempt++) {   // the topology can change between the size query and the query
+        UINT32 np = 0, nm = 0;
+        if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &np, &nm) != ERROR_SUCCESS || !np || !nm) break;
+        free(paths);
+        free(modes);
+        paths = calloc(np, sizeof *paths);
+        modes = calloc(nm, sizeof *modes);
+        if (!paths || !modes) break;
+        LONG rc = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &np, paths, &nm, modes, NULL);
+        if (rc == ERROR_INSUFFICIENT_BUFFER) continue;
+        if (rc != ERROR_SUCCESS) break;
+        for (UINT32 i = 0; i < np; i++) {
+            DISPLAYCONFIG_SOURCE_DEVICE_NAME src = {.header = {.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+                                                               .size = sizeof src,
+                                                               .adapterId = paths[i].sourceInfo.adapterId,
+                                                               .id = paths[i].sourceInfo.id}};
+            DISPLAYCONFIG_TARGET_DEVICE_NAME tgt = {.header = {.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+                                                               .size = sizeof tgt,
+                                                               .adapterId = paths[i].targetInfo.adapterId,
+                                                               .id = paths[i].targetInfo.id}};
+            if (DisplayConfigGetDeviceInfo(&src.header) != ERROR_SUCCESS ||
+                DisplayConfigGetDeviceInfo(&tgt.header) != ERROR_SUCCESS)
+                continue;
+            for (int k = 0; k < l->n; k++)
+                if (!l->m[k].name[0] && !_wcsicmp(src.viewGdiDeviceName, l->m[k].device))
+                    wcsncpy(l->m[k].name, tgt.monitorFriendlyDeviceName, (sizeof l->m[k].name / sizeof(wchar_t)) - 1);
+        }
+        break;
+    }
+    free(paths);
+    free(modes);
+}
+
+static int enum_monitors(MonList *l) {
+    *l = (MonList){0};
+    EnumDisplayMonitors(NULL, NULL, enum_monitor, (LPARAM)l);
+    fill_monitor_names(l);
+    return l->n;
+}
+
+// "2  \\.\DISPLAY3  "Name"  1920x1080 at 2560,0  primary  dpi 144 (150%)": one monitor, for the log and --list-monitors.
+static void monitor_line(const MonList *l, int i, char *out, size_t cap) {
+    const MonInfo *m = &l->m[i];
+    char dev[CCHDEVICENAME * 4], name[64 * 4];
+    to_utf8(m->device, dev, sizeof dev);
+    to_utf8(m->name, name, sizeof name);
+    snprintf(out, cap, "%d  %s  \"%s\"  %ldx%ld at %ld,%ld%s  dpi %u (%u%%)", i + 1, dev, name, m->rc.right - m->rc.left,
+             m->rc.bottom - m->rc.top, m->rc.left, m->rc.top, m->primary ? "  primary" : "", m->dpi,
+             m->dpi * 100 / USER_DEFAULT_SCREEN_DPI);
+}
+
+static int monitor_unset(const char *v) { return !v || !*v || !_stricmp(v, "auto"); }
+
+// Whether text contains needle_lower, which is already lower-cased; the comparison ignores case.
+static int contains_nocase(const wchar_t *text, const wchar_t *needle_lower) {
+    wchar_t buf[CCHDEVICENAME + 64];
+    if (!*needle_lower) return 0;
+    wcsncpy(buf, text, (sizeof buf / sizeof *buf) - 1);
+    buf[(sizeof buf / sizeof *buf) - 1] = 0;
+    CharLowerBuffW(buf, (DWORD)wcslen(buf));
+    return wcsstr(buf, needle_lower) != NULL;
+}
+
+// Which monitor of the list a NX2NAVI_MONITOR value (not empty, not auto) names, as a 0-based index; -1 when none.
+// Rules, in this order: "primary"; all digits, a 1-based index; any other text, a case-insensitive substring of a
+// monitor's GDI device name or friendly name (the first monitor in list order when several match). why gets the
+// rule that matched, or the reason nothing did.
+static int resolve_monitor(const MonList *l, const char *want, char *why, size_t cap) {
+    if (!_stricmp(want, "primary")) {
+        for (int i = 0; i < l->n; i++)
+            if (l->m[i].primary) {
+                snprintf(why, cap, "the primary monitor");
+                return i;
+            }
+        snprintf(why, cap, "no monitor is marked primary");
+        return -1;
+    }
+    if (want[strspn(want, "0123456789")] == 0) {
+        long idx = strtol(want, NULL, 10);
+        if (idx >= 1 && idx <= l->n) {
+            snprintf(why, cap, "index %ld of %d", idx, l->n);
+            return (int)idx - 1;
+        }
+        snprintf(why, cap, "index %s is outside 1..%d", want, l->n);
+        return -1;
+    }
+    wchar_t needle[CCHDEVICENAME + 64];
+    if (!MultiByteToWideChar(CP_UTF8, 0, want, -1, needle, (int)(sizeof needle / sizeof *needle))) {
+        snprintf(why, cap, "the text is not valid UTF-8 or is too long");
+        return -1;
+    }
+    CharLowerBuffW(needle, (DWORD)wcslen(needle));
+    int first = -1, hits = 0;
+    for (int i = 0; i < l->n; i++)
+        if (contains_nocase(l->m[i].device, needle) || contains_nocase(l->m[i].name, needle)) {
+            if (first < 0) first = i;
+            hits++;
+        }
+    if (first < 0) {
+        snprintf(why, cap, "no device name or monitor name contains it");
+        return -1;
+    }
+    if (hits > 1) snprintf(why, cap, "device or monitor name contains it; the first of %d matches", hits);
+    else snprintf(why, cap, "device or monitor name contains it");
+    return first;
+}
+
+// The monitor NX2NAVI_MONITOR picks, copied to *out; 0 when it is unset or auto (the system places the window), or when
+// it matches nothing now (the monitors present are logged, and the default placement applies). log: say what was decided
+// and why. The window thread asks with log set; the size query below, which widescreen.c makes before the window
+// exists, stays quiet.
+static int chosen_monitor(MonInfo *out, int log) {
+    const char *want = cfg_get("NX2NAVI_MONITOR");
+    if (monitor_unset(want)) return 0;
+    MonList l;
+    char why[256], line[512];
+    int n = enum_monitors(&l), pick = -1;
+    if (n) pick = resolve_monitor(&l, want, why, sizeof why);
+    else snprintf(why, sizeof why, "no monitor was found");
+    if (pick < 0) {
+        if (log) {
+            rt_log("gfx: NX2NAVI_MONITOR=%s picks no monitor (%s); the window gets the default placement. Monitors present:",
+                   want, why);
+            for (int i = 0; i < n; i++) {
+                monitor_line(&l, i, line, sizeof line);
+                rt_log("gfx:   %s", line);
+            }
+        }
+        return 0;
+    }
+    if (log) {
+        monitor_line(&l, pick, line, sizeof line);
+        rt_log("gfx: NX2NAVI_MONITOR=%s picks monitor %s (%s)", want, line, why);
+    }
+    *out = l.m[pick];
+    return 1;
+}
+
+// --list-monitors (main.c): one line per monitor, then what the current NX2NAVI_MONITOR would pick. No game files.
+int list_monitors(void) {
+    MonList l;
+    char line[512], why[256];
+    int n = enum_monitors(&l);
+    if (!n) {
+        fprintf(stderr, "list-monitors: no monitor found\n");
+        return 1;
+    }
+    printf("index  device  name  desktop rectangle  primary  dpi\n");
+    for (int i = 0; i < n; i++) {
+        monitor_line(&l, i, line, sizeof line);
+        printf("%s\n", line);
+    }
+    const char *want = cfg_get("NX2NAVI_MONITOR");
+    if (monitor_unset(want)) {
+        printf("NX2NAVI_MONITOR is not set (auto): the system places the window\n");
+    } else {
+        int pick = resolve_monitor(&l, want, why, sizeof why);
+        if (pick >= 0) printf("NX2NAVI_MONITOR=%s picks monitor %d (%s)\n", want, pick + 1, why);
+        else printf("NX2NAVI_MONITOR=%s picks no monitor (%s)\n", want, why);
+    }
+    return 0;
+}
+
+// The top-left that centres an ow x oh window in work; a window larger than the work area keeps its corner at the
+// work area's corner, so its title bar stays reachable.
+static void center_in(const RECT *work, int ow, int oh, int *x, int *y) {
+    int ww = work->right - work->left, wh = work->bottom - work->top;
+    *x = work->left + (ww > ow ? (ww - ow) / 2 : 0);
+    *y = work->top + (wh > oh ? (wh - oh) / 2 : 0);
+}
+
+// Before the window exists (widescreen.c wide_init at start), the monitor a fullscreen window opens on: the one
+// NX2NAVI_MONITOR picks (window_main places the window there), else the primary monitor.
 int gfx_window_monitor_size(int *w, int *h) {
     MONITORINFO mi = {sizeof mi};
-    HMONITOR mon = g_hwnd ? MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTOPRIMARY) : MonitorFromPoint((POINT){0, 0}, MONITOR_DEFAULTTOPRIMARY);
+    MonInfo chosen;
+    HMONITOR mon = g_hwnd                      ? MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTOPRIMARY)
+                   : chosen_monitor(&chosen, 0) ? chosen.h
+                                                : MonitorFromPoint((POINT){0, 0}, MONITOR_DEFAULTTOPRIMARY);
     if (!GetMonitorInfoW(mon, &mi)) return 0;
     *w = mi.rcMonitor.right - mi.rcMonitor.left;
     *h = mi.rcMonitor.bottom - mi.rcMonitor.top;
@@ -230,18 +496,6 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
             input_cursor_suspend(0);
         }
         return 0;
-    case WM_SYSCOMMAND:
-        if ((w & 0xfff0) == SC_MINIMIZE || (w & 0xfff0) == SC_MAXIMIZE || (w & 0xfff0) == SC_RESTORE)
-            vk_dlssg_suspend(1);
-        break;
-    case WM_WINDOWPOSCHANGING: {
-        const WINDOWPOS *pos = (const WINDOWPOS *)l;
-        RECT old;
-        if (!(pos->flags & SWP_NOSIZE) && GetWindowRect(h, &old) &&
-            (pos->cx != old.right - old.left || pos->cy != old.bottom - old.top))
-            vk_dlssg_suspend(1);
-        break;
-    }
     case WM_SIZE:
         keep_awake(w != SIZE_MINIMIZED);
         if (w != SIZE_MINIMIZED) gfx_window_mark_dirty();
@@ -250,8 +504,15 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_EXITSIZEMOVE:   // dragged onto another monitor
         refresh_rate_update(h, 0);
         break;
-    case WM_DISPLAYCHANGE:
+    case WM_DISPLAYCHANGE:   // a resolution, layout or HDR change of the desktop
         refresh_rate_update(h, 1);
+        if (is_fullscreen(h) && !IsIconic(h)) {   // keep covering the monitor at its new size (a same size sends no WM_SIZE)
+            MONITORINFO mi = {sizeof mi};
+            if (GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mi))
+                SetWindowPos(h, NULL, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
+                             mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        gfx_window_mark_dirty();   // the swapchain is made again: its size, and its colour space after an HDR switch
         break;
     case WM_GETDPISCALEDSIZE:   // a framed window keeps its client size in pixels on a monitor at another scale
         if (!is_fullscreen(h) && !IsZoomed(h)) {
@@ -288,6 +549,12 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         return 0;
     }
+    case WM_ENDSESSION:
+        // Windows is shutting down, restarting or logging off: it ends the process after this message without a
+        // WM_CLOSE, so the close path runs here (the settings menu's pending save, RTSS's profile, a save Commit in
+        // flight); gfx_window_closed does not return
+        if (w) gfx_window_closed();
+        return 0;
     case WM_CLOSE:
         gfx_window_closed();
     case WM_ERASEBKGND:
@@ -384,17 +651,29 @@ static void window_main(void *arg) {
                                             GetSystemMetrics(SM_CYSMICON), LR_SHARED),
                       .hCursor = pointer_cursor(), .lpszClassName = L"NX2naviRecompWindow"};
     RegisterClassExW(&wc);
-    int cw, ch, ow, oh;
+    int cw, ch, ow, oh, x = CW_USEDEFAULT, y = CW_USEDEFAULT;
     cfg_window_size(&cw, &ch);
+    // NX2NAVI_MONITOR: the window is created centred in the chosen monitor's work area, with its frame measured at that
+    // monitor's DPI, so it opens there at the scale it will have. Without a choice the system places it. Either way
+    // the size is scaled down first if it does not fit the work area it opens in.
+    MonInfo mon;
+    int on_mon = chosen_monitor(&mon, 1);
+    fit_work_area(&cw, &ch, on_mon ? &mon.work : NULL, on_mon && mon.dpi ? mon.dpi : GetDpiForSystem());
     outer_size(NULL, cw, ch, &ow, &oh);
+    if (on_mon) {
+        outer_size_at(cw, ch, mon.dpi ? mon.dpi : GetDpiForSystem(), &ow, &oh);
+        center_in(&mon.work, ow, oh, &x, &y);
+    }
     // The window opens behind the user's windows first and is then raised (raise_window): a game started by a frontend
     // has no other way to reach it. The game counts itself in focus until the first WM_ACTIVATEAPP, so loading goes on,
     // and keyboard input waits for the foreground (input_win.c). If Windows still refuses the foreground, the taskbar
-    // button flashes, and NX2NAVI_FULLSCREEN waits for the first activation.
+    // button flashes. With NX2NAVI_FULLSCREEN the window is made fullscreen on the monitor it was created on before it
+    // is first shown (fullscreen_before_show), so no framed window appears; the windowed rectangle stays in g_saved_place
+    // for F11. If that fails, g_fs_pending retries at the first activation (wnd_proc, WM_ACTIVATEAPP).
     // NX2NAVI_BACKGROUND_WINDOW=1 (test runs): no flashing, never fullscreen at start, and F11 keeps the window's place.
     int background = g_background = cfg_get("NX2NAVI_BACKGROUND_WINDOW") && atoi(cfg_get("NX2NAVI_BACKGROUND_WINDOW"));
-    g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"NX2navi", WND_STYLE, CW_USEDEFAULT, CW_USEDEFAULT, ow, oh, NULL,
-                             NULL, inst, NULL);
+    g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"NX2navi", WND_STYLE, x, y, ow, oh, NULL, NULL,
+                             inst, NULL);
     if (!g_hwnd) {
         rt_log("gfx: CreateWindowEx failed (%lu)", GetLastError());
         g_wnd_failed = 1;
@@ -404,15 +683,29 @@ static void window_main(void *arg) {
         // Detaching the game's window leaves the software keyboard alone: its edit box sits in a window of its own
         // (swkbd_win.c) and gets the IME it needs.
         ImmAssociateContext(g_hwnd, NULL);
-        // The frame was measured at the system DPI; the window may have opened on a monitor at another scale.
+        // The frame was measured at the system DPI (or the chosen monitor's); the window may have opened on a monitor at
+        // another scale. When the size changes on a chosen monitor, the window is centred again in its work area;
+        // otherwise it keeps the place it was created at.
+        int nw, nh, nx = 0, ny = 0;
+        UINT flags = SWP_NOACTIVATE | SWP_SHOWWINDOW;
         plat_xchg32(&g_dpi, (int32_t)GetDpiForWindow(g_hwnd));
-        outer_size(g_hwnd, cw, ch, &ow, &oh);
-        SetWindowPos(g_hwnd, HWND_BOTTOM, 0, 0, ow, oh, SWP_NOMOVE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        outer_size(g_hwnd, cw, ch, &nw, &nh);
+        if (on_mon && (nw != ow || nh != oh)) center_in(&mon.work, nw, nh, &nx, &ny);
+        else flags |= SWP_NOMOVE;
+        // the fullscreen setting: the window turns fullscreen on the monitor it is on before it is shown, and keeps
+        // that place and size (fullscreen_before_show); the windowed size stays for F11
+        int fs = !background && cfg_fullscreen() && fullscreen_before_show(g_hwnd, nw, nh);
+        SetWindowPos(g_hwnd, HWND_BOTTOM, nx, ny, nw, nh, flags | (fs ? SWP_NOSIZE | SWP_NOMOVE : 0));
+        if (on_mon && MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST) != mon.h)
+            rt_log("gfx: the window is not on the chosen monitor; F11 fullscreen covers the monitor it is on");
         if (!background) {
+            // Pending before the raise: the activation it gets is the first WM_ACTIVATEAPP, which takes the fullscreen
+            // setting; set after it, fullscreen waited for the next activation and the game started in a window. Only
+            // a window that did not become fullscreen before it was shown still needs that retry.
+            g_fs_pending = cfg_fullscreen() && !fs;
             raise_window(g_hwnd);   // a frontend's player may have no way to reach a window left behind
             FLASHWINFO fw = {.cbSize = sizeof fw, .hwnd = g_hwnd, .dwFlags = FLASHW_TRAY | FLASHW_TIMERNOFG};
             FlashWindowEx(&fw);
-            g_fs_pending = cfg_fullscreen();
         }
         note_applied();
         refresh_rate_update(g_hwnd, 1);

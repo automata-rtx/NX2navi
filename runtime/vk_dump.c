@@ -24,6 +24,8 @@
 // before the submission (vk_exec_draw.c upd_note).
 // NX2NAVI_DUMP_SKIP_RUNS=1: a render pass with the same targets as the render pass before it is logged but not copied
 // (the terrain decals draw one pass each into the G-buffer and would use up both caps).
+// NX2NAVI_DUMP_SHADERS=<hash>,...: copy images only for passes using those shader hashes; metadata covers the whole frame.
+// NX2NAVI_DUMP_RAW=1: also save each copied image's native texel bytes as .bin, for numerical analysis.
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -37,14 +39,16 @@
 
 #include "vk_exec.h"
 #include "flight.h"
+#include "input.h"
 uint64_t vk_exec_cs_storage_addr(const VkExec *ex, const GfxShaderRes *r);   // vk_exec_draw.c
+uint64_t vk_exec_storage_addr(const VkExec *ex, int st, const GfxShaderRes *r);   // vk_exec_draw.c
 int vk_exec_raw_9e5(VkImage img, VkFormat f);                               // vk_exec_draw.c
 #include "platform/platform.h"
 
 #define MAX_PASSES 400
 #define PNG_CAP (2ull << 30)
 #define INFLIGHT_CAP (3ull << 30)   // host buffers waiting for their submission
-#define MAX_ENTS 48                 // distinct pipeline + texture sets listed per pass
+#define MAX_ENTS 1024               // distinct pipeline + texture sets listed per pass
 #define MAX_LUTS 256                // 3D textures and small sampled 8-bit 2D textures dumped per frame
 #define TEX2D_CAP (1u << 20)        // texels of a sampled 2D texture that is dumped
 
@@ -58,6 +62,8 @@ static uint64_t dump_after;             // NX2NAVI_DUMP_AFTER
 static FILE *passes_f, *images_f;
 static int seq, finished, copied;      // copied: passes and dispatches of the dump frame whose images were copied
 static int skip_runs, dump_ubo;        // NX2NAVI_DUMP_SKIP_RUNS, NX2NAVI_DUMP_UBO (vec4 per block, 0 for none)
+static int dump_raw, ncopy_shaders;
+static uint64_t copy_shaders[16];
 static uint32_t want_tex[16][2];       // NX2NAVI_DUMP_TEX: slot id and 0, or width and height
 static int nwant_tex;
 static uint64_t last_targets;          // targets_sig of the last render pass; 0 after a dispatch
@@ -286,10 +292,10 @@ static void job_done(void *arg) {
     VmaAllocator vma = vk_ctx()->vma;
     vmaInvalidateAllocation(vma, j->alloc, 0, VK_WHOLE_SIZE);
     write_images(j);
-    // A BC texture's raw blocks also go to <name>.bin, packed rows of blocks, so a script can decode them: the PNG
-    // shows the block words through the integer mapping, which loses their bits.
+    // Raw captures retain the exact texel bytes. BC blocks always get a .bin because the PNG's integer mapping
+    // loses their bits; other formats get one when DUMP_RAW is enabled.
     size_t nl = strlen(j->name);
-    if (nl > 7 && !strcmp(j->name + nl - 7, "_blocks")) {
+    if (dump_raw || (nl > 7 && !strcmp(j->name + nl - 7, "_blocks"))) {
         char path[600];
         snprintf(path, sizeof path, "%s/%s.bin", dir, j->name);
         FILE *f = fopen(path, "wb");
@@ -462,9 +468,9 @@ static void buf_snap(VkExec *ex, int pass) {
     vk_completion_add(ex->fence, buf_done, j);
 }
 
-static int active(void) {
+static int active(void) {   // passes_f is NULL before a dump that opens its files when it starts (open_files)
     uint64_t f = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1;
-    return !finished && (f == dump_frame || (log_from && f >= log_from && f < dump_frame));
+    return !finished && passes_f && (f == dump_frame || (log_from && f >= log_from && f < dump_frame));
 }
 static uint64_t frame_now(void) { return __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1; }
 
@@ -512,7 +518,7 @@ static uint64_t shader_hash(const GfxShader *s) {
 typedef struct { VkPipeline p; uint64_t th; int draws; char *text; } Ent;
 static Ent ents[MAX_ENTS];
 static int nents, ents_over, pass_draws;
-typedef struct { VkImage image; VkFormat format; uint32_t w, h, d; int id, is2d; } Lut;
+typedef struct { VkImage image; VkFormat format; uint32_t w, h, d; int id, is2d; uint32_t layer, layers; } Lut;
 static Lut luts[MAX_LUTS];          // queued for the next pass end or dispatch
 static int nluts;
 static VkImage luts_done[MAX_LUTS];
@@ -522,10 +528,13 @@ static void queue_lut(const VkTexImage *t, int id) {
     if (frame_now() != dump_frame) return;
     for (int i = 0; i < nluts_done; i++)
         if (luts_done[i] == t->image) return;
-    if (nluts_done == MAX_LUTS) return;
-    luts_done[nluts_done++] = t->image;
-    luts[nluts++] = (Lut){t->image, t->format, t->width, t->height, t->type == VK_IMAGE_TYPE_3D ? t->depth : 1, id,
-                          t->type != VK_IMAGE_TYPE_3D};
+    for (int i = 0; i < nluts; i++)
+        if (luts[i].image == t->image) return;
+    if (nluts_done == MAX_LUTS || nluts == MAX_LUTS) return;
+    uint32_t nl = t->type != VK_IMAGE_TYPE_3D && t->layers > 1 ? t->layers : 1;
+    for (uint32_t k = 0; k < nl && nluts < MAX_LUTS; k++)
+        luts[nluts++] = (Lut){t->image, t->format, t->width, t->height, t->type == VK_IMAGE_TYPE_3D ? t->depth : 1, id,
+                              t->type != VK_IMAGE_TYPE_3D, k, nl};
 }
 
 // The uncompressed format of a BC format's block size, UNDEFINED for other formats: a BC texture is dumped as its raw
@@ -542,23 +551,32 @@ static void flush_luts(VkExec *ex, int n) {
     char fn[16];
     for (int i = 0; i < nluts; i++) {
         const Lut *l = &luts[i];
-        char name[160];
+        char name[160], lay[16] = "";
         VkFormat bf = block_format(l->format);
-        snprintf(name, sizeof name, "pass_%04d_%s%d_%ux%ux%u_%d_%s%s", n, l->is2d ? "tex" : "lut", l->id, l->w, l->h, l->d,
-                 (int)l->format, fmt_name(l->format, fn), bf ? "_blocks" : "");
+        if (l->layers > 1) snprintf(lay, sizeof lay, "L%u", l->layer);
+        snprintf(name, sizeof name, "pass_%04d_%s%d%s_%ux%ux%u_%d_%s%s", n, l->is2d ? "tex" : "lut", l->id, lay, l->w, l->h,
+                 l->d, (int)l->format, fmt_name(l->format, fn), bf ? "_blocks" : "");
         // a sampled depth texture copies its depth aspect (the colour aspect of a depth image read as zeros)
         VkImageAspectFlags asp = l->format >= VK_FORMAT_D16_UNORM && l->format <= VK_FORMAT_D32_SFLOAT_S8_UINT
                                      ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
-        const char *why = bf ? copy_region(ex, l->image, bf, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 0,
+        const char *why = bf ? copy_region(ex, l->image, bf, VK_IMAGE_ASPECT_COLOR_BIT, 0, l->layer, 0,
                                            (VkExtent3D){l->w, l->h, l->d}, (l->w + 3) / 4, (l->h + 3) / 4, l->d, name)
-                             : copy_out(ex, l->image, l->format, asp, 0, 0, l->w, l->h, l->d, name);
+                             : copy_out(ex, l->image, l->format, asp, 0, l->layer, l->w, l->h, l->d, name);
         fprintf(passes_f, "  %s tex %d -> %s.png%s%s\n", l->is2d ? "2D" : "3D", l->id, name, why ? " skipped: " : "",
                 why ? why : "");
+        if (!why && nluts_done < MAX_LUTS) {
+            int known = 0;
+            for (int k = 0; k < nluts_done; k++) known |= luts_done[k] == l->image;
+            if (!known) luts_done[nluts_done++] = l->image;
+        }
     }
     nluts = 0;
 }
 
-static int nvn_stage(int gfx_stage) { return gfx_stage == GFX_STAGE_VS ? 0 : gfx_stage == GFX_STAGE_FS ? 1 : 5; }
+static int nvn_stage(int gfx_stage) {   // the NVN stage numbers VkExec's slot arrays use: 6 task, 7 mesh
+    return gfx_stage == GFX_STAGE_VS ? 0 : gfx_stage == GFX_STAGE_FS ? 1 : gfx_stage == GFX_STAGE_TS ? 6
+         : gfx_stage == GFX_STAGE_MS ? 7 : 5;
+}
 
 static const char *decl_type(uint16_t t, char tmp[24]) {
     static const char *base[] = {"?", "1D", "buffer", "2D", "3D", "cube"};
@@ -580,7 +598,7 @@ static uint64_t handle_of(const VkExec *ex, int st, int slot, int img) {
 
 // The textures, images and samplers of info's bindings; 3D textures are queued for a copy.
 static void describe_bindings(Str *b, const VkExec *ex, const VkPipeInfo *info) {
-    static const char *stn[6] = {"vs", "fs", "?", "?", "?", "cs"};
+    static const char *stn[8] = {"vs", "fs", "?", "?", "?", "cs", "ts", "ms"};
     for (uint32_t i = 0; i < info->n_bindings; i++) {
         const VkPipeBinding *bd = &info->bindings[i];
         const GfxShaderRes *r = bd->res;
@@ -593,8 +611,8 @@ static void describe_bindings(Str *b, const VkExec *ex, const VkPipeInfo *info) 
                 memcpy(&pa, ex->cs_push + r->handle * 4 - 0x10, 8), memcpy(&ps, ex->cs_push + r->handle * 4 - 0x10 + 8, 4);
                 sp(b, " (push pointer %#llx+%#x)", (unsigned long long)pa, ps);
             }
-            if (st == 5) {   // the address and how far its backing span reaches (what a size-0 binding covers)
-                uint64_t ca = vk_exec_cs_storage_addr(ex, r);
+            if (st == 5 || st == 6 || st == 7) {   // the address and how far its backing span reaches (what a size-0 binding covers)
+                uint64_t ca = vk_exec_storage_addr(ex, st, r);
                 VkMemSpan ms;
                 sp(b, " -> %#llx", (unsigned long long)ca);
                 if (ca && vk_mem_resolve(ca, 1, &ms)) sp(b, " (span %#llx)", (unsigned long long)ms.avail);
@@ -727,11 +745,111 @@ static uint64_t bindings_hash(const VkExec *ex, const VkPipeInfo *info) {
     return h;
 }
 
-void vk_dump_draw(VkExec *ex, const VkPipeState *s, VkPipeline p, const VkPipeInfo *info) {
+// ---- mesh primitive counts: with VkCtx.has_mesh_queries, each mesh draw of the dumped frame runs inside a
+// VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT query, and mesh_prims.txt (written by vk_dump_present) lists what each
+// draw's mesh shader emitted, with its pass, program and depth state.
+// A pipeline statistics query runs alongside: task and mesh shader invocations, primitives the clipper got and gave
+// out, and fragment shader invocations (a triangle with a NaN or degenerate vertex is emitted but never clipped).
+enum { MQ_MAX = 1024, MQ_STATS = 5 };
+static const VkQueryPipelineStatisticFlags mq_stat_bits =
+    VK_QUERY_PIPELINE_STATISTIC_TASK_SHADER_INVOCATIONS_BIT_EXT | VK_QUERY_PIPELINE_STATISTIC_MESH_SHADER_INVOCATIONS_BIT_EXT |
+    VK_QUERY_PIPELINE_STATISTIC_CLIPPING_INVOCATIONS_BIT | VK_QUERY_PIPELINE_STATISTIC_CLIPPING_PRIMITIVES_BIT |
+    VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT;
+typedef struct { int pass; unsigned long long prog, ts, ms; unsigned dt, dw, df; } MqDraw;
+static VkQueryPool mq_pool, mq_stats;
+static int mq_failed;
+static uint32_t mq_n;                  // queries begun in the dumped frame
+static MqDraw mq_draw[MQ_MAX], mq_next;   // mq_next: the mesh draw vk_dump_draw saw last
+
+int vk_dump_mesh_begin(VkExec *ex) {
+    VkCtx *c = vk_ctx();
+    if (!c->has_mesh_queries) return -1;
+    int q = -1;
+    plat_mutex_lock(&rec_lock);
+    if (!active() || frame_now() != dump_frame || mq_n >= MQ_MAX || mq_failed) goto out;
+    if (!mq_pool) {
+        VkQueryPoolCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                                    .queryType = VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT, .queryCount = MQ_MAX};
+        if (vkCreateQueryPool(c->device, &ci, NULL, &mq_pool) != VK_SUCCESS) {
+            mq_pool = VK_NULL_HANDLE, mq_failed = 1;
+            rt_log("vk_dump: the mesh primitive query pool could not be created");
+            goto out;
+        }
+        VkQueryPoolCreateInfo si = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                                    .queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS, .queryCount = MQ_MAX,
+                                    .pipelineStatistics = mq_stat_bits};
+        if (vkCreateQueryPool(c->device, &si, NULL, &mq_stats) != VK_SUCCESS) mq_stats = VK_NULL_HANDLE;
+    }
+    if (!mq_n) {   // the last dump's queries finished at its present
+        vkResetQueryPool(c->device, mq_pool, 0, MQ_MAX);
+        if (mq_stats) vkResetQueryPool(c->device, mq_stats, 0, MQ_MAX);
+    }
+    q = (int)mq_n++;
+    mq_draw[q] = mq_next;
+    mq_draw[q].pass = seq;   // the number this pass gets when it ends
+    vkCmdBeginQuery(ex->cb, mq_pool, (uint32_t)q, 0);
+    if (mq_stats) vkCmdBeginQuery(ex->cb, mq_stats, (uint32_t)q, 0);
+    ex->recorded += 2;
+out:
+    plat_mutex_unlock(&rec_lock);
+    return q;
+}
+
+void vk_dump_mesh_end(VkExec *ex, int q) {
+    if (q < 0) return;
+    if (mq_stats) vkCmdEndQuery(ex->cb, mq_stats, (uint32_t)q);
+    vkCmdEndQuery(ex->cb, mq_pool, (uint32_t)q);
+    ex->recorded += 2;
+}
+
+static void mq_write(void) {   // after vk_sync_finish: every query of the frame was submitted and ran
+    if (!mq_n || !mq_pool) return;
+    uint64_t *r = calloc(2ull * mq_n, sizeof *r), *st = calloc((MQ_STATS + 1ull) * mq_n, sizeof *st);
+    char path[600];
+    snprintf(path, sizeof path, "%s/mesh_prims.txt", dir);
+    FILE *f = r && st ? fopen(path, "w") : NULL;
+    if (f) {
+        VkResult vr = vkGetQueryPoolResults(vk_ctx()->device, mq_pool, 0, mq_n, 16ull * mq_n, r, 16,
+                                            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+        VkResult vs = mq_stats ? vkGetQueryPoolResults(vk_ctx()->device, mq_stats, 0, mq_n, 8ull * (MQ_STATS + 1) * mq_n, st,
+                                                       8ull * (MQ_STATS + 1),
+                                                       VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT)
+                               : VK_ERROR_UNKNOWN;
+        fprintf(f, "# per mesh draw: primitives its mesh shader emitted (mesh primitives generated query; result %d), then "
+                   "pipeline statistics (result %d): task and mesh shader invocations, clipper input and output "
+                   "primitives, fragment shader invocations\n", (int)vr, (int)vs);
+        for (uint32_t i = 0; i < mq_n; i++) {
+            const MqDraw *d = &mq_draw[i];
+            const uint64_t *s = st + (MQ_STATS + 1ull) * i;
+            fprintf(f, "pass %04d prog %llu ts %016llx ms %016llx depth test %u write %u func %u: ", d->pass, d->prog, d->ts,
+                    d->ms, d->dt, d->dw, d->df);
+            if (r[2 * i + 1]) fprintf(f, "%llu primitives", (unsigned long long)r[2 * i]);
+            else fprintf(f, "primitives not available");
+            // the counters come in the order of their flag bits: clipping invocations 0x20, clipping primitives 0x40,
+            // fragment invocations 0x80, task invocations 0x800, mesh invocations 0x1000
+            if (mq_stats && s[MQ_STATS])
+                fprintf(f, "; task %llu mesh %llu clip in %llu clip out %llu fragments %llu", (unsigned long long)s[3],
+                        (unsigned long long)s[4], (unsigned long long)s[0], (unsigned long long)s[1], (unsigned long long)s[2]);
+            else fprintf(f, "; statistics not available");
+            fprintf(f, "\n");
+        }
+        fclose(f);
+    }
+    free(r), free(st);
+    mq_n = 0;
+}
+
+void vk_dump_draw(VkExec *ex, const VkPipeState *s, VkPipeline p, const VkPipeInfo *info, int mesh) {
     plat_mutex_lock(&rec_lock);
     if (!active()) goto out;
+    if (mesh)
+        mq_next = (MqDraw){0, ex->prog ? ex->prog->serial : 0, shader_hash(s->ts), shader_hash(s->vs), (unsigned)s->ds.dt,
+                           (unsigned)s->ds.dw, (unsigned)s->ds.df};
     pass_draws++;
     uint64_t th = bindings_hash(ex, info);
+    if (mesh)   // a mesh draw's per-draw parameters often live in its uniform blocks: draws that differ there are told apart
+        for (int st = 0; st < 8; st++)   // every NVN stage: 6 is task, 7 mesh
+            for (int k = 0; k < 18; k++) th = (th ^ ex->ubo[st][k].addr ^ ex->ubo[st][k].size << 48) * 0x100000001b3ull;
     for (int i = 0; i < nents; i++)
         if (ents[i].p == p && ents[i].th == th) {
             ents[i].draws++;
@@ -742,8 +860,23 @@ void vk_dump_draw(VkExec *ex, const VkPipeState *s, VkPipeline p, const VkPipeIn
         goto out;
     }
     Str b = {0};
-    sp(&b, "vs %016llx fs %016llx prog %llu prim %d\n", (unsigned long long)shader_hash(s->vs),
-       (unsigned long long)shader_hash(s->fs), (unsigned long long)(ex->prog ? ex->prog->serial : 0), s->prim);
+    if (mesh)   // depth: test, write and the NVN function (VkCompareOp + 1: LESS 2, EQUAL 3, LEQUAL 4, GREATER 5, GEQUAL 7)
+        sp(&b, "mesh: ts %016llx ms %016llx fs %016llx prog %llu depth test %u write %u func %u cull %u front %s\n",
+           (unsigned long long)shader_hash(s->ts), (unsigned long long)shader_hash(s->vs),
+           (unsigned long long)shader_hash(s->fs), (unsigned long long)(ex->prog ? ex->prog->serial : 0),
+           (unsigned)s->ds.dt, (unsigned)s->ds.dw, (unsigned)s->ds.df, (unsigned)s->poly.cull,
+           s->poly.front == NVN_FRONT_FACE_CW ? "CW" : "CCW");
+    else
+        sp(&b, "vs %016llx fs %016llx prog %llu prim %d\n", (unsigned long long)shader_hash(s->vs),
+           (unsigned long long)shader_hash(s->fs), (unsigned long long)(ex->prog ? ex->prog->serial : 0), s->prim);
+    // target 0's blending as NVN numbers (NVNblendFunc, NVNblendEquation), which decides whether a quad covers or mixes
+    const blend_st *bl = &s->blend[0];
+    sp(&b, "    blend: enabled targets %#x; target 0 rgb %u*src %u*dst eq %u, alpha %u*src %u*dst eq %u; channel mask %#x\n",
+       (unsigned)s->color.blend_en, (unsigned)bl->src_rgb, (unsigned)bl->dst_rgb, (unsigned)bl->eq_rgb,
+       (unsigned)bl->src_a, (unsigned)bl->dst_a, (unsigned)bl->eq_a, (unsigned)s->chmask.mask);
+    sp(&b, "    depth: test %u write %u func %u; alpha func %u; cull %u; a2c %u; samples %u; mesh task %d\n", (unsigned)s->ds.dt,
+       (unsigned)s->ds.dw, (unsigned)s->ds.df, (unsigned)s->color.alpha_func, (unsigned)s->poly.cull, (unsigned)s->ms.a2c,
+       (unsigned)s->samples, s->ts != NULL);
     describe_bindings(&b, ex, info);
     ents[nents++] = (Ent){p, th, 1, b.s};
 out:
@@ -786,15 +919,39 @@ static uint64_t targets_sig(const VkExec *ex) {
 }
 
 // Sets pass_skip for the pass or dispatch being logged and counts it when it copies.
-static void pass_decide(int same_targets) {
+static int render_copy_selected(void) {
+    if (!ncopy_shaders) return 1;
+    for (int k = 0; k < ncopy_shaders; k++) {
+        char vertex[24], fragment[24];
+        snprintf(vertex, sizeof vertex, "vs %016llx", (unsigned long long)copy_shaders[k]);
+        snprintf(fragment, sizeof fragment, "fs %016llx", (unsigned long long)copy_shaders[k]);
+        for (int i = 0; i < nents; i++)
+            if (strstr(ents[i].text, vertex) || strstr(ents[i].text, fragment)) return 1;
+    }
+    return 0;
+}
+
+static int compute_copy_selected(const GfxShader *cs) {
+    if (!ncopy_shaders) return 1;
+    uint64_t h = shader_hash(cs);
+    for (int k = 0; k < ncopy_shaders; k++)
+        if (copy_shaders[k] == h) return 1;
+    return 0;
+}
+
+static void pass_decide(int same_targets, int selected) {
     if (frame_now() != dump_frame) copied = 0;
-    pass_skip = copied >= MAX_PASSES ? "pass cap" : same_targets ? "same targets as the previous pass" : NULL;
+    pass_skip = !selected ? "shader not selected" : copied >= MAX_PASSES ? "pass cap" :
+                    same_targets ? "same targets as the previous pass" : NULL;
     if (!pass_skip) copied++;
 }
+
+static void open_files(void);
 
 void vk_dump_pass_end(VkExec *ex) {
     plat_mutex_lock(&rec_lock);
     if (dump_after && dump_frame == UINT64_MAX && ex->depth.tex && (uint64_t)(uintptr_t)ex->depth.tex->mem == dump_after) {
+        if (!passes_f) open_files();   // NX2NAVI_DUMP_WHITE and NX2NAVI_DUMP_MOVIE open them for each of their dumps
         dump_frame = frame_now();   // this pass and the rest of its frame
         rt_log("vk_dump: a pass drew into %#llx in frame %llu: it and the rest of the frame go to %s",
                (unsigned long long)dump_after, (unsigned long long)dump_frame, dir);
@@ -802,7 +959,7 @@ void vk_dump_pass_end(VkExec *ex) {
     if (!active()) goto out;
     int n = seq++;
     uint64_t sig = targets_sig(ex);
-    pass_decide(skip_runs && sig == last_targets);
+    pass_decide(skip_runs && sig == last_targets, render_copy_selected());
     last_targets = sig;
     fprintf(passes_f, "pass %04d: render pass, draws %d, area %ux%u layers %u, fence %llu, frame %llu\n", n, pass_draws,
             ex->pass_w, ex->pass_h, ex->pass_layers, (unsigned long long)ex->fence, (unsigned long long)frame_now());
@@ -832,7 +989,7 @@ void vk_dump_dispatch(VkExec *ex, const GfxShader *cs, VkPipeline p, const VkPip
     plat_mutex_lock(&rec_lock);
     if (!active()) goto out;
     int n = seq++;
-    pass_decide(0);
+    pass_decide(0, compute_copy_selected(cs));
     last_targets = 0;
     Str b = {0};
     describe_bindings(&b, ex, info);
@@ -943,6 +1100,29 @@ static void make_dirs(char *path) { plat_file_mkdir_p(path); }
 int vk_dump_white;   // vk_backend.c asks for a thumbnail of every present while it is set
 #define dump_white vk_dump_white
 
+// NX2NAVI_DUMP_MOVIE=<k>:<frame>[,<frame>...] (diagnosis): the k-th movie of the run (counted from 1 as each video
+// decoder comes up, ov_movie2.c ov_initialize) asks for a dump of the next present once it has shown each listed
+// frame, so a movie's picture can be followed through the game's passes at chosen moments. Each dump has its own
+// folder, base_dir/f<present>.
+static int movie_k, movie_n, movie_done;
+static int key_mode;   // NX2NAVI_DUMP=key (vk_dump_init)
+static uint64_t movie_at[8];
+static int movie_req;   // set by the movie's thread, taken by vk_dump_present
+
+void vk_dump_movie_frame(int k, uint64_t shown) {
+    if (!movie_k || k != movie_k || movie_done >= movie_n || shown != movie_at[movie_done]) return;
+    movie_done++;
+    __atomic_store_n(&movie_req, 1, __ATOMIC_RELEASE);
+    rt_log("vk_dump: movie %d shows frame %llu: dumping the next present", k, (unsigned long long)shown);
+}
+
+// NX2NAVI_DUMP_FILE=<path> (diagnosis): every 8th present looks for that file (a relative path starts in the game
+// folder); when it is there, the present deletes it and asks for a dump of the next present, so a shell or a test
+// script takes dumps at the moments it chooses, as many as it likes. A number in the file (up to 8) dumps that many
+// consecutive frames, for what a frame hands to the next. Each dump has its own folder, base_dir/f<present>.
+static char dump_file[400];
+static int file_more;   // consecutive frames still to dump after the one named
+
 // passes.txt and images.txt in dir (a new folder per NX2NAVI_DUMP_WHITE attempt)
 static void open_files(void) {
     make_dirs(dir);
@@ -952,6 +1132,11 @@ static void open_files(void) {
     snprintf(path, sizeof path, "%s/images.txt", dir);
     images_f = fopen(path, "w");
     if (!passes_f || !images_f) rt_fatal("vk_dump: cannot write to %s", dir);
+    // NX2NAVI_DUMP_BUF with dumps named as the run goes (key, white, movie): the log goes with each dump's folder
+    if (bd_size && !bufs_f) {
+        snprintf(path, sizeof path, "%s/bufs.txt", dir);
+        bufs_f = fopen(path, "w");
+    }
 }
 
 void vk_dump_init(void) {
@@ -961,9 +1146,24 @@ void vk_dump_init(void) {
     // (a target drawn once, at an area load)
     const char *da = cfg_get("NX2NAVI_DUMP_AFTER");
     dump_after = da && *da ? strtoull(da, NULL, 0) : 0;
+    const char *dm = cfg_get("NX2NAVI_DUMP_MOVIE");
+    if (dm && *dm) {
+        char *q;
+        movie_k = (int)strtol(dm, &q, 10);
+        while ((*q == ':' || *q == ',') && movie_n < 8) movie_at[movie_n++] = strtoull(q + 1, &q, 10);
+        if (movie_k < 1 || !movie_n) movie_k = 0;
+    }
+    // NX2NAVI_DUMP=key: no frame is named; each press of Insert (input_dump_key: unbound in the game's layout, and read on
+    // Windows even while another window has the focus) dumps the frame after it into NX2NAVI_DUMP_DIR/f<frame>, as often
+    // as it is pressed: for a glitch that comes and goes, caught by the player while it is on screen.
+    key_mode = e && !strcmp(e, "key");
+    const char *df = cfg_get("NX2NAVI_DUMP_FILE");
+    if (df && *df) snprintf(dump_file, sizeof dump_file, "%s", df);
     if (dump_white || dump_after) {
         dump_frame = UINT64_MAX;
         vk_thumbs_enable(16);
+    } else if (movie_k || key_mode || dump_file[0]) {
+        dump_frame = UINT64_MAX;
     } else if (!e || !*e || !(dump_frame = strtoull(e, NULL, 10))) return;
     const char *lf = cfg_get("NX2NAVI_DUMP_LOG");
     if (lf && *lf) log_from = strtoull(lf, NULL, 10);
@@ -974,6 +1174,16 @@ void vk_dump_init(void) {
     if (dump_ubo == 1) dump_ubo = 16;
     if (dump_ubo > 4096) dump_ubo = 4096;
     if (dump_ubo < 0) dump_ubo = 0;
+    const char *raw = cfg_get("NX2NAVI_DUMP_RAW");
+    dump_raw = raw && *raw && *raw != '0';
+    const char *shaders = cfg_get("NX2NAVI_DUMP_SHADERS");
+    for (const char *p = shaders; p && *p && ncopy_shaders < 16;) {
+        char *end;
+        uint64_t h = strtoull(p, &end, 16);
+        if (end == p) break;
+        copy_shaders[ncopy_shaders++] = h;
+        p = *end ? end + 1 : end;
+    }
     const char *wt = cfg_get("NX2NAVI_DUMP_TEX");
     for (char *q = (char *)wt; q && *q && nwant_tex < 16; q += *q == ',') {
         uint32_t *w = want_tex[nwant_tex++];
@@ -984,7 +1194,7 @@ void vk_dump_init(void) {
     snprintf(base_dir, sizeof base_dir, "%s", d && *d ? d : "dump");
     snprintf(dir, sizeof dir, "%s", base_dir);
     char path[600];
-    if (!dump_white) open_files();
+    if (!dump_white && !movie_k && !key_mode && !dump_file[0]) open_files();
     const char *bf = cfg_get("NX2NAVI_DUMP_BUF");
     if (bf && *bf) {
         char *q;
@@ -996,7 +1206,8 @@ void vk_dump_init(void) {
         if (*q == ':') bd_h = (uint32_t)strtoul(q + 1, &q, 0);
         if (!bd_w || !bd_h) bd_stride = 0;
         snprintf(path, sizeof path, "%s/bufs.txt", dir);
-        if (bd_size && !(bufs_f = fopen(path, "w"))) bd_size = 0;
+        // a dump named as the run goes opens it with its folder (open_files); a named frame's folder exists already
+        if (bd_size && !dump_white && !movie_k && !key_mode && !dump_file[0] && !(bufs_f = fopen(path, "w"))) bd_size = 0;
     }
     vk_dump_armed = 1;
     rt_log("vk_dump: frame %llu goes to %s", (unsigned long long)dump_frame, dir);
@@ -1039,11 +1250,41 @@ void vk_dump_present(uint64_t frame) {
         white_last = 0;
     }
     if (dump_white && !white_caught && !white_last && dump_frame == UINT64_MAX) white_check(frame);
+    if (movie_k && dump_frame == UINT64_MAX && __atomic_exchange_n(&movie_req, 0, __ATOMIC_ACQ_REL)) {
+        snprintf(dir, sizeof dir, "%s/f%llu", base_dir, (unsigned long long)(frame + 1));
+        open_files();   // before the frame is named: its passes write to them
+        dump_frame = frame + 1;
+        rt_log("vk_dump: frame %llu goes to %s", (unsigned long long)dump_frame, dir);
+    }
+    if (key_mode && dump_frame == UINT64_MAX) {   // NX2NAVI_DUMP=key: a new press of Insert names the next frame
+        static int held;
+        int now = input_dump_key();
+        if (now && !held) {
+            snprintf(dir, sizeof dir, "%s/f%llu", base_dir, (unsigned long long)(frame + 1));
+            open_files();   // before the frame is named: its passes write to them
+            dump_frame = frame + 1;
+            rt_log("vk_dump: Insert: frame %llu goes to %s", (unsigned long long)dump_frame, dir);
+        }
+        held = now;
+    }
+    if (dump_file[0] && dump_frame == UINT64_MAX && frame % 8 == 0 && plat_file_exists(dump_file)) {
+        uint64_t sz = 0;
+        uint8_t *txt = plat_file_read(dump_file, &sz);
+        int n = txt ? atoi((const char *)txt) : 0;
+        free(txt);
+        file_more = n > 8 ? 7 : n > 1 ? n - 1 : 0;
+        plat_file_delete(dump_file);
+        snprintf(dir, sizeof dir, "%s/f%llu", base_dir, (unsigned long long)(frame + 1));
+        open_files();   // before the frame is named: its passes write to them
+        dump_frame = frame + 1;
+        rt_log("vk_dump: %s found: frame %llu goes to %s", dump_file, (unsigned long long)dump_frame, dir);
+    }
     if (frame != dump_frame) return;
     plat_mutex_lock(&rec_lock);
     finished = 1;
     plat_mutex_unlock(&rec_lock);
     vk_sync_finish();   // the frame's copies are converted and written
+    mq_write();
     plat_mutex_lock(&img_lock);
     fclose(images_f);
     images_f = NULL;
@@ -1053,13 +1294,20 @@ void vk_dump_present(uint64_t frame) {
     passes_f = NULL;
     rt_log("vk_dump: frame %llu: %d passes and dispatches, about %llu MB of PNGs in %s", (unsigned long long)frame, seq,
            (unsigned long long)(png_bytes >> 20), dir);
-    if (dump_white) {   // ready for another attempt (vk_dump_present checks this one's thumbnail 3 presents on)
-        white_last = frame;
+    if (dump_white || movie_k || key_mode || dump_file[0]) {   // ready for another dump (vk_dump_present checks a white one's thumbnail 3 presents on)
+        if (dump_white) white_last = frame;
         plat_mutex_lock(&rec_lock);
         seq = copied = 0, last_targets = 0, pass_skip = NULL, png_bytes = 0;
         nluts = nluts_done = nents = ents_over = pass_draws = 0;
         dump_frame = UINT64_MAX;
         finished = 0;
         plat_mutex_unlock(&rec_lock);
+    }
+    if (file_more > 0) {   // NX2NAVI_DUMP_FILE with a count: the next frame too
+        file_more--;
+        snprintf(dir, sizeof dir, "%s/f%llu", base_dir, (unsigned long long)(frame + 1));
+        open_files();
+        dump_frame = frame + 1;
+        rt_log("vk_dump: frame %llu goes to %s", (unsigned long long)dump_frame, dir);
     }
 }

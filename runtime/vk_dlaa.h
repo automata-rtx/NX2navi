@@ -2,14 +2,25 @@
 #pragma once
 #include "vk.h"
 #include "vk_ffx.h"
-#include "dlssg/nx2_sl.h"
 
 // The narrowest scene the DLSS pass and the motion passes recognise by its D32F depth: Ultra Performance at a 1080p
 // output renders 640 wide, smaller windows less.
 #define DLAA_SCENE_MIN_W 320u
 
 int vk_dlaa_wanted(void);   // the setting is on (the device may still lack DLSS)
-int vk_dlaa_fsr3(void);
+// DLSS Frame Generation through NGX itself (vk_dlaa.c vk_ngxfg_*, gfx_present.c's presenter): NX2NAVI_FRAMEGEN = dlss
+// where Streamline does not run (every build but the Windows one, where these all answer 0).
+typedef struct { VkImage img; VkImageView view; VkFormat fmt; uint32_t w, h; } VkNgxImage;   // in GENERAL
+int vk_ngxfg_wanted(void);   // this run can generate frames through NGX (DLSS upscaling on at the start)
+int vk_ngxfg_max(void);      // generated frames per rendered one the GPU allows (1 = 2x, 5 = 6x), 0 when unavailable
+int vk_ngxfg_on(void);       // ... and NX2NAVI_FRAMEGEN = dlss now (the menu switches it live)
+void vk_ngxfg_reset(void);   // the next generation starts without history (a resize, the menu)
+// Records count generated frames into out[] and a copy of bb into real; returns how many were made (0: none, and real
+// is not written).
+int vk_ngxfg_evaluate(VkCommandBuffer cb, const VkNgxImage *bb, const VkNgxImage *hudless, const VkNgxImage *out, int count,
+                      const VkNgxImage *real);
+int vk_dlaa_fsr3(void);   // the setting is on and its upscaler is AMD FSR 3.1, which loads
+int vk_dlaa_needs_restart(void);   // the menu's upscaler cannot start in this run
 // Frame generation (vk_fg.cpp): the depth and motion vectors of the frame DLSS or FSR 3.1 last ran on, with its jitter
 // and whether its history reset; 1 once per evaluation (0: none since the last call). The images stay valid until the
 // next frame's scene draws over them, after this present.
@@ -19,9 +30,9 @@ int vk_dlaa_fg_inputs(VkFfxImage *depth, VkFfxImage *mv, float *jx, float *jy, i
 typedef struct {
     float view_to_clip[16], clip_to_view[16], clip_to_prev_clip[16], prev_clip_to_clip[16];
     float pos[3], up[3], right[3], fwd[3];
-    float fov_y, aspect, znear, zfar;
+    float fov_y, aspect;
 } VkDlaaCamera;
-int vk_dlaa_fg_views(VkImageView *depth, VkImageView *mv, VkImageUsageFlags usage[2]);
+int vk_dlaa_fg_views(VkImageView *depth, VkImageView *mv);
 // The picture without the HUD at the size of the game's picture, in *fmt: RGBA8 UNORM bytes like it (sRGB-encoded), or
 // RGBA16F linear with HDR on; made at each evaluation while vk_dlaa_hudless_wanted (frame generation sets it); 1 once per
 // evaluation.
@@ -33,28 +44,29 @@ int vk_dlaa_fg_camera(VkDlaaCamera *c);     // ... and its temporal upscaler is 
 void vk_dlaa_instance_exts(const char **ext, uint32_t *n, uint32_t max);
 void vk_dlaa_device_exts(const VkExtensionProperties *have, uint32_t nhave, const char **ext, uint32_t *n, uint32_t max);
 void vk_dlaa_init(void);
+// vk_device.c destroy_all, once the device is idle and before the allocator and the device go (Linux): releases the NGX
+// features and parameters, frees every image, buffer, pipeline and query pool DLAA made, resets its state for a later
+// device and shuts NGX down for this one. Safe when NGX never came up, when nothing was made, and more than once.
+// Windows: does nothing.
+void vk_dlaa_release(void);
 // 1 when dlaa is on and NGX came up with DLSS (after vk_dlaa_init): a DLSS mode's smaller scene is scaled up by DLSS.
 int vk_dlaa_available(void);
+// The video memory DLSS reports for its features (NGX's statistics), for the log; -1 while unknown.
+int64_t vk_dlaa_vram(void);
 // vk_exec.c vk_exec_pass_begin, once the pass's targets are resolved and before its barrier: arms the frame on the
 // scene's light target or, at the first quarter-width pass after it, runs DLAA on that target. Each present ends the
 // frame (vk_dlaa_frame).
 typedef struct VkExec VkExec;
-VkImageView vk_dlaa_ui_attachment(const VkExec *ex);
-void vk_dlaa_ui_invalidate(VkImage image);
-void vk_dlaa_ui_draw(VkPipeState *s);
-int vk_dlaa_ui_image(Nx2SlImage *image);
+int vk_dlaa_scene_wanted(void);
+int vk_dlaa_scene_resolve(VkExec *ex, uint64_t source, uint64_t destination);
 void vk_dlaa_pass(VkExec *ex);
 void vk_dlaa_frame(void);
+// 1 once, at the present of the first frame whose scene has a new size after a setting changed (vk_dlaa.c).
+int vk_dlaa_resized_take(void);
 // vk_exec_draw.c notes the scene camera and requests the viewport offset for each submitted draw.
 void vk_dlaa_draw(VkExec *ex);
 void vk_dlaa_draw_jitter(const VkExec *ex, int mesh, float *x, float *y);
 void vk_dlaa_depth_copy(VkImage src, VkImage dst, int whole);
-// Replace the verified scene scaler as a unit. A zero return keeps the guest command list intact.
-int vk_dlaa_scene_wanted(void);
-int vk_dlaa_scene_resolve(VkExec *ex, uint64_t source, uint64_t destination);
-int vk_dlaa_replaces_edge_blend(void);
-int vk_dlaa_tensor_ready(uint32_t w, uint32_t h);
-int vk_dlaa_tensor_resolve(VkExec *ex, VkImage linear, VkImageView view, VkImage dst, uint32_t dw, uint32_t dh);
 // vk_mvsurvey.c (NX2NAVI_MV_SURVEY): notes the uniform blocks of each scene draw, beside vk_dlaa_draw; each present
 // compares them with the previous frames' and logs a summary now and then.
 void vk_mvsurvey_draw(VkExec *ex);

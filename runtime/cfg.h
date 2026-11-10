@@ -6,7 +6,7 @@
 // is kept). A name without the NX2NAVI_ prefix goes to getenv unchanged. Safe from any thread once cfg_init has returned.
 const char *cfg_get(const char *name);
 
-// Reads nx2navi.ini once, from mem_init after the address space is claimed and before any setting is read. Logs the file, its key count, unknown keys and environment overrides.
+// Reads nx2navi.ini once, from mem_init after the address space is claimed and before any setting is read. Logs the file, its key count, unknown keys and environment overrides. Keeps the restart-only settings' values (cfg_pending).
 void cfg_init(void);
 
 // Replaces the loaded keys with those of the file at path (tests). 1 when the file was read, 0 when missing.
@@ -19,6 +19,8 @@ void cfg_set(const char *name, const char *value);
 // Bumped by every cfg_set. A consumer that keeps a parsed value compares this with the number it last saw (one atomic
 // load) and parses again when it changed.
 unsigned cfg_version(void);
+// plat_setenv for an NX2NAVI_ variable the process reads back: also bumps cfg_version, so lookups see the new value.
+int cfg_setenv(const char *name, const char *value);
 // 1 when the environment sets name: cfg_set cannot change what cfg_get returns (the menu greys the setting out).
 int cfg_from_env(const char *name);
 // 1 when the player set name (the environment or nx2navi.ini), 0 when cfg_get gives a device profile's default or NULL.
@@ -53,6 +55,11 @@ const CfgMeta *cfg_meta_at(int i);
 // What key reads when the player has not set it: the device profile's value (the Steam Deck's), else the row's default;
 // NULL for a key without a row. The menu's "default" mark follows it.
 const char *cfg_default(const char *key);
+// A restart-only setting (live 0) whose value differs from the one cfg_init read at start, which the running game still
+// uses: 1 while a restart would change it, 0 otherwise and for a live key or one without a row (the menu's "after
+// restart" note). cfg_pending_count: how many restart-only settings differ.
+int cfg_pending(const char *key);
+int cfg_pending_count(void);
 
 // The setting's value for consumers: the environment or nx2navi.ini value, else the CfgMeta default. name has the NX2NAVI_
 // prefix, like cfg_get; a name without a row is a bug (rt_fatal). A row with an empty default has no fixed value: its

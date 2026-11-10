@@ -34,13 +34,15 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "cfg.h"
+#include "platform/platform.h"
 #include "host.h"
 #include "nvn_api.h"
 #include "nvn_tex.h"
 #include "tex.h"
 #include "vk.h"
-#include "vk_exec.h"
 #include "vk_dlaa.h"
+#include "vk_exec.h"
 
 enum { W_FORMAT, W_REGION, W_BUFFER, W_OVERLAP, W_COPY, W_CLEAR, W_QUERY, W_COUNT };
 
@@ -59,21 +61,22 @@ static uint32_t max1(uint32_t v) { return v ? v : 1; }
 
 // ---- completion callbacks (completion thread)
 
-typedef struct { uint64_t addr, size; VkBuffer buffer; } Range;
+typedef struct { uint64_t addr, size; int back; } Range;   // back: written into a VRAM mirror (vk_mem_mirrored)
 
 static void guest_written_cb(void *arg) {
     Range *r = arg;
-    vk_buffer_written(r->addr, r->size, r->buffer);
+    if (r->back) vk_gpu_written_back(r->addr, r->size);
+    else vk_gpu_written(r->addr, r->size);
     free(r);
 }
 
 // The GPU wrote [addr, addr+size) of CPU-visible memory: tell the texture cache once the fence is reached.
-static void note_gpu_write(VkExec *ex, uint64_t addr, uint64_t size, VkBuffer buffer) {
+static void note_gpu_write(VkExec *ex, uint64_t addr, uint64_t size) {
     vk_usnap_drop(addr, size);
     if (nvn_gpu_only(addr)) return;
     Range *r = malloc(sizeof *r);
     if (!r) rt_fatal("vk: out of memory");
-    *r = (Range){addr, size, buffer};
+    *r = (Range){addr, size, vk_mem_mirrored(addr, size)};
     vk_mem_gpu_pending(addr, size);
     vk_completion_add(ex->fence, guest_written_cb, r);
 }
@@ -335,12 +338,15 @@ static void oq_report(VkExec *ex, uint64_t addr) {
 }
 
 // ---- event order check
-// A recorded signal becomes visible to the guest CPU at its completion callback. Commands recorded after it
-// already see its new value. Once the fence completes, memory is authoritative again, including CPU resets
-// and new events at the same storage address. Accessed under the replay lock.
-typedef struct { volatile uint32_t *val; uint32_t value; uint64_t fence; } ReplayEvent;
-static ReplayEvent *ev_seen;
-static size_t ev_n, ev_cap;
+// The game orders work between its queues with events: a command buffer waits (WaitEvent) until another's SignalEvent
+// has set the value. Every submission replays here on one queue in the order it came, and a wait records nothing, so a
+// wait whose signal comes in a later submission does not hold its work back: that work runs before what it waits for.
+// The replay keeps the value each event reaches in replay order (ev_seen, the signals recorded so far, on top of the
+// value in memory) and counts the waits it reaches unmet; NX2NAVI_TRACE=perf logs the count, and the first few are
+// logged as they happen. Replay thread only.
+#define EV_SEEN 64
+static struct { volatile uint32_t *val; uint32_t v; } ev_seen[EV_SEEN];
+static int ev_n, ev_next;
 static uint64_t ev_waits, ev_unmet, ev_late, ev_late_subs;
 // Waits reached unmet, until a replayed signal meets them (ev_late: the signal came that many submissions later, so
 // the work after the wait ran before the work it waited for) or they are pushed out by newer ones.
@@ -348,33 +354,112 @@ static uint64_t ev_waits, ev_unmet, ev_late, ev_late_subs;
 static struct { volatile uint32_t *val; uint32_t mode, value; uint64_t sub; } ev_open[EV_OPEN];
 static int ev_open_n;
 
-static ReplayEvent *ev_slot(volatile uint32_t *val, int create) {
-    uint64_t done = vk_sync_fence_done();
-    size_t reusable = ev_n;
-    for (size_t i = 0; i < ev_n; i++) {
-        if (ev_seen[i].fence <= done) reusable = i;
-        else if (ev_seen[i].val == val) return &ev_seen[i];
-    }
+static uint32_t *ev_slot(volatile uint32_t *val, int create) {
+    for (int i = 0; i < ev_n; i++)
+        if (ev_seen[i].val == val) return &ev_seen[i].v;
     if (!create) return NULL;
-    if (reusable == ev_n) {
-        if (ev_n == ev_cap) {
-            ev_cap = ev_cap ? ev_cap * 2 : 32;
-            if (!(ev_seen = realloc(ev_seen, ev_cap * sizeof *ev_seen))) rt_fatal("vk: out of memory (events)");
-        }
-        ev_n++;
-    }
-    ev_seen[reusable] = (ReplayEvent){val, __atomic_load_n(val, __ATOMIC_ACQUIRE), 0};
-    return &ev_seen[reusable];
+    int i = ev_n < EV_SEEN ? ev_n++ : ev_next++ % EV_SEEN;
+    ev_seen[i].val = val, ev_seen[i].v = __atomic_load_n(val, __ATOMIC_ACQUIRE);
+    return &ev_seen[i].v;
 }
 
 static int ev_holds(uint32_t have, uint32_t mode, uint32_t want) {
     return mode == NVN_EVENT_WAIT_MODE_GEQUAL_WRAP ? (int32_t)(have - want) >= 0 : have == want;
 }
 
+// ---- events the CPU signals
+// Ocarina gates its main queue on the CPU: each frame the game sets one of two events to 0 (they take turns frame by
+// frame), submits the worker queues' command buffers and the main queue's, whose first command waits for the event
+// to be 1, and signals 1 from the CPU (nvnEventSignal) once it has finished writing what the frame's commands read.
+// The signal comes before the main queue's submit call, after it, or while that call is replaying. On the console
+// the GPU starts the queue at the signal and reads memory from then on.
+// Here a submission's recording begins with the copies of what it reads: the VRAM mirrors' sync and the uniform
+// snapshot (vk_exec_record), and the wait is tested when the walk reaches it, some hundred microseconds later. A
+// signal that came in between passed the wait, and the frame was drawn from copies taken before the game had
+// finished writing: single frames with the scene's shadowing missing or the whole scene black, the interface as it
+// was, most of them when other work keeps the CPU busy, since the game's threads then finish later and the signal
+// falls into the replay more often.
+// So a wait is tested against the value the event had when the submission took its copies: every nvnEventSignal is
+// numbered and keeps the value it replaced (vk_exec_event_cpu, before the write), vk_exec_record notes the number at
+// its start (vk_exec_event_sync), and a signal with a later number does not count for that submission. The wait then
+// stops the submission like any wait reached before its signal, and vk_backend.c submit_sync lets it go on at once
+// in a submission of its own, whose copies are taken after the signal.
+// NX2NAVI_EVENT_AT_SYNC=0: the value in memory when the walk reaches the wait, as before.
+#define CPU_EV 16
+#define CPU_EV_HIST 8
+static struct { const void *val; uint64_t seq[CPU_EV_HIST]; uint32_t before[CPU_EV_HIST]; unsigned n; } cpu_ev[CPU_EV];
+static int cpu_ev_n;                             // cpu_ev_lock
+static uint64_t cpu_ev_seq;                      // cpu_ev_lock: nvnEventSignal calls so far
+static uint64_t ev_sync_seq = UINT64_MAX;        // cpu_ev_lock: cpu_ev_seq at the recording's start; UINT64_MAX outside one
+static PlatMutex cpu_ev_lock = PLAT_MUTEX_INIT;
+static uint64_t ev_after_sync;                   // replay: waits only a signal after the copies would have passed
+
+int vk_exec_event_at_sync(void) {
+    static int on = -1;
+    if (on < 0) on = rt_knob("EVENT_AT_SYNC", "1");
+    return on;
+}
+
+void vk_exec_event_cpu(const void *event) {
+    plat_mutex_lock(&cpu_ev_lock);
+    int i = 0;
+    while (i < cpu_ev_n && cpu_ev[i].val != event) i++;
+    if (i == cpu_ev_n && cpu_ev_n < CPU_EV) cpu_ev[cpu_ev_n++].val = event, cpu_ev[i].n = 0;
+    cpu_ev_seq++;
+    if (i < cpu_ev_n) {
+        unsigned k = cpu_ev[i].n++ % CPU_EV_HIST;
+        cpu_ev[i].seq[k] = cpu_ev_seq, cpu_ev[i].before[k] = __atomic_load_n((const volatile uint32_t *)event, __ATOMIC_ACQUIRE);
+    }
+    plat_mutex_unlock(&cpu_ev_lock);
+}
+
+void vk_exec_event_sync(int begin) {
+    plat_mutex_lock(&cpu_ev_lock);
+    ev_sync_seq = begin ? cpu_ev_seq : UINT64_MAX;
+    plat_mutex_unlock(&cpu_ev_lock);
+}
+
+uint64_t vk_exec_event_late_take(void) {
+    uint64_t n = ev_after_sync;
+    ev_after_sync = 0;
+    return n;
+}
+
+// The event's value in memory, and in *at_sync the value it had when the submission being recorded took its copies
+// (the same outside a recording, and for an event the CPU has not signalled since).
+static uint32_t ev_mem(volatile uint32_t *val, uint32_t *at_sync) {
+    uint32_t mem = __atomic_load_n(val, __ATOMIC_ACQUIRE);
+    *at_sync = mem;
+    plat_mutex_lock(&cpu_ev_lock);
+    if (ev_sync_seq != UINT64_MAX)
+        for (int i = 0; i < cpu_ev_n; i++) {
+            if (cpu_ev[i].val != (const void *)val) continue;
+            uint64_t first = UINT64_MAX;
+            unsigned n = cpu_ev[i].n < CPU_EV_HIST ? cpu_ev[i].n : CPU_EV_HIST;
+            for (unsigned k = 0; k < n; k++)   // the earliest signal after the copies replaced the value they saw
+                if (cpu_ev[i].seq[k] > ev_sync_seq && cpu_ev[i].seq[k] < first) first = cpu_ev[i].seq[k], *at_sync = cpu_ev[i].before[k];
+            break;
+        }
+    plat_mutex_unlock(&cpu_ev_lock);
+    return mem;
+}
+
+// Whether the wait holds. *late: it holds only by a CPU signal that came after the submission's copies.
+static int ev_met(const p_wait_event *p, uint32_t *mem, const uint32_t **seen, int *late) {
+    uint32_t at_sync;
+    *mem = ev_mem(p->val, &at_sync);
+    *seen = ev_slot(p->val, 0);
+    int by_seen = *seen && ev_holds(**seen, p->mode, p->value);
+    int now = ev_holds(*mem, p->mode, p->value) || by_seen, then = ev_holds(at_sync, p->mode, p->value) || by_seen;
+    *late = now && !then;
+    return vk_exec_event_at_sync() ? then : now;
+}
+
 int vk_exec_event_met(const void *payload) {
-    const p_wait_event *p = payload;
-    const ReplayEvent *seen = ev_slot(p->val, 0);
-    return ev_holds(seen ? seen->value : __atomic_load_n(p->val, __ATOMIC_ACQUIRE), p->mode, p->value);
+    uint32_t mem;
+    const uint32_t *seen;
+    int late;
+    return ev_met(payload, &mem, &seen, &late);
 }
 
 int vk_exec_signalled;
@@ -382,15 +467,23 @@ int vk_exec_signalled;
 int vk_exec_wait_event(const void *payload) {
     const p_wait_event *p = payload;
     ev_waits++;
-    if (vk_exec_event_met(payload)) return 1;
+    uint32_t mem;
+    const uint32_t *seen;
+    int late;
+    int met = ev_met(p, &mem, &seen, &late);
+    if (late) {
+        ev_after_sync++;
+        vk_exec_evt('L', (const void *)p->val, 0);
+    }
+    if (met) return 1;
     ev_unmet++;
     if (ev_open_n == EV_OPEN) memmove(ev_open, ev_open + 1, sizeof ev_open - sizeof *ev_open), ev_open_n--;
     ev_open[ev_open_n].val = p->val, ev_open[ev_open_n].mode = p->mode, ev_open[ev_open_n].value = p->value;
     ev_open[ev_open_n++].sub = vk_exec_submit_seq;
     static int logged;
     if (logged++ < 8)
-        rt_log("vk: event wait reached before its signal: event %p, mode %u, wants %#x",
-               (void *)p->val, p->mode, p->value);
+        rt_log("vk: event wait reached before its signal: event %p, mode %u, wants %#x, memory %#x, replayed signals %s%#x",
+               (void *)p->val, p->mode, p->value, mem, seen ? "" : "none ", seen ? *seen : 0);
     return 0;
 }
 
@@ -399,20 +492,16 @@ void vk_exec_event_stats(uint64_t *waits, uint64_t *unmet, uint64_t *late, uint6
     ev_waits = ev_unmet = ev_late = ev_late_subs = 0;
 }
 
-static void record_signal(VkExec *ex, const p_signal_event *p) {
-    ReplayEvent *seen = ev_slot(p->val, 1);
-    seen->value = p->mode == NVN_EVENT_SIGNAL_MODE_ADD ? seen->value + p->value : p->value;
-    seen->fence = ex->fence;
+static void signal_event(VkExec *ex, const p_signal_event *p) {
+    uint32_t *seen = ev_slot(p->val, 1);
+    *seen = p->mode == NVN_EVENT_SIGNAL_MODE_ADD ? *seen + p->value : p->value;
+    vk_exec_evt('s', (const void *)p->val, *seen);
     vk_exec_signalled = 1;
     for (int i = 0; i < ev_open_n;)
-        if (ev_open[i].val == p->val && ev_holds(seen->value, ev_open[i].mode, ev_open[i].value)) {
+        if (ev_open[i].val == p->val && ev_holds(*seen, ev_open[i].mode, ev_open[i].value)) {
             ev_late++, ev_late_subs += vk_exec_submit_seq - ev_open[i].sub;
             ev_open[i] = ev_open[--ev_open_n];
         } else i++;
-}
-
-static void signal_event(VkExec *ex, const p_signal_event *p) {
-    if (vk_exec_event_order() || (rt_trace & RT_TRACE_GFX)) record_signal(ex, p);
     EventWrite *e = malloc(sizeof *e);
     if (!e) rt_fatal("vk: out of memory");
     *e = (EventWrite){p->val, p->mode, p->value};
@@ -603,6 +692,7 @@ static int buffer_side(const VkExec *ex, const Sub *s, uint64_t addr, uint64_t *
 static void copy_buffer_image(VkExec *ex, const p_copy_b2t *p, int to_image) {
     Sub s;
     if (!sub_resolve(p->tex, &p->view, p->has_view, &p->r, 1, &s)) return;
+    vk_gpu_gap_note(to_image ? VK_GAP_COPY_B2T : VK_GAP_COPY_T2B, (uint64_t)s.w * s.h);
     if (s.img->scale > 1) {   // the buffer holds the game's texel count, the image more
         warn_once(W_REGION, "buffer copy of a shadow map enlarged by NX2NAVI_SHADOW_SCALE: skipped");
         return;
@@ -617,11 +707,8 @@ static void copy_buffer_image(VkExec *ex, const p_copy_b2t *p, int to_image) {
     if (to_image) vkCmdCopyBufferToImage(ex->cb, m.buffer, s.img->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
     else vkCmdCopyImageToBuffer(ex->cb, s.img->image, VK_IMAGE_LAYOUT_GENERAL, m.buffer, 1, &c);
     ex->recorded++;
-    if (to_image) {
-        vk_dlaa_ui_invalidate(s.img->image);
-        vk_texture_gpu_written(p->tex);
-    }
-    else vk_mem_gpu_wrote(&m, size), note_gpu_write(ex, p->src, size, m.buffer);
+    if (to_image) vk_texture_gpu_written(p->tex);
+    else vk_mem_gpu_wrote(&m, size), note_gpu_write(ex, p->src, size);
 }
 
 static void copy_t2t(VkExec *ex, const p_copy_t2t *p) {
@@ -629,6 +716,7 @@ static void copy_t2t(VkExec *ex, const p_copy_t2t *p) {
     if (!sub_resolve(p->src, &p->sv, p->has_sv, &p->sr, 1, &s)) return;
     if (!sub_resolve(p->dst, &p->dv, p->has_dv, &p->dr, 1, &d)) return;
     d.nz = s.nz;
+    vk_gpu_gap_note(VK_GAP_COPY_T2T, (uint64_t)s.w * s.h);
     int same_size = s.w == d.w && s.h == d.h;
     int same_format = s.img->format == d.img->format;
     if (s.img->samples != d.img->samples && !(s.img->samples > 1 && d.img->samples == 1 && same_size && same_format)) {
@@ -660,7 +748,6 @@ static void copy_t2t(VkExec *ex, const p_copy_t2t *p) {
                        linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     }
     ex->recorded++;
-    vk_dlaa_ui_invalidate(d.img->image);
     vk_texture_gpu_written(p->dst);
     if (d.aspect == VK_IMAGE_ASPECT_DEPTH_BIT) {
         int whole = same_size && same_format && !s.x && !s.y && !d.x && !d.y && !sl.mipLevel && !dl.mipLevel &&
@@ -679,6 +766,7 @@ static void copy_t2t(VkExec *ex, const p_copy_t2t *p) {
 
 static void copy_b2b(VkExec *ex, const p_copy_b2b *p) {
     uint64_t src = p->src, dst = p->dst, left = p->size;
+    vk_gpu_gap_note(VK_GAP_COPY_B2B, p->size);
     int started = 0;
     while (left) {
         VkMemSpan s, d;
@@ -700,12 +788,12 @@ static void copy_b2b(VkExec *ex, const p_copy_b2b *p) {
         VkBufferCopy bc = {s.offset, d.offset, n};
         vkCmdCopyBuffer(ex->cb, s.buffer, d.buffer, 1, &bc);
         vk_mem_gpu_wrote(&d, n);
-        note_gpu_write(ex, dst, n, d.buffer);
         ex->recorded++;
         vk_mem_count(s.cls, VK_MUSE_COPY_SRC, n);
         vk_mem_count(d.cls, VK_MUSE_GPU_WRITE, n);
         src += n, dst += n, left -= n;
     }
+    if (started) note_gpu_write(ex, p->dst, p->size - left);
 }
 
 // ---- buffer fills (ClearBuffer, and ReportValue as a 4-byte one): vkCmdFillBuffer in GPU order after a full
@@ -719,6 +807,7 @@ static void clear_buf(VkExec *ex, const p_clear_buf *p) {
         return;
     }
     uint64_t dst = p->addr, left = p->size;
+    vk_gpu_gap_note(VK_GAP_CLEAR_BUF, p->size);
     int started = 0;
     while (left) {
         VkMemSpan d;
@@ -732,19 +821,16 @@ static void clear_buf(VkExec *ex, const p_clear_buf *p) {
         if (!started) vk_exec_pass_end(ex), vk_exec_barrier(ex), started = 1;
         VK_MEM_PICK(d);
         vkCmdFillBuffer(ex->cb, d.buffer, d.offset, n, p->value);
-        // Device-address atomics update both copies. Reset both in GPU command order
-        // so a counter increment after this fill starts from the same value in each.
+        // A VRAM mirror's guest copy is filled too, at once: atomics through the device address table count in both
+        // copies (translator patch 0036), and a counter reset here must start from the same value in both.
         VkBuffer twin = vk_mem_guest_twin(&d);
-        if (twin) {
-            vkCmdFillBuffer(ex->cb, twin, d.offset, n, p->value);
-            ex->recorded++;
-        }
+        if (twin) vkCmdFillBuffer(ex->cb, twin, d.offset, n, p->value), ex->recorded++;
         vk_mem_gpu_wrote(&d, n);
-        note_gpu_write(ex, dst, n, d.buffer);
         ex->recorded++;
         vk_mem_count(d.cls, VK_MUSE_GPU_WRITE, n);
         dst += n, left -= n;
     }
+    if (started) note_gpu_write(ex, p->addr, p->size - left);
 }
 
 // ---- texture clears
@@ -772,6 +858,7 @@ static void clear_tex(VkExec *ex, const p_clear_tex *p) {
     const VkTexImage *img = s.img;
     int is3d = img->type == VK_IMAGE_TYPE_3D;
     uint32_t lw = max1(img->width >> s.level), lh = max1(img->height >> s.level);
+    vk_gpu_gap_note(VK_GAP_CLEAR_TEX, (uint64_t)lw * lh);
     int reformat = p->has_view && p->view.set_format && p->view.format != t->d.format;
     if (s.x || s.y || s.w != lw || s.h != lh || (p->mask & 0xf) != 0xf || reformat ||
         (is3d && (s.z || s.nz != max1(img->depth >> s.level)))) {
@@ -796,7 +883,6 @@ static void clear_tex(VkExec *ex, const p_clear_tex *p) {
         }
         vk_exec_pass_end(ex);
         vk_exec_barrier(ex);
-        vk_dlaa_ui_invalidate(img->image);
         vkCmdClearColorImage(ex->cb, img->image, VK_IMAGE_LAYOUT_GENERAL, &cv, 1, &rng);
     } else {
         int both = (img->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) && (img->aspect & VK_IMAGE_ASPECT_STENCIL_BIT);
@@ -811,7 +897,7 @@ static void clear_tex(VkExec *ex, const p_clear_tex *p) {
     vk_texture_gpu_written(t);
 }
 
-void vk_exec_op_xfer(VkExec *ex, uint32_t op, const void *payload) {
+static void op_xfer_impl(VkExec *ex, uint32_t op, const void *payload) {
     if (op != OP_RENDER_ENABLE && op != OP_SIGNAL_EVENT) vk_contact_flush(ex);
     switch (op) {
     case OP_COPY_B2B: copy_b2b(ex, payload); break;
@@ -831,4 +917,14 @@ void vk_exec_op_xfer(VkExec *ex, uint32_t op, const void *payload) {
         break;
     default: rt_fatal("vk: op %s is not a transfer", nvn_op_name(op));
     }
+}
+
+// NX2NAVI_REPLAY_TIME: see the note over vk_exec_op_draw in vk_exec_draw.c; transfers are the third kind.
+void vk_exec_op_xfer(VkExec *ex, uint32_t op, const void *payload) {
+    static int on = -1;
+    if (on < 0) on = cfg_bool("NX2NAVI_REPLAY_TIME");
+    if (!on) { op_xfer_impl(ex, op, payload); return; }
+    uint64_t t0 = plat_now_ns();
+    op_xfer_impl(ex, op, payload);
+    perf_replay_op_at(PERF_RP_XFER, op, plat_now_ns() - t0);
 }

@@ -9,6 +9,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #endif
+#include <atomic>
 #include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -38,6 +39,19 @@ struct Api {
     int tried = 0, ok = 0;
 } A;
 
+// What the settings menu may ask before anything has used FSR 3.1 (vk_ffx_available), from any thread.
+std::atomic<int> g_loaded{-1};    // what vk_ffx_load found: 1 or 0; -1 while it has not run
+std::atomic<int> g_present{-1};   // whether the library file is there: 1 or 0; -1 while not asked
+
+#ifdef _WIN32
+// amd_fidelityfx_vk.dll next to the executable
+void library_path(char *path, size_t size) {
+    DWORD n = GetModuleFileNameA(NULL, path, (DWORD)size);
+    while (n && path[n - 1] != '\\') n--;
+    snprintf(path + n, size - n, "amd_fidelityfx_vk.dll");
+}
+#endif
+
 void message(uint32_t type, const wchar_t *msg) {
     char s[512];
     size_t n = 0;
@@ -47,12 +61,20 @@ void message(uint32_t type, const wchar_t *msg) {
     if (told++ < 40) rt_log("ffx: %s %s", type == FFX_API_MESSAGE_TYPE_ERROR ? "error:" : "warning:", s);
 }
 
-// One upscaling context per render and output size (the menu switches the mode live, so a few may exist); never
-// destroyed before shutdown, so none is released while the GPU may still run its work.
+// One upscaling context per render and output size: each render scale the menu sets brings its own, and so do the
+// game's second scenes. When all are taken, the least recently used one is destroyed for the new size once the GPU is
+// idle, as vk_dlaa.c free_size does for DLSS. Without that, a seventh size found no context, and vk_dlaa.c turned
+// FSR 3.1 off for the rest of the run: stepping through the render scales in the menu was enough.
 struct Up {
     ffxContext ctx = nullptr;
     uint32_t w = 0, h = 0, ow = 0, oh = 0;
+    uint64_t used = 0;   // up_tick when context_for last returned it
 } U[6];
+uint64_t up_tick;
+// A context used in the last few calls may sit in a command buffer that is not submitted yet, where waiting for the
+// GPU does not cover it: a frame makes one or two calls (the scene, and a second scene after it), so this is a few
+// frames back.
+const uint64_t UP_RECENT = 8;
 
 FfxApiResource image(const VkFfxImage *i, uint32_t state, uint32_t usage) {
     VkImageCreateInfo ci = {};
@@ -67,18 +89,37 @@ FfxApiResource image(const VkFfxImage *i, uint32_t state, uint32_t usage) {
 }
 
 Up *context_for(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh) {
+    up_tick++;
     for (Up &u : U)
-        if (u.ctx && u.w == w && u.h == h && u.ow == ow && u.oh == oh) return &u;
-    Up *slot = nullptr;
-    for (Up &u : U)
-        if (!u.ctx) { slot = &u; break; }
-    if (!slot) return nullptr;
+        if (u.ctx && u.w == w && u.h == h && u.ow == ow && u.oh == oh) {
+            u.used = up_tick;
+            return &u;
+        }
+    Up *slot = nullptr, *lru = nullptr;
+    for (Up &u : U) {
+        if (!u.ctx) {
+            slot = &u;
+            break;
+        }
+        if (up_tick - u.used >= UP_RECENT && (!lru || u.used < lru->used)) lru = &u;
+    }
     const VkCtx *c = vk_ctx();
+    if (!slot && lru) {
+        static int told;
+        if (told++ < 20)
+            rt_log("ffx: FSR 3.1 context %ux%u -> %ux%u destroyed for %ux%u -> %ux%u (all %d in use)", lru->w, lru->h, lru->ow,
+                   lru->oh, w, h, ow, oh, (int)(sizeof U / sizeof U[0]));
+        vk_queue_lock(), vkDeviceWaitIdle(c->device), vk_queue_unlock();   // its work may still be in flight
+        A.destroy(&lru->ctx, nullptr);
+        *lru = Up();
+        slot = lru;
+    }
+    if (!slot) return nullptr;
     ffxCreateBackendVKDesc be = {};
     be.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
     be.vkDevice = c->device;
     be.vkPhysicalDevice = c->phys;
-    be.vkDeviceProcAddr = vk_dpa;
+    be.vkDeviceProcAddr = vkGetDeviceProcAddr;
     ffxCreateContextDescUpscale d = {};
     d.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
     d.header.pNext = &be.header;
@@ -92,7 +133,7 @@ Up *context_for(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh) {
         slot->ctx = nullptr;
         return nullptr;
     }
-    slot->w = w, slot->h = h, slot->ow = ow, slot->oh = oh;
+    slot->w = w, slot->h = h, slot->ow = ow, slot->oh = oh, slot->used = up_tick;
     ffxQueryGetProviderVersion v = {};
     v.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
     A.query(&slot->ctx, &v.header);
@@ -107,12 +148,11 @@ extern "C" int vk_ffx_load(void) {
     A.tried = 1;
 #ifdef _WIN32
     char path[MAX_PATH];
-    DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
-    while (n && path[n - 1] != '\\') n--;
-    snprintf(path + n, sizeof path - n, "amd_fidelityfx_vk.dll");
+    library_path(path, sizeof path);
     HMODULE m = LoadLibraryA(path);
     if (!m) {
         rt_log("ffx: %s not found: FSR 3.1 off", path);
+        g_loaded.store(0, std::memory_order_release);
         return 0;
     }
     A.lib = m;
@@ -121,11 +161,35 @@ extern "C" int vk_ffx_load(void) {
     A.configure = (PfnFfxConfigure)(void *)GetProcAddress(m, "ffxConfigure");
     A.query = (PfnFfxQuery)(void *)GetProcAddress(m, "ffxQuery");
     A.dispatch = (PfnFfxDispatch)(void *)GetProcAddress(m, "ffxDispatch");
-#endif
     A.ok = A.create && A.destroy && A.configure && A.query && A.dispatch;
     rt_log("ffx: amd_fidelityfx_vk.dll %s", A.ok ? "loaded" : "lacks the API entry points: FSR 3.1 off");
+#else
+    // Only the Windows build loads AMD's library: there is nothing to load here
+    rt_log("ffx: this build has no FSR 3.1 (it needs amd_fidelityfx_vk.dll, which only the Windows build loads): FSR 3.1 off");
+#endif
+    g_loaded.store(A.ok, std::memory_order_release);
     return A.ok;
 }
+
+extern "C" int vk_ffx_available(void) {
+    int loaded = g_loaded.load(std::memory_order_acquire);
+    if (loaded >= 0) return loaded;
+#ifdef _WIN32
+    int present = g_present.load(std::memory_order_relaxed);
+    if (present < 0) {   // the menu asks every frame: look once, and leave the loading to the first use
+        char path[MAX_PATH];
+        library_path(path, sizeof path);
+        DWORD attr = GetFileAttributesA(path);
+        present = attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
+        g_present.store(present, std::memory_order_relaxed);
+    }
+    return present;
+#else
+    return 0;
+#endif
+}
+
+extern "C" int vk_ffx_framegen_available(void) { return vk_ffx_available(); }   // the same library, its API calls
 
 extern "C" int vk_ffx_upscale(VkCommandBuffer cb, const VkFfxImage *color, const VkFfxImage *depth, const VkFfxImage *mv,
                               const VkFfxImage *out, float jx, float jy, int reset, float dt_ms, float fov_y) {

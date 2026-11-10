@@ -1,10 +1,11 @@
 // Discord Rich Presence: "Playing NX2navi" with the elapsed play time in the player's Discord status, through
 // the local IPC of a running Discord client (platform.h's plat_ipc_*). Nothing leaves the machine but the activity
-// itself, and nothing is sent while NX2NAVI_DISCORD_RPC is off (the default: the status is information about the
-// player's session). NX2NAVI_DISCORD_APP_ID names the application whose name ("Playing <name>") and artwork Discord
-// shows, NX2NAVI_DISCORD_IMAGE the key of its uploaded art asset; both default to discord_app.h, the one place the
-// NX2navi application's id is written, and nx2navi.ini's discord_app_id and discord_image override them. With no
-// application id at all the thread stays idle and logs that once: there is nothing to show the status under.
+// itself, and nothing is sent while NX2NAVI_DISCORD_RPC is off (it is on by default, and does nothing without a
+// Discord client running on the same PC). NX2NAVI_DISCORD_APP_ID names the application whose name ("Playing <name>")
+// and artwork Discord shows, NX2NAVI_DISCORD_IMAGE the key of its uploaded art asset; both default to discord_app.h,
+// the one place the NX2navi application's id is written, and nx2navi.ini's discord_app_id and discord_image override
+// them. With no application id at all the thread stays idle and logs that once: there is nothing to show the status
+// under.
 //
 // One host thread owns the connection and never holds a virtual core (kernel.c: host work runs without one). It
 // re-reads the settings when cfg_version changes (a menu change reaches it within half a second), connects to the
@@ -202,10 +203,21 @@ static void discord_main(void *arg) {
         unsigned v = cfg_version();
         if (v != seen) {   // the settings changed (the menu writes them): pick the new ones up at once
             seen = v;
+            // any setting bumps the version (a slider step, a cheat): only a new app id needs a new handshake, and
+            // a new image only a resend; reconnecting on every change made the status blink and could hit Discord's
+            // rate limit while a slider was held
+            char was_id[APP_ID_CAP], was_image[IMAGE_KEY_CAP];
+            memcpy(was_id, app_id, sizeof was_id);
+            memcpy(was_image, image, sizeof was_image);
             read_setting("NX2NAVI_DISCORD_APP_ID", app_id, sizeof app_id, valid_app_id);
             read_setting("NX2NAVI_DISCORD_IMAGE", image, sizeof image, valid_image_key);
-            if (ipc) plat_ipc_close(ipc), ipc = NULL;   // the new app id needs a new handshake; the image is resent
-            said_no_client = said_no_app = 0;
+            if (strcmp(was_id, app_id)) {
+                if (ipc) plat_ipc_close(ipc), ipc = NULL;
+                retry_at = 0;
+                said_no_client = said_no_app = 0;
+            } else if (strcmp(was_image, image)) {
+                send_at = 0;
+            }
         }
         if (!cfg_bool("NX2NAVI_DISCORD_RPC")) {
             if (ipc) plat_ipc_close(ipc), ipc = NULL;

@@ -815,8 +815,10 @@ EMITTED = re.compile(r'^emitted (\d+)/(\d+) chunks')
 DISCOVERED = re.compile(r'^(\w+): \d+ functions \(.*discovery')
 
 
-CHEAT_PLACES = ('cheats', 'atmosphere/contents/0100F2C0115B6000/cheats', 'contents/0100F2C0115B6000/cheats',
-                '0100F2C0115B6000/cheats')
+MOD_TITLE = '0400486024DEC000'   # the game's title id, which names a mod's Atmosphere folders (tools/cheats.py TITLE)
+
+CHEAT_PLACES = ('cheats', f'atmosphere/contents/{MOD_TITLE}/cheats', f'contents/{MOD_TITLE}/cheats',
+                f'{MOD_TITLE}/cheats')
 
 
 def cheat_files(ctx):
@@ -831,8 +833,8 @@ def cheat_files(ctx):
                   for f in ((mod / where).glob('*.txt') if (mod / where).is_dir() else ()))
 
 
-EXEFS_PLACES = ('exefs', 'atmosphere/contents/0100F2C0115B6000/exefs', 'contents/0100F2C0115B6000/exefs',
-                '0100F2C0115B6000/exefs')
+EXEFS_PLACES = ('exefs', f'atmosphere/contents/{MOD_TITLE}/exefs', f'contents/{MOD_TITLE}/exefs',
+                f'{MOD_TITLE}/exefs')
 
 
 def exefs_files(ctx):
@@ -1013,29 +1015,10 @@ ASPECT_SIZES = ('2560x1080', '3440x1440', '3840x1600', '5120x2160', '3840x1080',
 class Prepare(Step):
     id = 'prepare'
 
-    def cached_preparation(self, dest):
-        exe = dest / ('nx2navi' + EXE)
-        try:
-            result = subprocess.run([str(exe), '--shader-cache-id'], cwd=dest, capture_output=True,
-                                    encoding='utf-8', errors='replace')
-        except OSError:
-            return None
-        device = re.search(r'^shader-cache-id (.+)$', result.stdout, re.M)
-        storage = re.search(r'^shader-storage (.+)$', result.stdout, re.M)
-        size = re.search(r'^shader-driver-cache-bytes ([0-9]+)$', result.stdout, re.M)
-        lines = result.stdout.splitlines()
-        if (result.returncode or not device or not storage or not size or 'shader-driver-cache-ready 1' not in lines
-                or 'shader-translations-ready 1' not in lines):
-            return None
-        groups = [dest / name for name in ('shader-prepared.bin', 'mesh-programs.bin', 'vertex-programs.bin')]
-        if not all(p.is_file() for p in groups):
-            return None
-        return fingerprint(device[1], storage[1], *groups), int(size[1])
-
     def key(self, ctx):
         layout = ctx.layout
         xlate_id = layout.xlate.with_suffix('.id')
-        tools = [layout.tools / n for n in ('prepare_shaders.py', 'shader_census.py', 'shader_passes.py', 'make_romfs_patches.py',
+        tools = [layout.tools / n for n in ('prepare_shaders.py', 'shader_census.py', 'make_romfs_patches.py',
                                             'pack_shader_cache.py', 'ultrawide_layout.py', 'button_icons.py')]
         # not the compile key: a rebuild for the mods' code cheats keeps the prepared shaders
         return fingerprint('prepare-2', ctx.keys['extract'], runtime_key(ctx), layout.xlate, xlate_id,
@@ -1044,16 +1027,16 @@ class Prepare(Step):
     def current(self, ctx, record):
         dest = ctx.dest
         xlate = dest / ctx.layout.xlate.name
-        if (not (dest / 'romfs-patches' / 'manifest.tsv').is_file() or not xlate.is_file()
-                or file_sha256(xlate) != record.get('xlate_sha256') or type(record.get('driver_bytes')) is not int):
-            return False
-        cached = self.cached_preparation(dest)
-        return bool(cached and cached[0] == record.get('prepared') and 0 < record['driver_bytes'] <= cached[1])
+        return ((dest / 'shader-prepared.bin').is_file() and (dest / 'romfs-patches' / 'manifest.tsv').is_file()
+                and xlate.is_file() and file_sha256(xlate) == record.get('xlate_sha256'))
 
     def run(self, ctx):
         layout, rep, dest = ctx.layout, ctx.reporter, ctx.dest
         xlate = dest / layout.xlate.name
-        # Stored game inputs can be translated again. Compiled outputs are already keyed by translator and host.
+        if xlate.is_file() and file_sha256(xlate) != file_sha256(layout.xlate):
+            # Another translator: its cache keys differ, so the old translations would only take space.
+            for name in ('shader-cache', 'shader-prepared.bin'):
+                remove(dest / name)
         # nx2navi.exe starts nx2navi_xlate.exe as a child while it prepares shaders; a preparation that was stopped from
         # outside leaves that child holding this file, and Windows then refuses to replace it (issue #174).
         try:
@@ -1137,10 +1120,7 @@ class Prepare(Step):
         code, log = run_tool(ctx, 'prepare', layout.tools / 'pack_shader_cache.py', [dest / 'shader-cache'])
         if code:
             raise InstallError('prepare.pack_failed', code=code, log=str(log))
-        prepared = self.cached_preparation(dest)
-        if not prepared:
-            raise InstallError('prepare.shaders_failed', code=1, log=str(log))
-        return {'xlate_sha256': file_sha256(xlate), 'prepared': prepared[0], 'driver_bytes': prepared[1]}
+        return {'xlate_sha256': file_sha256(xlate)}
 
 
 # ---- 7. NVIDIA DLSS
