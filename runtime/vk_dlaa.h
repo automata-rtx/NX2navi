@@ -57,14 +57,16 @@ int64_t vk_dlaa_vram(void);
 // scene's light target or, at the first quarter-width pass after it, runs DLAA on that target. Each present ends the
 // frame (vk_dlaa_frame).
 typedef struct VkExec VkExec;
+int vk_dlaa_scene_wanted(void);
+int vk_dlaa_scene_resolve(VkExec *ex, uint64_t source, uint64_t destination);
 void vk_dlaa_pass(VkExec *ex);
 void vk_dlaa_frame(void);
 // 1 once, at the present of the first frame whose scene has a new size after a setting changed (vk_dlaa.c).
 int vk_dlaa_resized_take(void);
-// vk_exec_draw.c, each draw before its fixed state is recorded: notes the scene camera block (vk_dlaa_draw), and moves
-// the viewport of the scene's draws by the frame's jitter (vk_dlaa_viewport, when the viewport is recorded).
+// vk_exec_draw.c notes the scene camera and requests the viewport offset for each submitted draw.
 void vk_dlaa_draw(VkExec *ex);
-void vk_dlaa_viewport(VkExec *ex, VkViewport *v);
+void vk_dlaa_draw_jitter(const VkExec *ex, int mesh, float *x, float *y);
+void vk_dlaa_depth_copy(VkImage src, VkImage dst, int whole);
 // vk_mvsurvey.c (NX2NAVI_MV_SURVEY): notes the uniform blocks of each scene draw, beside vk_dlaa_draw; each present
 // compares them with the previous frames' and logs a summary now and then.
 void vk_mvsurvey_draw(VkExec *ex);

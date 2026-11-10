@@ -148,6 +148,7 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   (`runtime/vk_pipeline.c`, "compute pipelines the boot keeps").
 - The game's tensor-core upscaler is replaced by a decode-and-scale pass (`vk_tonemap.c`); `vk_fsr.c` runs AMD FSR 1
   (EASU, RCAS) on the present when the window is larger than the picture.
+- On game 1.1.1 the replacement scene scaler skips both SMAA clears and its three dispatches. DLSS and DLAA jitter camera geometry, reconstruct the original HDR lighting and apply the game's bloom and tonemap at output resolution when the grade inputs match.
 - HDR (`vk_hdr.c`): the game tonemaps its scene into a float target, upscales it, draws the HUD into a second float
   target and copies that into the 8-bit sRGB window texture it presents. With `NX2NAVI_HDR=1` the tonemap shader gets
   the function of `shaders/hdr_tonemap.frag` spliced in where its SDR curve clamps each channel, so the float picture
