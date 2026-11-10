@@ -10,8 +10,8 @@
 // attributes a VS declares and the colour targets an FS declares (SPIR-V Locations). The input id is sha256 over "TKSI",
 // IN_VERSION, the code hash and the answers with everything outside the mask zeroed (fixed little-endian layout), so
 // stale bindings in slots the shader never reads do not make new ids; it does not depend on the translator. The cache
-// key is sha256 over "TKSK", KEY_VERSION, the translator identity and the input id. A code hash without a known mask is
-// translated under a provisional key ("TKSP", full answers); its files are renamed to the cache key and the mask stored.
+// key is sha256 over the stage family's tag ("TKSM" for task/mesh, "TKSK" otherwise), KEY_VERSION, the translator
+// identity and the input id. A code hash without a known mask uses "TKPM" or "TKSP" and the full answers until translated.
 //
 // Translator identity: build/xlate/nx2navi_xlate.id, sha256 hex that tools/build_xlate.py writes over the sources it
 // builds from (Program.cs, the csproj, the patches, the vendor tree); without it the sha256 of the exe. NX2NAVI_XLATE_ID
@@ -1269,10 +1269,13 @@ static void mask_answers(const GfxShaderAnswers *a, const UseMask *m, GfxShaderA
     o->mvprev = a->mvprev;   // another translation, not an answer the use mask covers
 }
 
-// The cache key of an input id under the current translator.
-static void key_of_input(const uint8_t iid[32], uint8_t key[32]) {
+static int mesh_stage(int stage) { return stage == GFX_STAGE_TS || stage == GFX_STAGE_MS; }
+
+// Pipeline recipes keep their input IDs. Only task/mesh translations need a new
+// cache namespace for the payload header included in build_request.
+static void key_of_input(const uint8_t iid[32], int mesh, uint8_t key[32]) {
     uint8_t buf[8 + 32 + 32], *p = buf;
-    memcpy(p, "TKSK", 4), p += 4;
+    memcpy(p, mesh ? "TKSM" : "TKSK", 4), p += 4;
     put_u32(&p, KEY_VERSION);
     memcpy(p, xlate_id, 32), p += 32;
     memcpy(p, iid, 32), p += 32;
@@ -1280,7 +1283,7 @@ static void key_of_input(const uint8_t iid[32], uint8_t key[32]) {
 }
 
 // The input id and cache key (m given), or the provisional key (m NULL: full answers; iid untouched).
-static void build_key(const uint8_t code_hash[32], const GfxShaderAnswers *a, const UseMask *m, uint8_t key[32],
+static void build_key(int stage, const uint8_t code_hash[32], const GfxShaderAnswers *a, const UseMask *m, uint8_t key[32],
                       uint8_t iid[32]) {
     GfxShaderAnswers masked;
     uint8_t buf[8 + 32 + 32 + 256], *p = buf;
@@ -1291,10 +1294,10 @@ static void build_key(const uint8_t code_hash[32], const GfxShaderAnswers *a, co
         mask_answers(a, m, &masked);
         p += pack_answers(p, &masked);
         rt_sha256(buf, (size_t)(p - buf), iid);
-        key_of_input(iid, key);
+        key_of_input(iid, mesh_stage(stage), key);
         return;
     }
-    memcpy(p, "TKSP", 4), p += 4;
+    memcpy(p, mesh_stage(stage) ? "TKPM" : "TKSP", 4), p += 4;
     put_u32(&p, KEY_VERSION);
     memcpy(p, xlate_id, 32), p += 32;
     memcpy(p, code_hash, 32), p += 32;
@@ -1370,8 +1373,12 @@ static size_t build_request(char *o0, const char *hex, const char *stage, const 
             // mesh stage; +0x60 vertex limit (low 16 bits) and primitive limit (high 16 bits).
             uint32_t w58, w5c, w60;
             memcpy(&w58, control + 0x58, 4), memcpy(&w5c, control + 0x5c, 4), memcpy(&w60, control + 0x60, 4);
+            uint32_t payload = (w58 >> 24) * 256;
+            // The size field counts the program data following its 24-byte task payload header.
+            // Pass the total rounded to 16 bytes. A zero data field represents one 256-byte unit.
+            if (!strcmp(stage, "ts") || (w5c >> 16 & 0xff)) payload = (payload ? payload : 256) + 32;
             o += sprintf(o, ",\"mesh\":{\"stage\":%d,\"threads\":%u,\"payload\":%u,\"maxv\":%u,\"maxp\":%u,\"topo\":%u,\"task\":%s}",
-                         !strcmp(stage, "ts") ? 6 : 7, w58 & 0xffff, (w58 >> 24) * 256, w60 & 0xffff, w60 >> 16, w5c >> 24,
+                         !strcmp(stage, "ts") ? 6 : 7, w58 & 0xffff, payload, w60 & 0xffff, w60 >> 16, w5c >> 24,
                          (w5c >> 16 & 0xff) ? "true" : "false");
         }
         if (!strcmp(stage, "cs")) {
@@ -1499,7 +1506,7 @@ static int req_init(Req *r, int stage, const uint8_t *control, const uint8_t *co
     paths();
     UseMask m;
     r->final = use_find(r->code_hash, &m);
-    build_key(r->code_hash, a, r->final ? &m : NULL, r->key, r->iid);
+    build_key(stage, r->code_hash, a, r->final ? &m : NULL, r->key, r->iid);
     return 1;
 }
 
@@ -1634,7 +1641,7 @@ static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *co
     uint8_t mk[32], miid[32];
     // Another thread may have translated it while this one waited in flight_enter.
     const uint8_t *look = r->final ? key : NULL, *look_iid = r->iid;
-    if (!r->final && use_find(r->code_hash, &m)) build_key(r->code_hash, a, &m, mk, miid), look = mk, look_iid = miid;
+    if (!r->final && use_find(r->code_hash, &m)) build_key(stage, r->code_hash, a, &m, mk, miid), look = mk, look_iid = miid;
     if (look && (s = mem_find(look))) return plat_inc64(&n_hits), s;
     if (look && (s = disk_load(look, look_iid))) return plat_inc64(&n_hits), mem_insert(s);
 
@@ -1680,7 +1687,7 @@ static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *co
     if (!(s = disk_load(key, r->iid))) return fail("translator output missing or malformed", hex);
     if (!r->final) {                                       // name the files after the cache key, remember the mask
         m = use_of(s);
-        build_key(r->code_hash, a, &m, mk, miid);
+        build_key(stage, r->code_hash, a, &m, mk, miid);
         char mhex[65], to[PATH_CAP + 80];
         key_hex(mk, mhex);
         snprintf(to, PATH_CAP + 80, "%s/%s.spv", cache_dir, mhex);
@@ -1868,15 +1875,11 @@ const uint8_t *gfx_shader_input_id(const GfxShader *s) { return s->iid; }
 // By input id: memory, then the disk cache under the current translator, then (xlate 1) a translation from the stored
 // inputs. NULL when none has it; a failed translation is counted as a failure.
 const GfxShader *gfx_shader_load_input(const uint8_t iid[32], int xlate) {
-    paths();
-    if (!cache_dir[0]) return NULL;
-    uint8_t key[32];
-    key_of_input(iid, key);
-    GfxShader *s = mem_find(key);
-    if (s) return s;
-    if ((s = disk_load(key, iid))) return mem_insert(s);
+    int owned;
+    const GfxShader *s = gfx_shader_load_private(iid, &owned);
+    if (s) return owned ? mem_insert((GfxShader *)s) : s;
     Inputs in;
-    if (!xlate || !in_load(iid, &in)) return NULL;
+    if (!cache_dir[0] || !xlate || !in_load(iid, &in)) return NULL;
     const GfxShader *t = gfx_shader_get(in.stage, in.control, in.code, in.length, in.c1, &in.a);
     free(in.buf);
     return t;
@@ -1889,16 +1892,60 @@ const GfxShader *gfx_shader_load_private(const uint8_t iid[32], int *owned) {
     *owned = 0;
     paths();
     if (!cache_dir[0]) return NULL;
-    uint8_t key[32];
-    key_of_input(iid, key);
-    GfxShader *s = mem_find(key);
-    if (s) return s;
-    if ((s = disk_load(key, iid))) *owned = 1;
-    return s;
+    uint8_t keys[2][32];
+    for (int mesh = 0; mesh <= 1; mesh++) {
+        key_of_input(iid, mesh, keys[mesh]);
+        GfxShader *s = mem_find(keys[mesh]);
+        if (s && mesh_stage(s->stage) == mesh) return s;
+    }
+    // The input ID alone does not contain its stage. A current packed entry is
+    // cheap to locate; otherwise check the revised key before its legacy sibling.
+    int first = pack_find(PACK_SPV, keys[1]) != NULL;
+    for (int i = 0; i < 2; i++) {
+        int mesh = first ^ i;
+        GfxShader *s = disk_load(keys[mesh], iid);
+        if (!s) continue;
+        if (mesh_stage(s->stage) == mesh) {
+            *owned = 1;
+            return s;
+        }
+        shader_free(s);
+    }
+    return NULL;
 }
 
 void gfx_shader_release_private(const GfxShader *s) {
     if (s) shader_free((GfxShader *)s);
+}
+
+// Prepared records name the stage. With only an input ID, the old namespace's
+// reflection distinguishes reusable vertex/fragment/compute code from an old mesh
+// payload. This presence check never reads the much larger SPIR-V module.
+static int cached_input_present(const uint8_t iid[32], int stage) {
+    int first = stage < 0 ? 1 : mesh_stage(stage);
+    for (int mesh = first; mesh >= (stage < 0 ? 0 : first); mesh--) {
+        uint8_t key[32];
+        char name[65], path[PATH_CAP + 80];
+        key_of_input(iid, mesh, key);
+        key_hex(key, name);
+        const PackEnt *spv = pack_find(PACK_SPV, key), *res = pack_find(PACK_RES, key);
+        int packed = spv && spv->size >= 20 && !(spv->size % 4) && res && res->size;
+        snprintf(path, sizeof path, "%s/%s.res.json", cache_dir, name);
+        if (!packed) {
+            char bin[PATH_CAP + 80];
+            snprintf(bin, sizeof bin, "%s/%s.spv", cache_dir, name);
+            int64_t n = plat_file_size(bin);
+            if (n < 20 || n % 4 || plat_file_size(path) <= 0) continue;
+        }
+        if (stage >= 0 || mesh) return 1;
+        uint64_t n = 0;
+        char *js = (char *)(packed ? pack_read(PACK_RES, key, &n) : read_file(path, &n));
+        char st[8] = {0};
+        if (js) json_str(js, js + n, "stage", st, sizeof st);
+        free(js);
+        return !strcmp(st, "vs") || !strcmp(st, "ps") || !strcmp(st, "cs");
+    }
+    return 0;
 }
 
 // ---- boot prewarm (gfx_shader_prewarm)
@@ -1909,6 +1956,8 @@ typedef struct {
     const GfxShader **out;
     uint8_t (*other)[32];                                  // other stored inputs: translated when not cached, not loaded
     size_t n_other;
+    GfxWarmEnt *stages;                                    // input IDs with known stages in the saved manifests
+    size_t n_stages;
     volatile int64_t next, done;
     volatile int32_t missing, other_cached;
 } Warm;
@@ -1923,6 +1972,9 @@ void gfx_shader_prewarm_progress(int64_t *done, int64_t *total, int64_t *transla
     *translated = __atomic_load_n(&pw_xlated, __ATOMIC_RELAXED);
 }
 
+static int iid_cmp(const void *x, const void *y) { return memcmp(x, y, 32); }
+static size_t saved_stages(GfxWarmEnt **out);
+
 static void warm_worker(void *arg) {
     Warm *w = arg;
     for (;;) {
@@ -1932,19 +1984,13 @@ static void warm_worker(void *arg) {
             if (!(w->out[i] = gfx_shader_load_input(w->named[i], 1))) plat_inc32(&w->missing);
         } else {
             const uint8_t *iid = w->other[i - w->n_named];
-            uint8_t key[32];
-            char hex[65], p[PATH_CAP + 80];
-            key_of_input(iid, key);
-            key_hex(key, hex);
-            snprintf(p, PATH_CAP + 80, "%s/%s.spv", cache_dir, hex);
-            if (pack_find(PACK_SPV, key) || file_exists(p)) plat_inc32(&w->other_cached);
+            const GfxWarmEnt *entry = w->n_stages ? bsearch(iid, w->stages, w->n_stages, sizeof *w->stages, iid_cmp) : NULL;
+            if (cached_input_present(iid, entry ? entry->stage : -1)) plat_inc32(&w->other_cached);
             else gfx_shader_load_input(iid, 1);
         }
         plat_inc64(&w->done);
     }
 }
-
-static int iid_cmp(const void *x, const void *y) { return memcmp(x, y, 32); }
 
 typedef struct {
     const uint8_t (*named)[32];
@@ -1996,6 +2042,7 @@ void gfx_shader_prewarm(const uint8_t (*iids)[32], size_t n, const GfxShader **o
     if (sorted) memcpy(sorted, iids, n * 32), qsort(sorted, n, 32, iid_cmp);
     Warm w = {.named = iids, .n_named = n, .out = out};
     w.n_other = other_inputs(sorted, sorted ? n : 0, &w.other);
+    if (w.n_other) w.n_stages = saved_stages(&w.stages);
     free(sorted);
     size_t total = w.n_named + w.n_other;
     __atomic_store_n(&pw_done, 0, __ATOMIC_RELAXED);
@@ -2026,7 +2073,7 @@ void gfx_shader_prewarm(const uint8_t (*iids)[32], size_t n, const GfxShader **o
            "cached); %llu translated, %llu failed, with up to %d translators and %d threads, in %.0f ms", w.n_named,
            (long)w.missing, w.n_other, (long)w.other_cached, (unsigned long long)((uint64_t)n_xlated - xl0),
            (unsigned long long)((uint64_t)n_failures - fail0), procs, k, (double)plat_now_ms() - t0);
-    free(w.other);
+    free(w.stages), free(w.other);
 }
 const uint32_t *gfx_shader_spirv(const GfxShader *s, uint64_t *words) {
     if (words) *words = s->words;
@@ -2456,19 +2503,22 @@ int gfx_shader_prepared_present(const char *dir) {
     size_t bytes = 0;
     if (!rec_read(path, "NX2NSPRP", PRP_VERSION, PRP_REC, &records, &bytes)) return 0;
     int ok = bytes && bytes % PRP_REC == 0;
-    for (size_t i = 0; ok && i < bytes; i += PRP_REC) {
-        uint8_t key[32];
-        key_of_input(records + i + 4, key);
-        const PackEnt *spv = pack_find(PACK_SPV, key), *res = pack_find(PACK_RES, key);
-        if (spv && spv->size >= 20 && !(spv->size % 4) && res && res->size) continue;
-        char hex[65];
-        key_hex(key, hex);
-        snprintf(path, sizeof path, "%s/%s.spv", cache_dir, hex);
-        int64_t size = plat_file_size(path);
-        snprintf(path, sizeof path, "%s/%s.res.json", cache_dir, hex);
-        ok = size >= 20 && !(size % 4) && plat_file_size(path) > 0;
-    }
+    for (size_t i = 0; ok && i < bytes; i += PRP_REC)
+        ok = cached_input_present(records + i + 4, records[i]);
     free(records);
+    // Earlier preparation manifests list only VS/FS/CS. Their separate mesh
+    // program inventory still names the task/mesh translations the driver bake needs.
+    GfxArchiveProgram *programs = NULL;
+    size_t count = 0;
+    if (ok) ok = gfx_shader_archive_programs(dir, 1, &programs, &count);
+    Set64 seen = {0};
+    static const uint8_t zero[32];
+    for (size_t i = 0; ok && i < count; i++) {
+        const GfxArchiveProgram *p = &programs[i];
+        if (set_add(&seen, hash8(p->first))) ok = cached_input_present(p->first, GFX_STAGE_MS);
+        if (ok && memcmp(zero, p->ts, 32) && set_add(&seen, hash8(p->ts))) ok = cached_input_present(p->ts, GFX_STAGE_TS);
+    }
+    free(seen.v), free(programs);
     return ok;
 }
 
@@ -2650,5 +2700,18 @@ size_t gfx_shader_warm_list(const char *dir, int include_prepared, GfxWarmEnt **
     free(seen.v), free(ab), free(pb);
     rt_log("gfx_shader: warm list: %zu variants (%zu met in play, %zu prepared)", n, na, np);
     *out = e;
+    return n;
+}
+
+// Boot can identify most stored inputs directly from the preparation and play
+// manifests, so it avoids opening a reflection file for each cached shader.
+static size_t saved_stages(GfxWarmEnt **out) {
+    if (!RC.on) return 0;
+    char dir[PATH_CAP];
+    snprintf(dir, sizeof dir, "%s", RC.ans_path);
+    char *cut = plat_last_sep(dir);
+    if (cut) *cut = 0;
+    size_t n = gfx_shader_warm_list(cut ? dir : ".", 1, out, NULL);
+    if (n) qsort(*out, n, sizeof **out, iid_cmp);
     return n;
 }

@@ -16,6 +16,7 @@
 #include "nvn_tex.h"
 #include "vk.h"
 #include "vk_exec.h"
+#include "vk_gpa.h"
 #include "platform/platform.h"
 
 #define SUBMITS 100
@@ -1037,6 +1038,37 @@ static int test_mirror(const GfxBackend *b, uint8_t *guest, int *bytes) {
     CHECK(xf_submit(b, stream, p), "dirty flush readback timed out");
     CHECK(m[0x7800] == 0x31 && m[0x7801] == 0x77 && m[0x8000] == 0xcb,
           "flushed CPU edits or adjacent GPU data changed");
+    if (direct && vk_gpa_on() && !rt_knob("GPA_EMPTY", "0")) {
+        const uint32_t stale[4] = {0, 0, 182, 1}, expected[4] = {182, 42, 0, 2};
+        uint32_t *counts = (uint32_t *)(m + 0xa000), *readback = (uint32_t *)(m + 0xb000);
+        memcpy(counts, stale, sizeof stale);
+        const p_copy_b2b copy = {a + 0xa000, a + 0xb000, sizeof stale};
+        p = put(stream, OP_BEGIN, NULL, 0);
+        p = put(p, OP_COPY_B2B, &copy, sizeof copy);
+        CHECK(xf_submit(b, stream, p) && !memcmp(readback, stale, sizeof stale), "initial indirect records differ");
+        // A shader that already holds a GPU pointer writes the mirror directly. Save that backing before
+        // the CPU edits another word on its page; looking up a binding after the flush would hide the bug.
+        VkMemSpan sp;
+        CHECK(vk_mem_resolve(copy.src, sizeof stale, &sp), "indirect records are unbacked");
+        VK_MEM_USE(sp);
+        counts[3] = expected[3];
+        nvn_pool_flushed(&pool, 0xa00c, 4);
+        p = put(stream, OP_BEGIN, NULL, 0);
+        CHECK(xf_submit(b, stream, p), "unbound producer submission timed out");
+        // Four-byte GPU writes stand in for the culling shader's counter updates, with no explicit binding
+        // and no write-back to the imported copy. The final count represents a genuinely culled draw.
+        VkCommandBuffer cb = vk_upload_begin();
+        for (uint32_t i = 0; i < 3; i++)
+            vkCmdFillBuffer(cb, sp.buffer, sp.offset + 4 * i, 4, expected[i]);
+        vk_upload_end();
+        vk_upload_flush(1);
+        p = put(stream, OP_BEGIN, NULL, 0);
+        p = put(p, OP_COPY_B2B, &copy, sizeof copy);
+        CHECK(xf_submit(b, stream, p), "indirect record readback timed out");
+        CHECK(!memcmp(readback, expected, sizeof expected),
+              "GPU-produced counts %u/%u/%u, neighbor %u; expected 182/42/0 and 2",
+              readback[0], readback[1], readback[2], readback[3]);
+    }
     b->pool_fini(&pool);
     *bytes = 4096 + 0x1000 + 4096 + 0x1000;
     return 0;

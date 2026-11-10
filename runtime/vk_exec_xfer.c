@@ -732,6 +732,13 @@ static void clear_buf(VkExec *ex, const p_clear_buf *p) {
         if (!started) vk_exec_pass_end(ex), vk_exec_barrier(ex), started = 1;
         VK_MEM_PICK(d);
         vkCmdFillBuffer(ex->cb, d.buffer, d.offset, n, p->value);
+        // Device-address atomics update both copies. Reset both in GPU command order
+        // so a counter increment after this fill starts from the same value in each.
+        VkBuffer twin = vk_mem_guest_twin(&d);
+        if (twin) {
+            vkCmdFillBuffer(ex->cb, twin, d.offset, n, p->value);
+            ex->recorded++;
+        }
         vk_mem_gpu_wrote(&d, n);
         note_gpu_write(ex, dst, n, d.buffer);
         ex->recorded++;

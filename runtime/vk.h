@@ -260,6 +260,7 @@ void vk_mem_dirty_submit(void);                   // vk_sync_submit, under its l
 extern int vk_mirror_on;
 void vk_mem_use(VkMemSpan *sp);
 void vk_mem_pick(VkMemSpan *sp);
+VkBuffer vk_mem_guest_twin(const VkMemSpan *sp);   // imported buffer at the same offset as an active mirror, or null
 #define VK_MEM_USE(sp) do { if (vk_mirror_on && (sp).pool) vk_mem_use(&(sp)); } while (0)
 #define VK_MEM_PICK(sp) do { if (vk_mirror_on && (sp).pool) vk_mem_pick(&(sp)); } while (0)
 void vk_mem_gpu_wrote(const VkMemSpan *sp, uint64_t size);

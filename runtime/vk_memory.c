@@ -1538,7 +1538,7 @@ static void mirror_sync(PoolRec *r) {
     mrep.sync_t += qpc() - t0;
 }
 
-static int movie_mirrors_pending;
+static int published_mirrors_pending;
 
 void vk_mem_publish_movie_buffer(uint64_t addr, uint64_t size) {
     if (!vk_mirror_on || !size) return;
@@ -1547,7 +1547,7 @@ void vk_mem_publish_movie_buffer(uint64_t addr, uint64_t size) {
     PoolRec *r = e ? e->buf : NULL;
     if (r && r->kind == POOL_IMPORT) {
         __atomic_store_n(&r->movie_written, 1, __ATOMIC_RELEASE);
-        __atomic_store_n(&movie_mirrors_pending, 1, __ATOMIC_RELEASE);
+        __atomic_store_n(&published_mirrors_pending, 1, __ATOMIC_RELEASE);
     }
     plat_mutex_unlock_shared(&pool_lock);
 }
@@ -1565,6 +1565,11 @@ void vk_mem_pick(VkMemSpan *sp) {
     if (!r || r->mstate != MS_ON) return;
     if (r->acc_sub != msub) mirror_sync(r);
     sp->buffer = r->mbuf;
+}
+
+VkBuffer vk_mem_guest_twin(const VkMemSpan *sp) {
+    const PoolRec *r = sp->pool;
+    return r && r->mstate == MS_ON && sp->buffer == r->mbuf ? r->buf : VK_NULL_HANDLE;
 }
 
 int vk_mem_mirror_probe(uint64_t addr, int *direct) {
@@ -1908,6 +1913,7 @@ void nvn_pool_flushed(const pool_t *p, uint64_t off, uint64_t size) {
         __atomic_store_n(&r->fl_n, flush_add(r->fl, r->fl_n, a, b, flush_cap), __ATOMIC_RELEASE);
         r->fl_calls++, r->fl_sum += size;
         plat_mutex_unlock(&flush_lock);
+        __atomic_store_n(&published_mirrors_pending, 1, __ATOMIC_RELEASE);
     }
     plat_mutex_unlock_shared(&pool_lock);
 }
@@ -1960,10 +1966,18 @@ void vk_mem_mirror_begin(void) {
     mrep.presnap_bytes += ww_bytes - b0;
     if (freeze_idle) freeze_pass();
     plat_mutex_unlock(&gen_lock);
-    // Indirect GPU reads have no binding to trigger vk_mem_use. Sync a published movie buffer before the dispatch.
-    if (__atomic_exchange_n(&movie_mirrors_pending, 0, __ATOMIC_ACQ_REL))
-        for (int i = 0; i < nm; i++)
-            if (__atomic_exchange_n(&mlist[i]->movie_written, 0, __ATOMIC_ACQ_REL)) mirror_sync(mlist[i]);
+    // A shader can reach a flushed pool through its device address before the first descriptor or indirect draw
+    // names the pool. Publish its changed pages in this submission's prologue: a later upload could overwrite
+    // the workgroup count the culling dispatch has just produced on that page.
+    if (__atomic_exchange_n(&published_mirrors_pending, 0, __ATOMIC_ACQ_REL)) {
+        for (int i = 0; i < nm; ++i) {
+            PoolRec *r = mlist[i];
+            int movie = __atomic_exchange_n(&r->movie_written, 0, __ATOMIC_ACQ_REL);
+            if (!movie && !(r->gpa_rec && __atomic_load_n(&r->fl_n, __ATOMIC_ACQUIRE))) continue;
+            if (shadow_on) shadow_touch(r);
+            mirror_sync(r);
+        }
+    }
     plat_mutex_unlock_shared(&pool_lock);
     mrep.subs++;
     mrep.presnap_queries += q;
