@@ -1045,6 +1045,52 @@ int plat_file_write_atomic(const char *path, const void *data, size_t n) { retur
 
 int plat_file_write_cached(const char *path, const void *data, size_t n) { return write_swap(path, data, n, 0); }
 
+struct PlatFileWrite {
+    int fd;
+    void *data;
+    size_t size;
+    char tmp[PATH_MAX + 48], path[PATH_MAX];
+};
+
+PlatFileWrite *plat_file_write_begin(const char *path, size_t n, void **data) {
+    *data = NULL;
+    if (!n || n > INT64_MAX || (access(path, W_OK) && errno != ENOENT)) return NULL;
+    PlatFileWrite *f = calloc(1, sizeof *f);
+    if (!f) return NULL;
+    f->fd = -1;
+    int len = snprintf(f->path, sizeof f->path, "%s", path);
+    if (len < 0 || len >= (int)sizeof f->path) goto fail;
+    len = snprintf(f->tmp, sizeof f->tmp, "%s.%u.%u.tmp", path, plat_process_id(), plat_thread_id());
+    if (len < 0 || len >= (int)sizeof f->tmp) goto fail;
+    f->fd = open(f->tmp, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    // Reserve the backing storage before handing out a writable mapping: disk-full must not become SIGBUS.
+    if (f->fd < 0 || posix_fallocate(f->fd, 0, (off_t)n)) goto fail;
+    f->data = mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_SHARED, f->fd, 0);
+    if (f->data == MAP_FAILED) { f->data = NULL; goto fail; }
+    f->size = n;
+    *data = f->data;
+    return f;
+fail:
+    plat_file_write_finish(f, 0);
+    return NULL;
+}
+
+int plat_file_write_finish(PlatFileWrite *f, size_t n) {
+    if (!f) return 0;
+    int ok = f->data && n && n <= f->size;
+    if (ok) ok = msync(f->data, n, MS_SYNC) == 0;
+    if (f->data && munmap(f->data, f->size)) ok = 0;
+    if (f->fd >= 0) {
+        if (ok) ok = ftruncate(f->fd, (off_t)n) == 0 && fsync(f->fd) == 0;
+        if (close(f->fd)) ok = 0;
+    }
+    if (ok) ok = rename(f->tmp, f->path) == 0;
+    if (ok) sync_dir_of(f->path);
+    else if (f->fd >= 0) unlink(f->tmp);
+    free(f);
+    return ok;
+}
+
 int plat_file_flush(const char *path) {
     int fd = open(path, O_WRONLY | O_CLOEXEC);
     if (fd < 0) return 0;
@@ -1437,6 +1483,10 @@ const void *plat_file_map(PlatFile *f) {
     if (fstat(fd_of(f), &st) || !st.st_size) return NULL;
     void *v = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd_of(f), 0);
     return v == MAP_FAILED ? NULL : v;
+}
+
+void plat_file_unmap(const void *data, size_t n) {
+    if (data) munmap((void *)data, n);
 }
 
 int plat_fs_os_error(void) { return errno; }

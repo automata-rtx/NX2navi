@@ -615,13 +615,23 @@ uint8_t *plat_file_read(const char *path, uint64_t *size) {
     return buf;
 }
 
+static int file_write_all(HANDLE h, const void *data, size_t n) {
+    const unsigned char *p = data;
+    while (n) {
+        DWORD put = 0, chunk = (DWORD)(n > (16u << 20) ? (16u << 20) : n);
+        if (!WriteFile(h, p, chunk, &put, NULL) || !put) return 0;
+        p += put;
+        n -= put;
+    }
+    return 1;
+}
+
 int plat_file_write(const char *path, const void *data, size_t n) {
     wchar_t w[WPATH];
     if (!widen(path, w, WPATH)) return 0;
     HANDLE h = CreateFileW(w, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return 0;
-    DWORD put = 0;
-    int ok = WriteFile(h, data, (DWORD)n, &put, NULL) && put == n;
+    int ok = file_write_all(h, data, n);
     CloseHandle(h);
     return ok;
 }
@@ -698,8 +708,7 @@ static int write_swap(const char *path, const void *data, size_t n, int durable)
     if (len < 0 || len >= (int)sizeof tmp || !widen(tmp, a, WPATH) || !widen(path, b, WPATH)) return 0;
     HANDLE h = CreateFileW(a, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return 0;
-    DWORD put = 0;
-    int ok = WriteFile(h, data, (DWORD)n, &put, NULL) && put == n && (!durable || FlushFileBuffers(h));
+    int ok = file_write_all(h, data, n) && (!durable || FlushFileBuffers(h));
     CloseHandle(h);
     if (ok && MoveFileExW(a, b, MOVEFILE_REPLACE_EXISTING | (durable ? MOVEFILE_WRITE_THROUGH : 0))) return 1;
     DeleteFileW(a);
@@ -709,6 +718,52 @@ static int write_swap(const char *path, const void *data, size_t n, int durable)
 int plat_file_write_atomic(const char *path, const void *data, size_t n) { return write_swap(path, data, n, 1); }
 
 int plat_file_write_cached(const char *path, const void *data, size_t n) { return write_swap(path, data, n, 0); }
+
+struct PlatFileWrite {
+    HANDLE file;
+    void *data;
+    size_t size;
+    wchar_t tmp[WPATH], path[WPATH];
+};
+
+PlatFileWrite *plat_file_write_begin(const char *path, size_t n, void **data) {
+    *data = NULL;
+    if (!n || n > INT64_MAX) return NULL;
+    PlatFileWrite *f = calloc(1, sizeof *f);
+    if (!f) return NULL;
+    f->file = INVALID_HANDLE_VALUE;
+    char tmp[WPATH + 48];
+    int len = snprintf(tmp, sizeof tmp, "%s.%u.%u.tmp", path, plat_process_id(), plat_thread_id());
+    if (len < 0 || len >= (int)sizeof tmp || !widen(tmp, f->tmp, WPATH) || !widen(path, f->path, WPATH)) goto fail;
+    f->file = CreateFileW(f->tmp, GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f->file == INVALID_HANDLE_VALUE) goto fail;
+    HANDLE map = CreateFileMappingW(f->file, NULL, PAGE_READWRITE, (DWORD)((uint64_t)n >> 32), (DWORD)n, NULL);
+    f->data = map ? MapViewOfFile(map, FILE_MAP_WRITE, 0, 0, n) : NULL;
+    if (map) CloseHandle(map);
+    if (!f->data) goto fail;
+    f->size = n;
+    *data = f->data;
+    return f;
+fail:
+    plat_file_write_finish(f, 0);
+    return NULL;
+}
+
+int plat_file_write_finish(PlatFileWrite *f, size_t n) {
+    if (!f) return 0;
+    int ok = f->data && n && n <= f->size;
+    if (ok) ok = FlushViewOfFile(f->data, n) != 0;
+    if (f->data && !UnmapViewOfFile(f->data)) ok = 0;
+    if (f->file != INVALID_HANDLE_VALUE) {
+        LARGE_INTEGER size = {.QuadPart = (LONGLONG)n};
+        if (ok) ok = SetFilePointerEx(f->file, size, NULL, FILE_BEGIN) && SetEndOfFile(f->file) && FlushFileBuffers(f->file);
+        if (!CloseHandle(f->file)) ok = 0;
+    }
+    if (ok) ok = MoveFileExW(f->tmp, f->path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+    if (!ok && f->file != INVALID_HANDLE_VALUE) DeleteFileW(f->tmp);
+    free(f);
+    return ok;
+}
 
 int plat_file_flush(const char *path) {
     wchar_t w[WPATH];
@@ -1292,6 +1347,11 @@ const void *plat_file_map(PlatFile *f) {
     const void *v = map ? MapViewOfFile(map, FILE_MAP_READ, 0, 0, 0) : NULL;
     if (map) CloseHandle(map);   // the view keeps the mapping alive
     return v;
+}
+
+void plat_file_unmap(const void *data, size_t n) {
+    (void)n;
+    if (data) UnmapViewOfFile(data);
 }
 
 static __thread DWORD fs_last_error;
