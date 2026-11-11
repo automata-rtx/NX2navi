@@ -1167,6 +1167,7 @@ static void evo_resume(VkExec *ex) {
             if (!c || !cont_ready(c)) continue;
             progress = 1;
             evo_switches++;
+            vk_exec_brk++;
             vk_exec_pass_end(ex);
             vk_exec_barrier(ex);
             uint8_t *mine = malloc(ST_HI - ST_LO);
@@ -1367,11 +1368,78 @@ static const op_hdr *scene_scaler(VkExec *ex, const op_hdr *first) {
     return NULL;
 }
 
+// Ops that only store state or draw: nothing they record runs outside a pass, and the walk goes on with the op after
+// them. Counter reports and resets are among them: they close and open an occlusion query inside the pass, and the
+// value reaches guest memory from the completion thread once the submission's fence has passed (vk_exec_xfer.c
+// oq_cb, counter_cb), never from the GPU inside the run; so are the render conditions, which the replay decides on
+// the CPU. Ocarina reports a counter after most of its indirect mesh draws. Any other op the walk replays bumps
+// vk_exec_brk, and so does a held submission that goes on in between (evo_resume): what was prepared for the draws
+// of a run of such ops (vk_exec_draw.c, the indirect mesh draws' records) holds only while it stays the same.
+uint32_t vk_exec_brk;
+
+static int op_linear(uint32_t op) {
+    switch (op) {
+    case OP_BEGIN: case OP_JUMP: case OP_VIEWPORTS: case OP_SCISSOR: case OP_DEPTH_RANGE: case OP_STENCIL:
+    case OP_POLY_OFFSET: case OP_BLEND_COLOR: case OP_DEPTH_CLAMP: case OP_RASTER_DISCARD: case OP_PRIM_RESTART:
+    case OP_COPY_STRIDE: case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: case OP_DRAW: case OP_DRAW_IDX: case OP_DRAW_IDX_IND:
+    case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF: case OP_BIND_UBO:
+    case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_SAMP: case OP_BIND_IMG: case OP_PUSH_CC: case OP_DRAW_MESH:
+    case OP_DRAW_MESH_IND: case OP_REPORT_COUNTER: case OP_RESET_COUNTER: case OP_RENDER_ENABLE: case OP_RENDER_COND:
+        return 1;
+    default: return 0;
+    }
+}
+
+#define MESH_RUN_OPS 2048
+static uint32_t mesh_run_stop[OP_COUNT_];   // the op each run of vk_exec_mesh_run ended at, since the start
+
+// For the perf log: the ops the runs ended at most often.
+void vk_exec_mesh_run_stops(char *out, size_t n) {
+    uint32_t c[OP_COUNT_];
+    memcpy(c, mesh_run_stop, sizeof c);
+    size_t at = 0;
+    *out = 0;
+    for (int k = 0; k < 4; k++) {
+        int best = 0;
+        for (int i = 1; i < OP_COUNT_; i++)
+            if (c[i] > c[best]) best = i;
+        if (!c[best]) break;
+        int w = snprintf(out + at, n - at, "%s%u at %s", k ? ", " : "", c[best], nvn_op_name((uint32_t)best));
+        if (w < 0 || (size_t)w >= n - at) break;
+        at += (size_t)w, c[best] = 0;
+    }
+}
+
+// The indirect mesh draws that follow the op being replayed (cur: its payload) with only ops of op_linear between
+// them, MESH_RUN_OPS at most: their payloads into out, at most max. 0 when the walk is not at cur.
+int vk_exec_mesh_run(const void *cur, const void **out, int max) {
+    const op_hdr *h = AH.at[AH.depth];
+    if (!h || nvn_op_payload(h) != cur) return 0;
+    int n = 0;
+    h = nvn_op_next(h);
+    for (int ops = 0; ops < MESH_RUN_OPS && n < max; ops++) {
+        if (h->size < sizeof *h || (h->size & 7) || h->op >= OP_COUNT_) break;
+        if (!op_linear(h->op)) {
+            mesh_run_stop[h->op]++;
+            break;
+        }
+        if (h->op == OP_JUMP) {
+            h = (const op_hdr *)(uintptr_t)((const p_jump *)nvn_op_payload(h))->target;
+            continue;
+        }
+        if (h->op == OP_DRAW_MESH_IND) out[n++] = nvn_op_payload(h);
+        h = nvn_op_next(h);
+    }
+    return n;
+}
+
+
 static const op_hdr *walk(VkExec *ex, const op_hdr *h, int depth) {
     const op_hdr *scene_end = NULL;
     for (;;) {
         if (h->size < sizeof *h || (h->size & 7) || h->op >= OP_COUNT_)
             rt_fatal("vk: corrupt command record at %p: op %u size %u", (const void *)h, h->op, h->size);
+        if (!op_linear(h->op)) vk_exec_brk++;
         const void *a = nvn_op_payload(h);
         if (!scene_end && h->op == OP_CLEAR_TEX) scene_end = scene_scaler(ex, h);
         if (scene_end && (h->op == OP_CLEAR_TEX || h->op == OP_DISPATCH || h->op == OP_DISPATCH_IND)) {

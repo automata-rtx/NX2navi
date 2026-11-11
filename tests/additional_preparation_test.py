@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
-from extend_shader_preparation import HEADER, merge_manifests, read_manifest
+from extend_shader_preparation import HEADER, merge_manifests, read_manifest, archive_delta
 from shader_passes import PASS_TARGETS
 
 
@@ -14,6 +14,15 @@ def row(identity, stage=0):
 
 
 class AdditionalPreparationTest(unittest.TestCase):
+    def test_archive_delta_excludes_prepared_combinations(self):
+        for mesh, magic in ((True, b'NX2NMSID'), (False, b'NX2NVSID')):
+            header = struct.pack('<8sII', magic, 1, 96)
+            a, b = bytes([1]) * 96, bytes([2]) * 96
+            self.assertEqual(archive_delta(header + a, header + b + a + b, mesh), header + b)
+            self.assertEqual(archive_delta(header + a, header + a, mesh), header)
+            with self.assertRaises(ValueError):
+                archive_delta(header + a[:-1], header + b, mesh)
+
     def test_preserves_baseline_and_corrects_stage_without_rebuilding_it(self):
         baseline = HEADER + row(1) + row(2) + row(3, 5)
         prepared = HEADER + row(1, 7) + row(2) + row(4, 4)

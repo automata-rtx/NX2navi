@@ -51,6 +51,7 @@
 #include "tex.h"
 #include "vk_gpa.h"
 #include "vk_warm_hint.h"
+#include "vk_cache_revision.h"
 
 #define LOG_ONCE(...) do { static volatile int32_t once_; if (!plat_xchg32(&once_, 1)) rt_log(__VA_ARGS__); } while (0)
 
@@ -529,17 +530,25 @@ static PlatMutex cache_rw = PLAT_MUTEX_INIT;
 // but the background builder of large compute shaders) for P.cache itself. A create into it does not hold cache_rw, so
 // a build of minutes does not keep pipeline-cache.bin from being saved; bg_merge moves its content into P.cache.
 static __thread VkPipelineCache own_cache;
-// New content in P.cache that P.stats does not count, for autosave_once to save: bg_merge's merges, and the compiles
-// of pipelines built for the cache only (lb_compute keep 0).
-static volatile uint32_t cache_merges;
+// Live pipeline-object counts include cache hits. Only new cache content requires
+// another disk snapshot; the large prepared cache must not be rewritten for each new use.
+static VkCacheRevision cache_revision;
 
 static VkResult pipe_create_in(int kind, void *ci, VkPipeline *pipe, VkPipelineCache cache) {
     int shared = cache && !own_cache;
     if (cache && own_cache) cache = own_cache;
+    uint64_t lock_t0 = shared ? plat_now_ns() : 0;
     if (shared) plat_mutex_lock_shared(&cache_rw);
+    uint64_t lock_ns = shared ? plat_now_ns() - lock_t0 : 0;
     VkResult r = kind == 2 ? vkCreateComputePipelines(P.device, cache, 1, ci, NULL, pipe)
                            : vkCreateGraphicsPipelines(P.device, cache, 1, ci, NULL, pipe);
+    if (shared && r == VK_SUCCESS && vk_cache_create_changed(ci)) vk_cache_changed(&cache_revision);
     if (shared) plat_mutex_unlock_shared(&cache_rw);
+    static volatile int32_t lock_logs;
+    if (lock_ns >= 8000000 && plat_inc32(&lock_logs) <= 64)
+        rt_log("vk_pipeline: thread %u: %s creation waited %.1f ms for cache access before entering the driver",
+               plat_thread_id(),
+               kind == 2 ? "compute pipeline" : kind ? "shader library" : "graphics pipeline", lock_ns / 1e6);
     return r;
 }
 
@@ -5188,9 +5197,9 @@ static void bg_merge(VkPipelineCache own, int built) {
     while (built && !LB.stop && !(locked = plat_mutex_trylock(&cache_rw))) plat_sleep_ms(2);
     if (locked) {
         VkResult r = vkMergePipelineCaches(P.device, P.cache, 1, &own);
+        if (r == VK_SUCCESS) vk_cache_changed(&cache_revision);
         plat_mutex_unlock(&cache_rw);
-        if (r == VK_SUCCESS) __atomic_fetch_add(&cache_merges, 1, __ATOMIC_RELAXED);
-        else rt_log("vk_pipeline: background compute build: its cache did not merge into %s (%d)", P.cache_path, (int)r);
+        if (r != VK_SUCCESS) rt_log("vk_pipeline: background compute build: its cache did not merge into %s (%d)", P.cache_path, (int)r);
     }
     vkDestroyPipelineCache(P.device, own, NULL);
 }
@@ -5360,7 +5369,7 @@ static void lb_compute(const GfxShader *cs, const uint8_t iid[32], int keep) {
     }
     VkPipeline pipe = compute_create(cs, l, big);
     double ms = now_ms() - t0;
-    int compiled = pipe && cc_hit != 1, kept = 0;
+    int kept = 0;
     lb_lock();
     if (flight && cs_flight_remove(cs)) keep = 1;   // a dispatch waits for it
     Pipe *e = NULL;
@@ -5372,8 +5381,6 @@ static void lb_compute(const GfxShader *cs, const uint8_t iid[32], int keep) {
         P.stats.compute++;
     } else if (pipe) {
         vkDestroyPipeline(P.device, pipe, NULL);
-        // P.stats.compute does not count it, so the autosave would not see what its compile added to P.cache
-        if (compiled) __atomic_fetch_add(&cache_merges, 1, __ATOMIC_RELAXED);
     }
     lb_unlock();
     if (!pipe && big && bg_on()) bg_queue(cs, iid, words);
@@ -6041,13 +6048,13 @@ static int lb_warm_prepared(const char *dir, int mode) {
     size_t records = K.file_n, blocked = 0;
     GfxArchiveProgram *groups = NULL;
     size_t ngroups = 0, covered = 0, mesh_unavailable = 0;
-    if (mode != WARM_RECORDED && vk_ctx()->has_mesh_shader && !gfx_shader_archive_programs(dir, 1, &groups, &ngroups)) {
+    if (mode != WARM_RECORDED && vk_ctx()->has_mesh_shader && !gfx_shader_archive_programs(dir, 1, mode == WARM_ADDITIONAL, &groups, &ngroups)) {
         free(K.file), K.file = NULL, free(LB.e), LB.e = NULL;
         return 1;
     }
     GfxArchiveProgram *vertex = NULL;
     size_t nv = 0;
-    if (mode != WARM_RECORDED && P.dyn_vi && !gfx_shader_archive_programs(dir, 0, &vertex, &nv)) {
+    if (mode != WARM_RECORDED && P.dyn_vi && !gfx_shader_archive_programs(dir, 0, mode == WARM_ADDITIONAL, &vertex, &nv)) {
         free(groups), free(K.file), K.file = NULL, free(LB.e), LB.e = NULL;
         return 1;
     }
@@ -6499,11 +6506,16 @@ static int cache_save(uint32_t wait_ms) {
         plat_mutex_unlock(&save_lock);
         return 1;
     }
+    if (!vk_cache_pending(&cache_revision) && (P.cache_loaded || vk_cache_revision(&cache_revision))) {
+        plat_mutex_unlock(&save_lock);
+        return 1;   // a usable file already represents this cache, including explicit warm-up saves
+    }
     if (!cache_save_lock(wait_ms)) {
         plat_mutex_unlock(&save_lock);
         return 0;
     }
     size_t size = 0;
+    uint64_t snapshot = 0, snapshot_ns = 0, save_t0 = plat_now_ns();
     void *data = NULL;
     PlatFileWrite *file = NULL;
     int got = vkGetPipelineCacheData(P.device, P.cache, &size, NULL) == VK_SUCCESS && size;
@@ -6520,11 +6532,15 @@ static int cache_save(uint32_t wait_ms) {
             return 0;
         }
         size = capacity;
+        snapshot = vk_cache_revision(&cache_revision);
+        uint64_t snapshot_t0 = plat_now_ns();
         // VK_INCOMPLETE is discarded, never published as a cache: try a larger snapshot on the next save.
         got = vkGetPipelineCacheData(P.device, P.cache, &size, data) == VK_SUCCESS;
+        snapshot_ns = plat_now_ns() - snapshot_t0;
         plat_mutex_unlock(&cache_rw);
     }
     int saved = plat_file_write_finish(file, got ? size : 0);
+    vk_cache_saved(&cache_revision, snapshot, saved);
     if (!saved) rt_log("vk_pipeline: cannot save %s; the previous cache is retained", P.cache_path);
     else if (P.feedback) {
         char when[96];
@@ -6532,6 +6548,10 @@ static int cache_save(uint32_t wait_ms) {
                  ((double)size - (double)P.cache_loaded) / 1048576.0);
         fb_log(when);
     }
+    if (saved)
+        rt_log("vk_pipeline: cache snapshot saved: %.1f MiB, %.1f ms holding the cache lock, %.1f ms total; "
+               "newer cache changes %s", size / 1048576.0, snapshot_ns / 1e6, (plat_now_ns() - save_t0) / 1e6,
+               vk_cache_pending(&cache_revision) ? "still pending" : "none");
     plat_mutex_unlock(&save_lock);
     return saved ? 1 : -1;
 }
@@ -6594,10 +6614,15 @@ void vk_pipeline_save(void) {
     save_with(SAVE_WAIT_MS);
 }
 
-// The game never shuts the device down (boot.c and the window end the process), so the cache is saved while it
-// runs: at most every 20 s, and only after new pipelines were built. New pipeline keys are appended every 2 s.
+// During play, append only the small usage records. A driver-cache snapshot must
+// hold cache_rw exclusively, and a cache of several GiB can hold it for seconds.
+// A new draw can arrive after the try-lock succeeds, so an idle instant does not
+// make a snapshot safe. Normal window close, guest exit, timed-run exit and
+// explicit preparation all call vk_pipeline_save outside continuing gameplay.
+// An abnormal termination can lose newly compiled driver data, but the existing
+// atomic snapshot and the appended preparation records remain available.
 static void autosave_once(void) {
-    static uint64_t last_n, last_ms, last_keys;
+    static uint64_t last_keys;
     if (!P.ready) return;
     uint64_t now = plat_now_ms();
     if (now - last_keys >= 2000) {
@@ -6607,23 +6632,10 @@ static void autosave_once(void) {
         cu_flush();
     }
     gfx_shader_record_flush(0);
-    if (now - last_ms < 20000) return;
-    VkPipeStats s;
-    vk_pipeline_stats(&s);
-    uint64_t n = s.graphics + s.compute + cache_merges;   // a merge comes after its pipeline was counted (bg_main)
-    if (n == last_n) return;
-    // Only at a moment with no build running (cache_save): while one runs the save waits for the next tick, 500 ms
-    // on, before it logs or flushes anything, so a busy stretch does not repeat the statistics lines every tick.
-    if (P.cache && P.cache_path[0]) {
-        if (!plat_mutex_trylock(&cache_rw)) return;
-        plat_mutex_unlock(&cache_rw);
-    }
-    last_n = n, last_ms = now;
-    save_with(0);
 }
 
-// On its own thread: the save (vkGetPipelineCacheData and the file write, about 60 ms) and the key appends (a flush to
-// the disk each) ran on the present thread, and the render thread waited for it to take the next frame.
+// Durable record appends stay off the present thread too. Full snapshots are
+// restricted to explicit saves, never this gameplay background worker.
 static void autosave_main(void *arg) {
     (void)arg;
     plat_thread_priority(PLAT_PRIO_BELOW_NORMAL);
@@ -6636,6 +6648,7 @@ static void autosave_main(void *arg) {
 void vk_pipeline_autosave(void) {
     static int32_t started;
     if (!P.ready || plat_xchg32(&started, 1)) return;
+    rt_log("vk_pipeline: gameplay persists usage records only; driver-cache snapshots wait for exit or explicit preparation");
     if (!plat_thread_spawn(autosave_main, NULL, "pipe autosave", 0))
         rt_log("vk_pipeline: cannot start the autosave thread; the cache is saved at exit only");
 }

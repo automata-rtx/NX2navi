@@ -259,6 +259,9 @@ uint64_t vk_exec_event_late_take(void);       // waits only a CPU signal after t
 // signal met, and the sum of how many submissions later it came.
 void vk_exec_event_stats(uint64_t *waits, uint64_t *unmet, uint64_t *late, uint64_t *late_subs);
 extern uint64_t vk_exec_submit_seq;   // replay thread: submissions replayed so far
+extern uint32_t vk_exec_brk;          // replay thread: bumped by every op that is not state or a draw (vk_exec.c op_linear)
+int vk_exec_mesh_run(const void *cur, const void **out, int max);
+void vk_exec_mesh_run_stops(char *out, size_t n);
 // NX2NAVI_EVO_TRACE=1 (diagnostics, vk_exec.c "event order trace"): one token per step of the replay's event order.
 void vk_exec_evt(char what, const void *event, uint32_t value);
 void vk_exec_evt_frame(uint64_t frame);   // the game's present call: the frame's tokens are closed and logged

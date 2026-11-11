@@ -93,6 +93,10 @@ int gfx_shader_prepared_present(const char *dir);
 // shader reads as integers become uint, a compute shader's textures and images take the types its translation
 // declares. 1 when *out differs from *a (translate again with *out).
 int gfx_shader_guess_refine(const GfxShader *s, int stage, const GfxShaderAnswers *a, GfxShaderAnswers *out);
+// Bounded alternatives derived from translated resources, not a recorded play session.
+enum { GFX_PREP_ALTERNATIVES = 33 };
+int gfx_shader_guess_alternatives(const GfxShader *s, int stage, const GfxShaderAnswers *a,
+                                  GfxShaderAnswers out[GFX_PREP_ALTERNATIVES]);
 typedef struct { uint8_t iid[32]; uint8_t stage, prio; } GfxWarmEnt;   // prio 0: met in play; 1..3: prepared
 size_t gfx_shader_warm_list(const char *dir, int include_prepared, GfxWarmEnt **out, int *manifest_ok);
 size_t gfx_shader_additional_list(const char *dir, GfxWarmEnt **out, int *manifest_ok);
@@ -135,7 +139,7 @@ typedef struct {
     union { uint8_t ts[32]; GfxArchivePass pass; };  // task ID for mesh, attachment layout for vertex (tag 0: default)
 } GfxArchiveProgram;
 int gfx_archive_program_order(const void *a, const void *b);
-int gfx_shader_archive_programs(const char *dir, int mesh, GfxArchiveProgram **programs, size_t *count);
+int gfx_shader_archive_programs(const char *dir, int mesh, int additional, GfxArchiveProgram **programs, size_t *count);
 int gfx_shader_stage(const GfxShader *s);                   // GFX_STAGE_VS, GFX_STAGE_FS or GFX_STAGE_CS
 int gfx_shader_resources(const GfxShader *s, int kind, const GfxShaderRes **res);   // count of GFX_RES_* kind; array in *res
 uint32_t gfx_shader_exact_seen(void);   // shaders loaded so far with a GfxShaderRes.exact texture (the texture census line)

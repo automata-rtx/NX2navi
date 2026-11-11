@@ -1536,6 +1536,16 @@ def step_shaders(out, update=False):
                 copy_if_changed(d / name, out / name)
             break
     if update and shader_carry(out):
+        from extend_shader_preparation import PREPARATION_RULES
+        receipt = out / 'shader-preparation-rules.txt'
+        if not receipt.is_file() or receipt.read_text().strip() != str(PREPARATION_RULES):
+            say('  extending preparation with new game-data rules while retaining the completed cache')
+            workers = os.environ.get('NX2NAVI_PREWARM_XLATE', '4')
+            rc = shader_run([sys.executable, '-u', str(KIT / 'tools' / 'extend_shader_preparation.py'),
+                             str(out), '--workers', workers, '--exe', EXE_NAME])
+            if rc:
+                fail('extending shader preparation failed; the completed cache is retained. Retry the shader step')
+            return
         say('  the shaders prepared before this update stay in use; the game translates them again in the background')
         if loose_shaders(out) >= PACK_LOOSE_MIN:
             pack_shader_cache(out)

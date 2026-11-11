@@ -44,6 +44,10 @@ static uint64_t reserved;         // highest fence promised to a producer while 
 static int stop;
 static Pending *queue;            // side effects in the order they were added
 static int qhead, qn, qcap;
+static Pending *rqueue;
+static int rqhead, rqn, rqcap;
+static PlatMutex res_lock = PLAT_MUTEX_INIT;
+static void results_run(uint64_t upto);
 
 // ---- submit batching
 // Every game submission used to be its own vkQueueSubmit2, about 150 a frame, each a trip into the driver on the render
@@ -84,10 +88,13 @@ static int hold_max = -1;
 // them, still covers the write-backs. NX2NAVI_WB_SPLIT=0: no split, and the wait is the fence's.
 static VkSemaphore exec_tl;
 static uint64_t exec_sig;             // sub_lock: the newest value a submitted part signals on exec_tl
-static int wb_split = -1;
+static int wb_split = -1, wb_results = 1;
 
 int vk_sync_wb_split(void) {
-    if (wb_split < 0) wb_split = cfg_bool("NX2NAVI_WB_SPLIT");
+    if (wb_split < 0) {
+        wb_split = cfg_bool("NX2NAVI_WB_SPLIT");
+        wb_results = cfg_int("NX2NAVI_WB_SPLIT") != 3;
+    }
     return wb_split && exec_tl != VK_NULL_HANDLE;
 }
 
@@ -383,7 +390,7 @@ static void completion_main(void *arg) {
     VkCtx *c = arg;
     plat_mutex_lock(&st_lock);
     for (;;) {
-        while (!stop && done == issued && !(qn && queue[qhead].fence <= done))
+        while (!stop && done == issued && !(qn && queue[qhead].fence <= done) && !(rqn && rqueue[rqhead].fence <= done))
             plat_cond_wait(&cv_work, &st_lock);
         if (stop) break;
         uint64_t reached = done;
@@ -405,6 +412,9 @@ static void completion_main(void *arg) {
             plat_mutex_lock(&st_lock);
             if (reached > issued) reached = issued;
         }
+        plat_mutex_unlock(&st_lock);
+        results_run(reached);
+        plat_mutex_lock(&st_lock);
         while (qn && queue[qhead].fence <= reached) {
             Pending p = queue[qhead++];
             qn--;
@@ -664,25 +674,56 @@ uint64_t vk_sync_probe_submit(void (*record)(VkCommandBuffer, void *), void *arg
     return submit(NULL, 0, record, arg, 0);
 }
 
-void vk_completion_add(uint64_t fence, void (*fn)(void *), void *arg) {
-    plat_mutex_lock(&st_lock);
-    if (qhead + qn == qcap) {
-        if (qhead) {
-            memmove(queue, queue + qhead, sizeof *queue * (size_t)qn);
-            qhead = 0;
+// st_lock held: p at the end of the queue *q.
+static void pending_push(Pending **q, int *head, int *n, int *cap, Pending p) {
+    if (*head + *n == *cap) {
+        if (*head) {
+            memmove(*q, *q + *head, sizeof **q * (size_t)*n);
+            *head = 0;
         } else {
-            int cap = qcap ? qcap * 2 : 256;
-            Pending *q = realloc(queue, sizeof *q * (size_t)cap);
-            if (!q) rt_fatal("vk: out of memory (completion queue)");
-            queue = q, qcap = cap;
+            int c = *cap ? *cap * 2 : 256;
+            Pending *m = realloc(*q, sizeof *m * (size_t)c);
+            if (!m) rt_fatal("vk: out of memory (completion queue)");
+            *q = m, *cap = c;
         }
     }
-    queue[qhead + qn++] = (Pending){fence, fn, arg};
+    (*q)[*head + (*n)++] = p;
+}
+
+void vk_completion_add(uint64_t fence, void (*fn)(void *), void *arg) {
+    plat_mutex_lock(&st_lock);
+    pending_push(&queue, &qhead, &qn, &qcap, (Pending){fence, fn, arg});
     // The completion thread sleeps only while nothing is issued beyond done: a callback for a later value (the replay's,
     // for the submission it records: counter reports, freed resources) becomes due through the submit, which wakes it.
     if (fence <= done) plat_cond_broadcast(&cv_work);
     plat_mutex_unlock(&st_lock);
 }
+
+// A side effect the game's CPU reads once the GPU has run submission fence's own commands: it runs before the other
+// side effects of the values reached, and a wait after a submit runs it itself (vk_sync_exec_wait).
+void vk_completion_add_result(uint64_t fence, void (*fn)(void *), void *arg) {
+    plat_mutex_lock(&st_lock);
+    pending_push(&rqueue, &rqhead, &rqn, &rqcap, (Pending){fence, fn, arg});
+    if (fence <= done) plat_cond_broadcast(&cv_work);
+    plat_mutex_unlock(&st_lock);
+}
+
+// Runs the results queued for the values up to upto, which the GPU has passed: on the completion thread for each
+// value it reaches, and on a guest thread whose wait on exec_tl has just returned. st_lock not held.
+static void results_run(uint64_t upto) {
+    plat_mutex_lock(&res_lock);
+    plat_mutex_lock(&st_lock);
+    while (rqn && rqueue[rqhead].fence <= upto) {
+        Pending p = rqueue[rqhead++];
+        rqn--;
+        plat_mutex_unlock(&st_lock);
+        p.fn(p.arg);
+        plat_mutex_lock(&st_lock);
+    }
+    plat_mutex_unlock(&st_lock);
+    plat_mutex_unlock(&res_lock);
+}
+
 
 static int fence_wait_impl(uint64_t value, uint64_t timeout_ns);
 
@@ -718,8 +759,9 @@ static int fence_wait_impl(uint64_t value, uint64_t timeout_ns) {
     return ok;
 }
 
-// Waits until the GPU has executed submission value's own commands (the executed timeline); its write-backs and the
-// CPU side effects of its fence may still be to come. 1 when reached.
+// Waits for the submission's commands and the counters and events the game reads
+// next. Other completion work and write-backs may still follow. 3 keeps the bare
+// executed-timeline wait for comparison; 0 waits for the complete fence.
 int vk_sync_exec_wait(uint64_t value, uint64_t timeout_ns) {
     vk_sync_start();
     if (!vk_sync_wb_split()) return vk_sync_fence_wait(value, timeout_ns);
@@ -734,6 +776,7 @@ int vk_sync_exec_wait(uint64_t value, uint64_t timeout_ns) {
         vk_device_fault_report(r);
         rt_fatal("vk: the wait for a submission's commands failed (%d; device lost?)", (int)r);
     }
+    if (r == VK_SUCCESS && wb_results) results_run(value);
     perf_end(PERF_FENCE, p0);
     perf_gpu_wait(p0);
     return r == VK_SUCCESS;
@@ -760,7 +803,7 @@ void vk_sync_shutdown(void) {
         plat_thread_join(completion_thread);
         completion_thread = NULL;
         plat_mutex_lock(&st_lock);
-        qhead = qn = 0;   // callbacks of values never submitted
+        qhead = qn = rqhead = rqn = 0;   // callbacks of values never submitted
         plat_mutex_unlock(&st_lock);
         plat_mutex_lock(&sub_lock);
         VkCtx *c = vk_ctx();

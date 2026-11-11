@@ -425,7 +425,16 @@ void perfmon_snapshot(PerfStats *out) {
     plat_mutex_lock(&g_lock);
     uint64_t now = plat_now_ns();
     frames_summary(&g_stats, now);
+    uint64_t previous = g_win.t0;
     counters_summary(now);
     *out = g_stats;
+    int trace = (rt_trace & RT_TRACE_PRESENT) && g_win.t0 != previous;
+    int shown = g_shown_report && now - g_shown_report < 1000000000ull;
     plat_mutex_unlock(&g_lock);
+    // Log the values handed to the overlay, at its existing half-second refresh.
+    // Presentation tracing can then compare its rolling lows with individual frames.
+    if (trace)
+        rt_log("overlay: at %llu ns world %.3f ms source %s fps %.3f low1 %.3f low01 %.3f avg %.3f ms max %.3f ms",
+               (unsigned long long)now, frame_step_world_us() / 1000.0, shown ? "present" : "game",
+               out->fps, out->low1_fps, out->low01_fps, out->frame_ms_avg, out->frame_ms_max);
 }

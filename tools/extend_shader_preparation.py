@@ -14,6 +14,7 @@ import subprocess
 import sys
 
 HEADER = struct.pack('<8sII', b'NX2NSPRP', 1, 36)
+PREPARATION_RULES = 3
 SEEDS = ('seed-programs.bin', 'seed-answers.bin', 'seed-mesh.bin', 'seed-vertex.bin', 'seed-passes.bin')
 
 
@@ -39,6 +40,16 @@ def merge_manifests(baseline, prepared):
     union = old | new
     delta = {key: value for key, value in new.items() if key not in old}
     return HEADER + b''.join(union.values()), HEADER + b''.join(delta.values()), len(old), len(delta)
+
+
+def archive_delta(baseline, prepared, mesh):
+    header = struct.pack('<8sII', b'NX2NMSID' if mesh else b'NX2NVSID', 1, 96)
+    def rows(data):
+        if data[:16] != header or (len(data) - 16) % 96:
+            raise ValueError('Malformed archive pipeline inventory')
+        return {data[i:i + 96] for i in range(16, len(data), 96)}
+    old = rows(baseline) if baseline else set()
+    return header + b''.join(sorted(rows(prepared) - old))
 
 
 def atomic_write(path, data):
@@ -110,18 +121,26 @@ def extend(game, workers, exe_name):
         state_path = work / 'state.json'
         baseline_path = work / 'baseline.bin'
         stamp = hashlib.sha256(exe.read_bytes()).hexdigest()
+        state = None
         if state_path.exists():
             state = json.loads(state_path.read_text())
-            if state['identity'] != identity or state['executable'] != stamp:
+            same = state['identity'] == identity and state['executable'] == stamp
+            if not same and state['phase'] != 'complete':
                 raise RuntimeError('Renderer or driver changed during additive preparation; review before resuming')
-            if state['phase'] == 'complete':
+            if same and state['phase'] == 'complete' and state.get('rules') == PREPARATION_RULES:
                 print('Additional preparation already completed for this renderer and driver.', flush=True)
                 return
-        else:
+            if state['phase'] == 'complete':
+                state = None
+        if state is None:
             baseline = manifest.read_bytes()
             read_manifest(baseline)
             atomic_write(baseline_path, baseline)
-            state = dict(identity=identity, executable=stamp, phase='inventory', cache_bytes_before=cache.stat().st_size)
+            for kind in ('mesh', 'vertex'):
+                path = game / f'{kind}-programs.bin'
+                atomic_write(work / f'baseline-{kind}.bin', path.read_bytes() if path.exists() else b'')
+            state = dict(identity=identity, executable=stamp, rules=PREPARATION_RULES,
+                         phase='inventory', cache_bytes_before=cache.stat().st_size)
             atomic_write(state_path, json.dumps(state, indent=2).encode())
         baseline = baseline_path.read_bytes()
         if state['phase'] == 'inventory':
@@ -134,6 +153,11 @@ def extend(game, workers, exe_name):
                 union, delta, reused, added = merge_manifests(baseline, manifest.read_bytes())
                 atomic_write(game / 'shader-additional.bin', delta)
                 atomic_write(manifest, union)
+                for kind in ('mesh', 'vertex'):
+                    old = work / f'baseline-{kind}.bin'
+                    delta = archive_delta(old.read_bytes() if old.exists() else b'',
+                                          (game / f'{kind}-programs.bin').read_bytes(), kind == 'mesh')
+                    atomic_write(game / f'{kind}-additional.bin', delta)
             except BaseException:
                 atomic_write(manifest, baseline)
                 raise
@@ -150,6 +174,7 @@ def extend(game, workers, exe_name):
             game, env, work / 'packing.log')
         state.update(phase='complete', cache_bytes_after=cache.stat().st_size)
         atomic_write(state_path, json.dumps(state, indent=2).encode())
+        atomic_write(game / 'shader-preparation-rules.txt', f'{PREPARATION_RULES}\n'.encode())
         for name in SEEDS:
             (game / name).unlink(missing_ok=True)
         print(f'Additional preparation saved. Report: {state_path}', flush=True)

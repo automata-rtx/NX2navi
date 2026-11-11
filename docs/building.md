@@ -155,6 +155,20 @@ of them.
    version; they build at their first draw instead, another driver version builds them again, and so does deleting the
    file.
 
+   Preparation also derives bounded alternatives from each program's translated resources
+   (`gfx_shader_guess.c`, `gfx_shader_guess_alternatives`). Vertex programs reading a user uniform bank other than
+   the camera bank receive previous-position translations, using the same initial eligibility rule as motion-vector
+   rendering. Float vertex layouts remain prepared alongside inferred integer layouts. Compute programs with declared
+   2D sampled textures receive individual array-view alternatives and an all-array alternative. Image-query slots also
+   receive these lookup aliases because the persisted input-key mask combines texture and image queries; the image
+   types and formats stay unchanged. This does not enumerate
+   arbitrary combinations of texture dimensions, unknown runtime-generated programs, or every possible graphics state.
+   Motion variants are prepared as stages; they are not paired with the game's fragment shader as ordinary draws.
+
+   `tools/extend_shader_preparation.py` applies these rules to a completed install. It retains existing translations,
+   warms only added stage IDs and added archive program/pass records, and deduplicates the resulting archive.
+   `shader-preparation-rules.txt` records the completed rule version so a setup update can extend older coverage.
+
 7. Run. The game keeps running when its window loses the focus (`assume_focus = 1` in `nx2navi.ini`, the default; the
    Game tab switches it). With 0 it pauses, as it does on the Switch when Home is pressed.
 
@@ -271,6 +285,25 @@ The Deck's GPU (Van Gogh) has no native ASTC, so its textures go through the com
 `NX2NAVI_ASTC`) as on desktop AMD GPUs without it; frame times measured there include it.
 
 ## Checks
+
+Pipeline-cache persistence checks run without a GPU: `python tests/cache_revision_check.py` verifies cache-hit and
+dirty-revision handling; `python tests/cache_autosave_check.py` exercises the runtime's autosave entry point with
+mock storage. Gameplay appends small usage records, while full driver-cache snapshots happen at explicit preparation
+or normal exit. A crash can lose newly compiled driver data since the last snapshot, but retains the existing cache
+and the usage records already appended. This avoids multi-second exclusive cache-lock holds during play.
+
+`NX2NAVI_TEXUP_LOG_MS` defaults to 16. Slow texture frames report creation, uploads, descriptor-pool refreshes and
+texture-lock waits. Pool time includes nested texture work; do not add it to upload or creation time. Deferred-slot
+counts are observations across refreshes, not a count of unique textures. Set the option to 0 to disable these lines.
+
+`python tests/texture_streaming_check.py` compiles the texture feedback, creation-budget and pool-refresh functions
+with deterministic clocks and resource responses. It checks first-load recovery, swizzle-alias backlog counting,
+deadlines within a pool walk, bounded priority recovery and retrying a new sampler kind after a deferred creation.
+It also checks sparse pending retries, changed tokens within a spent frame, submission freshness, duplicate dirty
+notifications, changes made during a refresh, and dirty-ring overflow. Pending slots no longer force a full table
+walk inside a submission; repeated dirty notifications are coalesced before resolving their slots.
+It requires Clang, but no GPU or game files. These checks do not replace an in-game streaming and memory-pressure
+reproduction: an individual upload cannot be interrupted, and missing terrain can also come from pending pipelines.
 
 Before a commit:
 

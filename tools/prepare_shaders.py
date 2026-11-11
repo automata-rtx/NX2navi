@@ -315,6 +315,9 @@ def main():
               'again without the variants it was building (nx2navi.exe --warm-shaders)', flush=True)
         r = subprocess.run([str(exe), '--warm-shaders'], cwd=str(out))
     print(f'{a.exe} --prepare-shaders: rc={r.returncode}; total {time.monotonic() - t0:.1f} s')
+    if not r.returncode:
+        from extend_shader_preparation import PREPARATION_RULES, atomic_write
+        atomic_write(out / 'shader-preparation-rules.txt', f'{PREPARATION_RULES}\n'.encode())
     return r.returncode
 
 
