@@ -102,6 +102,10 @@ static inline const op_hdr *nvn_op_next(const op_hdr *h) { return (const op_hdr 
 static inline const void *nvn_op_payload(const op_hdr *h) { return h + 1; }
 int nvn_handle_live(uint64_t handle);                      // 1 while the handle's copy exists (its control memory was
                                                            // not added again)
+// Prepared game recordings only. A held mutable recording owns its resolved bindings.
+uint64_t nvn_hold_submitted(uint64_t handle);
+void nvn_drop_submitted(uint64_t handle);
+int nvn_submitted_has_wait(uint64_t handle);
 uint64_t nvn_handle_bytes(uint64_t handle);                // bytes of the copy, OP_BEGIN to OP_END; 0 if not live
 uint64_t nvn_submit_count(void);                           // QueueSubmitCommands calls so far
 // Submits a texture pin outlives its last tex_pin and the release of the last recording copy naming it: about 20 s at

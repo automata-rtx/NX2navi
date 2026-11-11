@@ -297,9 +297,6 @@ void vk_mem_gpu_wrote_shader(const VkMemSpan *sp, uint64_t size);
 // Uniform blocks as of the submit call (vk_usnap.c): vk_exec_record copies the uniform ranges a submission binds before
 // it records, ubo bindings take the copy (0: not copied, bind memory), GPU writes of the replay drop the copies they touch.
 void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence);
-// NX2NAVI_REPLAY_ASYNC: the submitting thread takes the copy before it queues the submission; vk_usnap_begin on the
-// replay thread then uses it.
-void vk_usnap_take(const uint64_t *handles, int n);
 void vk_usnap_end(uint64_t fence);
 int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out);
 const uint8_t *vk_usnap_map(void);   // a host copy of the current arena, at the offsets vk_usnap_find gives
@@ -309,6 +306,8 @@ uint64_t vk_usnap_gen(void);                      // changes whenever a binding 
 // [addr, addr+n) into dst: 1 from this submission's copy, 2 from guest memory where the copy lacks it but the bytes are
 // ones the CPU writes (an imported pool) and no GPU write in flight touches them, 0 neither (dst untouched).
 int vk_usnap_read(uint64_t addr, uint64_t n, void *dst);
+// The readable source vk_usnap_read would copy. Only live guest memory participates in CPU write tracking.
+const uint8_t *vk_usnap_read_source(uint64_t addr, uint64_t n, int *live);
 // Why vk_usnap_find finds nothing for [addr, addr+n) in this submission (diagnostics).
 enum { VK_USNAP_FOUND, VK_USNAP_NO_SNAPSHOT, VK_USNAP_DROPPED, VK_USNAP_IN_FLIGHT, VK_USNAP_NOT_CPU, VK_USNAP_NOT_BOUND };
 int vk_usnap_why(uint64_t addr, uint64_t n);
@@ -373,6 +372,7 @@ int vk_mem_lookup(uint64_t addr, uint64_t size, VkMemSpan *out);
 // Changes whenever vk_mem_resolve plus VK_MEM_USE may give another span for an address: a pool added, finalized or
 // mapped, a mirror created, refused or forgotten, a submission started.
 uint64_t vk_mem_gen(void);
+uint64_t vk_mem_import_identity(uint64_t addr, uint64_t size);   // registration owning the range, zero without an import
 // Page write generations over guest memory (mem_written_pages plus vk_guest_written). Returns 1 when a page of the
 // range was written after generation `since`, 0 when not, -1 when the range is not write-watched (treat as written);
 // *now is the generation to pass next time.
@@ -604,7 +604,11 @@ uint64_t vk_sync_submit(const uint64_t *handles, int n);   // records with vk_ex
 // --probe-vkmem: record gives the submission's commands in place of the replay, under the same submission lock,
 // recorder, memory prologue and fence.
 uint64_t vk_sync_probe_submit(void (*record)(VkCommandBuffer, void *), void *arg);
-uint64_t vk_sync_reserve(void);            // asynchronous replay: the value the next queued submission signals
+void vk_sync_announce(uint64_t fence);
+void vk_replay_prepared(uint64_t fence);
+void vk_sync_snapshot_ready(void);
+// Submitted NVN handles whose CPU event waits may need another recording with fresh snapshots.
+uint64_t vk_sync_submit_ordered(const uint64_t *handles, int n);
 int vk_sync_fence_wait(uint64_t value, uint64_t timeout_ns);   // 1 when done; 0 on timeout or a value never submitted
 // The executed timeline (vk_sync.c): a submission's own commands are through the GPU, its write-backs maybe not yet.
 int vk_sync_exec_wait(uint64_t value, uint64_t timeout_ns);

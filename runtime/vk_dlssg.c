@@ -43,6 +43,7 @@ static struct {
     PFN_nx2sl_device_proc gdpa;
     PFN_nx2sl_available available;
     PFN_nx2sl_frame frame;
+    PFN_nx2sl_picture picture;
     PFN_nx2sl_present_marker marker;
     PFN_nx2sl_sleep sleep;
     PFN_nx2sl_submit_end submit_end;
@@ -104,6 +105,7 @@ int vk_dlssg_early(void) {
     S.gdpa = (PFN_nx2sl_device_proc)(void *)GetProcAddress(m, "nx2sl_device_proc");
     S.available = (PFN_nx2sl_available)(void *)GetProcAddress(m, "nx2sl_available");
     S.frame = (PFN_nx2sl_frame)(void *)GetProcAddress(m, "nx2sl_frame");
+    S.picture = (PFN_nx2sl_picture)(void *)GetProcAddress(m, "nx2sl_picture");
     S.marker = (PFN_nx2sl_present_marker)(void *)GetProcAddress(m, "nx2sl_present_marker");
     S.sleep = (PFN_nx2sl_sleep)(void *)GetProcAddress(m, "nx2sl_sleep");
     S.submit_end = (PFN_nx2sl_submit_end)(void *)GetProcAddress(m, "nx2sl_submit_end");
@@ -279,10 +281,10 @@ void vk_dlssg_present_frame(uint64_t frame) { S.cur = (uint32_t)frame; }
 
 uint64_t vk_dlssg_shown(void) { return S.active ? S.shown() : 0; }
 
-void vk_dlssg_frame(VkCommandBuffer cb, VkExtent2D ext) {
+void vk_dlssg_frame(VkCommandBuffer cb, VkExtent2D ext, const int picture[4]) {
     if (!S.active) return;
-    VkFfxImage d, m;
-    VkImageView dv, mvv;
+    VkFfxImage d = {0}, m = {0};
+    VkImageView dv = VK_NULL_HANDLE, mvv = VK_NULL_HANDLE;
     VkDlaaCamera c;
     float jx = 0, jy = 0;
     int reset = 0;
@@ -303,12 +305,16 @@ void vk_dlssg_frame(VkCommandBuffer cb, VkExtent2D ext) {
         memcpy(k.view_to_clip, c.view_to_clip, 64), memcpy(k.clip_to_view, c.clip_to_view, 64);
         memcpy(k.clip_to_prev_clip, c.clip_to_prev_clip, 64), memcpy(k.prev_clip_to_clip, c.prev_clip_to_clip, 64);
         memcpy(k.pos, c.pos, 12), memcpy(k.up, c.up, 12), memcpy(k.right, c.right, 12), memcpy(k.fwd, c.fwd, 12);
-        k.znear = 0.1f, k.zfar = 1e8f, k.fov_y = c.fov_y, k.aspect = c.aspect;   // Ocarina's projection (vk_ffx.cpp)
+        k.znear = c.znear, k.zfar = c.zfar, k.fov_y = c.fov_y, k.aspect = c.aspect;
         k.jitter[0] = jx, k.jitter[1] = jy;
         k.mv_scale[0] = 1.0f / (float)d.width, k.mv_scale[1] = 1.0f / (float)d.height;   // render pixels
         k.reset = reset;
     }
     // the frames to generate between two rendered ones: the multiplier less the rendered one, 0 off
+    if (have && on && S.picture) {
+        VkRect2D rect = {{picture[0], picture[1]}, {(uint32_t)picture[2], (uint32_t)picture[3]}};
+        S.picture(cb, S.cur, &rect);
+    }
     S.frame(cb, have ? &zd : NULL, have ? &zm : NULL, NULL, have ? &k : NULL, ext.width, ext.height, on ? mult - 1 : 0, S.cur);
 }
 

@@ -167,6 +167,7 @@ typedef struct {
     // The CPU waited for fence: small render targets written by work up to it go to their storage (vk_texture.c
     // vk_texture_write_back_small).
     void (*cpu_synced)(uint64_t fence);
+    void (*buffer_registered)(uint64_t addr, uint64_t size);  // a CPU-readable buffer is bound to its pool storage
 } GfxBackend;
 extern const GfxBackend gfx_null_backend, gfx_vulkan_backend;
 const GfxBackend *gfx_backend(void);                       // NX2NAVI_GPU=null|vulkan (default vulkan)

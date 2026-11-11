@@ -19,7 +19,7 @@ void vk_dlssg_destroy_swapchain(VkDevice d, VkSwapchainKHR sc);
 VkResult vk_dlssg_get_images(VkDevice d, VkSwapchainKHR sc, uint32_t *n, VkImage *img);
 VkResult vk_dlssg_acquire(VkDevice d, VkSwapchainKHR sc, uint64_t timeout, VkSemaphore sem, uint32_t *idx);
 VkResult vk_dlssg_present(VkQueue q, const VkPresentInfoKHR *pi);
-void vk_dlssg_frame(VkCommandBuffer cb, VkExtent2D ext);   // each present, before its command buffer is submitted
+void vk_dlssg_frame(VkCommandBuffer cb, VkExtent2D ext, const int picture[4]);   // each present, before its command buffer is submitted
 // Frames are numbered by the game's presents (frame n ends with the n-th). Reflex's frame timing while active:
 void vk_dlssg_frame_start(void);    // the game starts a frame (nvn_api_obj.c nvnWindowAcquireTexture): Reflex's sleep
 void vk_dlssg_game_present(void);   // the game presents it (vk_backend.c vk_be_present): counts it

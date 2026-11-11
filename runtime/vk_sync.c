@@ -1,12 +1,12 @@
 // Submission, fences and the completion thread of the Vulkan back end.
 // One timeline semaphore (VkCtx.timeline) orders everything: each submission records its command handles into a
-// primary command buffer (vk_exec_record) and signals the next timeline value, which is the NVN fence value
-// the front end hands to syncs. The completion thread waits on the timeline and, in submit order, runs the CPU side
+// primary command buffer (vk_exec_record). An ordered submission that may resume after a CPU signal reserves its
+// continuation's value before returning to the game. The final submission signals that value, including when no
+// continuation was needed. The completion thread waits on the timeline and, in submit order, runs the CPU side
 // effects queued for each value (event writes, counter reports, sync state), then frees the memory and texture objects whose users
 // completed. A value counts as done only after its side effects ran, so a guest woken by fence_wait sees them.
 //
-// One timeline value per submission, signalled at ALL_COMMANDS; waits use vkWaitSemaphores, and a failed wait is
-// treated as a lost device.
+// Values increase in submission order and are signalled at ALL_COMMANDS. Waits use vkWaitSemaphores.
 // Contains code Copyright (c) 2026 Peiikai, Copyright (c) 2026 jhaizhou (MIT; see THIRD_PARTY_NOTICES.md).
 #include <stdlib.h>
 #include <string.h>
@@ -15,7 +15,7 @@
 #include "gfx.h"
 #include "host.h"
 #include "nvn_api.h"
-#include "vk.h"
+#include "vk_exec.h"
 #include "platform/platform.h"
 
 #define WEAK __attribute__((weak))
@@ -40,7 +40,7 @@ static PlatMutex st_lock = PLAT_MUTEX_INIT;
 static PlatCond cv_work = PLAT_COND_INIT;   // a submission, a callback or stop
 static PlatCond cv_done = PLAT_COND_INIT;   // done advanced
 static uint64_t issued, done;     // newest submitted value; newest value whose side effects ran
-static uint64_t reserved;         // asynchronous replay: newest value handed out before its submission (>= issued)
+static uint64_t reserved;         // highest fence promised to a producer while its submission is being recorded
 static int stop;
 static Pending *queue;            // side effects in the order they were added
 static int qhead, qn, qcap;
@@ -551,24 +551,24 @@ static VkCommandBuffer split_part(int exec) {
     return s->cb;
 }
 
-// Asynchronous replay (vk_backend.c): the value the next queued submission or present will signal. Values are handed
-// out in queue order and the replay thread submits them in that order, so each vk_sync_submit gets exactly its value.
-uint64_t vk_sync_reserve(void) {
-    vk_sync_start();
+void vk_sync_announce(uint64_t fence) {
     plat_mutex_lock(&st_lock);
-    if (reserved < issued) reserved = issued;
-    uint64_t v = ++reserved;
+    if (reserved < fence) reserved = fence;
     plat_mutex_unlock(&st_lock);
-    return v;
 }
 
-static uint64_t submit(const uint64_t *handles, int n, void (*probe_record)(VkCommandBuffer, void *), void *arg) {
-    vk_sync_start();
+// A CPU signal during recording can make a held command list runnable. The worker
+// promises the final value at snapshot time so the producer can proceed in either case.
+static uint64_t snapshot_fence;   // sub_lock
+void vk_sync_snapshot_ready(void) { vk_replay_prepared(snapshot_fence); }
+
+static uint64_t submit_locked(const uint64_t *handles, int n, void (*probe_record)(VkCommandBuffer, void *),
+                              void *arg, int *resume) {
     VkCtx *c = vk_ctx();
-    plat_mutex_lock(&sub_lock);
     vk_mem_dirty_submit();   // NX2NAVI_TRACE=perf: what a mirror would upload before this submit
     uint64_t fence = __atomic_load_n(&issued, __ATOMIC_ACQUIRE) + 1;
     cur_fence = fence;
+    snapshot_fence = resume ? fence + 1 : fence;
     CmdSlot *s = take_slot(c, fence);
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
@@ -604,6 +604,16 @@ static uint64_t submit(const uint64_t *handles, int n, void (*probe_record)(VkCo
                                      .value = fence, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT},
                                     {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = exec_tl,
                                      .value = fence, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT}};
+    // Decide at the submission boundary, after recording and uploading. If the CPU signal
+    // requires fresh copies, the first part signals its internal value and the continuation
+    // signals the promised fence. Otherwise this same submission signals the promised value.
+    if (resume) {
+        *resume = vk_exec_held() && vk_exec_held_ready();
+        if (!*resume) {
+            fence = snapshot_fence;
+            sig[0].value = sig[1].value = fence;
+        }
+    }
     int both = exec_tl && exec_sig < fence;
     if (both) exec_sig = fence;
     VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
@@ -626,15 +636,32 @@ static uint64_t submit(const uint64_t *handles, int n, void (*probe_record)(VkCo
             rt_log("vk: submit batching: %llu submissions in %llu queue calls (%.2f each)", (unsigned long long)H.subs,
                    (unsigned long long)H.batches, H.batches ? (double)H.subs / (double)H.batches : 0.0);
     }
+    return fence;
+}
+
+static uint64_t submit(const uint64_t *handles, int n, void (*record)(VkCommandBuffer, void *), void *arg, int ordered) {
+    vk_sync_start();
+    plat_mutex_lock(&sub_lock);
+    // Only an existing continuation or a new event wait can require a second recording.
+    // Ordinary submissions keep their single value and early execution-only signal.
+    int may_resume = ordered && vk_exec_held();
+    for (int i = 0; ordered && !may_resume && i < n; i++) may_resume = nvn_submitted_has_wait(handles[i]);
+    int resume = 0;
+    uint64_t fence = submit_locked(handles, n, record, arg, may_resume ? &resume : NULL);
+    if (resume) {
+        vk_texture_new_submit();
+        fence = submit_locked(NULL, 0, NULL, NULL, NULL);
+    }
     plat_mutex_unlock(&sub_lock);
     return fence;
 }
 
-uint64_t vk_sync_submit(const uint64_t *handles, int n) { return submit(handles, n, NULL, NULL); }
+uint64_t vk_sync_submit(const uint64_t *handles, int n) { return submit(handles, n, NULL, NULL, 0); }
+uint64_t vk_sync_submit_ordered(const uint64_t *handles, int n) { return submit(handles, n, NULL, NULL, 1); }
 
 // Memory probes record their shader here, not in the upload batch (which is submitted before the memory prologue).
 uint64_t vk_sync_probe_submit(void (*record)(VkCommandBuffer, void *), void *arg) {
-    return submit(NULL, 0, record, arg);
+    return submit(NULL, 0, record, arg, 0);
 }
 
 void vk_completion_add(uint64_t fence, void (*fn)(void *), void *arg) {

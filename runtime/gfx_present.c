@@ -1508,7 +1508,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     }
     if (src) vk_fg_frame(cb, g_sc, g_sc_fmt, g_sc_ext, hudless, g_hl_view, to);   // frame generation: this frame's preparation
     if (src) output_rate();
-    if (src) vk_dlssg_frame(cb, g_sc_ext);                // DLSS Frame Generation: constants and tags (vk_dlssg.c)
+    if (src) vk_dlssg_frame(cb, g_sc_ext, to);                // DLSS Frame Generation: constants and tags (vk_dlssg.c)
     // through the presenter: the picture stays in ng.bb, and DLSS Frame Generation's frames and the copy for the
     // presenter are recorded; otherwise the swapchain image is ready to present
     int ng_set = 0;

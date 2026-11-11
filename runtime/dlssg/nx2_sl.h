@@ -64,6 +64,8 @@ typedef int (*PFN_nx2sl_frame)(VkCommandBuffer cb, const Nx2SlImage *depth, cons
 // numFramesToGenerateMax: 1 on a GPU that does 2x, 3 on one that does 4x); 0 until Streamline reports it. Asked after
 // the device exists and refreshed after each present. Optional: an older DLL lacks it, and the game then asks for one.
 typedef uint32_t (*PFN_nx2sl_frames_max)(void);
+// Optional in version 3. The final picture occupies this rectangle of the current backbuffer.
+typedef void (*PFN_nx2sl_picture)(VkCommandBuffer cb, uint32_t frame, const VkRect2D *rect);
 typedef void (*PFN_nx2sl_present_marker)(int after, uint32_t frame);
 // The frames the display got, generated ones included, counted after each present (on the present thread)
 typedef uint64_t (*PFN_nx2sl_shown)(void);

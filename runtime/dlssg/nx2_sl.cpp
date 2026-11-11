@@ -187,6 +187,14 @@ extern "C" NX2SL_API void nx2sl_submit_end(uint32_t frame) {
     if (t) p_marker(sl::PCLMarker::eRenderSubmitEnd, *t);
 }
 
+extern "C" NX2SL_API void nx2sl_picture(VkCommandBuffer cb, uint32_t frame, const VkRect2D *rect) {
+    sl::FrameToken *t = token(frame);
+    if (!t || !rect) return;
+    sl::Extent picture{(uint32_t)rect->offset.y, (uint32_t)rect->offset.x, rect->extent.width, rect->extent.height};
+    sl::ResourceTag tag(nullptr, sl::kBufferTypeBackbuffer, sl::ResourceLifecycle::eValidUntilPresent, &picture);
+    p_tag(*t, sl::ViewportHandle(0), &tag, 1, (sl::CommandBuffer *)cb);
+}
+
 extern "C" NX2SL_API int nx2sl_frame(VkCommandBuffer cb, const Nx2SlImage *depth, const Nx2SlImage *mv,
                                      const Nx2SlImage *hudless, const Nx2SlCamera *cam, uint32_t out_w, uint32_t out_h,
                                      int enable, uint32_t frame) {
