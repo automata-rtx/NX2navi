@@ -123,11 +123,14 @@ A path the Windows ANSI code page cannot hold breaks the MSYS2 tools, so the too
      (it reads UCRT64's headers; `make_game.py` `fast_clang` checks that both report the same version and target).
    - The lifted code is compiled for the processor's own level, x86-64-v3 (AVX2, FMA) or v2 (`cpu_level`): the game
      runs on the PC that builds it, and a generic build would do every fused multiply-add of the game in software.
-3. **Prepare the Shaders**: make_game.py translates every shader of the game, in its default bind state,
-   into the game's shader cache and builds its stage library or compute pipeline into the driver's own cache
-   (`tools/prepare_shaders.py`), so play stops for them far less often. Variants met in play with another bind state are
-   still translated then, full pipelines are still linked in play (quickly, from the cached parts), and the driver's
-   cache is kept per executable and is lost when the driver clears it. Its bar
+3. **Prepare the Shaders**: make_game.py scans the installed shader archives and executable modules, translates their
+   default and refined binding variants, and builds stage libraries and compute pipelines. Archive stage pairings,
+   integer output variants, alternate vertex attribute types and named pass layouts also drive complete mesh and
+   vertex pipeline preparation (`tools/prepare_shaders.py`, `runtime/gfx_shader.c`, `runtime/vk_pipeline.c`).
+   The pass layouts are bounded candidates; they do not enumerate every state a draw can select at runtime.
+   Recorded draws add their exact states. Missing inputs and compilation or persistence failures fail preparation.
+   Driver crash exclusions and unsupported pass candidates are reported separately. The saved cache is tied to the
+   GPU, driver and renderer's effective shader options. Its bar
    follows the game's own counts, printed every 2 s: the translation fills the first half, the build into the
    driver's cache the second. An update every 10 s keeps the step's text current while nothing is printed, and after
    3 minutes without a count moving it says so, and that the step is still running.
@@ -370,6 +373,18 @@ The release resolves the MSYS2 packages of the day into `toolchain.lock.json` (`
 repository keeps old package files, so a release keeps building with the compiler it was tested with.
 
 ## Tests
+
+To extend an installation prepared before archive combinations were included, first build its updated executable,
+then run `python tools/extend_shader_preparation.py <game folder> --workers 12` with the game's bundled Python.
+The tool checks the existing cache, keeps a baseline inventory in `build-cache/additional-preparation`, resolves the
+current installed archives using cached translations, and warms only new stage IDs plus archive graphics combinations.
+It never runs the whole stage warm list. The combined inventory preserves old entries; a failure retains the baseline
+and a retry continues the additional phase. Logs and the completion receipt stay beside the baseline. A changed
+renderer or driver requires review before resuming. Successful partial pipeline work is saved even if a build fails.
+
+`tests/additional_preparation_test.py` checks inventory preservation and current attachment IDs;
+`tests/shader_archive_test.py` checks archive pairing and pass extraction. `tests/prepared_translation_check.py`
+compares independent translation results, packed-cache reuse, and the additive stage queue on synthetic shaders.
 
 `python tests/launcher_test.py` (Python 3.14): versions, settings, the toolchain resolver and installer against a
 local fake repository, resumed and checked downloads, the certificate checks against a local HTTPS server (its

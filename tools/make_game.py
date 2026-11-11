@@ -1547,7 +1547,7 @@ def step_shaders(out, update=False):
     if rc:
         fail('preparing the shaders failed (the lines above say why); the game still runs, compiling shaders as it '
              'meets them. Run the build again to retry this step')
-    for seed in ('seed-programs.bin', 'seed-answers.bin'):   # translated now: the shader cache holds them
+    for seed in ('seed-programs.bin', 'seed-answers.bin', 'seed-mesh.bin', 'seed-vertex.bin', 'seed-passes.bin'):
         (out / seed).unlink(missing_ok=True)
     pack_shader_cache(out)
 
@@ -1773,6 +1773,7 @@ def step_key(step, identity, out=None):
     # shaders: the built game and the translator that prepared them, the one xlate_source finds (the kit's bin/, or a
     # source checkout's build/xlate/)
     return (f'shaders-1|{sha256_file(KIT / "tools" / "fg_pose_catalog.py")}|{compile_key}|{sha256_file(KIT / "tools" / "prepare_shaders.py")}'
+            f'|{sha256_file(KIT / "tools" / "shader_census.py")}|{sha256_file(KIT / "tools" / "shader_passes.py")}'
             f'|{sha256_file(xlate_source() / "nx2navi_xlate.id")}')
 
 

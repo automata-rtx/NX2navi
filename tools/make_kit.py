@@ -28,7 +28,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 NAME = 'NX2navi-BuildKit'
 TOOLS = ('make_game.py', 'nup.py', 'romfs_index.py', 'check_content.py', 'hostmem.py', 'prepare_shaders.py',
-         'shader_census.py', 'shader_list.py', 'zstd_compat.py', 'pad_prompts.py', 'prompt_art.py', 'button_icons.py', 'romfs_check.py',
+         'shader_census.py', 'shader_list.py', 'shader_passes.py', 'extend_shader_preparation.py', 'zstd_compat.py', 'pad_prompts.py', 'prompt_art.py', 'button_icons.py', 'romfs_check.py',
          'build_game.py', 'check_isa.py', 'build_shaders.py', 'make_dlaa_mask.py', 'make_mvobj_fs.py',
          'pack_shader_cache.py')   # make_game.py imports build_game's vma_include on Linux for the VMA header, and
 # build_game.py imports check_isa and build_shaders, which reads the two make_ scripts' shaders

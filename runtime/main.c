@@ -514,7 +514,9 @@ static int usage(const char *argv0) {
                     "--probe-cfg | --probe-dpi | --probe-mods | --probe-kernel | --probe-ipc | --probe-services | --probe-fs | --probe-gfx-abi | "
                     "--probe-nvn | --probe-nvn-tex | --probe-window | --probe-shader | --probe-vkmem | "
                     "--probe-vkexec | --probe-astc | --probe-zstd | --probe-input | --probe-movie | --probe-crash-call | --probe-crash-null | --probe-discord | "
-                    "--prepare-shaders | --warm-shaders | --probe-prewarm | --boot |--seconds S [--shot PNG]]\n", argv0);
+                    "--shader-cache-id | --prepare-shaders | --warm-shaders | --warm-recorded-pipelines | "
+                    "--warm-archive-pipelines | --prepare-shader-inputs | --warm-additional-pipelines | "
+                    "--probe-prewarm | --boot | --seconds S [--shot PNG]]\n", argv0);
     return 2;
 }
 
@@ -662,6 +664,11 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "--probe-input")) return probe_gamepad();
     if (!strcmp(mode, "--probe-vkdevice")) return probe_vkdevice();
     if (!strcmp(mode, "--probe-movie")) return probe_movie();
+    if (!strcmp(mode, "--shader-cache-id")) return vk_shader_cache_id();
+    if (!strcmp(mode, "--warm-recorded-pipelines")) return vk_pipeline_warm_recorded();
+    if (!strcmp(mode, "--warm-archive-pipelines")) return vk_pipeline_warm_archive();
+    if (!strcmp(mode, "--prepare-shader-inputs")) return vk_pipeline_prepare_inputs();
+    if (!strcmp(mode, "--warm-additional-pipelines")) return vk_pipeline_warm_additional();
     if (!strcmp(mode, "--prepare-shaders")) return vk_pipeline_prepare_shaders();
     if (!strcmp(mode, "--warm-shaders")) return vk_pipeline_warm_shaders();
     if (!strcmp(mode, "--probe-prewarm")) return vk_pipeline_probe_prewarm();

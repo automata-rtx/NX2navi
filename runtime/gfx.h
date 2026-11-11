@@ -86,12 +86,16 @@ void gfx_shader_prepare_recorded(int threads, int procs);
 // nx2navi.exe --prepare-shaders: translates <dir>/seed-answers.bin + seed-programs.bin (tools/prepare_shaders.py) and
 // writes <dir>/shader-prepared.bin (stage, priority, input id per variant). 0 on success.
 int gfx_shader_prepare_seed(const char *dir, int threads, int procs);
+void gfx_shader_cache_identity(char translator[65], const char **storage);   // after gfx_shader_set_host
+void gfx_shader_print_carry_ids(void);
+int gfx_shader_prepared_present(const char *dir);
 // gfx_shader_guess.c: the answers of a prepared default variant, read from its first translation s: vertex inputs the
 // shader reads as integers become uint, a compute shader's textures and images take the types its translation
 // declares. 1 when *out differs from *a (translate again with *out).
 int gfx_shader_guess_refine(const GfxShader *s, int stage, const GfxShaderAnswers *a, GfxShaderAnswers *out);
 typedef struct { uint8_t iid[32]; uint8_t stage, prio; } GfxWarmEnt;   // prio 0: met in play; 1..3: prepared
-size_t gfx_shader_warm_list(GfxWarmEnt **out);              // malloc'd; recorded first, then prepared; needs recording on
+size_t gfx_shader_warm_list(const char *dir, int include_prepared, GfxWarmEnt **out, int *manifest_ok);
+size_t gfx_shader_additional_list(const char *dir, GfxWarmEnt **out, int *manifest_ok);
 // Disk-cache load the caller owns (*owned 1: release it), or the memory cache's entry (*owned 0). NULL if not cached.
 const GfxShader *gfx_shader_load_private(const uint8_t iid[32], int *owned);
 void gfx_shader_release_private(const GfxShader *s);
@@ -125,6 +129,13 @@ typedef struct {
                                 // needs every level of the texture as the game made it (gfx_shader.c reflect_exact)
 } GfxShaderRes;
 typedef struct { uint8_t type, comps, packed; } GfxShaderIo;   // GFX_TYPE_*, components, 1 with a Component decoration
+typedef struct { uint8_t tag, color[8], depth, points, reserved; } GfxArchivePass;
+typedef struct {
+    uint8_t first[32], fs[32];
+    union { uint8_t ts[32]; GfxArchivePass pass; };  // task ID for mesh, attachment layout for vertex (tag 0: default)
+} GfxArchiveProgram;
+int gfx_archive_program_order(const void *a, const void *b);
+int gfx_shader_archive_programs(const char *dir, int mesh, GfxArchiveProgram **programs, size_t *count);
 int gfx_shader_stage(const GfxShader *s);                   // GFX_STAGE_VS, GFX_STAGE_FS or GFX_STAGE_CS
 int gfx_shader_resources(const GfxShader *s, int kind, const GfxShaderRes **res);   // count of GFX_RES_* kind; array in *res
 uint32_t gfx_shader_exact_seen(void);   // shaders loaded so far with a GfxShaderRes.exact texture (the texture census line)
