@@ -128,7 +128,7 @@ A path the Windows ANSI code page cannot hold breaks the MSYS2 tools, so the too
    integer output variants, alternate vertex attribute types and named pass layouts also drive complete mesh and
    vertex pipeline preparation (`tools/prepare_shaders.py`, `runtime/gfx_shader.c`, `runtime/vk_pipeline.c`).
    The pass layouts are bounded candidates; they do not enumerate every state a draw can select at runtime.
-   Recorded draws add their exact states. Missing inputs and compilation or persistence failures fail preparation.
+   Recorded draws add their exact states. Missing prepared inputs and compilation or persistence failures fail preparation.
    Driver crash exclusions and unsupported pass candidates are reported separately. The saved cache is tied to the
    GPU, driver and renderer's effective shader options. Its bar
    follows the game's own counts, printed every 2 s: the translation fills the first half, the build into the
@@ -381,6 +381,9 @@ current installed archives using cached translations, and warms only new stage I
 It never runs the whole stage warm list. The combined inventory preserves old entries; a failure retains the baseline
 and a retry continues the additional phase. Logs and the completion receipt stay beside the baseline. A changed
 renderer or driver requires review before resuming. Successful partial pipeline work is saved even if a build fails.
+After compilation, both setup and additive preparation pack the shader archive with exact-content deduplication.
+All lookup keys remain present. Identical payloads of the same kind share one stored copy, with byte comparisons
+protecting against hash collisions. This pass does not remove variants or alter NVIDIA's opaque Vulkan cache.
 
 `tests/additional_preparation_test.py` checks inventory preservation and current attachment IDs;
 `tests/shader_archive_test.py` checks archive pairing and pass extraction. `tests/prepared_translation_check.py`

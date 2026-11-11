@@ -141,7 +141,13 @@ def extend(game, workers, exe_name):
             atomic_write(state_path, json.dumps(state, indent=2).encode())
         print(f"Preserving {state['baseline_stages']} prepared stages; warming {state['additional_stages']} additional "
               'stages and archive graphics combinations.', flush=True)
-        run([str(exe), '--warm-additional-pipelines'], game, env, work / 'pipelines.log')
+        if state['phase'] == 'pipelines':
+            run([str(exe), '--warm-additional-pipelines'], game, env, work / 'pipelines.log')
+            state.update(phase='packing')
+            atomic_write(state_path, json.dumps(state, indent=2).encode())
+        print('Packing shader files and sharing byte-identical payloads...', flush=True)
+        run([sys.executable, str(Path(__file__).with_name('pack_shader_cache.py')), str(game / 'shader-cache')],
+            game, env, work / 'packing.log')
         state.update(phase='complete', cache_bytes_after=cache.stat().st_size)
         atomic_write(state_path, json.dumps(state, indent=2).encode())
         for name in SEEDS:
