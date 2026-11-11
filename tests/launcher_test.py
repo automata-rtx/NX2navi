@@ -1444,7 +1444,7 @@ class MakeGameTest(Tmp):
         with contextlib.redirect_stdout(buf):
             self.mg.step_shaders(self.out)
         self.assertTrue((cache / 'shader-cache.pack').is_file())
-        self.assertEqual(sorted(p.name for p in cache.iterdir()), ['shader-cache.pack'])
+        self.assertEqual(sorted(p.name for p in cache.iterdir()), ['.pack.lock', 'shader-cache.pack'])
         self.assertIn('shader cache packed', buf.getvalue())
 
     def test_carried_update_packs_many_loose_shaders(self):
