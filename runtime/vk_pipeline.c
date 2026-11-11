@@ -599,12 +599,17 @@ static void cache_load(VkCtx *c) {
     size_t size = 0;
     FILE *f = P.cache_path[0] ? fopen(P.cache_path, "rb") : NULL;
     if (f) {
-        fseek(f, 0, SEEK_END);
-        long len = ftell(f);
-        fseek(f, 0, SEEK_SET);
-        if (len > (long)sizeof(VkPipelineCacheHeaderVersionOne) && (data = malloc((size_t)len)) &&
-            fread(data, 1, (size_t)len, f) == (size_t)len)
-            size = (size_t)len;
+        // Windows long is 32 bits. Use the same large-file operations as the binary archive.
+        int64_t len = pb_seek(f, 0, SEEK_END) ? -1 : pb_tell(f);
+        if (len < 0 || pb_seek(f, 0, SEEK_SET)) {
+            rt_log("vk_pipeline: cannot determine or seek the size of %s", P.cache_path);
+        } else if ((uint64_t)len > SIZE_MAX) {
+            rt_log("vk_pipeline: %s is too large for this process", P.cache_path);
+        } else if (len > (int64_t)sizeof(VkPipelineCacheHeaderVersionOne)) {
+            data = malloc((size_t)len);
+            if (data && fread(data, 1, (size_t)len, f) == (size_t)len) size = (size_t)len;
+            else rt_log("vk_pipeline: cannot allocate or read %lld bytes from %s", (long long)len, P.cache_path);
+        }
         fclose(f);
         VkPipelineCacheHeaderVersionOne h;
         if (size) memcpy(&h, data, sizeof h);
@@ -613,12 +618,8 @@ static void cache_load(VkCtx *c) {
             rt_log("vk_pipeline: %s was written by another device or driver; starting empty", P.cache_path);
             size = 0;
         }
-        // NX2NAVI_PIPELINE_CACHE_MAX_MB (default 512; 0 no limit): a larger file starts the run empty, and the run's
-        // saves replace it. The file only grows: entries of earlier translators and builds stay, and on NVIDIA
-        // (621.01) an entry another executable wrote is neither used nor written again, so a renamed or updated exe
-        // compiles while the file keeps its size (2026-11-09: 650 MB, 15-18 % of the pipelines read from it). The
-        // whole file sits in process memory twice at the boot (this read and the driver's copy) and is copied out
-        // at every save, which a 16 GB machine near its commit limit cannot spare.
+        // Broad preparation can produce multi-gigabyte caches. Keep them by default.
+        // An explicit NX2NAVI_PIPELINE_CACHE_MAX_MB limit starts empty above that size.
         uint64_t cap = (uint64_t)strtoull(cfg_value("NX2NAVI_PIPELINE_CACHE_MAX_MB"), NULL, 10) << 20;
         if (size && cap && size > cap) {
             rt_log("vk_pipeline: %s holds %.0f MB, over NX2NAVI_PIPELINE_CACHE_MAX_MB %llu: starting empty; this run "
