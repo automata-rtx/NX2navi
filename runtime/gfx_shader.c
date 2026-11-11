@@ -48,8 +48,8 @@
 //
 // Pack: tools/pack_shader_cache.py folds the .spv, .res.json, .use and in/*.in files into <cache>/shader-cache.pack
 // (one file instead of four per shader: ~117,000 files after an install) and deletes them; the installer runs it after
-// preparing the shaders. The pack is read-only here. Every read looks in the pack first and then for the loose file,
-// and new translations are written as loose files as before, until the tool runs again (section "cache pack").
+// preparing the shaders. New translations are loose until the tool runs again. Compiled shader pairs and masks are
+// read from the pack first. A newer loose rebuild input takes precedence over its original packed record.
 //
 // Stored inputs: every translation also writes <cache>/in/<input id>.in (magic "TKSI"; stage, the full answers, the
 // control section, the code up to its length, c1), so a pipeline key record (vk_pipeline.c), which names its shaders by
@@ -72,14 +72,17 @@
 // The code layout the translator sees (graphics: code[0x30..], compute: code[0..]; c1 = code[c1..length]
 // with c1 and length at control+0x700) follows tools/shader_census.py.
 #include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <zstd.h>
 
 #include "cfg.h"
 #include "gfx.h"
 #include "host.h"
 #include "platform/platform.h"
+#include "shader_workers.h"
 
 #define CONTROL_SIZE 0x880
 #define CODE_SKIP 0x30                                     // graphics code starts after the first 0x30 bytes of the program
@@ -195,7 +198,7 @@ static int carry_on(void) {
 #define write_file plat_file_write
 
 // ---- cache pack (<cache>/shader-cache.pack, written by tools/pack_shader_cache.py)
-// Little-endian: "TKSPACK1", u32 count, u32 0, then count entries sorted by (kind, name), then the data. name is the
+// Little-endian: "TKSPACK1", u32 count and flags, then count entries sorted by (kind, name), then the data. name is the
 // 32 bytes the loose file's 64 hex digits spell. The index is read once (48 bytes a file: ~5.6 MB after an install);
 // the data is read per lookup with positioned reads on one handle, safe from every thread. A pack that fails a check is
 // ignored as a whole and the loose files are used.
@@ -204,7 +207,7 @@ typedef struct { uint8_t name[32]; uint32_t kind, size; uint64_t offset; } PackE
 _Static_assert(sizeof(PackEnt) == 48, "shader-cache.pack entry layout");
 static PlatFile *pack_file;
 static PackEnt *pack_ix;
-static uint32_t pack_n;
+static uint32_t pack_n, pack_flags;
 
 static int pack_cmp(const PackEnt *a, uint32_t kind, const uint8_t name[32]) {
     if (a->kind != kind) return a->kind < kind ? -1 : 1;
@@ -236,7 +239,8 @@ static void pack_open(void) {
         else if (!pack_read_at(sizeof head, ix, n * (uint32_t)sizeof *ix)) why = "index read";
     }
     for (uint32_t i = 0; !why && i < n; i++) {
-        if (ix[i].offset + ix[i].size > id.size) why = "entry out of bounds";
+        if (ix[i].offset < sizeof head + (uint64_t)n * sizeof *ix || ix[i].offset > id.size ||
+            ix[i].size > id.size - ix[i].offset) why = "entry out of bounds";
         else if (i && pack_cmp(&ix[i - 1], ix[i].kind, ix[i].name) >= 0) why = "index order";
     }
     if (why) {
@@ -247,6 +251,7 @@ static void pack_open(void) {
         return;
     }
     pack_ix = ix, pack_n = n;
+    memcpy(&pack_flags, head + 12, sizeof pack_flags);
     rt_log("gfx_shader: cache pack %s: %u files", p, n);
 }
 
@@ -272,6 +277,20 @@ static uint8_t *pack_read(uint32_t kind, const uint8_t name[32], uint64_t *size)
         return NULL;
     }
     buf[e->size] = 0;
+    if (kind == PACK_IN && e->size >= 4 && !memcmp(buf, "\x28\xb5\x2f\xfd", 4)) {
+        unsigned long long n = ZSTD_getFrameContentSize(buf, e->size);
+        if (!n || n > (64u << 20) || ZSTD_findFrameCompressedSize(buf, e->size) != e->size)
+            return free(buf), NULL;
+        uint8_t *raw = malloc((size_t)n + 1);
+        if (!raw || ZSTD_decompress(raw, (size_t)n, buf, e->size) != n) {
+            free(raw);
+            return free(buf), NULL;
+        }
+        free(buf);
+        raw[n] = 0;
+        *size = n;
+        return raw;
+    }
     *size = e->size;
     return buf;
 }
@@ -728,6 +747,21 @@ static void key_hex(const uint8_t key[32], char out[65]) {
     out[64] = 0;
 }
 
+void gfx_shader_cache_identity(char translator[65], const char **storage) {
+    key_hex(xlate_id, translator);
+    *storage = cache_dir;
+}
+
+// Receipt identities include the active host options, as do the lookup keys used on this device.
+void gfx_shader_print_carry_ids(void) {
+    if (!carry_on()) return;
+    for (int i = 0; i < C.n_prev; i++) {
+        char hex[65];
+        key_hex(C.prev_eff[i], hex);
+        printf("shader-carry-id %s\n", hex);
+    }
+}
+
 // A .res.json the translator wrote: one JSON object that names its stage, no NUL inside. A file an interrupted write
 // left zero-filled (3647 of 21924 in one cache were) fails this; reflect() would take it for a vertex shader with
 // no resources, and its pipeline layout would lack the shader's buffers and textures.
@@ -760,9 +794,8 @@ static void reflect_spirv(GfxShader *s);
 static void reflect_stage(GfxShader *s);
 
 // Reads <key>.spv and <key>.res.json from the pack (packed 1) or the loose files; NULL if either is missing or
-// malformed. iid: the input id, NULL when the caller sets it. full 0: only the stage and the interface Locations are
-// reflected and the SPIR-V is left as the translator wrote it (the carry pass checks a translation it does not keep).
-static GfxShader *disk_load_from(const uint8_t key[32], const uint8_t *iid, int packed, int full) {
+// malformed. iid: the input id, NULL when the caller sets it.
+static GfxShader *disk_read_pair(const uint8_t key[32], const uint8_t *iid, int packed) {
     static volatile int32_t n_bad;
     char hex[65], p[PATH_CAP + 80];
     key_hex(key, hex);
@@ -790,12 +823,20 @@ static GfxShader *disk_load_from(const uint8_t key[32], const uint8_t *iid, int 
         return NULL;
     }
     GfxShader *s = calloc(1, sizeof *s);
+    if (!s) return free(res), free(spv), NULL;
     memcpy(s->key, key, 32);
     if (iid) memcpy(s->iid, iid, 32);
     s->spirv = (uint32_t *)spv;
     s->words = spv_size / 4;
     s->reflection = (char *)res;
     s->reflection_size = res_size;
+    return s;
+}
+
+// The carry pass only needs the stage and interface locations of an unmodified translation.
+static GfxShader *disk_load_from(const uint8_t key[32], const uint8_t *iid, int packed, int full) {
+    GfxShader *s = disk_read_pair(key, iid, packed);
+    if (!s) return NULL;
     if (!full) {
         reflect_stage(s), reflect_spirv(s);
         return s;
@@ -1348,6 +1389,22 @@ static void use_put(const uint8_t h[32], int known, const UseMask *m) {
     if (known) (*e)->known = 1, (*e)->m = *m;
 }
 
+// A malformed packed mask may have been regenerated as a loose file.
+static int use_read(const uint8_t name[32], UseMask *m) {
+    uint64_t n = 0;
+    uint32_t *f = (uint32_t *)pack_read(PACK_USE, name, &n);
+    if (!f || n != 20 || f[0] != USE_MAGIC || f[1] != USE_VERSION) {
+        free(f);
+        char p[PATH_CAP + 80];
+        use_path_of(name, p);
+        f = (uint32_t *)read_file(p, &n);
+    }
+    int known = f && n == 20 && f[0] == USE_MAGIC && f[1] == USE_VERSION;
+    if (known) m->slots = f[2], m->attrs = f[3], m->fouts = f[4];
+    free(f);
+    return known;
+}
+
 // 1 with *m when the use mask of h is known (memory, then <hash>.use; a disk miss is remembered).
 static int use_find(const uint8_t h[32], UseMask *m) {
     plat_mutex_lock_shared(&cache_lock);
@@ -1361,16 +1418,7 @@ static int use_find(const uint8_t h[32], UseMask *m) {
     if (plat_cas32(&use_files_ready, 0, 0)) {   // complete: a name not in it has no file
         UseFile *u = *use_file_slot(name);
         if ((known = u != NULL)) *m = u->m;
-    } else {
-        char p[PATH_CAP + 80];
-        use_path_of(name, p);
-        uint64_t n = 0;
-        uint32_t *f = (uint32_t *)pack_read(PACK_USE, name, &n);
-        if (!f) f = (uint32_t *)read_file(p, &n);
-        known = f && n == 20 && f[0] == USE_MAGIC && f[1] == USE_VERSION;
-        if (known) m->slots = f[2], m->attrs = f[3], m->fouts = f[4];
-        free(f);
-    }
+    } else known = use_read(name, m);
     plat_mutex_lock(&cache_lock);
     use_put(h, known, m);
     plat_mutex_unlock(&cache_lock);
@@ -1488,13 +1536,15 @@ static void build_key(const uint8_t code_hash[32], const GfxShaderAnswers *a, co
 }
 
 static size_t build_request(char *o0, const char *hex, const char *stage, const char *code_path, const uint8_t *c1,
-                            uint32_t c1_len, const GfxShaderAnswers *a, const uint8_t *control) {
+                            uint32_t c1_len, const GfxShaderAnswers *a, const uint8_t *control, uint8_t *options_hash) {
     char *o = o0;
     o += sprintf(o, "{\"job\":{\"key\":\"");
     json_esc(&o, hex);
-    o += sprintf(o, "\",\"stage\":\"%s\",\"debug\":false,\"code\":\"", stage);
+    o += sprintf(o, "\",\"code\":\"");
     json_esc(&o, code_path);
-    o += sprintf(o, "\",\"c1\":\"");
+    o += sprintf(o, "\",");
+    const char *options = o;
+    o += sprintf(o, "\"stage\":\"%s\",\"debug\":false,\"c1\":\"", stage);
     for (uint32_t i = 0; i < c1_len; i++) o += sprintf(o, "%02x", c1[i]);
     o += sprintf(o, "\"");
     if (a) {
@@ -1568,6 +1618,7 @@ static size_t build_request(char *o0, const char *hex, const char *stage, const 
             if (end >= 8 * (ntex + nimg)) o += sprintf(o, ",\"nvn2_table\":[%d,%d,%d]", end - 8 * (ntex + nimg), ntex, nimg);
         }
     }
+    if (options_hash) rt_sha256(options, (size_t)(o - options), options_hash);
     o += sprintf(o, "},\"out\":\"");
     json_esc(&o, cache_dir);
     o += sprintf(o, "\"}");
@@ -1586,14 +1637,7 @@ static int use_lookup(const uint8_t id[32], const uint8_t h[32], UseMask *m) {
         if (u) *m = u->m;
         return u != NULL;
     }
-    char p[PATH_CAP + 80];
-    uint64_t n = 0;
-    uint32_t *f = (uint32_t *)pack_read(PACK_USE, name, &n);
-    if (!f) use_path_of(name, p), f = (uint32_t *)read_file(p, &n);
-    int known = f && n == 20 && f[0] == USE_MAGIC && f[1] == USE_VERSION;
-    if (known) m->slots = f[2], m->attrs = f[3], m->fouts = f[4];
-    free(f);
-    return known;
+    return use_read(name, m);
 }
 
 // Previous identity j's entry `key` from the disk cache into the memory cache; NULL when the cache has no valid one.
@@ -1806,6 +1850,11 @@ static int failed_slot(const uint8_t key[32], int insert) {
     return found;
 }
 
+typedef struct PreparedJobs PreparedJobs;
+static _Thread_local PreparedJobs *preparing;
+static void in_store(const uint8_t iid[32], int stage, const uint8_t *control, const uint8_t *code, const Req *r,
+                     const GfxShaderAnswers *a);
+
 // The lookup order with carry (see "Carry" at the top): the current key in memory, a previous translator's entry in
 // memory, the current key on disk, a previous translator's entry on disk.
 static const GfxShader *get_one(const Req *r, int stage, const uint8_t *control, const uint8_t *code,
@@ -1814,7 +1863,10 @@ static const GfxShader *get_one(const Req *r, int stage, const uint8_t *control,
     if (s || (s = carry_find(r->code_hash, a, stage, 0))) return plat_inc64(&n_hits), s;
     paths();
     if (!cache_dir[0]) return fail("no cache directory", NULL);
-    if (r->final && (s = disk_load(r->key, r->iid))) return plat_inc64(&n_hits), mem_insert(s);
+    if (r->final && (s = disk_load(r->key, r->iid))) {
+        if (preparing) in_store(r->iid, stage, control, code, r, a);
+        return plat_inc64(&n_hits), mem_insert(s);
+    }
     if ((s = carry_find(r->code_hash, a, stage, 1))) return plat_inc64(&n_hits), s;
     if (failed_slot(r->key, 0)) return NULL;
     const GfxShader *t = translate(r, stage, control, code, a);
@@ -1853,13 +1905,32 @@ static void in_path(const uint8_t iid[32], char *p) {
     snprintf(p, PATH_CAP + 80, "%s/in/%s.in", cache_dir, hex);
 }
 
+static int in_load(const uint8_t iid[32], Inputs *in);
+
 // Stores the inputs of a translation unless they are stored already; the file appears whole (written, then renamed)
 // and is on the disk before its rename, the one cache file that is (see "Durability" at the top).
 static void in_store(const uint8_t iid[32], int stage, const uint8_t *control, const uint8_t *code, const Req *r,
                      const GfxShaderAnswers *a) {
     char p[PATH_CAP + 80], tmp[PATH_CAP + 120];
     in_path(iid, p);
-    if (pack_find(PACK_IN, iid) || file_exists(p)) return;
+    if (pack_find(PACK_IN, iid) || file_exists(p)) {
+        if (!preparing) return;
+        Inputs stored;
+        if (in_load(iid, &stored)) {
+            // Different binding answers can resolve to the same input ID. The program itself must match.
+            int valid = stored.stage == stage && stored.length == r->length && stored.c1_len == r->c1_len &&
+                        !memcmp(stored.control, control, CONTROL_SIZE) && !memcmp(stored.code, code, stored.length) &&
+                        !memcmp(stored.c1, r->c1, stored.c1_len);
+            if (valid && a && memcmp(&stored.a, a, sizeof *a)) {
+                UseMask mask;
+                uint8_t resolved[32];
+                valid = use_find(r->code_hash, &mask);
+                if (valid) iid_of(r->code_hash, &stored.a, &mask, resolved), valid = !memcmp(resolved, iid, 32);
+            }
+            free(stored.buf);
+            if (valid) return;
+        }
+    }
     GfxShaderAnswers zero = {0};
     InHeader h = {IN_MAGIC, IN_VERSION, (uint32_t)stage, r->length, r->c1_len, sizeof(GfxShaderAnswers)};
     size_t n = sizeof h + sizeof zero + CONTROL_SIZE + r->length + r->c1_len;
@@ -1876,17 +1947,11 @@ static void in_store(const uint8_t iid[32], int stage, const uint8_t *control, c
     free(buf);
 }
 
-// Reads stored inputs into *in (free in->buf); 0 when absent or malformed.
-static int in_load(const uint8_t iid[32], Inputs *in) {
-    char p[PATH_CAP + 80];
-    in_path(iid, p);
-    uint64_t n = 0;
-    uint8_t *f = pack_read(PACK_IN, iid, &n);
-    if (!f) f = read_file(p, &n);
+static int in_decode(uint8_t *f, uint64_t n, Inputs *in) {
     InHeader h;
     if (!f || n < sizeof h) return free(f), 0;
     memcpy(&h, f, sizeof h);
-    if (h.magic != IN_MAGIC || h.version != IN_VERSION || h.answers_size != sizeof(GfxShaderAnswers) ||
+    if (h.magic != IN_MAGIC || h.version != IN_VERSION || h.answers_size != sizeof(GfxShaderAnswers) || h.c1_len > h.length ||
         n != sizeof h + sizeof(GfxShaderAnswers) + CONTROL_SIZE + (uint64_t)h.length + h.c1_len)
         return free(f), 0;
     const uint8_t *o = f + sizeof h;
@@ -1898,10 +1963,100 @@ static int in_load(const uint8_t iid[32], Inputs *in) {
     return 1;
 }
 
+// A newer loose input may repair a packed record whose header is intact but whose program bytes are wrong.
+static int in_load(const uint8_t iid[32], Inputs *in) {
+    uint64_t n = 0;
+    char p[PATH_CAP + 80];
+    in_path(iid, p);
+    uint8_t *f = read_file(p, &n);
+    if (f && in_decode(f, n, in)) return 1;
+    f = pack_read(PACK_IN, iid, &n);
+    return in_decode(f, n, in);
+}
+
 // ---- translation
 
+// Only preparation workers share translator results. Logical shader and input IDs continue to include the full
+// guest program. The child sees the bytes of the code file and the serialized options in build_request.
+typedef struct PreparedJob {
+    struct PreparedJob *next;
+    uint8_t digest[32];
+    PlatCond done;
+    int busy, ready;
+    char cache_key[65], reflection_key[65];
+} PreparedJob;
+
+struct PreparedJobs {
+    PlatMutex lock;
+    PreparedJob *buckets[BUCKETS];
+    volatile int64_t reused;
+};
+
+// One worker owns a cold request. A failed owner leaves it available for the next worker to retry.
+static PreparedJob *prepared_enter(const uint8_t options_hash[32], const uint8_t *bytes, size_t n, PreparedJob **owner) {
+    uint8_t parts[3][32], digest[32];
+    memcpy(parts[0], xlate_id, 32);
+    rt_sha256(bytes, n, parts[1]);
+    memcpy(parts[2], options_hash, 32);
+    rt_sha256(parts, sizeof parts, digest);
+    uint32_t slot;
+    memcpy(&slot, digest, sizeof slot);
+    PreparedJob **bucket = &preparing->buckets[slot % BUCKETS];
+    plat_mutex_lock(&preparing->lock);
+    PreparedJob *j = *bucket;
+    while (j && memcmp(j->digest, digest, 32)) j = j->next;
+    if (!j && (j = calloc(1, sizeof *j))) {
+        memcpy(j->digest, digest, 32);
+        plat_cond_init(&j->done);
+        j->next = *bucket;
+        *bucket = j;
+    }
+    if (j) {
+        while (j->busy) plat_cond_wait(&j->done, &preparing->lock);
+        if (!j->ready) {
+            j->busy = 1;
+            *owner = j;
+        }
+    }
+    plat_mutex_unlock(&preparing->lock);
+    return *owner ? NULL : j;
+}
+
+static void prepared_finish(PreparedJob *owner, const GfxShader *s, const uint8_t request_key[32]) {
+    plat_mutex_lock(&preparing->lock);
+    if (s) {
+        key_hex(s->key, owner->cache_key);
+        key_hex(request_key, owner->reflection_key);
+        owner->ready = 1;
+    }
+    owner->busy = 0;
+    plat_cond_broadcast(&owner->done);
+    plat_mutex_unlock(&preparing->lock);
+}
+
+// Copy the unmodified disk SPIR-V. disk_load_from applies the per-install HDR substitution in memory.
+// The translator embeds its job key in reflection, so each logical job gets the key it would have emitted.
+static GfxShader *prepared_copy(const PreparedJob *j, const Req *r, const char *hex, const char *spv, const char *res) {
+    char path[PATH_CAP + 80];
+    uint64_t ns = 0, nr = 0;
+    snprintf(path, sizeof path, "%s/%s.res.json", cache_dir, j->cache_key);
+    uint8_t *reflection = read_file(path, &nr);
+    if (!reflection) return NULL;
+    const char *end = (char *)reflection + nr;
+    const char *id = json_key((char *)reflection, end, "key");
+    if (!id || end - id < 66 || *id != '"' || id[65] != '"' || memcmp(id + 1, j->reflection_key, 64))
+        return free(reflection), NULL;
+    memcpy((char *)id + 1, hex, 64);
+    snprintf(path, sizeof path, "%s/%s.spv", cache_dir, j->cache_key);
+    uint8_t *raw = read_file(path, &ns);
+    int ok = raw && plat_file_write_cached(spv, raw, (size_t)ns) && plat_file_write_cached(res, reflection, (size_t)nr);
+    free(raw);
+    free(reflection);
+    return ok ? disk_load_from(r->key, r->iid, 0, 1) : NULL;
+}
+
 static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *control, const uint8_t *code,
-                                      const GfxShaderAnswers *a) {
+                                      const GfxShaderAnswers *a, PreparedJob **owner, int *published) {
     const uint8_t *key = r->key;
     GfxShader *s;
     UseMask m;
@@ -1919,39 +2074,47 @@ static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *co
     snprintf(code_path, PATH_CAP + 80, "%s/%s.code", cache_dir, hex);
     snprintf(spv_path, PATH_CAP + 80, "%s/%s.spv", cache_dir, hex);
     snprintf(res_path, PATH_CAP + 80, "%s/%s.res.json", cache_dir, hex);
-    if (!write_file(code_path, code + skip, (size_t)(r->length - skip))) return fail("cannot write the code file", hex);
-    size_t cap = 2 * PATH_CAP * 6 + 2 * r->c1_len + 8192;
+    size_t cap = 2 * PATH_CAP * 6 + 2 * (size_t)r->c1_len + 8192;
     char *req = malloc(cap), reply[LINE_MAX_LEN];
-    if (!req) return plat_file_delete(code_path), fail("out of memory", hex);
-    build_request(req, hex, r->stage_name, code_path, r->c1, r->c1_len, a, control);
-    int ok = svc_request(req, reply, sizeof reply);
+    if (!req) return fail("out of memory", hex);
     // NX2NAVI_XLATE_KEEP=1: a last-frame variant's job stays as <key>.job (one request line) with its code, to run the
     // translator on by hand (nx2navi_xlate --serve < <key>.job); 2 keeps every job translated in this run (delete a
     // key's .res.json and .spv from the cache to have it translated, and kept, again)
-    static int keep = -1;
-    if (keep < 0) {
-        const char *k = cfg_get("NX2NAVI_XLATE_KEEP");
-        keep = k && *k ? atoi(k) : 0;
-    }
-    // A failed translation keeps its job and code too (rare; what a translator fix is tested on).
-    int failed = ok && strncmp(reply, "ok ", 3);
-    int kept = keep >= 2 || (keep && a && a->mvprev) || failed;
-    if (kept) {
-        char job_path[PATH_CAP + 80];
-        snprintf(job_path, sizeof job_path, "%s/%s.job", cache_dir, hex);
-        write_file(job_path, req, strlen(req));
-    }
-    free(req);
-    if (!kept) plat_file_delete(code_path);
-    if (!ok) return fail("translator unavailable", hex);
-    if (strncmp(reply, "ok ", 3)) {
-        plat_file_delete(spv_path), plat_file_delete(res_path);
-        if (r->sm86) plat_inc64(&n_sm86);
-        return fail(reply, hex);
+    const char *k = cfg_get("NX2NAVI_XLATE_KEEP");
+    int keep = k && *k ? atoi(k) : 0;
+    uint8_t options[32];
+    int share = preparing && !keep;
+    build_request(req, hex, r->stage_name, code_path, r->c1, r->c1_len, a, control, share ? options : NULL);
+    size_t code_len = (size_t)(r->length - skip);
+    PreparedJob *prior = share ? prepared_enter(options, code + skip, code_len, owner) : NULL;
+    s = prior ? prepared_copy(prior, r, hex, spv_path, res_path) : NULL;
+    int reused = s != NULL;
+    if (s) {
+        free(req);
+    } else {
+        if (!write_file(code_path, code + skip, code_len)) return free(req), fail("cannot write the code file", hex);
+        int ok = svc_request(req, reply, sizeof reply);
+        // Keep a failed translation's job and code for diagnosis.
+        int failed = ok && strncmp(reply, "ok ", 3);
+        int kept = keep >= 2 || (keep && a && a->mvprev) || failed;
+        if (kept) {
+            char job_path[PATH_CAP + 80];
+            snprintf(job_path, sizeof job_path, "%s/%s.job", cache_dir, hex);
+            write_file(job_path, req, strlen(req));
+        }
+        free(req);
+        if (!kept) plat_file_delete(code_path);
+        if (!ok) return fail("translator unavailable", hex);
+        if (failed) {
+            plat_file_delete(spv_path), plat_file_delete(res_path);
+            if (r->sm86) plat_inc64(&n_sm86);
+            return fail(reply, hex);
+        }
+        if (!(s = disk_load_from(key, r->iid, 0, 1))) return fail("translator output missing or malformed", hex);
     }
     // Not flushed (see "Durability" at the top): the translator wrote them whole, and disk_load checks both.
     if (cache_flush()) plat_file_flush(spv_path), plat_file_flush(res_path);
-    if (!(s = disk_load(key, r->iid))) return fail("translator output missing or malformed", hex);
+    *published = 1;
     if (!r->final) {                                       // name the files after the cache key, remember the mask
         m = use_of(s);
         build_key(r->code_hash, a, &m, mk, miid);
@@ -1964,6 +2127,7 @@ static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *co
         if (moved) {
             use_store(r->code_hash, &m);
         } else {                                           // keep the mask for this run only
+            *published = 0;
             plat_file_delete(spv_path), plat_file_delete(res_path), rt_log("gfx_shader: cannot rename %s", hex);
             plat_mutex_lock(&cache_lock);
             use_put(r->code_hash, 1, &m);
@@ -1972,7 +2136,8 @@ static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *co
         memcpy(s->key, mk, 32), memcpy(s->iid, miid, 32);
     }
     in_store(s->iid, stage, control, code, r, a);
-    plat_inc64(&n_xlated);
+    if (reused) plat_inc64(&preparing->reused);
+    else plat_inc64(&n_xlated);
     return mem_insert(s);
 }
 
@@ -1983,7 +2148,10 @@ static const GfxShader *translate(const Req *r, int stage, const uint8_t *contro
     int away = kern_core_away();
     const uint8_t *id = r->final ? r->key : r->code_hash;
     flight_enter(id);
-    const GfxShader *s = translate_one(r, stage, control, code, a);
+    PreparedJob *owner = NULL;
+    int published = 0;
+    const GfxShader *s = translate_one(r, stage, control, code, a, &owner, &published);
+    if (owner) prepared_finish(owner, published ? s : NULL, r->key);
     flight_leave(id);
     kern_core_back(&away);
     return s;
@@ -2427,7 +2595,7 @@ int gfx_shader_write_code(const GfxShader *s, const char *path) {
     char *req = st ? malloc(cap) : NULL, job[PATH_CAP + 80], hex[65];
     if (ok && req) {
         key_hex(s->key, hex);
-        build_request(req, hex, st, path, in.c1, in.c1_len, &in.a, in.control);
+        build_request(req, hex, st, path, in.c1, in.c1_len, &in.a, in.control, NULL);
         snprintf(job, sizeof job, "%s.job", path);
         write_file(job, req, strlen(req));
     }
@@ -2485,7 +2653,7 @@ void gfx_shader_local_size(const GfxShader *s, uint32_t local[3]) { memcpy(local
 #define PRG_VERSION 1
 #define PRG_HEAD (12 + 32 + CONTROL_SIZE)
 typedef struct { char magic[8]; uint32_t version, rec_size; } RecHeader;
-typedef struct { uint64_t *v; uint32_t cap, n; } Set64;    // open addressing, 0 empty
+typedef struct { uint64_t *v; uint32_t cap, n; int failed; } Set64;    // open addressing, 0 empty
 typedef struct { uint8_t *p; size_t n, cap; } Bytes;
 
 static struct {
@@ -2502,7 +2670,7 @@ static int set_add(Set64 *s, uint64_t h) {                 // 1 if new
     if ((s->n + 1) * 2 > s->cap) {
         uint32_t cap = s->cap ? s->cap * 2 : 4096;
         uint64_t *t = calloc(cap, sizeof *t);
-        if (!t) return 0;
+        if (!t) return s->failed = 1, 0;
         for (uint32_t i = 0; i < s->cap; i++)
             if (s->v[i]) {
                 uint32_t j = (uint32_t)s->v[i] & (cap - 1);
@@ -2549,33 +2717,42 @@ static void unpack_answers(const uint8_t *p, GfxShaderAnswers *a) {
     a->depth_minus_w = *p & 0x7f, a->mvprev = *p >> 7;
 }
 
-// Reads a record file's body (after its header) into *body; 0 when absent, and a file with another header is removed.
-static volatile int32_t rec_kept;   // a record file rec_read could not read and kept: nothing is appended to it this run
-
-static int rec_read(const char *path, const char *magic, uint32_t version, uint32_t rec_size, uint8_t **body, size_t *n) {
+// Returns 1 for a matching record file, 0 when a new one may be started, and -1 when it must be kept untouched.
+static int rec_load(const char *path, const char *magic, uint32_t version, uint32_t rec_size, uint8_t **body, size_t *n,
+                    int repair) {
     *body = NULL, *n = 0;
     FILE *f = fopen(path, "rb");
-    if (!f) return 0;
+    if (!f) return errno == ENOENT ? 0 : -1;
     RecHeader h;
-    fseek(f, 0, SEEK_END);
-    long len = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    int head = len >= (long)sizeof h && fread(&h, sizeof h, 1, f) == 1;
-    int format = head && !memcmp(h.magic, magic, 8) && h.version == version && h.rec_size == rec_size;
-    int ok = format;
-    if (ok && len > (long)sizeof h) {
+    int64_t len = plat_fseek64(f, 0, SEEK_END) == 0 ? plat_ftell64(f) : -1;
+    int ok = len >= 0 && plat_fseek64(f, 0, SEEK_SET) == 0;
+    if (ok && len >= (int64_t)sizeof h) ok = fread(&h, sizeof h, 1, f) == 1;
+    if (ok && (len < (int64_t)sizeof h || memcmp(h.magic, magic, 8) || h.version != version || h.rec_size != rec_size)) {
+        fclose(f);
+        if (!len) return 0;
+        rt_log("gfx_shader: %s has an incompatible or incomplete header", path);
+        return repair && remove(path) == 0 ? 0 : -1;
+    }
+    if (ok && len > (int64_t)sizeof h) {
         *n = (size_t)len - sizeof h;
-        ok = (*body = malloc(*n)) && fread(*body, 1, *n, f) == *n;
+        *body = malloc(*n);
+        ok = *body != NULL;
+        for (size_t at = 0; ok && at < *n;) {
+            size_t chunk = *n - at;
+            if (chunk > (64u << 20)) chunk = 64u << 20;
+            ok = fread(*body + at, 1, chunk, f) == chunk;
+            at += chunk;
+        }
     }
     fclose(f);
-    if (!ok) {
-        free(*body), *body = NULL, *n = 0;
-        // Only a file of another format or version is deleted. A read that failed (no memory for the body when the
-        // system commit runs low, a short read) keeps the file: it holds every program and answer met in play.
-        if ((head && !format) || (len > 0 && len < (long)sizeof h)) rt_log("gfx_shader: %s has another format or version; it is rewritten", path), remove(path);
-        else if (len > 0) rt_log("gfx_shader: cannot read %s (%ld bytes); kept as it is", path, len), plat_xchg32(&rec_kept, 1);
-    }
-    return ok;
+    if (ok) return 1;
+    free(*body), *body = NULL, *n = 0;
+    rt_log("gfx_shader: could not read %s; kept its records", path);
+    return -1;
+}
+
+static int rec_read(const char *path, const char *magic, uint32_t version, uint32_t rec_size, uint8_t **body, size_t *n) {
+    return rec_load(path, magic, version, rec_size, body, n, 0) == 1;
 }
 
 // Walks shader-programs.bin records; returns the byte length of the whole records. fn may be NULL.
@@ -2594,9 +2771,10 @@ static size_t prg_walk(const uint8_t *b, size_t n, void (*fn)(const uint8_t *rec
 
 static void prg_seen(const uint8_t *rec, void *ctx) { set_add(ctx, hash8(rec + 12)); }
 
-static void truncate_to(const char *path, size_t size) {
-    if (!plat_file_truncate(path, size)) return;
+static int truncate_to(const char *path, size_t size) {
+    if (!plat_file_truncate(path, size)) return 0;
     rt_log("gfx_shader: %s had a torn tail; cut to %zu bytes", path, size);
+    return 1;
 }
 
 void gfx_shader_record_at(const char *keys_path) {
@@ -2609,20 +2787,20 @@ void gfx_shader_record_at(const char *keys_path) {
     snprintf(RC.prg_path, sizeof RC.prg_path, "%.*sshader-programs.bin", dir, keys_path);
     uint8_t *b;
     size_t n;
-    plat_xchg32(&rec_kept, 0);
-    if (rec_read(RC.ans_path, "NX2NSANS", ANS_VERSION, ANS_REC, &b, &n)) {
+    int answers = rec_load(RC.ans_path, "NX2NSANS", ANS_VERSION, ANS_REC, &b, &n, 1);
+    if (answers == 1) {
         for (size_t o = 0; o + ANS_REC <= n; o += ANS_REC) set_add(&RC.pairs, hash8(b + o + 36));
-        if (n % ANS_REC) truncate_to(RC.ans_path, sizeof(RecHeader) + n / ANS_REC * ANS_REC);
+        if (n % ANS_REC && !truncate_to(RC.ans_path, sizeof(RecHeader) + n / ANS_REC * ANS_REC)) answers = -1;
     }
     free(b);
-    if (rec_read(RC.prg_path, "NX2NSPRG", PRG_VERSION, 0, &b, &n)) {
+    int programs = rec_load(RC.prg_path, "NX2NSPRG", PRG_VERSION, 0, &b, &n, 1);
+    if (programs == 1) {
         size_t whole = prg_walk(b, n, prg_seen, &RC.progs);
-        if (whole != n) truncate_to(RC.prg_path, sizeof(RecHeader) + whole);
+        if (whole != n && !truncate_to(RC.prg_path, sizeof(RecHeader) + whole)) programs = -1;
     }
     free(b);
-    if (plat_xchg32(&rec_kept, 0)) {   // without what it holds, appends would repeat its records after a possibly torn tail
-        rt_log("gfx_shader: answers met in play are not recorded this run (%s or %s could not be read)", RC.ans_path,
-               RC.prg_path);
+    if (answers < 0 || programs < 0 || RC.pairs.failed || RC.progs.failed) {
+        rt_log("gfx_shader: recording disabled because a previous record file could not be read, indexed or repaired");
         plat_mutex_unlock(&RC.lock);
         return;
     }
@@ -2701,14 +2879,17 @@ void gfx_shader_record_flush(int force) {
 // answers are read again from its first translation (gfx_shader_guess.c) and the variant it resolves to is the
 // translation with those, when they differ.
 #define SEED_DEFAULT 0x80                                  // tools/prepare_shaders.py DEFAULT_FLAG
+typedef struct { uint8_t id[2][32]; } SeedVariants;   // preferred binding answers, then an optional vertex alternative
 typedef struct { const uint8_t *rec; } PrgIdx;
 typedef struct { PrgIdx *idx; size_t n; } PrgList;
 typedef struct {
     PrgList progs;
     const uint8_t *ans;
     size_t n_ans;
-    uint8_t (*iid)[32];                                    // per answers record: the resolved input id, zero on failure
-    volatile int64_t next, done, missing, failed, refined;
+    SeedVariants *ids;                                     // zero for an unavailable variant
+    ShaderWork work;
+    PreparedJobs jobs;
+    volatile int64_t done, missing, failed, refined;
 } Prep;
 
 static int prg_cmp(const void *x, const void *y) { return memcmp(((const PrgIdx *)x)->rec + 12, ((const PrgIdx *)y)->rec + 12, 32); }
@@ -2720,9 +2901,9 @@ static void prg_collect(const uint8_t *rec, void *ctx) {
 
 static void prep_worker(void *arg) {
     Prep *p = arg;
-    for (;;) {
-        size_t i = (size_t)plat_inc64(&p->next) - 1;
-        if (i >= p->n_ans) return;
+    preparing = &p->jobs;
+    size_t i = SIZE_MAX;
+    while ((i = shader_work_next(&p->work, i)) != SIZE_MAX) {
         const uint8_t *r = p->ans + i * ANS_REC;
         uint8_t key_rec[12 + 32];
         memcpy(key_rec + 12, r + 4, 32);
@@ -2738,19 +2919,30 @@ static void prep_worker(void *arg) {
         unpack_answers(r + 68, &a);
         const GfxShader *s = gfx_shader_get((int)st, control, code, len, c1, &a), *t;
         if (s && r[ANS_REC - 1] & SEED_DEFAULT && gfx_shader_guess_refine(s, (int)st, &a, &b) &&
-            (t = gfx_shader_get((int)st, control, code, len, c1, &b)))
-            s = t, plat_inc64(&p->refined);
+            (t = gfx_shader_get((int)st, control, code, len, c1, &b))) {
+            // A bitcast can also unpack bits from a float attribute. Model draws use both layouts at
+            // locations 8 and 9, independently of integer indices elsewhere in the same shader.
+            if (p->ids && st == GFX_STAGE_VS && (b.attr_type[8] != a.attr_type[8] || b.attr_type[9] != a.attr_type[9])) {
+                b.attr_type[8] = a.attr_type[8];
+                b.attr_type[9] = a.attr_type[9];
+                const GfxShader *alt = !memcmp(&a, &b, sizeof a) ? s : gfx_shader_get((int)st, control, code, len, c1, &b);
+                if (alt && memcmp(alt->iid, t->iid, 32)) memcpy(p->ids[i].id[1], alt->iid, 32);
+            }
+            s = t;
+            plat_inc64(&p->refined);
+        }
         if (!s) plat_inc64(&p->failed);
-        else if (p->iid) memcpy(p->iid[i], s->iid, 32);
+        else if (p->ids) memcpy(p->ids[i].id[0], s->iid, 32);
         plat_inc64(&p->done);
     }
+    preparing = NULL;
 }
 
 // Translates every record of ans_path whose program is in prg_path on `threads` threads with up to `procs` translators.
-// *ans_out, *iid_out (optional; free them): the answers records and the input id each resolved to (zero: failed).
+// *ans_out, *ids_out (optional; free them): the answers records and their resolved input IDs.
 // Returns the record count, -1 without the files.
 static long long prepare_files(const char *ans_path, const char *prg_path, int threads, int procs, const char *what,
-                               uint8_t **ans_out, uint8_t (**iid_out)[32]) {
+                               uint8_t **ans_out, SeedVariants **ids_out) {
     paths();
     double t0 = (double)plat_now_ms();
     uint8_t *ab = NULL, *pb = NULL;
@@ -2762,14 +2954,23 @@ static long long prepare_files(const char *ans_path, const char *prg_path, int t
         return -1;
     }
     Prep p = {.progs = {calloc(pn / PRG_HEAD + 1, sizeof(PrgIdx)), 0}, .ans = ab, .n_ans = an / ANS_REC};
-    if (iid_out) p.iid = calloc(p.n_ans + 1, 32);
-    if (!p.progs.idx || (iid_out && !p.iid)) return free(p.progs.idx), free(p.iid), free(ab), free(pb), -1;
+    if (!shader_work_open(&p.work, p.n_ans, procs, ids_out != NULL)) {
+        rt_log("gfx_shader: cannot open the launcher's shader worker control");
+        return free(p.progs.idx), free(ab), free(pb), -1;
+    }
+    if (!p.work.limit) p.work.automatic = 64;   // the translator pool itself limits standalone runs
+    if (ids_out) p.ids = calloc(p.n_ans + 1, sizeof *p.ids);
+    if (!p.progs.idx || (ids_out && !p.ids)) {
+        shader_work_close(&p.work);
+        return free(p.progs.idx), free(p.ids), free(ab), free(pb), -1;
+    }
     prg_walk(pb, pn, prg_collect, &p.progs);
     qsort(p.progs.idx, p.progs.n, sizeof *p.progs.idx, prg_cmp);
-    plat_inc32(&C.suspended);   // a preparation translates everything under the current translator, carrying nothing
+    plat_inc32(&C.suspended);
+    plat_mutex_init(&p.jobs.lock);
     uint64_t xl0 = (uint64_t)n_xlated;
     threads = threads < 1 ? 1 : threads > 64 ? 64 : threads;
-    svc_set_limit(procs);
+    svc_set_limit(p.work.limit ? threads : procs);
     PlatThread *t[64];
     int k = 0;
     for (int i = 0; i < threads; i++)
@@ -2788,16 +2989,25 @@ static long long prepare_files(const char *ans_path, const char *prg_path, int t
     printf("prepare-shaders: progress translate %zu %zu\n", p.n_ans, p.n_ans);
     fflush(stdout);
     plat_dec32(&C.suspended);
+    shader_work_close(&p.work);
     svc_set_limit(svc_runtime_limit());
-    rt_log("gfx_shader: prepare: %zu %s of %zu programs: %llu translated, %lld failed, %lld without a program, the rest "
-           "cached; %lld default variants with refined answers; %.0f ms", p.n_ans, what, p.progs.n,
-           (unsigned long long)((uint64_t)n_xlated - xl0), (long long)p.failed, (long long)p.missing, (long long)p.refined,
-           (double)plat_now_ms() - t0);
+    rt_log("gfx_shader: prepare: %zu %s of %zu programs: %llu translated, %lld failed, %lld without a program, "
+           "%lld equivalent requests reused; %lld default variants with refined answers; %.0f ms", p.n_ans, what,
+           p.progs.n, (unsigned long long)((uint64_t)n_xlated - xl0), (long long)p.failed, (long long)p.missing,
+           (long long)p.jobs.reused, (long long)p.refined, (double)plat_now_ms() - t0);
+    for (int b = 0; b < BUCKETS; b++) {
+        PreparedJob *j = p.jobs.buckets[b];
+        while (j) {
+            PreparedJob *next = j->next;
+            free(j);
+            j = next;
+        }
+    }
     free(p.progs.idx), free(pb);
     if (ans_out) *ans_out = ab;
     else free(ab);
-    if (iid_out) *iid_out = p.iid;
-    return (long long)p.n_ans;
+    if (ids_out) *ids_out = p.ids;
+    return p.failed || p.missing ? -1 : (long long)p.n_ans;
 }
 
 void gfx_shader_prepare_recorded(int threads, int procs) {
@@ -2814,6 +3024,155 @@ void gfx_shader_prepare_recorded(int threads, int procs) {
 #define PRP_VERSION 1
 #define PRP_REC 36
 
+// Check the bytes play would read, including a valid loose replacement for a damaged packed pair.
+static int prepared_pair(const uint8_t id[32], const uint8_t iid[32], int stage) {
+    uint8_t key[32];
+    key_of_input_id(id, iid, key);
+    GfxShader *s = pack_n ? disk_read_pair(key, iid, 1) : NULL;
+    if (!s) s = disk_read_pair(key, iid, 0);
+    if (!s) return 0;
+    reflect_stage(s);
+    int ok = s->stage == stage;
+    shader_free(s);
+    return ok;
+}
+
+// Draws look up the use mask before the compiled shader. The original input also lets the next
+// translator recover the program. Both must agree with the manifest before setup can reuse it.
+static int prepared_lookup(const uint8_t iid[32], int stage) {
+    Inputs in;
+    if (!in_load(iid, &in)) return 0;
+    uint8_t hash[32], resolved[32];
+    int input_ok = in.stage == stage && build_code_hash(stage, in.control, in.code, in.length, in.c1, in.c1_len, hash);
+    int ok = 0, previous = carry_on() ? C.n_prev : 0;
+    for (int j = -1; input_ok && !ok && j < previous; j++) {
+        const uint8_t *id = j < 0 ? xlate_id : C.prev_eff[j];
+        UseMask mask;
+        if (!use_lookup(id, hash, &mask)) continue;
+        iid_of(hash, &in.a, &mask, resolved);
+        ok = !memcmp(iid, resolved, sizeof resolved) && prepared_pair(id, iid, stage);
+    }
+    free(in.buf);
+    return ok;
+}
+
+int gfx_shader_prepared_present(const char *dir) {
+    char path[PATH_CAP + 80];
+    snprintf(path, sizeof path, "%s/shader-prepared.bin", dir);
+    uint8_t *records = NULL;
+    size_t bytes = 0;
+    if (!rec_read(path, "NX2NSPRP", PRP_VERSION, PRP_REC, &records, &bytes)) return 0;
+    int ok = bytes && bytes % PRP_REC == 0;
+    for (size_t i = 0; ok && i < bytes; i += PRP_REC) {
+        const uint8_t *r = records + i;
+        // Older manifests labeled mesh/task inputs as vertex. Accept only when their stored input,
+        // use mask and compiled stage agree; the next seed preparation writes the correct stage.
+        ok = r[1] <= 2 && !r[2] && !r[3] &&
+             (prepared_lookup(r + 4, r[0]) || (r[0] == GFX_STAGE_VS &&
+              (prepared_lookup(r + 4, GFX_STAGE_MS) || prepared_lookup(r + 4, GFX_STAGE_TS))));
+    }
+    free(records);
+    return ok;
+}
+
+int gfx_archive_program_order(const void *a, const void *b) {
+    return memcmp(a, b, sizeof(GfxArchiveProgram));
+}
+
+int gfx_shader_archive_programs(const char *dir, int mesh, GfxArchiveProgram **programs, size_t *count) {
+    char path[PATH_CAP + 32];
+    snprintf(path, sizeof path, "%s/%s-programs.bin", dir, mesh ? "mesh" : "vertex");
+    uint8_t *data = NULL;
+    size_t bytes = 0;
+    *programs = NULL, *count = 0;
+    if (!plat_file_exists(path)) return 1;   // installs prepared before archive combinations were saved
+    if (!rec_read(path, mesh ? "NX2NMSID" : "NX2NVSID", 1, sizeof(GfxArchiveProgram), &data, &bytes) || bytes % sizeof(GfxArchiveProgram)) {
+        free(data);
+        return 0;
+    }
+    *programs = (GfxArchiveProgram *)data, *count = bytes / sizeof(GfxArchiveProgram);
+    return 1;
+}
+
+static int resolve_archive_programs(const char *dir, int mesh, const uint8_t *answers, const SeedVariants *ids, size_t n) {
+    char path[PATH_CAP + 32];
+    snprintf(path, sizeof path, "%s/seed-%s.bin", dir, mesh ? "mesh" : "vertex");
+    uint8_t *indices = NULL;
+    size_t bytes = 0;
+    if (plat_file_exists(path) && (!rec_read(path, mesh ? "NX2NMSIX" : "NX2NVSIX", 1, 12, &indices, &bytes) || bytes % 12)) {
+        free(indices);
+        return 0;
+    }
+    uint8_t *passes = NULL;
+    size_t pass_bytes = 0;
+    _Static_assert(sizeof(GfxArchivePass) == 12 && sizeof(GfxArchiveProgram) == 96, "archive record layout");
+    const size_t pass_size = 8 + sizeof(GfxArchivePass);
+    if (!mesh) {
+        snprintf(path, sizeof path, "%s/seed-passes.bin", dir);
+        if (plat_file_exists(path) && (!rec_read(path, "NX2NPSIX", 1, pass_size, &passes, &pass_bytes) || pass_bytes % pass_size)) {
+            free(indices), free(passes);
+            return 0;
+        }
+    }
+    RecHeader header = {.version = 1, .rec_size = sizeof(GfxArchiveProgram)};
+    memcpy(header.magic, mesh ? "NX2NMSID" : "NX2NVSID", sizeof header.magic);
+    size_t count = bytes / 12 + pass_bytes / pass_size, max_per_group = mesh ? 1 : 2;
+    if (count > (SIZE_MAX - sizeof header) / sizeof(GfxArchiveProgram) / max_per_group) {
+        free(indices), free(passes);
+        return 0;
+    }
+    uint8_t *file = calloc(1, sizeof header + count * max_per_group * sizeof(GfxArchiveProgram));
+    if (!file) { free(indices), free(passes); return 0; }
+    memcpy(file, &header, sizeof header);
+    size_t written = sizeof header;
+    for (size_t i = 0; i < count; i++) {
+        int explicit_pass = i >= bytes / 12;
+        const uint8_t *row = explicit_pass ? passes + (i - bytes / 12) * pass_size : indices + i * 12;
+        uint32_t vs, fs, ts = UINT32_MAX;
+        memcpy(&vs, row, 4);
+        memcpy(&fs, row + 4, 4);
+        if (!explicit_pass) memcpy(&ts, row + 8, 4);
+        const uint8_t zero[32] = {0};
+        if (vs >= n || answers[vs * (size_t)ANS_REC] != (mesh ? GFX_STAGE_MS : GFX_STAGE_VS) ||
+            !memcmp(ids[vs].id[0], zero, 32)) continue;
+        GfxArchiveProgram group = {0};
+        memcpy(group.first, ids[vs].id[0], 32);
+        if (fs != UINT32_MAX) {
+            if (fs >= n || answers[fs * (size_t)ANS_REC] != GFX_STAGE_FS || !memcmp(ids[fs].id[0], zero, 32)) continue;
+            memcpy(group.fs, ids[fs].id[0], 32);
+        }
+        if (ts != UINT32_MAX) {
+            if (!mesh || ts >= n || answers[ts * (size_t)ANS_REC] != GFX_STAGE_TS || !memcmp(ids[ts].id[0], zero, 32)) continue;
+            memcpy(group.ts, ids[ts].id[0], 32);
+        }
+        if (explicit_pass) {
+            memcpy(&group.pass, row + 8, sizeof group.pass);
+            if (group.pass.tag != 1 || group.pass.points > 1 || group.pass.reserved) continue;
+        }
+        memcpy(file + written, &group, sizeof group);
+        written += sizeof group;
+        if (!mesh && memcmp(ids[vs].id[1], zero, 32)) {
+            memcpy(group.first, ids[vs].id[1], 32);
+            memcpy(file + written, &group, sizeof group);
+            written += sizeof group;
+        }
+    }
+    if (!mesh) {
+        GfxArchiveProgram *groups = (GfxArchiveProgram *)(file + sizeof header);
+        size_t count = (written - sizeof header) / sizeof *groups, unique = 0;
+        qsort(groups, count, sizeof *groups, gfx_archive_program_order);
+        for (size_t i = 0; i < count; i++)
+            if (!unique || gfx_archive_program_order(&groups[unique - 1], &groups[i]))
+                groups[unique++] = groups[i];
+        written = sizeof header + unique * sizeof *groups;
+    }
+    snprintf(path, sizeof path, "%s/%s-programs.bin", dir, mesh ? "mesh" : "vertex");
+    int ok = plat_file_write_atomic(path, file, written);
+    printf("prepare-shaders: resolved %zu archive %s program/pass records from %zu seed records\n", (written - sizeof header) / sizeof(GfxArchiveProgram), mesh ? "mesh" : "vertex", count);
+    free(indices), free(passes), free(file);
+    return ok;
+}
+
 int gfx_shader_prepare_seed(const char *dir, int threads, int procs) {
     char ans[PATH_CAP + 32], prg[PATH_CAP + 32], out[PATH_CAP + 32];
     snprintf(ans, sizeof ans, "%s/seed-answers.bin", dir);
@@ -2821,59 +3180,64 @@ int gfx_shader_prepare_seed(const char *dir, int threads, int procs) {
     snprintf(out, sizeof out, "%s/shader-prepared.bin", dir);
     double t0 = (double)plat_now_ms();
     uint64_t fail0 = (uint64_t)n_failures;
-    uint8_t *ab = NULL, (*iid)[32] = NULL;
-    // For the whole run: the variants built into the driver's cache after it (vk_pipeline.c lb_warm_prepared) are the
-    // current translator's, as before carrying existed.
+    uint8_t *ab = NULL;
+    SeedVariants *ids = NULL;
+    // Keep the current translator selected for the driver pipeline build that follows this call.
     plat_inc32(&C.suspended);
-    long long n = prepare_files(ans, prg, threads, procs, "seed variants", &ab, &iid);
-    if (n < 0) return 1;
-    uint8_t *recs = calloc((size_t)n + 1, PRP_REC);
+    long long n = prepare_files(ans, prg, threads, procs, "seed variants", &ab, &ids);
+    if (n < 0) { free(ab), free(ids); return 1; }
+    uint8_t *recs = calloc((size_t)n + 1, 2 * PRP_REC);
     static const uint8_t zero[32];
     size_t u = 0, by[3] = {0}, stages[8] = {0};
     Set64 seen = {0};
     for (long long i = 0; recs && i < n; i++) {           // seed records come in priority order: the first id wins
-        if (!memcmp(iid[i], zero, 32) || !set_add(&seen, hash8(iid[i]))) continue;
-        uint8_t *r = recs + u * PRP_REC;
         const uint8_t *a = ab + (size_t)i * ANS_REC;
-        uint8_t prio = a[ANS_REC - 1] & ~SEED_DEFAULT;
-        r[0] = a[0] < 6 ? a[0] : 0, r[1] = prio > 2 ? 2 : prio;
-        memcpy(r + 4, iid[i], 32);
-        by[r[1]]++, stages[r[0]]++, u++;
+        if (a[0] > GFX_STAGE_MS) continue;
+        for (int variant = 0; variant < 2; variant++) {
+            const uint8_t *id = ids[i].id[variant];
+            if (!memcmp(id, zero, 32) || !set_add(&seen, hash8(id))) continue;
+            uint8_t *r = recs + u * PRP_REC;
+            uint8_t prio = a[ANS_REC - 1] & ~SEED_DEFAULT;
+            r[0] = a[0], r[1] = prio > 2 ? 2 : prio;
+            memcpy(r + 4, id, 32);
+            by[r[1]]++, stages[r[0]]++, u++;
+        }
     }
     free(seen.v);
     RecHeader h = {{'N', 'X', '2', 'N', 'S', 'P', 'R', 'P'}, PRP_VERSION, PRP_REC};
-    uint8_t *file = recs ? malloc(sizeof h + u * PRP_REC + 1) : NULL;
+    uint8_t *file = recs && !seen.failed ? malloc(sizeof h + u * PRP_REC + 1) : NULL;
     int ok = file != NULL;
     if (ok) {
         memcpy(file, &h, sizeof h), memcpy(file + sizeof h, recs, u * PRP_REC);
         ok = plat_file_write_atomic(out, file, sizeof h + u * PRP_REC);
     }
     char msg[640];
-    snprintf(msg, sizeof msg, "gfx_shader: prepared %zu shader variants (vertex %zu, fragment %zu, compute %zu; title %zu, "
+    snprintf(msg, sizeof msg, "gfx_shader: prepared %zu shader variants (vertex %zu, fragment %zu, compute %zu, task %zu, mesh %zu; title %zu, "
              "warm-up %zu, other %zu) from %lld seed records, %llu translations failed, in %.0f ms; %s %s", u,
-             stages[GFX_STAGE_VS], stages[GFX_STAGE_FS], stages[GFX_STAGE_CS], by[0], by[1], by[2], n,
+             stages[GFX_STAGE_VS], stages[GFX_STAGE_FS], stages[GFX_STAGE_CS], stages[GFX_STAGE_TS], stages[GFX_STAGE_MS], by[0], by[1], by[2], n,
              (unsigned long long)((uint64_t)n_failures - fail0), (double)plat_now_ms() - t0,
              ok ? "wrote" : "cannot write", out);
     rt_log("%s", msg);
     printf("%s\n", msg);
-    free(file), free(recs), free(iid), free(ab);
-    return ok ? 0 : 1;
+    if (ok) ok = resolve_archive_programs(dir, 1, ab, ids, (size_t)n);
+    if (ok) ok = resolve_archive_programs(dir, 0, ab, ids, (size_t)n);
+    free(file), free(recs), free(ids), free(ab);
+    return ok && (uint64_t)n_failures == fail0 ? 0 : 1;
 }
 
 // The variants the boot prebuild warms, most likely first: every input id play recorded (shader-answers.bin, priority
 // 0), then the prepared ones (shader-prepared.bin, priority 1 + their list priority). One entry per input id.
-size_t gfx_shader_warm_list(GfxWarmEnt **out) {
+size_t gfx_shader_warm_list(const char *dir, int include_prepared, GfxWarmEnt **out, int *manifest_ok) {
     *out = NULL;
-    if (!RC.on) return 0;
-    char prp[PATH_CAP + 32];
-    snprintf(prp, sizeof prp, "%.*sshader-prepared.bin", (int)(strlen(RC.ans_path) - strlen("shader-answers.bin")),
-             RC.ans_path);
+    char prp[PATH_CAP + 32], answers[PATH_CAP + 32];
+    snprintf(prp, sizeof prp, "%s/shader-prepared.bin", dir);
+    snprintf(answers, sizeof answers, "%s/shader-answers.bin", dir);
     uint8_t *ab = NULL, *pb = NULL;
     size_t an = 0, pn = 0;
     plat_mutex_lock(&rec_io);                      // no append meanwhile
-    rec_read(RC.ans_path, "NX2NSANS", ANS_VERSION, ANS_REC, &ab, &an);
+    rec_read(answers, "NX2NSANS", ANS_VERSION, ANS_REC, &ab, &an);
     plat_mutex_unlock(&rec_io);
-    rec_read(prp, "NX2NSPRP", PRP_VERSION, PRP_REC, &pb, &pn);
+    int ok = !include_prepared || (rec_read(prp, "NX2NSPRP", PRP_VERSION, PRP_REC, &pb, &pn) && pn && pn % PRP_REC == 0);
     size_t na = an / ANS_REC, np = pn / PRP_REC, n = 0;
     GfxWarmEnt *e = calloc(na + np + 1, sizeof *e);
     Set64 seen = {0};
@@ -2889,8 +3253,31 @@ size_t gfx_shader_warm_list(GfxWarmEnt **out) {
     }
     free(seen.v), free(ab), free(pb);
     rt_log("gfx_shader: warm list: %zu variants (%zu met in play, %zu prepared)", n, na, np);
+    if (manifest_ok) *manifest_ok = ok && e && !seen.failed;
     *out = e;
     return n;
+}
+
+// A delta contains only input IDs absent from the completed preparation baseline. Empty is valid:
+// archive pipeline combinations can be new even when every individual stage was already translated.
+size_t gfx_shader_additional_list(const char *dir, GfxWarmEnt **out, int *manifest_ok) {
+    char path[PATH_CAP + 40];
+    snprintf(path, sizeof path, "%s/shader-additional.bin", dir);
+    uint8_t *records = NULL;
+    size_t bytes = 0;
+    int ok = rec_read(path, "NX2NSPRP", PRP_VERSION, PRP_REC, &records, &bytes) && bytes % PRP_REC == 0;
+    size_t count = ok ? bytes / PRP_REC : 0;
+    GfxWarmEnt *entries = ok ? calloc(count + 1, sizeof *entries) : NULL;
+    for (size_t i = 0; entries && i < count; i++) {
+        const uint8_t *r = records + i * PRP_REC;
+        if (r[0] > GFX_STAGE_MS || r[1] > 2 || r[2] || r[3]) { ok = 0; break; }
+        entries[i].stage = r[0], entries[i].prio = r[1] + 1;
+        memcpy(entries[i].iid, r + 4, 32);
+    }
+    free(records);
+    *manifest_ok = ok && entries;
+    *out = entries;
+    return count;
 }
 
 // ---- carry: the background pass, pruning and the pruned pack (see "Carry" at the top)
@@ -3000,7 +3387,7 @@ static int carry_translate(const Req *r, const Inputs *in, char *why, size_t nwh
     size_t cap = 2 * PATH_CAP * 6 + 2 * (size_t)r->c1_len + 8192;
     char *req = malloc(cap), reply[LINE_MAX_LEN];
     if (!req) return plat_file_delete(code_path), snprintf(why, nwhy, "out of memory"), -1;
-    build_request(req, hex, r->stage_name, code_path, r->c1, r->c1_len, &in->a, in->control);
+    build_request(req, hex, r->stage_name, code_path, r->c1, r->c1_len, &in->a, in->control, NULL);
     int ok = carry_exchange(req, reply, sizeof reply), refused = ok && strncmp(reply, "ok ", 3);
     if (refused) {   // as translate_one: the job and its code stay, for a translator fix to be tested on
         char job_path[PATH_CAP + 80];
@@ -3098,6 +3485,7 @@ static size_t carry_prune_one(const CarryItem *it, size_t m, int j, Drops *d) {
             kept++;
             if (it[i].h_known) set_add(&keep, hash8(it[i].h));
         }
+    if (keep.failed) return free(keep.v), m;   // retain the identity and its masks if the keep set was incomplete
     for (size_t i = 0; i < m; i++) {
         if (!(it[i].has >> j & 1) || it[i].state != CI_COVERED) continue;
         uint8_t key[32], name[32];
@@ -3111,6 +3499,14 @@ static size_t carry_prune_one(const CarryItem *it, size_t m, int j, Drops *d) {
     return kept + (d->left - left0);
 }
 
+typedef struct { uint64_t offset; uint32_t size, entry; } PackSpan;
+
+static int pack_span_order(const void *a, const void *b) {
+    const PackSpan *x = a, *y = b;
+    if (x->offset != y->offset) return x->offset < y->offset ? -1 : 1;
+    return (x->size > y->size) - (x->size < y->size);
+}
+
 // Writes shader-cache.pack.pruned: the open pack without the dropped files, with a trailer naming the pack it was copied
 // from (pack_swap_pruned puts it in place at the next start; the open pack cannot be replaced while this process reads
 // it). Written under another name, flushed, then renamed, so a copy that exists is whole. 1 when it was written.
@@ -3118,7 +3514,8 @@ static int carry_repack(Drops *d) {
     char tmp[PATH_CAP + 48], out[PATH_CAP + 48];
     qsort(d->v, d->n, sizeof *d->v, drop_cmp);
     PackEnt *nix = malloc(((size_t)pack_n + 1) * sizeof *nix);
-    uint64_t *src = malloc(((size_t)pack_n + 1) * sizeof *src), at;
+    PackSpan *src = malloc(((size_t)pack_n + 1) * sizeof *src);
+    uint64_t at;
     uint32_t k = 0;
     PlatFileId id;
     uint64_t have = 0;
@@ -3133,10 +3530,23 @@ static int carry_repack(Drops *d) {
         PackDrop key = {pack_ix[i].kind, {0}};
         memcpy(key.name, pack_ix[i].name, 32);
         if (bsearch(&key, d->v, d->n, sizeof *d->v, drop_cmp)) continue;
-        src[k] = pack_ix[i].offset, nix[k] = pack_ix[i], k++;
+        src[k] = (PackSpan){pack_ix[i].offset, pack_ix[i].size, k};
+        nix[k++] = pack_ix[i];
     }
     at = 16 + (uint64_t)k * sizeof *nix;
-    for (uint32_t i = 0; i < k; i++) nix[i].offset = at, at += nix[i].size;
+    // Copy each physical span once. Several retained logical shader keys can name the same bytes.
+    qsort(src, k, sizeof *src, pack_span_order);
+    uint32_t unique = 0;
+    uint64_t dest = at;
+    for (uint32_t i = 0; i < k; i++) {
+        PackSpan span = src[i];
+        if (!unique || pack_span_order(&span, &src[unique - 1])) {
+            src[unique++] = span;
+            dest = at;
+            at += span.size;
+        }
+        nix[span.entry].offset = dest;
+    }
     snprintf(tmp, sizeof tmp, "%s/shader-cache.pack.pruned.tmp", cache_dir);
     snprintf(out, sizeof out, "%s/shader-cache.pack.pruned", cache_dir);
     plat_file_delete(tmp);
@@ -3144,27 +3554,28 @@ static int carry_repack(Drops *d) {
     PlatFile *f = plat_fs_create(tmp, &err);
     uint8_t head[16] = "TKSPACK1", trailer[PACK_TRAILER] = PACK_SRC_MAGIC;
     memcpy(head + 8, &k, 4);
+    memcpy(head + 12, &pack_flags, sizeof pack_flags);
     file_id_put(trailer + 8, &id);
     size_t cap = 4u << 20, fill = 0;
     uint8_t *buf = malloc(cap);
     at = 16 + (uint64_t)k * sizeof *nix;   // where buf's first byte goes
     int ok = f && buf && plat_file_pwrite(f, head, 16, 0) == 16 &&
              plat_file_pwrite(f, nix, k * (uint32_t)sizeof *nix, 16) == (int64_t)k * (int64_t)sizeof *nix;
-    for (uint32_t i = 0; ok && i <= k; i++) {
-        uint32_t size = i < k ? nix[i].size : 0;
-        if (i == k || fill + size > cap) {   // the buffer out; between writes on-demand translation goes first
+    for (uint32_t i = 0; ok && i <= unique; i++) {
+        uint32_t size = i < unique ? src[i].size : 0;
+        if (i == unique || fill + size > cap) {   // the buffer out; between writes on-demand translation goes first
             ok = !fill || plat_file_pwrite(f, buf, (uint32_t)fill, at) == (int64_t)fill;
             at += fill, fill = 0;
             carry_wait();
         }
-        if (i == k || !ok) continue;
+        if (i == unique || !ok) continue;
         if (size > cap) {
             uint8_t *big = malloc(size);
-            ok = big && pack_read_at(src[i], big, size) && plat_file_pwrite(f, big, size, at) == (int64_t)size;
+            ok = big && pack_read_at(src[i].offset, big, size) && plat_file_pwrite(f, big, size, at) == (int64_t)size;
             at += size;
             free(big);
         } else {
-            ok = pack_read_at(src[i], buf + fill, size);
+            ok = pack_read_at(src[i].offset, buf + fill, size);
             fill += size;
         }
     }

@@ -1247,6 +1247,11 @@ print(json.dumps({'status': 'pass', 'folders': []}))
 class MakeGameTest(Tmp):
     def setUp(self):
         super().setUp()
+        from unittest import mock
+        # These synthetic archives exercise build bookkeeping, not the game's model-pose parser.
+        pose = mock.patch('fg_pose_catalog.write_catalog')
+        pose.start()
+        self.addCleanup(pose.stop)
         import make_game
         self.mg = make_game
         exefs = {'main': nso(bytes.fromhex(make_game.MAIN_BUILD_ID)), 'sdk': nso(), 'subsdk0': nso(), 'rtld': nso(),
@@ -1525,6 +1530,8 @@ class MakeGameTest(Tmp):
         kit = self.tmp / 'kit'
         (kit / 'tools').mkdir(parents=True)
         (kit / 'tools' / 'prepare_shaders.py').write_text('')
+        for name in ('fg_pose_catalog.py', 'shader_census.py', 'shader_passes.py'):
+            (kit / 'tools' / name).write_text('')
         xlate = kit / 'build' / 'xlate'
         xlate.mkdir(parents=True)
         (xlate / self.mg.XLATE_NAME).write_bytes(b'')
@@ -1533,6 +1540,9 @@ class MakeGameTest(Tmp):
         def key():
             return self.mg.step_key('shaders', 'game', self.out)
         with mock.patch.object(self.mg, 'KIT', kit):
+            first = key()
+            (kit / 'tools' / 'shader_passes.py').write_text('new pass recipe')
+            self.assertNotEqual(key(), first)
             first = key()
             (xlate / 'nx2navi_xlate.id').write_text('xlate 2\n')
             self.assertNotEqual(key(), first)
