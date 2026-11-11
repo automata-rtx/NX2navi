@@ -16,6 +16,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #endif
+#include <float.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -544,6 +545,7 @@ static struct {
     VkDlaaCamera fg_cam;         // this frame's camera (mv_pass), fg_cam_ok when known
     int fg_cam_ok;
     float fg_jx, fg_jy;
+    uint64_t distance_frame;
     int fg_fresh, fg_reset;      // fresh: not handed out yet (vk_dlaa_fg_inputs)
     // the picture without the HUD for frame generation (vk_dlaa_fg_hudless): DLSS's output encoded to sRGB as the game's
     // last pass encodes its picture, then copied bit for bit into an RGBA8 UNORM image, the format the present reads; with
@@ -583,6 +585,21 @@ int vk_dlaa_fg_views(VkImageView *depth, VkImageView *mv) {
     return D.fg_depth_view && D.fg_mv_view;
 }
 
+// The distance image written by the previous resolved frame is sampled by Link's motion fragment shader.
+int vk_dlaa_pose_depth(uint64_t frame, uint32_t w, uint32_t h, VkDescriptorImageInfo *image, float history[4]) {
+    const struct Size *last = D.last;
+    if (!last || !last->dist_ok || last->w != w || last->h != h || !frame ||
+        D.distance_frame != frame - 1 || !D.fg_cam_ok) return 0;
+    const float *p = D.fg_cam.view_to_clip;
+    if (fabsf(p[11]) < 1e-6f) return 0;
+    *image = (VkDescriptorImageInfo){D.mv_samp, last->dist_view[last->dist_cur ^ 1], VK_IMAGE_LAYOUT_GENERAL};
+    history[0] = D.fg_jx;
+    history[1] = D.fg_jy;
+    history[2] = p[11];
+    history[3] = p[15];
+    return 1;
+}
+
 int vk_dlaa_fg_camera(VkDlaaCamera *c) {
     if (!D.fg_cam_ok) return 0;
     *c = D.fg_cam;
@@ -592,7 +609,7 @@ int vk_dlaa_fg_camera(VkDlaaCamera *c) {
 int vk_dlaa_fg_inputs(VkFfxImage *depth, VkFfxImage *mv, float *jx, float *jy, int *reset) {
     if (!D.fg_fresh || D.failed) return 0;
     D.fg_fresh = 0;
-    *depth = D.fg_depth, *mv = D.fg_mv, *jx = D.fg_jx, *jy = D.fg_jy, *reset = 0;
+    *depth = D.fg_depth, *mv = D.fg_mv, *jx = D.fg_jx, *jy = D.fg_jy, *reset = D.fg_reset;
     return 1;
 }
 
@@ -929,13 +946,28 @@ static void fg_store(float out[16], const double m[16]) {
     for (int r = 0; r < 4; r++)
         for (int k = 0; k < 4; k++) out[r * 4 + k] = (float)m[k * 4 + r];
 }
-static void fg_camera(const float *v, const double m[16]) {
-    double P[16], Pi[16], mi[16];
+static int fg_camera(const float *v, const double m[16], VkDlaaCamera *c) {
+    double P[16], Pi[16], reproj[16], mi[16];
     for (int i = 0; i < 16; i++) P[i] = v[28 + i];
-    if (!inv4(P, Pi) || !inv4(m, mi)) return;
-    VkDlaaCamera *c = &D.fg_cam;
+    // The motion shader reconstructs guest clip Z as 2 * depth - 1. Streamline
+    // feeds the stored depth directly into these matrices. Map the projection's
+    // output and both ends of the reprojection into the stored depth convention.
+    memcpy(reproj, m, sizeof reproj);
+    for (int k = 0; k < 4; k++) {
+        P[8 + k] = 0.5 * (P[8 + k] + P[12 + k]);
+        reproj[8 + k] = 0.5 * (m[8 + k] + m[12 + k]);
+    }
+    for (int r = 0; r < 4; r++) {
+        reproj[4 * r + 3] -= reproj[4 * r + 2];
+        reproj[4 * r + 2] *= 2.0;
+    }
+    if (!inv4(P, Pi) || !inv4(reproj, mi) || !P[10]) return 0;
+    double near_z = fabs(P[11] / P[10]);
+    double far_z = P[10] == P[14] ? FLT_MAX : fabs((P[15] - P[11]) / (P[10] - P[14]));
+    if (!(near_z > 0 && far_z > near_z && far_z <= FLT_MAX)) return 0;
+    c->znear = (float)near_z, c->zfar = (float)far_z;
     fg_store(c->view_to_clip, P), fg_store(c->clip_to_view, Pi);
-    fg_store(c->clip_to_prev_clip, m), fg_store(c->prev_clip_to_clip, mi);
+    fg_store(c->clip_to_prev_clip, reproj), fg_store(c->prev_clip_to_clip, mi);
     for (int i = 0; i < 3; i++) {
         c->right[i] = v[i], c->up[i] = v[4 + i], c->fwd[i] = -v[8 + i];
         // the position: -R^T t, R the view's 3x3 and t its last column
@@ -943,7 +975,7 @@ static void fg_camera(const float *v, const double m[16]) {
     }
     c->fov_y = P[5] != 0 ? 2.0f * (float)atan(1.0 / fabs(P[5])) : 1.0f;
     c->aspect = P[0] != 0 ? (float)fabs(P[5] / P[0]) : 1.777f;
-    D.fg_cam_ok = 1;
+    return 1;
 }
 
 // Frames without a camera (dlaa_cam_keep, NX2NAVI_DLAA_CAM_KEEP; 1 by default, 0 restores the old handling). Measured in
@@ -1049,7 +1081,7 @@ static int mv_pass(VkExec *ex, struct Size *e, VkImageView zv, float jx, float j
         }
     }
     D.fg_cam_ok = 0;
-    if (cr && have_m && D.cam_size == OCAM_BLOCK) fg_camera(cr, m);
+    if (cr && have_m && D.cam_size == OCAM_BLOCK) D.fg_cam_ok = fg_camera(cr, m, &D.fg_cam);
     int s = D.cam_slot, had_prev = D.cam_prev_ok;
     if (D.cam_size == CAM_BLOCK) {   // the whole block, for the per-object motion pass (the deferred engine's only)
         VkBufferCopy bc = {cam.offset, (VkDeviceSize)s * CAM_SLOT, CAM_BLOCK};
@@ -1129,7 +1161,11 @@ static int mv_pass(VkExec *ex, struct Size *e, VkImageView zv, float jx, float j
     vk_mvcheck_camera(cb, e->mv, w, h, jx, jy);   // NX2NAVI_MV_CHECK (test)
     // the characters' own motion over the camera's (vk_exec_draw.c, per-object motion)
     uint64_t c0 = T.on > 0 ? kern_now_ns() : 0;
-    if (D.cam_size == CAM_BLOCK && vk_mvobj_execute(ex, D.cam_addr, e->mv_view, zv, D.depth.format, w, h)) full_barrier(cb);
+    int object_motion = D.cam_size == CAM_BLOCK;
+    if (RT_V111 && D.cam_size == OCAM_BLOCK && zv && D.depth.width == w && D.depth.height == h) {
+        object_motion = vk_link_pose_prepare(D.cam_addr, D.depth.image) && !D.reset && D.last == e && D.last_color == D.color.image;
+    }
+    if (object_motion && vk_mvobj_execute(ex, D.cam_addr, e->mv_view, zv, D.depth.format, w, h)) full_barrier(cb);
     if (T.on > 0) T.cpu_mv += kern_now_ns() - c0;
     times_mark(cb, T_OBJ);
     if (T.on > 0) T.used[T.slot] = 1;   // the DLSS marks follow in evaluate
@@ -1764,6 +1800,7 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst, const SceneInput *scen
     if (!NGX_OK(r)) return dl_fail("DLSS evaluation", r);
 evaluated:
     if (timed) times_mark(cb, T_DL1);   // through the recorder, after NGX's own commands
+    D.fg_reset = D.reset;
     D.reset = 0;
     D.last = e, e->used = D.evals + 1;
     if (D.evals % 600 == 0) query_vram();
@@ -1806,6 +1843,7 @@ evaluated:
     D.fg_depth = (VkFfxImage){z->image, z->format, w, h, 0};
     D.fg_mv = (VkFfxImage){e->mv, VK_FORMAT_R16G16_SFLOAT, w, h, 1};
     D.fg_depth_view = zv, D.fg_mv_view = e->mv_view;
+    D.distance_frame = vk_dlaa_replay_frame();
     D.fg_jx = jx, D.fg_jy = jy, D.fg_fresh = 1;
     D.jittered += D.jit_used != 0;
     next_jitter(w, ow, scene && !fsr && mv == 1);
@@ -2149,7 +2187,13 @@ int vk_dlaa_resized_take(void) {
     return 1;
 }
 
+// A present can arrive before held commands finish replaying. Advance pose history
+// at the resolved scene boundary so all draws of that scene share one identity.
+static uint64_t replay_frame = 1;
+uint64_t vk_dlaa_replay_frame(void) { return replay_frame; }
+
 void vk_dlaa_frame(void) {
+    ++replay_frame;
     static unsigned cfg_seen;
     static int cfg_known;
     unsigned v = cfg_version();
@@ -2360,8 +2404,8 @@ int vk_ngxfg_evaluate(VkCommandBuffer cb, const VkNgxImage *bb, const VkNgxImage
     static const char *const fw[] = {"DLSSG.CameraFwdX", "DLSSG.CameraFwdY", "DLSSG.CameraFwdZ"};
     for (int i = 0; i < 3; i++)
         p_setf(p, pos[i], c.pos[i]), p_setf(p, up[i], c.up[i]), p_setf(p, rt[i], c.right[i]), p_setf(p, fw[i], c.fwd[i]);
-    p_setf(p, "DLSSG.CameraNear", 0.1f);   // Ocarina's projection, as vk_dlssg.c gives it
-    p_setf(p, "DLSSG.CameraFar", 1e8f);
+    p_setf(p, "DLSSG.CameraNear", c.znear);
+    p_setf(p, "DLSSG.CameraFar", c.zfar);
     p_setf(p, "DLSSG.CameraFOV", c.fov_y);
     p_setf(p, "DLSSG.CameraAspectRatio", c.aspect);
     p_setu(p, "DLSSG.ColorBuffersHDR", 0);

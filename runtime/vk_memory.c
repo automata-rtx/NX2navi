@@ -40,6 +40,7 @@ typedef struct { uint64_t lo, hi; } FlushRange;
 
 typedef struct PoolRec {
     const pool_t *key;
+    uint64_t identity;                 // unique for this registration, including reuse of the same storage
     int kind;
     uint32_t flags;
     uint64_t lo, size;                 // GPU address range of the pool
@@ -247,7 +248,7 @@ int vk_fix_zero(void) {
 }
 
 static void index_put(PoolRec *r) {
-    __atomic_add_fetch(&pool_gen, 1, __ATOMIC_RELEASE);
+    r->identity = __atomic_add_fetch(&pool_gen, 1, __ATOMIC_RELEASE);
     pidx_ent e = {.lo = r->lo, .hi = r->lo + r->size, .base = r->lo, .buf = r, .gpu = r->lo, .key = r->key};
     pidx_remove(&pool_index, r->key, NULL);   // an object initialized again without Finalize
     if (!pidx_insert(&pool_index, &e)) rt_fatal("vk: out of memory for the pool index");
@@ -553,6 +554,15 @@ static int resolve_locked(uint64_t addr, uint64_t size, VkMemSpan *out, int touc
     return ok;
 }
 
+uint64_t vk_mem_import_identity(uint64_t addr, uint64_t size) {
+    plat_mutex_lock_shared(&pool_lock);
+    const pidx_ent *entry = pidx_find(&pool_index, addr, size);
+    const PoolRec *r = entry ? entry->buf : NULL;
+    uint64_t identity = r && r->kind == POOL_IMPORT ? r->identity : 0;
+    plat_mutex_unlock_shared(&pool_lock);
+    return identity;
+}
+
 uint64_t vk_mem_gen(void) {
     return __atomic_load_n(&pool_gen, __ATOMIC_ACQUIRE) + __atomic_load_n(&mirror_gen, __ATOMIC_ACQUIRE);
 }
@@ -810,6 +820,7 @@ void vk_guest_written(uint64_t addr, uint64_t size) {
 
 int vk_mem_changed(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now) {
     if (!size) { *now = since; return 0; }
+    if (addr >= RT_ADDRESS_LIMIT || size > RT_ADDRESS_LIMIT - addr) { *now = since; return -1; }
     uint64_t lo = addr & ~0xfffull, hi = (addr + size + 0xfff) & ~0xfffull;
     plat_mutex_lock(&gen_lock);
     uint32_t g = ++gen_now;

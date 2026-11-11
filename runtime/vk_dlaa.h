@@ -30,8 +30,9 @@ int vk_dlaa_fg_inputs(VkFfxImage *depth, VkFfxImage *mv, float *jx, float *jy, i
 typedef struct {
     float view_to_clip[16], clip_to_view[16], clip_to_prev_clip[16], prev_clip_to_clip[16];
     float pos[3], up[3], right[3], fwd[3];
-    float fov_y, aspect;
+    float fov_y, aspect, znear, zfar;
 } VkDlaaCamera;
+int vk_dlaa_pose_depth(uint64_t frame, uint32_t w, uint32_t h, VkDescriptorImageInfo *image, float history[4]);
 int vk_dlaa_fg_views(VkImageView *depth, VkImageView *mv);
 // The picture without the HUD at the size of the game's picture, in *fmt: RGBA8 UNORM bytes like it (sRGB-encoded), or
 // RGBA16F linear with HDR on; made at each evaluation while vk_dlaa_hudless_wanted (frame generation sets it); 1 once per
@@ -61,6 +62,7 @@ int vk_dlaa_scene_wanted(void);
 int vk_dlaa_scene_resolve(VkExec *ex, uint64_t source, uint64_t destination);
 void vk_dlaa_pass(VkExec *ex);
 void vk_dlaa_frame(void);
+uint64_t vk_dlaa_replay_frame(void);
 // 1 once, at the present of the first frame whose scene has a new size after a setting changed (vk_dlaa.c).
 int vk_dlaa_resized_take(void);
 // vk_exec_draw.c notes the scene camera and requests the viewport offset for each submitted draw.
@@ -76,6 +78,8 @@ void vk_mvprev_draw(VkExec *ex);   // vk_mvprev.c: notes the scene draw's object
 // their vertex shader's last-frame variant; vk_dlaa.c mv_pass records them over the camera motion into ex->cb (and
 // leaves every binding of the replay to be set again; draws whose camera block is not cam are left out).
 // vk_dlaa_prev_camera: last frame's camera block and this frame's jitter, 0 when there is no history.
+int vk_link_pose_prepare(uint64_t cam, VkImage depth);
+void vk_link_pose_register_buffer(uint64_t addr, uint64_t size);
 int vk_mvobj_execute(VkExec *ex, uint64_t cam, VkImageView mv, VkImageView depth, VkFormat depth_fmt, uint32_t w,
                      uint32_t h);
 int vk_dlaa_prev_camera(VkDescriptorBufferInfo *out, float jitter[2]);

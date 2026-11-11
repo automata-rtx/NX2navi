@@ -1057,10 +1057,7 @@ static int evo_enabled(void) {
     if (evo_on < 0) {
         const char *e = cfg_get("NX2NAVI_EVENT_ORDER");
         evo_on = !(e && !strcmp(e, "0"));
-        if (evo_on && gfx_replay_async()) {
-            evo_on = 0;
-            rt_log("vk: event order across queues off: the replay runs on its own thread (NX2NAVI_REPLAY_ASYNC)");
-        } else rt_log("vk: event order across queues %s (NX2NAVI_EVENT_ORDER)", evo_on ? "on" : "off");
+        rt_log("vk: event order across queues %s (NX2NAVI_EVENT_ORDER)", evo_on ? "on" : "off");
     }
     return evo_on;
 }
@@ -1075,22 +1072,15 @@ static int evq_slot(uintptr_t q) {
     return free_i;
 }
 
-// Holds h[from..n), stopped at `at` in h[from] (NULL: from its start). The recordings are copied: the game records a
-// command buffer again once the fence it took after the submission is done, and that fence does not wait for a held
-// part (it signals with the submission that held it).
+// Held recordings keep their texture pins and the bindings resolved for this submission.
 static Cont *cont_new(const uint64_t *h, int n, int from, const op_hdr *at) {
     Cont *c = calloc(1, sizeof *c);
     if (!c || !(c->h = calloc((size_t)(n - from) + 1, sizeof *c->h))) rt_fatal("vk: out of memory (held submission)");
     for (int k = from; k < n; k++) {
-        const op_hdr *x = nvn_op_first(h[k]);
-        uint64_t bytes = 0;
-        for (; x->op != OP_END; x = nvn_op_next(x)) bytes += x->size;
-        bytes += x->size;
-        uint8_t *copy = malloc(bytes);
-        if (!copy) rt_fatal("vk: out of memory (held submission, %llu bytes)", (unsigned long long)bytes);
-        memcpy(copy, (const void *)(uintptr_t)h[k], bytes);
-        c->h[k - from] = (uintptr_t)copy;
-        if (k == from && at) c->at = (const op_hdr *)(const void *)(copy + ((const uint8_t *)at - (const uint8_t *)(uintptr_t)h[k]));
+        uint64_t held = nvn_hold_submitted(h[k]);
+        c->h[k - from] = held;
+        if (k == from && at)
+            c->at = (const op_hdr *)(uintptr_t)(held + ((uintptr_t)at - h[k]));
     }
     c->n = n - from;
     c->since = vk_exec_submit_seq;
@@ -1098,7 +1088,7 @@ static Cont *cont_new(const uint64_t *h, int n, int from, const op_hdr *at) {
 }
 
 static void cont_free(Cont *c) {
-    for (int k = 0; k < c->n; k++) free((void *)(uintptr_t)c->h[k]);
+    for (int k = 0; k < c->n; k++) nvn_drop_submitted(c->h[k]);
     free(c->h), free(c->st), free(c);
 }
 
@@ -1582,6 +1572,7 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
     }
     for (int i = 0; i < n; i++)
         if (!handles[i]) rt_fatal("vk: command handle %d of a submission is null", i);
+    vk_sync_snapshot_ready();
     if (evo_pending) evo_resume(ex);   // signals the CPU gave since, and holds past CONT_MAX
     if (evo && evq[slot].head) {   // the queue waits: this submission lines up behind it
         if (n) cont_push(slot, cont_new(handles, n, 0, NULL)), evo_held++, vk_exec_evt('p', NULL, 0);

@@ -410,7 +410,7 @@ void nvn_pins_stats(uint64_t *live, uint64_t *freed) {
 // about 500 lookups per AddControlMemory under the exclusive lock (1.4.3 field: 53 calls a frame, 2 MiB ranges, 3.7
 // copies per page), and the recording threads waited on it.
 // deferred: 0 unknown, 1 none, 2 some; pins: texture pins its ops name, counted in their refs (pin_refs)
-typedef struct { uint64_t magic, bytes, made_at, used_at, deferred, pins; } copy_prefix;
+typedef struct { uint64_t magic, bytes, made_at, used_at, deferred, pins; uint32_t refs, has_wait; } copy_prefix;
 _Static_assert(sizeof(copy_prefix) % 8 == 0, "records stay 8-byte aligned");
 typedef struct { uintptr_t lo, hi; uint8_t *copy; } cmd_copy;
 typedef struct { cmd_copy *v; uint32_t n, cap; } copy_bucket;
@@ -433,8 +433,37 @@ static void zombie_add(copy_prefix *pf) {   // copy_lock held
 }
 
 static void copy_free(copy_prefix *pf) {   // copy_lock not held
+    if (__atomic_sub_fetch(&pf->refs, 1, __ATOMIC_ACQ_REL)) return;
     if (pf->pins) pin_refs((const uint8_t *)(pf + 1), -1);
     free(pf);
+}
+
+// The caller owns a submitted NVN handle. Immutable recordings and their texture
+// pins can outlive the submitting queue. A deferred binding needs a private copy
+// because a later submission resolves its handles again.
+uint64_t nvn_hold_submitted(uint64_t handle) {
+    copy_prefix *pf = (copy_prefix *)(uintptr_t)handle - 1;
+    if (pf->deferred == 1) {
+        __atomic_add_fetch(&pf->refs, 1, __ATOMIC_RELAXED);
+    } else {
+        size_t bytes = sizeof *pf + pf->bytes;
+        copy_prefix *copy = malloc(bytes);
+        if (!copy) rt_fatal("nvn: out of memory for a held recording");
+        *copy = (copy_prefix){.bytes = pf->bytes, .deferred = pf->deferred, .pins = pf->pins, .has_wait = pf->has_wait};
+        memcpy(copy + 1, pf + 1, pf->bytes);
+        copy->refs = 1;
+        if (copy->pins) pin_refs((const uint8_t *)(copy + 1), 1);
+        handle = (uintptr_t)(copy + 1);
+    }
+    return handle;
+}
+
+void nvn_drop_submitted(uint64_t handle) {
+    copy_free((copy_prefix *)(uintptr_t)handle - 1);
+}
+
+int nvn_submitted_has_wait(uint64_t handle) {
+    return ((const copy_prefix *)(uintptr_t)handle - 1)->has_wait;
 }
 
 // Released copies nothing reads any more are freed once copy_lock is dropped: uncounting a copy's pins walks its ops,
@@ -505,12 +534,18 @@ static uint8_t *flatten_recording(const uint8_t *p, size_t n) {
     if (!out) rt_fatal("nvn: command copy allocation");
     memcpy(out + sizeof(copy_prefix), p, n);
     uint64_t pins_named = 0;
+    int deferred = 0, has_wait = 0;
     for (size_t at = 0;;) {   // the records stay checked: a corrupt one stops here, not in the replay
         op_hdr h;
         memcpy(&h, p + at, sizeof h);
         if (h.size < 8 || (h.size & 7) || h.op >= OP_COUNT_ || h.op == OP_JUMP || h.op == OP_CALL || at + h.size > n ||
             (!at && h.op != OP_BEGIN))
             rt_fatal("nvn: corrupt recording at %p (op %u size %u)", (const void *)(p + at), h.op, h.size);
+        if (h.op == OP_WAIT_EVENT) has_wait = 1;
+        if (h.op == OP_BIND_TEX || h.op == OP_BIND_IMG || h.op == OP_BIND_SAMP) {
+            const p_bind_handles *b = (const p_bind_handles *)(const void *)(p + at + sizeof h);
+            if (b->src && b->n > 0 && b->n <= 32) deferred = 1;
+        }
         const tex_t *pinned[9];
         int k = PIN_OPS >> h.op & 1 ? op_pins(h.op, out + sizeof(copy_prefix) + at + 8, pinned) : 0;
         for (int i = 0; i < k; i++) pin_ref(pinned[i], 1, 0);
@@ -521,7 +556,8 @@ static uint8_t *flatten_recording(const uint8_t *p, size_t n) {
             break;
         }
     }
-    *(copy_prefix *)out = (copy_prefix){.magic = COPY_MAGIC, .bytes = n, .pins = pins_named};
+    *(copy_prefix *)out = (copy_prefix){.magic = COPY_MAGIC, .bytes = n, .pins = pins_named, .refs = 1,
+                                       .deferred = deferred ? 2 : 1, .has_wait = has_wait};
     return out + sizeof(copy_prefix);
 }
 
@@ -1282,6 +1318,7 @@ void nvn_submit_prepare_async(const uint64_t *handles, uint64_t *out, int n) {
             if (cl->pins) pin_refs((const uint8_t *)(cl + 1), 1);
             cl->magic = 0;   // not a live handle: the game never sees it
             cl->used_at = now;
+            cl->refs = 1;
             zombie_add(cl);
             out[i] = (uintptr_t)(cl + 1);
             __atomic_fetch_add(&n_clones, 1, __ATOMIC_RELAXED);
@@ -1292,8 +1329,8 @@ void nvn_submit_prepare_async(const uint64_t *handles, uint64_t *out, int n) {
     plat_mutex_unlock(&copy_lock);
     doom_free(doomed);
     for (int i = 0; i < n; i++) {
-        int nd = resolve_deferred((const uint8_t *)(uintptr_t)out[i], 0);
-        if (out[i] == handles[i]) ((copy_prefix *)(uintptr_t)out[i] - 1)->deferred = nd ? 2 : 1;
+        if (((const copy_prefix *)(uintptr_t)out[i] - 1)->deferred == 2)
+            resolve_deferred((const uint8_t *)(uintptr_t)out[i], 0);
     }
     if (now % 7200 == 0)
         rt_log("nvn: asynchronous replay at submit %llu: %llu recording clones so far, %u copies waiting for the replay",

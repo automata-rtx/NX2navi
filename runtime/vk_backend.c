@@ -11,10 +11,7 @@
 // the frame's display time from the pacer (nvn_api_obj.c), so present-to-present intervals stay even whatever the
 // replay took. The blit is already on the queue, so the wait blocks no submission.
 //
-// Asynchronous replay (NX2NAVI_REPLAY_ASYNC, default 0; 1 turns it on): nvnQueueSubmitCommands
-// and nvnQueuePresentTexture only queue. Each item gets its timeline value at enqueue (vk_sync_reserve), in queue
-// order; the replay thread runs the synchronous submit and present bodies in that order, so every value is signalled
-// by the submission it was handed out for. The game runs at most one frame ahead: queueing present N waits until the
+// Ordered replay snapshots the submission before its producer proceeds. Present N waits until the
 // replay thread handled present N-1. Calls that read or free GPU state that queued work may use drain the queue first
 // (replay_drain), each cause counted.
 #include <stdio.h>
@@ -36,7 +33,7 @@
 
 #define WEAK __attribute__((weak))
 
-typedef struct { VkImage image; VkFormat format; int w, h, has_crop, crop[4]; uint64_t frame, at, queued, value; } PresentJob;
+typedef struct { VkImage image; VkFormat format; int w, h, has_crop, crop[4]; uint64_t frame, at, queued; } PresentJob;
 
 static PlatMutex pl = PLAT_MUTEX_INIT;
 static PlatCond pcv = PLAT_COND_INIT;   // job queued, job taken, job submitted
@@ -86,10 +83,7 @@ static void present_main(void *arg) {
         if (flight_on || vk_dump_white) vk_thumbs_frame(j.frame);   // NX2NAVI_DUMP_WHITE reads them too
         vk_dlssg_present_frame(j.frame);
         vk_present_blit(j.image, VK_IMAGE_LAYOUT_GENERAL, j.format, j.w, j.h, j.has_crop ? j.crop : NULL);
-        uint64_t f = vk_sync_submit(NULL, 0);   // a timeline value after the blit: deferred destruction waits for the blit too
-        if (j.value && f != j.value)
-            rt_fatal("vk: the present of frame %llu signalled %llu, queued as %llu", (unsigned long long)j.frame,
-                     (unsigned long long)f, (unsigned long long)j.value);
+        vk_sync_submit(NULL, 0);   // deferred destruction also waits for the blit
         plat_mutex_lock(&pl);
         busy = 0;
         plat_cond_broadcast(&pcv);
@@ -211,9 +205,8 @@ static int frame_hold(uint32_t skipped, int resized, uint64_t frame) {
 }
 
 // The present after the frame count: resolves the image and hands the blit to the present thread. queued: when the game
-// presented; value: the timeline value queued for this present (asynchronous replay), 0 for the next one (synchronous).
-static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uint64_t queued, uint64_t frame,
-                          uint64_t value) {
+// presented.
+static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uint64_t queued, uint64_t frame) {
     static volatile int32_t n_skipped;
     static int vram_probe;
     if (!vram_probe) vram_probe = 1, perfmon_set_vram_game(vk_mem_device_used_mb);   // the overlay's "game" beside VRAM
@@ -232,15 +225,10 @@ static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uin
     if (held || !img || !(img->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) {
         if (!held && plat_inc32(&n_skipped) <= 8)
             rt_log("vk: present of texture %p (format %#x) skipped: no colour image", (const void *)t, t ? t->d.format : 0);
-        if (value) {   // the queued value is still signalled, in order
-            vk_present_drain();
-            uint64_t f = vk_sync_submit(NULL, 0);
-            if (f != value) rt_fatal("vk: skipped present signalled %llu, queued as %llu", (unsigned long long)f, (unsigned long long)value);
-        }
         return;
     }
     PresentJob j = {.image = img->image, .format = img->format, .w = (int)img->width, .h = (int)img->height, .frame = frame,
-                    .at = at_ns, .queued = queued, .value = value};
+                    .at = at_ns, .queued = queued};
     vk_hdr_present_source(img, &j.image, &j.format);   // NX2NAVI_HDR: the float picture the game copied into it, same size
     if (crop) {
         j.has_crop = 1;
@@ -261,12 +249,17 @@ static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uin
 }
 
 // ---- Asynchronous replay
-enum { RI_SUBMIT, RI_PRESENT, RI_RELEASE };
+enum { RI_SUBMIT, RI_PRESENT, RI_RELEASE, RI_REGISTER_TEXTURE, RI_REGISTER_SAMPLER };
 typedef struct {
-    int kind, n, has_crop, crop[4];
-    uint64_t value, submit_no, at, queued;
-    uint64_t *h;
-    const tex_t *tex;   // RI_RELEASE: a copy the item owns (the game may reuse the object's memory)
+    int kind, n, has_crop, crop[4], has_texture;
+    uint64_t submit_no, at, queued;
+    uint64_t *h, *started;
+    uintptr_t origin;
+    union {
+        tex_t texture;
+        struct { tex_t t; view_t view; int has_view; } reg;
+        samp_par sampler;
+    };
 } ReplayItem;
 #define RQ_CAP 1024   // a frame queues 1 submit and 1 present, and up to a few hundred releases
 enum { DR_POOL_FINI, DR_MAP_VIRTUAL, DR_TEX_RELEASE, DR_PROG_RELEASE, DR_FINISH, DR_READ_TEXELS, DR_WRITE_TEXELS,
@@ -277,6 +270,7 @@ static const char *const dr_name[DR_N] = {
 
 static PlatMutex rl = PLAT_MUTEX_INIT;
 static PlatCond rcv = PLAT_COND_INIT;   // item queued, item taken, item done
+static PlatCond producer_ready = PLAT_COND_INIT;
 static ReplayItem rq[RQ_CAP];
 static int rq_head, rq_n, r_busy, r_started;
 static uint64_t r_presents_queued, r_presents_done, r_submit_done, game_frames;
@@ -289,10 +283,7 @@ static uint64_t ck_reads, ck_diff, ck_diff_unexplained, ck_diff_idle;
 int vk_replay_async(void) {
     static int on = -1;
     if (on < 0) {
-        // Off by default. Where the game waits for the GPU it overlaps the replay with the game threads (a GTX 1650 in
-        // one scene went from 450-686 frames over 50 ms a minute to 10-13, issue #88), the only place a gain was
-        // measured. While it was the default, a GTX 1660 Ti at the 60 fps cap with the GPU at 26 % reported uneven
-        // motion that 0.3.4 did not have (#659). It adds up to a frame of latency.
+        // The queue holds at most one unhandled present.
         on = cfg_bool("NX2NAVI_REPLAY_ASYNC");
         rt_log("vk: replay %s (NX2NAVI_REPLAY_ASYNC=%d)",
                on ? "on its own thread, at most one frame behind the game" : "on the submitting thread", on);
@@ -300,12 +291,6 @@ int vk_replay_async(void) {
     return on;
 }
 
-// With the replay on its own thread a submission's value covers its replay too, and the wait stays the fence's.
-static int vk_be_exec_wait(uint64_t value, uint64_t timeout_ns) {
-    return vk_replay_async() ? vk_sync_fence_wait(value, timeout_ns) : vk_sync_exec_wait(value, timeout_ns);
-}
-
-// The front end's view (nvn_api_core.c, nvn_api_cmd.c): replay is asynchronous only on this back end.
 int gfx_replay_async(void) { return gfx_backend() == &gfx_vulkan_backend && vk_replay_async(); }
 
 // The front end's nvnEventSignal, before it writes (vk_exec_xfer.c "events the CPU signals").
@@ -331,12 +316,11 @@ uint64_t gfx_replayed_submits(void) {
 // picture from before, a flash of the whole picture; the frame was then drawn after its present, in the present
 // thread's empty submission, next to the following frame. So with work held at a present, what can go on now goes
 // first, in a submission of its own (held_resume); if work is still held, the present waits and goes out right after
-// the submission that replays the last of it, at the next present, or after PH_MAX submissions at the latest. Only with
-// the replay on the submitting thread, as the event order. NX2NAVI_PRESENT_HELD=0: every present goes out at once.
+// the submission that replays the last of it, at the next present, or after PH_MAX submissions at the latest. NX2NAVI_PRESENT_HELD=0: every present goes out at once.
 #define PH_MAX 8
 static struct {
     int on;                      // a present waits
-    const tex_t *t;
+    tex_t t;
     int crop[4], has_crop;
     uint64_t at_ns, queued, frame, since;   // since: vk_exec_submit_seq when it began to wait
     uint64_t waited, ran, after, capped, next, logged;   // presents that waited; held work run first at a present;
@@ -345,11 +329,11 @@ static struct {
 
 static int present_held_on(void) {
     static int on = -1;
-    if (on < 0) on = !gfx_replay_async() && rt_knob("PRESENT_HELD", "1");
+    if (on < 0) on = rt_knob("PRESENT_HELD", "1");
     return on;
 }
 
-static uint64_t submit_sync(const uint64_t *handles, int n);
+static uint64_t submit_sync(const uint64_t *handles, int n, uint64_t *started);
 
 // The held work that can go on now, in a submission of its own (vk_exec_record syncs it like any other: held_sync).
 // The present thread first finishes what it was handed: its empty submission replays held work and frees what it
@@ -357,7 +341,7 @@ static uint64_t submit_sync(const uint64_t *handles, int n);
 static int held_resume(void) {
     vk_present_drain();
     if (!vk_exec_held() || !vk_exec_held_ready()) return 0;
-    submit_sync(NULL, 0);
+    submit_sync(NULL, 0, NULL);
     PH.ran++;
     return 1;
 }
@@ -371,7 +355,7 @@ static void ph_flush(uint64_t *why) {
                             (unsigned long long)(vk_exec_submit_seq - PH.since), vk_exec_held(),
                             why == &PH.after ? "the held work was replayed" : why == &PH.capped ? "PH_MAX reached"
                                                                                          : "the next present came");
-    present_image(PH.t, PH.has_crop ? PH.crop : NULL, PH.at_ns, PH.queued, PH.frame, 0);
+    present_image(&PH.t, PH.has_crop ? PH.crop : NULL, PH.at_ns, PH.queued, PH.frame);
     if (PH.waited % 600 == 0)
         rt_log("vk: presents that waited for held work: %llu (held work run at the present %llu times; out after it %llu, "
                "at %d submissions %llu, at the next present %llu)", (unsigned long long)PH.waited,
@@ -379,7 +363,21 @@ static void ph_flush(uint64_t *why) {
                (unsigned long long)PH.next);
 }
 
-static uint64_t submit_sync(const uint64_t *handles, int n) {
+// While recording an asynchronously queued command, release its producer once the uniform
+// snapshot has been taken and the final GPU fence is known. A reserved continuation keeps a late
+// CPU signal inside that fence. Internal resumes have no producer.
+static _Thread_local uint64_t *producer_fence;
+void vk_replay_prepared(uint64_t fence) {
+    if (!producer_fence) return;
+    vk_sync_announce(fence);
+    plat_mutex_lock(&rl);
+    *producer_fence = fence;
+    producer_fence = NULL;
+    plat_cond_broadcast(&producer_ready);
+    plat_mutex_unlock(&rl);
+}
+
+static uint64_t submit_sync(const uint64_t *handles, int n, uint64_t *started) {
     vk_sync_start();
     if (PH.on && n) {   // a present waits: what can go on goes first, then the present, then this submission
         held_resume();
@@ -387,11 +385,14 @@ static uint64_t submit_sync(const uint64_t *handles, int n) {
     }
     vk_present_drain();
     vk_texture_new_submit();
-    uint64_t f = vk_sync_submit(handles, n);
+    producer_fence = started;
+    int ordered = started && n && gfx_submit_queue && vk_exec_event_at_sync();
+    uint64_t f = ordered ? vk_sync_submit_ordered(handles, n) : vk_sync_submit(handles, n);
     // The submission stopped at a wait whose signal the CPU gave while it was being replayed (vk_exec_xfer.c "events
     // the CPU signals"): it goes on now, in a submission of its own with copies taken after the signal, and that
     // submission's value is the one the game's fence stands for.
-    if (n && vk_exec_event_at_sync() && vk_exec_held() && vk_exec_held_ready()) f = submit_sync(NULL, 0);
+    if (!ordered && n && vk_exec_event_at_sync() && vk_exec_held() && vk_exec_held_ready()) f = submit_sync(NULL, 0, NULL);
+    vk_replay_prepared(f);
     if (PH.on && n) {
         if (!vk_exec_held()) ph_flush(&PH.after);
         else if (vk_exec_submit_seq - PH.since >= PH_MAX) ph_flush(&PH.capped);
@@ -400,6 +401,21 @@ static uint64_t submit_sync(const uint64_t *handles, int n) {
 }
 
 int vk_sub_in_frame;
+
+static void ordered_present(const tex_t *t, const int crop[4], uint64_t at_ns, uint64_t queued, uint64_t frame) {
+    if (present_held_on()) {   // present_held
+        vk_present_drain();    // the present thread's empty submission may run held work: done before it is read
+        if (PH.on) held_resume(), ph_flush(&PH.next);   // the last present still waits: out now
+        if (vk_exec_held()) held_resume();
+        if (t && vk_exec_held()) {
+            PH.on = 1, PH.t = *t, PH.has_crop = crop != NULL, PH.at_ns = at_ns, PH.queued = queued, PH.frame = frame;
+            if (crop) memcpy(PH.crop, crop, sizeof PH.crop);
+            PH.since = vk_exec_submit_seq, PH.waited++;
+            return;
+        }
+    }
+    present_image(t, crop, at_ns, queued, frame);
+}
 
 static void replay_main(void *arg) {
     (void)arg;
@@ -416,24 +432,27 @@ static void replay_main(void *arg) {
         plat_mutex_unlock(&rl);
         if (it.kind == RI_SUBMIT) {
             vk_sub_in_frame = sub_idx++;
-            uint64_t f = submit_sync(it.h, it.n);
-            if (f != it.value)
-                rt_fatal("vk: replayed submission signalled %llu, queued as %llu", (unsigned long long)f,
-                         (unsigned long long)it.value);
+            gfx_submit_queue = it.origin;
+            submit_sync(it.h, it.n, it.started);
+            gfx_submit_queue = 0;
             free(it.h);
+        } else if (it.kind == RI_REGISTER_TEXTURE) {
+            vk_texture_register(it.n, &it.reg.t, it.reg.has_view ? &it.reg.view : NULL);
+        } else if (it.kind == RI_REGISTER_SAMPLER) {
+            vk_sampler_register(it.n, &it.sampler);
         } else if (it.kind == RI_RELEASE) {
             vk_present_drain();
-            vk_texture_release(it.tex);
-            free((void *)it.tex);
+            vk_texture_release(&it.texture);
         } else {
             uint64_t frame = __atomic_add_fetch(&gfx_counters.frames, 1, __ATOMIC_RELAXED);
             vk_dlssg_submitted(frame);   // the frame's submissions were replayed before its present
-            present_image(it.tex, it.has_crop ? it.crop : NULL, it.at, it.queued, frame, it.value);
+            vk_exec_evt_frame(frame);
+            ordered_present(it.has_texture ? &it.texture : NULL, it.has_crop ? it.crop : NULL, it.at, it.queued, frame);
             sub_idx = 0;
         }
         plat_mutex_lock(&rl);
         if (it.kind == RI_SUBMIT) r_submit_done = it.submit_no;
-        else r_presents_done++;
+        else if (it.kind == RI_PRESENT) r_presents_done++;
         r_busy = 0;
         plat_cond_broadcast(&rcv);
     }
@@ -463,7 +482,7 @@ static void core_back_unlocked(int *away) {
     plat_mutex_lock(&rl);
 }
 
-// Queues an item (waits while the queue is full) and returns its value, reserved under rl so values follow queue order.
+// Submitters wait until replay can identify the fence covering all their work.
 static uint64_t replay_enqueue(ReplayItem *it) {
     plat_mutex_lock(&rl);
     if (!r_started) {
@@ -479,12 +498,14 @@ static uint64_t replay_enqueue(ReplayItem *it) {
         wait_counted(DR_FULL, p0);
         core_back_unlocked(&away);
     }
-    it->value = it->kind == RI_RELEASE ? 0 : vk_sync_reserve();   // a release signals nothing
+    uint64_t fence = 0;
+    if (it->kind == RI_SUBMIT) it->started = &fence;
     rq[(rq_head + rq_n) % RQ_CAP] = *it;
     rq_n++;
     plat_cond_broadcast(&rcv);
+    while (it->kind == RI_SUBMIT && !fence) plat_cond_wait(&producer_ready, &rl);
     plat_mutex_unlock(&rl);
-    return it->value;
+    return fence;
 }
 
 // Returns once every queued item was replayed and submitted. Back-end entries only: the replay thread never calls them.
@@ -540,19 +561,7 @@ static void vk_be_present(const tex_t *t, const int crop[4], uint64_t at_ns) {
         vk_dlssg_submitted(frame);
         vk_exec_evt_frame(frame);
         perf_present(frame);   // before vk_exec_frame_log, which resets the frame's exec counts the flight recorder reads
-        uint64_t queued = kern_now_ns();
-        if (present_held_on()) {   // present_held
-            vk_present_drain();    // the present thread's empty submission may run held work: done before it is read
-            if (PH.on) held_resume(), ph_flush(&PH.next);   // the last present still waits: out now
-            if (vk_exec_held()) held_resume();
-            if (vk_exec_held()) {
-                PH.on = 1, PH.t = t, PH.has_crop = crop != NULL, PH.at_ns = at_ns, PH.queued = queued, PH.frame = frame;
-                if (crop) memcpy(PH.crop, crop, sizeof PH.crop);
-                PH.since = vk_exec_submit_seq, PH.waited++;
-                return;
-            }
-        }
-        present_image(t, crop, at_ns, queued, frame, 0);
+        ordered_present(t, crop, at_ns, kern_now_ns(), frame);
         return;
     }
     // Frame bound: the replay thread handled the previous present before this one is queued.
@@ -568,7 +577,8 @@ static void vk_be_present(const tex_t *t, const int crop[4], uint64_t at_ns) {
     uint64_t frame = ++game_frames;
     perf_present(frame);
     if (frame % 1800 == 0) replay_log(frame, 0);
-    ReplayItem it = {.kind = RI_PRESENT, .tex = t, .at = at_ns, .queued = kern_now_ns()};
+    ReplayItem it = {.kind = RI_PRESENT, .has_texture = t != NULL, .at = at_ns, .queued = kern_now_ns()};
+    if (t) it.texture = *t;
     if (crop) {
         it.has_crop = 1;
         for (int i = 0; i < 4; i++) it.crop[i] = crop[i];
@@ -587,8 +597,19 @@ static int vk_be_pool_map_virtual(pool_t *v, int n, const void *requests) {
     vk_present_drain();
     return vk_pool_map_virtual(v, n, requests);
 }
-static void vk_be_texture_register(int id, const tex_t *t, const view_t *v) { vk_sync_start(); vk_texture_register(id, t, v); }
-static void vk_be_sampler_register(int id, const samp_par *s) { vk_sync_start(); vk_sampler_register(id, s); }
+static void vk_be_texture_register(int id, const tex_t *t, const view_t *v) {
+    vk_sync_start();
+    if (!gfx_replay_async()) { vk_texture_register(id, t, v); return; }
+    ReplayItem it = {.kind = RI_REGISTER_TEXTURE, .n = id, .reg = {.t = *t, .has_view = v != NULL}};
+    if (v) it.reg.view = *v;
+    replay_enqueue(&it);
+}
+static void vk_be_sampler_register(int id, const samp_par *s) {
+    vk_sync_start();
+    if (!gfx_replay_async()) { vk_sampler_register(id, s); return; }
+    ReplayItem it = {.kind = RI_REGISTER_SAMPLER, .n = id, .sampler = *s};
+    replay_enqueue(&it);
+}
 // Asynchronous: the release is queued behind the submissions before it, so their replay still resolves the texture's
 // slots to its image (a released slot follows another live texture at the storage), and the ones after it see it
 // released, the order of the synchronous replay. vk_texture_release reads only the object's key fields: a copy.
@@ -600,10 +621,7 @@ static void vk_be_texture_release(const tex_t *t) {
         return;
     }
     if (!t || !t->mem) return;
-    tex_t *copy = malloc(sizeof *copy);
-    if (!copy) rt_fatal("vk: out of memory (replay queue)");
-    *copy = *t;
-    ReplayItem it = {.kind = RI_RELEASE, .tex = copy};
+    ReplayItem it = {.kind = RI_RELEASE, .texture = *t};
     plat_mutex_lock(&rl);
     dr_calls[DR_TEX_RELEASE]++, dr_tcalls[DR_TEX_RELEASE]++;
     plat_mutex_unlock(&rl);
@@ -615,16 +633,15 @@ static void vk_be_program_release(const prog_t *p) { replay_drain(DR_PROG_RELEAS
 static uint64_t vk_be_submit(const uint64_t *handles, int n) {
     if (!gfx_replay_async()) {
         vk_sub_in_frame = nvn_submits_in_frame;   // the front end counts it up after the submit returns
-        return submit_sync(handles, n);
+        return submit_sync(handles, n, NULL);
     }
     vk_sync_start();
-    ReplayItem it = {.kind = RI_SUBMIT, .n = n, .submit_no = nvn_submit_count()};
+    ReplayItem it = {.kind = RI_SUBMIT, .origin = gfx_submit_queue, .n = n, .submit_no = nvn_submit_count()};
     if (n > 0) {
         it.h = malloc(sizeof *it.h * (size_t)n);
         if (!it.h) rt_fatal("vk: out of memory (replay queue)");
         memcpy(it.h, handles, sizeof *it.h * (size_t)n);
     }
-    vk_usnap_take(handles, n);   // the uniform blocks as they are now: the game writes on once this returns
     return replay_enqueue(&it);
 }
 static void vk_be_finish(void) { vk_sync_start(); replay_drain(DR_FINISH); vk_present_drain(); vk_sync_finish(); }
@@ -748,7 +765,7 @@ const GfxBackend gfx_vulkan_backend = {
     .program_release = vk_be_program_release,
     .submit = vk_be_submit,
     .fence_wait = vk_sync_fence_wait,
-    .exec_wait = vk_be_exec_wait,
+    .exec_wait = vk_sync_exec_wait,
     .fence_done = vk_sync_fence_done,
     .present = vk_be_present,
     .frame_start = vk_dlssg_frame_start,
@@ -758,6 +775,7 @@ const GfxBackend gfx_vulkan_backend = {
     .guest_written = vk_be_guest_written,
     .guest_read = vk_be_guest_read,
     .cpu_synced = vk_be_cpu_synced,
+    .buffer_registered = vk_link_pose_register_buffer,
 };
 
 void vk_backend_shutdown(void) {

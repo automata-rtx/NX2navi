@@ -1524,6 +1524,8 @@ def step_shaders(out, update=False):
     update: after a kit update the shaders prepared before stay in use and the game translates them again in the
     background (shader_carry), so the update does not wait the minutes a full preparation takes; the driver's cache
     gets their stage libraries again (warm_driver_cache)."""
+    from fg_pose_catalog import write_catalog
+    write_catalog(out / 'romfs', out / 'link-pose.txt')
     # The game translates with the copy beside it. The compile step refreshes that copy, but a kit that changes only
     # the translator runs this step again alone (step_key), which would then prepare with the old one. Only a kit that
     # has one: the compile step, which always runs first, stops a build without it.
@@ -1770,7 +1772,7 @@ def step_key(step, identity, out=None):
         return compile_key
     # shaders: the built game and the translator that prepared them, the one xlate_source finds (the kit's bin/, or a
     # source checkout's build/xlate/)
-    return (f'shaders-1|{compile_key}|{sha256_file(KIT / "tools" / "prepare_shaders.py")}'
+    return (f'shaders-1|{sha256_file(KIT / "tools" / "fg_pose_catalog.py")}|{compile_key}|{sha256_file(KIT / "tools" / "prepare_shaders.py")}'
             f'|{sha256_file(xlate_source() / "nx2navi_xlate.id")}')
 
 

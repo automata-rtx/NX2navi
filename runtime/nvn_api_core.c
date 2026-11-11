@@ -443,6 +443,11 @@ NVN_API(nvnBufferInitialize) {
         return;
     }
     *o = (buf_t){BUF_MAGIC, s->pool, s->off, s->size};
+    if (RT_V111 && s->pool->mem &&
+        !(s->pool->flags & (NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS | NVN_MEMORY_POOL_FLAGS_VIRTUAL | NVN_MEMORY_POOL_FLAGS_PHYSICAL))) {
+        const GfxBackend *backend = gfx_backend();
+        if (backend->buffer_registered) backend->buffer_registered((uintptr_t)s->pool->mem + s->off, s->size);
+    }
     ret_x(c, 1);
 }
 // void nvnBufferFinalize(NVNbuffer *b)

@@ -743,7 +743,17 @@ static void probe_pins(void) {
     h = record_target(ctl, &pin);
     nvn_pins_stats(&live, &freed);
     CHECK(pin && pin->serial == serial && live == live0 + 1, "naming the texture again makes a new pin");
+    uint64_t held = nvn_hold_submitted(h);
+    CHECK(held == h && !nvn_submitted_has_wait(held), "an immutable recording is retained without copying");
     CALL(nvnCommandBufferAddControlMemory, U(&cmd2), U(ctl), 0x1000);
+    nvn_pins_sweep(s + 3 * NVN_PIN_AGE, NULL, 0);
+    nvn_pins_stats(&live, &freed);
+    CHECK(!nvn_handle_live(h) && live == live0 + 1 && pin->serial == serial,
+          "a held recording keeps its texture pin after control memory is reused");
+    nvn_drop_submitted(held);
+    nvn_pins_sweep(s + 4 * NVN_PIN_AGE, NULL, 0);
+    nvn_pins_stats(&live, &freed);
+    CHECK(live == live0 && freed == freed0 + 2, "dropping the last retained recording releases its pin");
     CALL(nvnCommandBufferFinalize, U(&cmd2));
     CALL(nvnTextureFinalize, U(&tex3));
 }
@@ -754,6 +764,11 @@ static void probe_commands(void) {
     ctlmem3 = mem_kernel_alloc(0x1000, 16);
     uint64_t h = record_all();
     parse_all(h);
+    uint64_t held = nvn_hold_submitted(h);
+    CHECK(held != h && nvn_submitted_has_wait(held), "deferred bindings and event waits survive a held copy");
+    CHECK(!memcmp((const void *)(uintptr_t)held, (const void *)(uintptr_t)h, nvn_handle_bytes(h)),
+          "a held recording keeps the submitted commands and resolved bindings");
+    nvn_drop_submitted(held);
 
     // CallCommands inlines the called recording at the call position
     begin(&cmd2, ctlmem2, 0x34000);
