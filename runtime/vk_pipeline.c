@@ -5524,18 +5524,26 @@ static void lb_warm_worker(void *arg) {
     }
 }
 
+static int cache_save(uint32_t wait_ms);
+
 // Preparation: every variant of <dir>/shader-prepared.bin on every core at normal priority.
-static void lb_warm_prepared(const char *dir) {
+static int lb_warm_prepared(const char *dir) {
     char path[PLAT_PATH_MAX * 2 + 32];
     snprintf(path, sizeof path, "%s/shader-prepared.bin", dir);
     uint64_t size = 0;
     uint8_t *f = plat_file_read(path, &size);
-    size_t n = f && size >= 16 ? (size_t)(size - 16) / 36 : 0;
+    uint32_t version = 0, record_size = 0;
+    if (f && size >= 16) memcpy(&version, f + 8, 4), memcpy(&record_size, f + 12, 4);
+    size_t n = f && size >= 16 && !memcmp(f, "NX2NSPRP", 8) && version == 1 && record_size == 36 &&
+               (size - 16) % 36 == 0 ? (size_t)(size - 16) / 36 : 0;
     LB.e = n ? calloc(n, sizeof *LB.e) : NULL;
     for (size_t i = 0; LB.e && i < n; i++)
         memcpy(LB.e[i].iid, f + 16 + 36 * i + 4, 32), LB.e[i].stage = f[16 + 36 * i], LB.e[i].prio = f[16 + 36 * i + 1];
     free(f);
-    if (!LB.e) return;
+    if (!LB.e) {
+        rt_log("prepare-shaders: cannot read a nonempty prepared inventory from %s", path);
+        return 1;
+    }
     skip_init(dir);
     char jp[PLAT_PATH_MAX * 2 + 48];
     snprintf(jp, sizeof jp, "%s/shader-prepare-journal.bin", dir);
@@ -5576,7 +5584,28 @@ static void lb_warm_prepared(const char *dir) {
     if (skipped)   // installer/steps.py Prepare reads this line
         printf("prepare-shaders: %llu variants skipped: the graphics driver crashed while building them in an earlier "
                "run (shader-prepare-skip.txt); they build at their first draw\n", skipped);
+    int failed = LB.noshader != 0 || LB.fail[0] || LB.fail[1] || LB.fail[2];
     free(LB.e), LB.e = NULL, LB.n = 0, LB.next = 0, LB.done = 0, LB.skipped = 0;
+    // Preparation has no present loop or autosave thread. Persist its compiled data before the process exits,
+    // including on an incomplete run so a retry retains the pipelines that did finish.
+    if (PB.on) {
+        pb_flush();
+        plat_mutex_lock(&PB.lock);
+        failed |= PB.pend_n != 0 || PB.capture_fail != 0;
+        plat_mutex_unlock(&PB.lock);
+    } else if (!P.cache || !P.cache_path[0] || cache_save(5000) != 1) {
+        rt_log("prepare-shaders: compiled pipeline cache was not saved; preparation is incomplete");
+        failed = 1;
+    }
+    if (!failed && !skipped && !LB.nolib) {
+        VkPhysicalDeviceProperties pp;
+        vkGetPhysicalDeviceProperties(vk_ctx()->phys, &pp);
+        snprintf(LW.stamp, sizeof LW.stamp, "%s/shader-warm.txt", dir);
+        snprintf(LW.id, sizeof LW.id, "%04x:%04x:%08x", pp.vendorID, pp.deviceID, pp.driverVersion);
+        lw_stamp("done", 0);   // the next launch probes reuse, rather than resuming an old unfinished warm blindly
+    }
+    if (failed) rt_log("prepare-shaders: preparation incomplete; a variant could not be built or its cache saved");
+    return failed ? 1 : 0;
 }
 
 // nx2navi.exe --prepare-shaders (tools/prepare_shaders.py): the device sets the translator's host answers (they are in every
@@ -5593,7 +5622,7 @@ int vk_pipeline_prepare_shaders(void) {
     const char *pe = cfg_get("NX2NAVI_PREWARM_XLATE");   // no fixed default: half the CPUs, at most 16, when unset
     int procs = pe && *pe ? atoi(pe) : cpus / 2 > 16 ? 16 : cpus / 2;
     int rc = gfx_shader_prepare_seed(dir, cpus, procs < 1 ? 1 : procs);
-    if (!rc) lb_warm_prepared(dir);
+    if (!rc) rc = lb_warm_prepared(dir);
     return rc;
 }
 
@@ -5614,8 +5643,7 @@ int vk_pipeline_warm_shaders(void) {
         fprintf(stderr, "warm-shaders: no %s (tools/prepare_shaders.py writes it)\n", prp);
         return 1;
     }
-    lb_warm_prepared(dir);
-    return 0;
+    return lb_warm_prepared(dir);
 }
 
 // nx2navi.exe --probe-prewarm: the boot's shader and pipeline stages without the game, from the caches next to
@@ -5858,7 +5886,7 @@ static int cache_save_lock(uint32_t wait_ms) {
 // File backing avoids committing another several gigabytes of private memory during gameplay.
 // The lock is only ever tried, never waited for: a waiting exclusive request would hold back every new build
 // (a shared request queues behind it), so a pending save could stall the replay. wait_ms: how long to keep trying
-// while builds run (0: one try). Returns 0 when no build-free moment came, 1 otherwise (saved, or nothing to save).
+// while builds run (0: one try). Returns 0 when no build-free moment came, -1 on a failed save, 1 on success/no cache.
 static int cache_save(uint32_t wait_ms) {
     if (!P.ready || !P.cache || !P.cache_path[0]) return 1;
     // Not under P.lock: pipeline lookups must continue while a large cache is being saved.
@@ -5901,7 +5929,7 @@ static int cache_save(uint32_t wait_ms) {
         fb_log(when);
     }
     plat_mutex_unlock(&save_lock);
-    return 1;
+    return saved ? 1 : -1;
 }
 
 // Builds still running after this long at a save that waits (exit, the shader preparation) leave the file as it was.
