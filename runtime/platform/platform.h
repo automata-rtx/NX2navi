@@ -341,6 +341,11 @@ int plat_file_write_atomic(const char *path, const void *data, size_t n);
 // cut can leave a torn or zero-filled one. For files whose readers check them and that can be made again (the shader
 // cache). Each flush costs 1-5 ms on an NVMe drive and much more on a SATA SSD or a hard drive. 1 on success.
 int plat_file_write_cached(const char *path, const void *data, size_t n);
+// A file-backed scratch view for large generated files, without a private allocation of their full size.
+// finish publishes the first n bytes atomically and durably; n == 0 discards it. Every successful begin needs finish.
+typedef struct PlatFileWrite PlatFileWrite;
+PlatFileWrite *plat_file_write_begin(const char *path, size_t n, void **data);
+int plat_file_write_finish(PlatFileWrite *f, size_t n);
 // Takes the file at path (made when missing) as a lock no other process can take, held until this process ends:
 // 1 held (again, when this process holds it already), 0 another process holds it, -1 the file cannot be made.
 int plat_lock_file(const char *path);
@@ -382,6 +387,7 @@ int64_t plat_file_pread(PlatFile *f, void *buf, uint32_t n, uint64_t off);
 typedef struct { uint64_t volume, file_id, size, write_time, create_time; } PlatFileId;
 int plat_file_id(PlatFile *f, PlatFileId *out);
 const void *plat_file_map(PlatFile *f);                   // a read-only view of the whole file, kept until exit; NULL
+void plat_file_unmap(const void *data, size_t n);         // release a view before exit; n is the mapped file size
 
 // ---- the host file system under the game's save data (fs_host.c). Calls that can fail return PLAT_FS_OK (0) or the
 // reason; other processes may open the same files meanwhile.

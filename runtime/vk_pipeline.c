@@ -595,22 +595,18 @@ static void cache_load(VkCtx *c) {
         rt_log("vk_pipeline: %s is not read or written while pipeline binaries are on", P.cache_path);
         return;
     }
-    void *data = NULL;
-    size_t size = 0;
-    FILE *f = P.cache_path[0] ? fopen(P.cache_path, "rb") : NULL;
+    const void *data = NULL;
+    size_t size = 0, mapped_size = 0;
+    PlatFile *f = P.cache_path[0] ? plat_file_open(P.cache_path) : NULL;
     if (f) {
-        // Windows long is 32 bits. Use the same large-file operations as the binary archive.
-        int64_t len = pb_seek(f, 0, SEEK_END) ? -1 : pb_tell(f);
-        if (len < 0 || pb_seek(f, 0, SEEK_SET)) {
-            rt_log("vk_pipeline: cannot determine or seek the size of %s", P.cache_path);
-        } else if ((uint64_t)len > SIZE_MAX) {
-            rt_log("vk_pipeline: %s is too large for this process", P.cache_path);
-        } else if (len > (int64_t)sizeof(VkPipelineCacheHeaderVersionOne)) {
-            data = malloc((size_t)len);
-            if (data && fread(data, 1, (size_t)len, f) == (size_t)len) size = (size_t)len;
-            else rt_log("vk_pipeline: cannot allocate or read %lld bytes from %s", (long long)len, P.cache_path);
+        PlatFileId id;
+        if (!plat_file_id(f, &id) || id.size > SIZE_MAX) {
+            rt_log("vk_pipeline: cannot determine a usable size for %s", P.cache_path);
+        } else if (id.size > sizeof(VkPipelineCacheHeaderVersionOne)) {
+            data = plat_file_map(f);
+            if (data) size = mapped_size = (size_t)id.size;
+            else rt_log("vk_pipeline: cannot map %llu bytes from %s", (unsigned long long)id.size, P.cache_path);
         }
-        fclose(f);
         VkPipelineCacheHeaderVersionOne h;
         if (size) memcpy(&h, data, sizeof h);
         if (size && (h.headerVersion != VK_PIPELINE_CACHE_HEADER_VERSION_ONE || h.vendorID != c->props.vendorID ||
@@ -633,7 +629,8 @@ static void cache_load(VkCtx *c) {
         ci.initialDataSize = 0, ci.pInitialData = NULL;
         if (vkCreatePipelineCache(c->device, &ci, NULL, &P.cache) != VK_SUCCESS) P.cache = VK_NULL_HANDLE;
     }
-    free(data);
+    plat_file_unmap(data, mapped_size);
+    plat_file_close(f);
     // What the driver kept of the file: a driver may drop initial data it does not accept without failing the create,
     // which leaves every build of the run compiling while the cache file looks valid.
     size_t kept = 0;
@@ -5848,42 +5845,61 @@ void vk_pipeline_stats(VkPipeStats *s) {
 
 static PlatMutex save_lock = PLAT_MUTEX_INIT;   // one cache save at a time; shutdown takes it to destroy the cache
 
-// Copies P.cache's data into pipeline-cache.bin, with cache_rw held exclusively for the copy only (not the file write).
+static int cache_save_lock(uint32_t wait_ms) {
+    uint64_t until = plat_now_ms() + wait_ms;
+    while (!plat_mutex_trylock(&cache_rw)) {
+        if (plat_now_ms() >= until) return 0;
+        plat_sleep_ms(2);
+    }
+    return 1;
+}
+
+// Copies P.cache into a temporary file-backed view, then releases cache_rw before flushing and publishing the file.
+// File backing avoids committing another several gigabytes of private memory during gameplay.
 // The lock is only ever tried, never waited for: a waiting exclusive request would hold back every new build
 // (a shared request queues behind it), so a pending save could stall the replay. wait_ms: how long to keep trying
 // while builds run (0: one try). Returns 0 when no build-free moment came, 1 otherwise (saved, or nothing to save).
 static int cache_save(uint32_t wait_ms) {
     if (!P.ready || !P.cache || !P.cache_path[0]) return 1;
-    // Not under P.lock: holding P.lock through the copy and the file write (about 60 ms on the 1.4.3 fight) stopped
-    // every pipeline lookup of the replay, a freeze at each 20 s autosave.
+    // Not under P.lock: pipeline lookups must continue while a large cache is being saved.
     plat_mutex_lock(&save_lock);
     if (!P.cache) {   // vk_pipeline_shutdown destroyed it
         plat_mutex_unlock(&save_lock);
         return 1;
     }
-    uint64_t until = plat_now_ms() + wait_ms;
-    while (!plat_mutex_trylock(&cache_rw)) {
-        if (plat_now_ms() >= until) {
-            plat_mutex_unlock(&save_lock);
-            return 0;
-        }
-        plat_sleep_ms(2);
+    if (!cache_save_lock(wait_ms)) {
+        plat_mutex_unlock(&save_lock);
+        return 0;
     }
     size_t size = 0;
     void *data = NULL;
-    int got = vkGetPipelineCacheData(P.device, P.cache, &size, NULL) == VK_SUCCESS && size && (data = malloc(size)) &&
-              vkGetPipelineCacheData(P.device, P.cache, &size, data) == VK_SUCCESS;
+    PlatFileWrite *file = NULL;
+    int got = vkGetPipelineCacheData(P.device, P.cache, &size, NULL) == VK_SUCCESS && size;
     plat_mutex_unlock(&cache_rw);
+    // Reserving several gigabytes of disk space can take time. Let pipeline builds continue through it.
+    // Leave room for growth during that reservation; the published file uses only the driver's returned size.
+    size_t capacity = size <= SIZE_MAX - (64u << 20) ? size + (64u << 20) : size;
+    if (got) file = plat_file_write_begin(P.cache_path, capacity, &data);
+    got = file != NULL;
     if (got) {
-        if (!plat_file_write_atomic(P.cache_path, data, size)) rt_log("vk_pipeline: cannot write %s", P.cache_path);
-        else if (P.feedback) {
-            char when[96];
-            snprintf(when, sizeof when, "at a save of %.1f MB (%+.1f MB since the boot)", size / 1048576.0,
-                     ((double)size - (double)P.cache_loaded) / 1048576.0);
-            fb_log(when);
+        if (!cache_save_lock(wait_ms)) {
+            plat_file_write_finish(file, 0);
+            plat_mutex_unlock(&save_lock);
+            return 0;
         }
+        size = capacity;
+        // VK_INCOMPLETE is discarded, never published as a cache: try a larger snapshot on the next save.
+        got = vkGetPipelineCacheData(P.device, P.cache, &size, data) == VK_SUCCESS;
+        plat_mutex_unlock(&cache_rw);
     }
-    free(data);
+    int saved = plat_file_write_finish(file, got ? size : 0);
+    if (!saved) rt_log("vk_pipeline: cannot save %s; the previous cache is retained", P.cache_path);
+    else if (P.feedback) {
+        char when[96];
+        snprintf(when, sizeof when, "at a save of %.1f MB (%+.1f MB since the boot)", size / 1048576.0,
+                 ((double)size - (double)P.cache_loaded) / 1048576.0);
+        fb_log(when);
+    }
     plat_mutex_unlock(&save_lock);
     return 1;
 }
