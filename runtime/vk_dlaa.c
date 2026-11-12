@@ -479,6 +479,9 @@ static struct {
         VkImage dist[2];         // each pixel's view distance, this and last frame (R32F, dlaa_mv.comp depth_out)
         VmaAllocation dist_mem[2];
         VkImageView dist_view[2];
+        uint64_t pose_distance_frame;
+        float pose_history[4];
+        int pose_distance_valid;
         int dist_cur, dist_ok;   // as chars_cur and chars_ok
         NgxHandle *feat;
         uint64_t used;           // evals count when it last ran
@@ -596,6 +599,15 @@ int vk_dlaa_fg_hudless(VkImage *img, VkImageView *view, uint32_t *w, uint32_t *h
 int vk_dlaa_fg_views(VkImageView *depth, VkImageView *mv) {
     *depth = D.fg_depth_view, *mv = D.fg_mv_view;
     return D.fg_depth_view && D.fg_mv_view;
+}
+
+int vk_dlaa_pose_depth(uint64_t frame, uint32_t w, uint32_t h, VkDescriptorImageInfo *image, float history[4]) {
+    const struct Size *last = D.last;
+    if (!last || !last->pose_distance_valid || !last->dist_ok || last->w != w || last->h != h ||
+        !frame || last->pose_distance_frame != frame - 1 || fabsf(last->pose_history[2]) < 1e-6f) return 0;
+    *image = (VkDescriptorImageInfo){D.mv_samp, last->dist_view[last->dist_cur ^ 1], VK_IMAGE_LAYOUT_GENERAL};
+    memcpy(history, last->pose_history, sizeof last->pose_history);
+    return 1;
 }
 
 int vk_dlaa_fg_camera(VkDlaaCamera *c) {
@@ -1251,7 +1263,10 @@ static int mv_pass(VkExec *ex, struct Size *e, VkImageView zv, float jx, float j
     vk_mvcheck_camera(cb, e->mv, w, h, jx, jy);   // NX2NAVI_MV_CHECK (test)
     // the characters' own motion over the camera's (vk_exec_draw.c, per-object motion)
     uint64_t c0 = T.on > 0 ? kern_now_ns() : 0;
-    if (D.cam_size == CAM_BLOCK && vk_mvobj_execute(ex, D.cam_addr, e->mv_view, zv, D.depth.format, w, h)) full_barrier(cb);
+    int object_motion = D.cam_size == CAM_BLOCK;
+    if (D.cam_size == OCAM_BLOCK)
+        object_motion = vk_fg_pose_prepare(D.cam_addr, D.depth.image) && !D.reset;
+    if (object_motion && vk_mvobj_execute(ex, D.cam_addr, e->mv_view, zv, D.depth.format, w, h)) full_barrier(cb);
     if (T.on > 0) T.cpu_mv += kern_now_ns() - c0;
     times_mark(cb, T_OBJ);
     if (T.on > 0) T.used[T.slot] = 1;   // the DLSS marks follow in evaluate
@@ -1260,6 +1275,11 @@ static int mv_pass(VkExec *ex, struct Size *e, VkImageView zv, float jx, float j
     if (use) e->chars_cur ^= 1, e->chars_ok = 1, D.masked++;
     else e->chars_ok = 0;
     if (zfit && bias > 0) D.masked++;
+    e->pose_distance_valid = zfit && D.fg_cam_ok;
+    e->pose_distance_frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+    e->pose_history[0] = jx, e->pose_history[1] = jy;
+    e->pose_history[2] = D.fg_cam.view_to_clip[11];
+    e->pose_history[3] = D.fg_cam.view_to_clip[15];
     e->dist_cur ^= 1, e->dist_ok = zfit;
     *masked = use || (zfit && bias > 0);
     return 1;

@@ -937,3 +937,6 @@ typedef struct { uint64_t made, from_cache, compiled, uncached; } VkForeignPipes
 void vk_pipeline_foreign_counts(VkForeignPipes *o);
 
 #include "vk_rec.h"   // last: its macros route the vkCmd* calls of every file that includes vk.h
+
+// Select the main scene view for selective animated motion.
+int vk_fg_pose_prepare(uint64_t cam, VkImage depth);
