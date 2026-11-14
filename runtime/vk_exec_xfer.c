@@ -223,7 +223,48 @@ static uint32_t oq_nseg, oq_capseg;
 static int oq_lost;                      // replay: the segment missed a draw (ring full)
 static uint64_t oq_count;                // completion thread: samples since the last reset
 
-typedef struct { uint64_t addr, seq; int reset; volatile int32_t lost; uint32_t n, cap; uint32_t *q; } OqSegment;
+typedef struct {
+    uint64_t addr, seq;
+    int reset;
+    volatile int32_t lost;
+    uint32_t n, cap, first;
+    uint32_t *q;
+    void *release_block;
+} OqSegment;
+
+// The submitting thread allocates these in stream order. The result queue calls them in the
+// same order, so the last callback in a full block can release the storage for the whole block.
+enum { OQ_SEGMENTS_PER_BLOCK = 128 };
+static OqSegment *oq_block;
+static unsigned oq_used;
+
+static OqSegment *oq_new_segment(void) {
+    if (!oq_block) {
+        oq_block = calloc(OQ_SEGMENTS_PER_BLOCK, sizeof *oq_block);
+        if (!oq_block) rt_fatal("vk: out of memory (occlusion reports)");
+    }
+    OqSegment *s = &oq_block[oq_used++];
+    s->q = &s->first;
+    s->cap = 1;
+    if (oq_used == OQ_SEGMENTS_PER_BLOCK) {
+        s->release_block = oq_block;
+        oq_block = NULL;
+        oq_used = 0;
+    }
+    return s;
+}
+
+static void oq_reserve_slots(OqSegment *s, uint32_t cap) {
+    if (cap <= s->cap) return;
+    if (s->q == &s->first) {
+        s->q = malloc(sizeof *s->q * cap);
+        if (s->q && s->n) s->q[0] = s->first;
+    } else {
+        s->q = realloc(s->q, sizeof *s->q * cap);
+    }
+    if (!s->q) rt_fatal("vk: out of memory (occlusion slots)");
+    s->cap = cap;
+}
 
 // The replay workers (vk_exec.c "parallel groups") record the draws of one group at once. The front pass replays a
 // group's samples-passed resets and reports in the order of the stream before the workers record (vk_exec_xfer_front):
@@ -300,19 +341,9 @@ void vk_exec_xfer_group_merge(int group, int nchunks) {
         __typeof__(CP[0][0]) *l = &CP[group][c];
         for (uint32_t i = 0; i < l->n; i++) {
             uint32_t q = l->q[i];
-            if (l->seg[i] < gs->n) {
-                OqSegment *s = gs->s[l->seg[i]];
-                if (s->n == s->cap) {
-                    s->cap = s->cap ? s->cap * 2 : 16;
-                    if (!(s->q = realloc(s->q, sizeof *s->q * s->cap))) rt_fatal("vk: out of memory");
-                }
-                s->q[s->n++] = q;
-            } else if (gs->tail) {
-                OqSegment *s = gs->tail;
-                if (s->n == s->cap) {
-                    s->cap = s->cap ? s->cap * 2 : 16;
-                    if (!(s->q = realloc(s->q, sizeof *s->q * s->cap))) rt_fatal("vk: out of memory");
-                }
+            OqSegment *s = l->seg[i] < gs->n ? gs->s[l->seg[i]] : gs->tail;
+            if (s) {
+                if (s->n == s->cap) oq_reserve_slots(s, s->cap * 2);
                 s->q[s->n++] = q;
             } else {
                 if (oq_nseg == oq_capseg) {
@@ -392,6 +423,9 @@ void vk_exec_oq_pass_end(VkExec *ex) { oq_close(ex); }
 static void oq_batch_drop(void);   // the results kept by the completion thread (oq_take)
 
 void vk_exec_xfer_shutdown(void) {
+    free(oq_block);
+    oq_block = NULL;
+    oq_used = 0;
     if (oq_state > 0) vkDestroyQueryPool(vk_ctx()->device, oq_pool, NULL);
     oq_pool = VK_NULL_HANDLE, oq_state = 0, oq_next = 0, oq_counting = oq_reported = oq_keep = 0, oq_open = -1;
     oq_nseg = 0, oq_lost = 0, oq_count = 0;
@@ -504,15 +538,15 @@ static void oq_cb(void *arg) {
             write_counter(s->addr, oq_count), pending_written(s->addr, s->seq);
         }
     }
-    free(s->q), free(s);
+    if (s->q != &s->first) free(s->q);
+    if (s->release_block) free(s->release_block);
 }
 
 // Hands the segment to the completion thread with a report (addr; 0: no CPU-visible memory) or a reset.
 static void oq_segment(VkExec *ex, uint64_t addr, int reset) {
     oq_close(ex);
-    OqSegment *s = calloc(1, sizeof *s);
-    if (!s || (oq_nseg && !(s->q = malloc(sizeof *s->q * oq_nseg)))) rt_fatal("vk: out of memory");
-    s->cap = oq_nseg;
+    OqSegment *s = oq_new_segment();
+    oq_reserve_slots(s, oq_nseg);
     s->addr = addr, s->seq = report_seq, s->reset = reset, s->lost = oq_lost, s->n = oq_nseg;
     if (oq_nseg) memcpy(s->q, oq_seg, sizeof *s->q * oq_nseg);
     if (gs_on >= 0) {   // the front pass: the workers add the queries of the group's ops before it

@@ -156,7 +156,7 @@ void vk_exec_ahead_op(VkExec *ex,uint32_t op,const void *payload) {
     (void)ex; (void)op; (void)payload; assert(!"Unrelated predicted state reached query fixture");
 }
 int vk_exec_draw_pool_leader_needed(VkExec *ex) { (void)ex; return 1; }
-int vk_exec_draw_pool_requirement_known(VkExec *ex) { return !ex->render_disabled; }
+int vk_exec_draw_pool_requirement_known(VkExec *ex, int direct_mesh) { return !ex->render_disabled; }
 void vk_exec_draw_pool_leader_finished(VkExec *ex) { (void)ex; leaders_accepted++; }
 void vk_exec_draw_pool_refused(VkExec *ex,int reason) { (void)ex; (void)reason; }
 void vk_exec_draw_pool_prefix_op(uint32_t op) { (void)op; }
