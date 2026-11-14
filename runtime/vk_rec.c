@@ -1,8 +1,8 @@
 // The recorder thread: see vk_rec.h. One producer (the submitting thread, between rec_begin and rec_end) and one
 // consumer (the recorder) share a ring of 64-bit words. A packet is a header word (op, length in words) and the
-// call's arguments; its pointers point into the packet itself, so the recorder passes the payload to the driver as
-// it is. A packet never wraps: one that does not fit before the end is preceded by a pad. The producer publishes head
-// after each packet; the recorder makes the calls and advances tail, which the producer waits on when the ring is
+// call's arguments; pointers name inline data or explicitly retained immutable submission data. A packet never wraps:
+// one that does not fit before the end is preceded by a pad. The producer publishes head after a completed packet or
+// bounded operation batch; the recorder advances tail, which the producer waits on when the ring is
 // full and in rec_drain. While a part is recorded the recorder spins on head; idle, it sleeps on an event, and a sleep
 // that ends with nothing new goes on without spinning first. The producer wakes a sleeping recorder once: it takes the
 // sleeping flag back itself, so the packets it makes while the recorder is still waking cost no further system call.
@@ -16,6 +16,8 @@
 #include "cfg.h"
 #include "host.h"
 #include "vk.h"
+#include "replay_phase_trace.h"
+#include "replay_work_trace.h"
 #include "platform/platform.h"
 
 #define RING_WORDS (1u << 21)   // 16 MiB: a part of a submission is ~1-2 MiB of packets in the town
@@ -25,6 +27,11 @@ static _Alignas(64) volatile uint64_t tail;   // words consumed by the recorder
 static volatile int32_t sleeping;         // the recorder waits for wake_ev
 static PlatEvent wake_ev;              // auto-reset
 static _Alignas(64) uint64_t put_h;    // producer: words written (published up to head)
+static uint64_t published_h;          // producer's copy of head, avoiding a consumer-shared read on each packet
+static uint32_t unpublished_packets;
+static _Thread_local uint32_t batch_depth;
+#define BATCH_WORDS 512u              // publish at 4 KiB or 32 packets, or when the outer operation ends
+#define BATCH_PACKETS 32u
 static uint64_t tail_seen;             // producer: tail as it last read it (wait_space); tail only grows
 static VkCommandBuffer rec_cb;         // the part being recorded (set while the recorder is idle)
 static int rec_live;                   // producer: rec_begin started the recorder for rec_cb
@@ -36,7 +43,10 @@ static volatile uint64_t part_h0;      // put_h at rec_begin: where the packets 
 static volatile uint64_t part_fence;   // the value of the part being recorded (rec_begin)
 
 // Producer statistics, logged by rec_stats_log.
-static struct { uint64_t packets, words, drains, fallbacks, drain_ns, full_waits, parts, parts_on; } RS_;
+static struct {
+    uint64_t packets, words, drains, fallbacks, drain_ns, full_waits, parts, parts_on;
+    uint64_t retained_pushes, retained_bytes, publication_deferrals, publications;
+} RS_;
 static volatile uint64_t full_ns_all, drain_ns_all;   // since the start, for rec_wait_totals (never reset)
 
 enum {
@@ -106,13 +116,24 @@ static void wake(void) {
     wake_if_sleeping();
 }
 
+static void publish_now(void) {
+    if (published_h == put_h) return;
+    published_h = put_h, unpublished_packets = 0;
+    RS_.publications++;
+    __atomic_store_n(&head, put_h, __ATOMIC_RELEASE);
+    wake_if_sleeping();
+}
+
 static void wait_space(uint64_t need) {
     if (put_h + need - tail_seen <= RING_WORDS) return;   // room even by the older tail
     tail_seen = __atomic_load_n(&tail, __ATOMIC_ACQUIRE);
     if (put_h + need - tail_seen <= RING_WORDS) return;
+    RP_SCOPE(rp_ring_wait, RP_RING_SPACE);
+    RP_VALUE(RPK_WORK_UNIT, gfx_rwt_current_id());
+    RWT_STAGE(work_ring_wait, RWT_STAGE_RING_WAIT);
     RS_.full_waits++;
     uint64_t t0 = now_ns();
-    __atomic_store_n(&head, put_h, __ATOMIC_RELEASE);
+    publish_now();
     wake();
     while (put_h + need - (tail_seen = __atomic_load_n(&tail, __ATOMIC_ACQUIRE)) > RING_WORDS) _mm_pause();
     full_ns_all += now_ns() - t0;
@@ -139,14 +160,32 @@ static void *put(uint32_t op, size_t bytes) {
 }
 
 static void pub(void) {
-    __atomic_store_n(&head, put_h, __ATOMIC_RELEASE);
-    wake_if_sleeping();
+    unpublished_packets++;
+    if (!batch_depth || unpublished_packets >= BATCH_PACKETS || put_h - published_h >= BATCH_WORDS) publish_now();
+    else RS_.publication_deferrals++;
+}
+
+int rec_batch_begin(VkCommandBuffer cb) {
+    // Worker command buffers execute their Vulkan calls directly. Checking keeps per-packet publication so its
+    // existing ring scanner does not conceal handles held in an unpublished batch.
+    if (!rec_live || cb != rec_cb || rec_chk) return 0;
+    batch_depth++;
+    return 1;
+}
+
+void rec_batch_end(int entered) {
+    if (!entered) return;
+    if (!batch_depth) rt_fatal("vk_rec: unbalanced operation batch");
+    if (!--batch_depth) publish_now();
 }
 
 void rec_drain(void) {
     if (!rec_thread || __atomic_load_n(&tail, __ATOMIC_ACQUIRE) == put_h) return;
+    RP_SCOPE(rp_rec_drain, RP_REC_DRAIN);
+    RP_VALUE(RPK_WORK_UNIT, gfx_rwt_current_id());
+    RWT_STAGE(work_rec_drain, RWT_STAGE_DRAIN);
     uint64_t t0 = now_ns();
-    __atomic_store_n(&head, put_h, __ATOMIC_RELEASE);
+    publish_now();
     wake();
     for (int i = 0; __atomic_load_n(&tail, __ATOMIC_ACQUIRE) != put_h; i++)
         if (i < 20000) _mm_pause();
@@ -158,6 +197,7 @@ void rec_drain(void) {
 void rec_wait_totals(uint64_t *full_ns, uint64_t *drain_ns) { *full_ns = full_ns_all, *drain_ns = drain_ns_all; }
 
 void rec_begin(VkCommandBuffer cb, uint64_t fence) {
+    publish_now();                     // part switches cannot strand completed packets behind a batch
     static int mode = -1;
     if (mode < 0) {
         // Default off on AMD GPUs. With the recorder those drivers lost the device or hung the GPU at startup on
@@ -240,6 +280,9 @@ void rec_stats_log(void) {
            (unsigned long long)RS_.parts_on, (unsigned long long)RS_.parts, (unsigned long long)RS_.packets,
            RS_.words * 8 / 1048576.0, (unsigned long long)RS_.drains, (unsigned long long)RS_.fallbacks,
            RS_.drain_ns / 1e6, (unsigned long long)RS_.full_waits);
+    rt_log("vk_rec: coverage: retained pushes %llu bytes %llu publication deferrals %llu publications %llu",
+           (unsigned long long)RS_.retained_pushes, (unsigned long long)RS_.retained_bytes,
+           (unsigned long long)RS_.publication_deferrals, (unsigned long long)RS_.publications);
     memset(&RS_, 0, sizeof RS_);
 }
 
@@ -303,7 +346,7 @@ void rec_check_log(void) {
 
 #define OWNED(cb) (rec_live && (cb) == rec_cb)
 // A call the ring takes no packet for: everything queued first, then the call here.
-#define FALLBACK() (rec_drain(), RS_.fallbacks++)
+#define FALLBACK() (RWT_COUNT(RWT_COUNT_RING_FALLBACK, 1), rec_drain(), RS_.fallbacks++)
 
 // Copies n elements of arr after the fixed part at *at and returns where they went (NULL for none).
 static void *tail_copy(uint8_t **at, const void *arr, size_t bytes) {
@@ -320,6 +363,7 @@ static void *tail_copy(uint8_t **at, const void *arr, size_t bytes) {
 #define FIXED(name, params, call_args, ...)                                                                             \
     typedef struct { __VA_ARGS__; } A_##name;                                                                          \
     void rc_vkCmd##name params {                                                                                       \
+        RWT_STAGE(work_native, OWNED(cb) ? RWT_STAGE_PACK : RWT_STAGE_DIRECT); \
         if (!OWNED(cb)) { vkCmd##name call_args; return; }                                                             \
         A_##name *a = put(R_##name, sizeof *a);                                                                        \
         PACK_##name;                                                                                                    \
@@ -407,6 +451,7 @@ FIXED(WriteTimestamp2, (VkCommandBuffer cb, VkPipelineStageFlags2 s, VkQueryPool
 
 typedef struct { uint32_t n; const VkViewport *v; } A_SetViewportWithCount;
 void rc_vkCmdSetViewportWithCount(VkCommandBuffer cb, uint32_t n, const VkViewport *v) {
+    RWT_STAGE(work_native, OWNED(cb) ? RWT_STAGE_PACK : RWT_STAGE_DIRECT);
     if (!OWNED(cb)) { vkCmdSetViewportWithCount(cb, n, v); return; }
     A_SetViewportWithCount *a = put(R_SetViewportWithCount, sizeof *a + sizeof *v * n);
     uint8_t *at = (uint8_t *)(a + 1);
@@ -416,6 +461,7 @@ void rc_vkCmdSetViewportWithCount(VkCommandBuffer cb, uint32_t n, const VkViewpo
 
 typedef struct { uint32_t n; const VkRect2D *r; } A_SetScissorWithCount;
 void rc_vkCmdSetScissorWithCount(VkCommandBuffer cb, uint32_t n, const VkRect2D *r) {
+    RWT_STAGE(work_native, OWNED(cb) ? RWT_STAGE_PACK : RWT_STAGE_DIRECT);
     if (!OWNED(cb)) { vkCmdSetScissorWithCount(cb, n, r); return; }
     A_SetScissorWithCount *a = put(R_SetScissorWithCount, sizeof *a + sizeof *r * n);
     uint8_t *at = (uint8_t *)(a + 1);
@@ -432,6 +478,7 @@ typedef struct {
 } A_BindDescriptorSets;
 void rc_vkCmdBindDescriptorSets(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout l, uint32_t first,
                                 uint32_t n, const VkDescriptorSet *s, uint32_t nd, const uint32_t *d) {
+    RWT_STAGE(work_native, OWNED(cb) ? RWT_STAGE_PACK : RWT_STAGE_DIRECT);
     if (!OWNED(cb)) { vkCmdBindDescriptorSets(cb, bp, l, first, n, s, nd, d); return; }
     A_BindDescriptorSets *a = put(R_BindDescriptorSets, sizeof *a + A8(sizeof *s * n) + A8(sizeof *d * nd));
     uint8_t *at = (uint8_t *)(a + 1);
@@ -443,6 +490,7 @@ void rc_vkCmdBindDescriptorSets(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPi
 typedef struct { uint32_t first, n; const VkBuffer *b; const VkDeviceSize *o, *sz, *st; } A_BindVertexBuffers2;
 void rc_vkCmdBindVertexBuffers2(VkCommandBuffer cb, uint32_t first, uint32_t n, const VkBuffer *b, const VkDeviceSize *o,
                                 const VkDeviceSize *sz, const VkDeviceSize *st) {
+    RWT_STAGE(work_native, OWNED(cb) ? RWT_STAGE_PACK : RWT_STAGE_DIRECT);
     if (!OWNED(cb)) { vkCmdBindVertexBuffers2(cb, first, n, b, o, sz, st); return; }
     size_t e = sizeof(VkDeviceSize) * n;
     A_BindVertexBuffers2 *a = put(R_BindVertexBuffers2, sizeof *a + A8(sizeof *b * n) + 3 * A8(e));
@@ -456,6 +504,7 @@ void rc_vkCmdBindVertexBuffers2(VkCommandBuffer cb, uint32_t first, uint32_t n, 
 typedef struct { VkImage s; VkImageLayout sl; VkImage d; VkImageLayout dl; uint32_t n; const void *r; VkFilter f; } A_Img;
 #define IMG_CMD(name, rtype, params, call, ...)                                                                         \
     void rc_vkCmd##name params {                                                                                       \
+        RWT_STAGE(work_native, OWNED(cb) ? RWT_STAGE_PACK : RWT_STAGE_DIRECT); \
         if (!OWNED(cb)) { vkCmd##name call; return; }                                                                  \
         A_Img *a = put(R_##name, sizeof *a + sizeof(rtype) * n);                                                       \
         uint8_t *at = (uint8_t *)(a + 1);                                                                              \
@@ -473,6 +522,7 @@ IMG_CMD(ResolveImage, VkImageResolve, (VkCommandBuffer cb, VkImage s, VkImageLay
 typedef struct { uint64_t s, d; VkImageLayout l; uint32_t n; const void *r; } A_Xfer;   // buffer or image handles
 #define XFER_CMD(name, rtype, params, call, S, D, L)                                                                    \
     void rc_vkCmd##name params {                                                                                       \
+        RWT_STAGE(work_native, OWNED(cb) ? RWT_STAGE_PACK : RWT_STAGE_DIRECT); \
         if (!OWNED(cb)) { vkCmd##name call; return; }                                                                  \
         A_Xfer *a = put(R_##name, sizeof *a + sizeof(rtype) * n);                                                      \
         uint8_t *at = (uint8_t *)(a + 1);                                                                              \
@@ -489,6 +539,7 @@ XFER_CMD(CopyImageToBuffer, VkBufferImageCopy, (VkCommandBuffer cb, VkImage s, V
 
 typedef struct { uint32_t na, nr; const VkClearAttachment *a; const VkClearRect *r; } A_ClearAttachments;
 void rc_vkCmdClearAttachments(VkCommandBuffer cb, uint32_t na, const VkClearAttachment *ca, uint32_t nr, const VkClearRect *r) {
+    RWT_STAGE(work_native, OWNED(cb) ? RWT_STAGE_PACK : RWT_STAGE_DIRECT);
     if (!OWNED(cb)) { vkCmdClearAttachments(cb, na, ca, nr, r); return; }
     A_ClearAttachments *a = put(R_ClearAttachments, sizeof *a + A8(sizeof *ca * na) + A8(sizeof *r * nr));
     uint8_t *at = (uint8_t *)(a + 1);
@@ -501,6 +552,7 @@ typedef struct { VkImage i; VkImageLayout l; union { VkClearColorValue c; VkClea
                  const VkImageSubresourceRange *r; } A_ClearImage;
 void rc_vkCmdClearColorImage(VkCommandBuffer cb, VkImage i, VkImageLayout l, const VkClearColorValue *c, uint32_t n,
                              const VkImageSubresourceRange *r) {
+    RWT_STAGE(work_native, OWNED(cb) ? RWT_STAGE_PACK : RWT_STAGE_DIRECT);
     if (!OWNED(cb)) { vkCmdClearColorImage(cb, i, l, c, n, r); return; }
     A_ClearImage *a = put(R_ClearColorImage, sizeof *a + sizeof *r * n);
     uint8_t *at = (uint8_t *)(a + 1);
@@ -509,6 +561,7 @@ void rc_vkCmdClearColorImage(VkCommandBuffer cb, VkImage i, VkImageLayout l, con
 }
 void rc_vkCmdClearDepthStencilImage(VkCommandBuffer cb, VkImage i, VkImageLayout l, const VkClearDepthStencilValue *c,
                                     uint32_t n, const VkImageSubresourceRange *r) {
+    RWT_STAGE(work_native, OWNED(cb) ? RWT_STAGE_PACK : RWT_STAGE_DIRECT);
     if (!OWNED(cb)) { vkCmdClearDepthStencilImage(cb, i, l, c, n, r); return; }
     A_ClearImage *a = put(R_ClearDepthStencilImage, sizeof *a + sizeof *r * n);
     uint8_t *at = (uint8_t *)(a + 1);
@@ -518,6 +571,7 @@ void rc_vkCmdClearDepthStencilImage(VkCommandBuffer cb, VkImage i, VkImageLayout
 
 typedef struct { uint32_t n; const VkCommandBuffer *c; } A_ExecuteCommands;
 void rc_vkCmdExecuteCommands(VkCommandBuffer cb, uint32_t n, const VkCommandBuffer *c) {
+    RWT_STAGE(work_native, OWNED(cb) ? RWT_STAGE_PACK : RWT_STAGE_DIRECT);
     if (!OWNED(cb)) { vkCmdExecuteCommands(cb, n, c); return; }
     A_ExecuteCommands *a = put(R_ExecuteCommands, sizeof *a + sizeof *c * n);
     uint8_t *at = (uint8_t *)(a + 1);
@@ -528,6 +582,7 @@ void rc_vkCmdExecuteCommands(VkCommandBuffer cb, uint32_t n, const VkCommandBuff
 typedef struct { VkPipelineLayout l; VkShaderStageFlags st; uint32_t o, n; const void *v; } A_PushConstants;
 void rc_vkCmdPushConstants(VkCommandBuffer cb, VkPipelineLayout l, VkShaderStageFlags st, uint32_t o, uint32_t n,
                            const void *v) {
+    RWT_STAGE(work_native, OWNED(cb) ? RWT_STAGE_PACK : RWT_STAGE_DIRECT);
     if (!OWNED(cb)) { vkCmdPushConstants(cb, l, st, o, n, v); return; }
     A_PushConstants *a = put(R_PushConstants, sizeof *a + n);
     uint8_t *at = (uint8_t *)(a + 1);
@@ -537,6 +592,7 @@ void rc_vkCmdPushConstants(VkCommandBuffer cb, VkPipelineLayout l, VkShaderStage
 }
 
 void rc_vkCmdPipelineBarrier2(VkCommandBuffer cb, const VkDependencyInfo *di) {
+    RWT_STAGE(work_native, OWNED(cb) ? RWT_STAGE_PACK : RWT_STAGE_DIRECT);
     if (!OWNED(cb)) { vkCmdPipelineBarrier2(cb, di); return; }
     int chained = di->pNext != NULL;
     for (uint32_t i = 0; i < di->memoryBarrierCount; i++) chained |= di->pMemoryBarriers[i].pNext != NULL;
@@ -556,6 +612,7 @@ void rc_vkCmdPipelineBarrier2(VkCommandBuffer cb, const VkDependencyInfo *di) {
 }
 
 void rc_vkCmdBeginRendering(VkCommandBuffer cb, const VkRenderingInfo *ri) {
+    RWT_STAGE(work_native, OWNED(cb) ? RWT_STAGE_PACK : RWT_STAGE_DIRECT);
     if (!OWNED(cb)) { vkCmdBeginRendering(cb, ri); return; }
     int chained = ri->pNext != NULL || (ri->pDepthAttachment && ri->pDepthAttachment->pNext) ||
                   (ri->pStencilAttachment && ri->pStencilAttachment->pNext);
@@ -577,6 +634,7 @@ typedef struct { PFN_vkCmdPushDescriptorSetWithTemplateKHR fn; VkDescriptorUpdat
                  uint32_t set; const void *data; } A_PushTpl;
 void rec_push_tpl(PFN_vkCmdPushDescriptorSetWithTemplateKHR fn, VkCommandBuffer cb, VkDescriptorUpdateTemplate tpl,
                   VkPipelineLayout layout, uint32_t set, const void *data, uint32_t bytes) {
+    RWT_STAGE(work_native, OWNED(cb) ? RWT_STAGE_PACK : RWT_STAGE_DIRECT);
     if (!OWNED(cb)) { fn(cb, tpl, layout, set, data); return; }
     A_PushTpl *a = put(R_PushTpl, sizeof *a + bytes);
     uint8_t *at = (uint8_t *)(a + 1);
@@ -585,10 +643,24 @@ void rec_push_tpl(PFN_vkCmdPushDescriptorSetWithTemplateKHR fn, VkCommandBuffer 
     pub();
 }
 
+void rec_push_tpl_retained(PFN_vkCmdPushDescriptorSetWithTemplateKHR fn, VkCommandBuffer cb,
+                           VkDescriptorUpdateTemplate tpl, VkPipelineLayout layout, uint32_t set,
+                           const void *data, uint32_t bytes) {
+    RWT_STAGE(work_native, OWNED(cb) ? RWT_STAGE_PACK : RWT_STAGE_DIRECT);
+    if (!OWNED(cb)) { fn(cb, tpl, layout, set, data); return; }
+    // Keep diagnostic visibility: the lifetime checker scans inline words, not arbitrary external pointers.
+    if (rec_chk) { rec_push_tpl(fn, cb, tpl, layout, set, data, bytes); return; }
+    A_PushTpl *a = put(R_PushTpl, sizeof *a);
+    *a = (A_PushTpl){fn, tpl, layout, set, data};
+    RS_.retained_pushes++, RS_.retained_bytes += bytes;
+    pub();
+}
+
 typedef struct { PFN_vkCmdPushDescriptorSetKHR fn; VkPipelineBindPoint bp; VkPipelineLayout l; uint32_t set, n;
                  VkWriteDescriptorSet *w; } A_Push;
 void rec_push(PFN_vkCmdPushDescriptorSetKHR fn, VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout layout,
               uint32_t set, uint32_t n, const VkWriteDescriptorSet *w) {
+    RWT_STAGE(work_native, OWNED(cb) ? RWT_STAGE_PACK : RWT_STAGE_DIRECT);
     if (!OWNED(cb)) { fn(cb, bp, layout, set, n, w); return; }
     size_t bytes = A8(sizeof *w * n);
     int chained = 0;
@@ -618,6 +690,7 @@ typedef struct { PFN_vkCmdSetVertexInputEXT fn; uint32_t nb, na; const VkVertexI
 void rec_vertex_input(PFN_vkCmdSetVertexInputEXT fn, VkCommandBuffer cb, uint32_t nb,
                       const VkVertexInputBindingDescription2EXT *b, uint32_t na,
                       const VkVertexInputAttributeDescription2EXT *v) {
+    RWT_STAGE(work_native, OWNED(cb) ? RWT_STAGE_PACK : RWT_STAGE_DIRECT);
     if (!OWNED(cb)) { fn(cb, nb, b, na, v); return; }
     A_VertexInput *a = put(R_VertexInput, sizeof *a + A8(sizeof *b * nb) + A8(sizeof *v * na));
     uint8_t *at = (uint8_t *)(a + 1);
@@ -628,6 +701,7 @@ void rec_vertex_input(PFN_vkCmdSetVertexInputEXT fn, VkCommandBuffer cb, uint32_
 
 typedef struct { PFN_vkCmdSetDepthClampEnableEXT fn; VkBool32 v; } A_Bool;
 void rec_bool(PFN_vkCmdSetDepthClampEnableEXT fn, VkCommandBuffer cb, VkBool32 v) {
+    RWT_STAGE(work_native, OWNED(cb) ? RWT_STAGE_PACK : RWT_STAGE_DIRECT);
     if (!OWNED(cb)) { fn(cb, v); return; }
     A_Bool *a = put(R_Bool, sizeof *a);
     *a = (A_Bool){fn, v};
@@ -636,6 +710,7 @@ void rec_bool(PFN_vkCmdSetDepthClampEnableEXT fn, VkCommandBuffer cb, VkBool32 v
 
 typedef struct { PFN_vkCmdSetPolygonModeEXT fn; VkPolygonMode m; } A_PolygonMode;
 void rec_polygon_mode(PFN_vkCmdSetPolygonModeEXT fn, VkCommandBuffer cb, VkPolygonMode m) {
+    RWT_STAGE(work_native, OWNED(cb) ? RWT_STAGE_PACK : RWT_STAGE_DIRECT);
     if (!OWNED(cb)) { fn(cb, m); return; }
     A_PolygonMode *a = put(R_PolygonMode, sizeof *a);
     *a = (A_PolygonMode){fn, m};
@@ -644,6 +719,7 @@ void rec_polygon_mode(PFN_vkCmdSetPolygonModeEXT fn, VkCommandBuffer cb, VkPolyg
 
 typedef struct { PFN_vkCmdDrawMeshTasksEXT fn; uint32_t x, y, z; } A_DrawMesh;
 void rec_draw_mesh(PFN_vkCmdDrawMeshTasksEXT fn, VkCommandBuffer cb, uint32_t x, uint32_t y, uint32_t z) {
+    RWT_STAGE(work_native, OWNED(cb) ? RWT_STAGE_PACK : RWT_STAGE_DIRECT);
     if (!OWNED(cb)) { fn(cb, x, y, z); return; }
     A_DrawMesh *a = put(R_DrawMesh, sizeof *a);
     *a = (A_DrawMesh){fn, x, y, z};
@@ -653,6 +729,7 @@ void rec_draw_mesh(PFN_vkCmdDrawMeshTasksEXT fn, VkCommandBuffer cb, uint32_t x,
 typedef struct { PFN_vkCmdDrawMeshTasksIndirectEXT fn; VkBuffer b; VkDeviceSize o; uint32_t n, stride; } A_DrawMeshInd;
 void rec_draw_mesh_ind(PFN_vkCmdDrawMeshTasksIndirectEXT fn, VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, uint32_t n,
                        uint32_t stride) {
+    RWT_STAGE(work_native, OWNED(cb) ? RWT_STAGE_PACK : RWT_STAGE_DIRECT);
     if (!OWNED(cb)) { fn(cb, b, o, n, stride); return; }
     A_DrawMeshInd *a = put(R_DrawMeshInd, sizeof *a);
     *a = (A_DrawMeshInd){fn, b, o, n, stride};
@@ -666,6 +743,7 @@ static void shading_rate_call(PFN_vkCmdSetFragmentShadingRateKHR fn, VkCommandBu
     fn(cb, &e, ops);
 }
 void rec_shading_rate(PFN_vkCmdSetFragmentShadingRateKHR fn, VkCommandBuffer cb, uint32_t size) {
+    RWT_STAGE(work_native, OWNED(cb) ? RWT_STAGE_PACK : RWT_STAGE_DIRECT);
     if (!OWNED(cb)) { shading_rate_call(fn, cb, size); return; }
     A_ShadingRate *a = put(R_ShadingRate, sizeof *a);
     *a = (A_ShadingRate){fn, size};
@@ -674,6 +752,7 @@ void rec_shading_rate(PFN_vkCmdSetFragmentShadingRateKHR fn, VkCommandBuffer cb,
 
 typedef struct { uint32_t id; int end; } A_PassMark;
 void rec_pass_mark(VkCommandBuffer cb, uint32_t id, int end) {
+    RWT_STAGE(work_native, OWNED(cb) ? RWT_STAGE_PACK : RWT_STAGE_DIRECT);
     if (!OWNED(cb)) { vk_pass_mark_cmd(cb, id, end); return; }
     A_PassMark *a = put(R_PassMark, sizeof *a);
     *a = (A_PassMark){id, end};
@@ -683,6 +762,7 @@ void rec_pass_mark(VkCommandBuffer cb, uint32_t id, int end) {
 typedef struct { void *fn; uint32_t first, n; const void *v; } A_Targets;
 #define TARGET_CMD(fname, R, PFN, T)                                                                                    \
     void fname(PFN fn, VkCommandBuffer cb, uint32_t first, uint32_t n, const T *v) {                                    \
+        RWT_STAGE(work_native, OWNED(cb) ? RWT_STAGE_PACK : RWT_STAGE_DIRECT); \
         if (!OWNED(cb)) { fn(cb, first, n, v); return; }                                                               \
         A_Targets *a = put(R, sizeof *a + sizeof *v * n);                                                              \
         uint8_t *at = (uint8_t *)(a + 1);                                                                              \

@@ -13,6 +13,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include "replay_phase_trace.h"
 #include <string.h>
 
 #include "cfg.h"
@@ -20,6 +21,8 @@
 #include "host.h"
 #include "nvn_api.h"
 #include "nvn_hmap.h"
+#include "nvn_exec_state_blob.h"
+#include "resource_prep.h"
 #include "platform/platform.h"
 
 #define CMD_MAGIC MAGIC('C', 'M', 'D', 'B')
@@ -362,16 +365,20 @@ static uint32_t pin_refs(const uint8_t *copy, int delta) {
 }
 
 void nvn_pins_sweep(uint64_t now, const tex_t *const *keep, int nkeep) {
-    if (now < NVN_PIN_AGE) return;
+    RP_SCOPE(rp_pins, RP_PIN_SWEEP);
+    if (now < NVN_PIN_AGE) { RP_VALUE(RPK_OUTCOME, RPO_NO_WORK); return; }
     static int on = -1;
     if (on < 0) {
         const char *s = cfg_get("NX2NAVI_PIN_SWEEP");
         on = !(s && !strcmp(s, "0"));
         if (!on) rt_log("nvn: NX2NAVI_PIN_SWEEP=0: texture pin copies are kept for the run (the heap grows in long sessions)");
     }
-    if (!on) return;
+    if (!on) { RP_VALUE(RPK_OUTCOME, RPO_DISABLED); return; }
     static uint64_t logged;
     plat_mutex_lock(&pin_lock);
+#if NX2NAVI_REPLAY_PHASES
+    uint64_t rp_freed = pins_freed;
+#endif
     for (int budget = 1024; pin_qh < pin_qn && budget; budget--) {
         pin_due d = pin_q[pin_qh];
         if (d.at > now - NVN_PIN_AGE) break;
@@ -395,6 +402,7 @@ void nvn_pins_sweep(uint64_t now, const tex_t *const *keep, int nkeep) {
         rt_log("nvn: texture pins at submit %llu: %llu live, %llu waiting, %llu freed so far", (unsigned long long)now,
                (unsigned long long)pins_live, (unsigned long long)(pin_qn - pin_qh), (unsigned long long)pins_freed);
     }
+    RP_VALUE(RPK_PINS_FREED, pins_freed - rp_freed);
     plat_mutex_unlock(&pin_lock);
 }
 
@@ -410,18 +418,84 @@ void nvn_pins_stats(uint64_t *live, uint64_t *freed) {
 // about 500 lookups per AddControlMemory under the exclusive lock (1.4.3 field: 53 calls a frame, 2 MiB ranges, 3.7
 // copies per page), and the recording threads waited on it.
 // deferred: 0 unknown, 1 none, 2 some; pins: texture pins its ops name, counted in their refs (pin_refs)
-typedef struct { uint64_t magic, bytes, made_at, used_at, deferred, pins; } copy_prefix;
+typedef struct {
+    uint64_t magic, bytes, made_at, used_at, deferred, pins;
+    // Immutable offsets into the command bytes, stored after the OP_END record. Clones copy this tail as well, so
+    // their deferred payloads can change without rebasing any metadata or sharing mutable state with another submit.
+    uint32_t indexed, plan_complete;
+    size_t nuniform, ndeferred, npinops, ncapture, nspans, nexec;
+    uint32_t nfront, plan_readers;  // front plan is limited to 16 MiB; readers are guarded by copy_lock
+    size_t state_bytes;
+} copy_prefix;
 _Static_assert(sizeof(copy_prefix) % 8 == 0, "records stay 8-byte aligned");
 typedef struct { uintptr_t lo, hi; uint8_t *copy; } cmd_copy;
 typedef struct { cmd_copy *v; uint32_t n, cap; } copy_bucket;
 static PlatMutex copy_lock = PLAT_MUTEX_INIT;    // guards the two maps, the counters and every prefix
 static nvn_hmap copy_pages = {.klen = 8};   // page -> copy_bucket
 static nvn_hmap copy_live = {.klen = 8};    // handle -> copy_prefix of a live copy
+// Includes retired copies and submission clones until replay releases them. Looking up here also makes raw command
+// sequences used by backend probes safe: no access before an unrecognized handle to guess whether it has a prefix.
+static nvn_hmap copy_indexed = {.klen = 8};
 static uint64_t ncopies, copy_bytes, copies_made;
 // Asynchronous replay: copies released by the game, and per-submission clones, that a queued submission still reads.
 // Freed once gfx_replayed_submits() reaches their used_at. Empty with synchronous replay.
 static copy_prefix **zombies;
 static uint32_t nzombies, cap_zombies;
+
+static const size_t *copy_offsets(const copy_prefix *pf) {
+    return (const size_t *)((const uint8_t *)(pf + 1) + pf->bytes);
+}
+
+static size_t copy_size(const copy_prefix *pf) {
+    return sizeof *pf + (size_t)pf->bytes +
+           (pf->nuniform + pf->ndeferred + pf->npinops + pf->ncapture) * sizeof(size_t) +
+           pf->nspans * sizeof(NvnRecordSpan) + pf->nexec * sizeof(NvnExecStep) +
+           pf->nfront * sizeof(NvnFrontStep) + pf->state_bytes;
+}
+
+static uint32_t copy_pin_refs(const copy_prefix *pf, int delta) {
+    const uint8_t *cmd = (const uint8_t *)(pf + 1);
+    if (!pf->indexed) return pin_refs(cmd, delta);
+    const size_t *off = copy_offsets(pf) + pf->nuniform + pf->ndeferred;
+    uint64_t now = __atomic_load_n(&nsubmits, __ATOMIC_RELAXED);
+    uint32_t n = 0;
+    for (size_t j = 0; j < pf->npinops; j++) {
+        const op_hdr *h = (const op_hdr *)(cmd + off[j]);
+        const tex_t *p[9];
+        int k = op_pins(h->op, nvn_op_payload(h), p);
+        for (int i = 0; i < k; i++) pin_ref(p[i], delta, now);
+        n += (uint32_t)k;
+    }
+    return n;
+}
+
+int nvn_record_uniform_offsets(uint64_t handle, const size_t **offsets, size_t *count) {
+    plat_mutex_lock_shared(&copy_lock);
+    const copy_prefix *pf = nvn_hm_get(&copy_indexed, &handle);
+    if (pf) *offsets = copy_offsets(pf), *count = pf->nuniform;
+    plat_mutex_unlock_shared(&copy_lock);
+    // The caller holds the same submission lifetime that protects reading the command bytes themselves.
+    return pf != NULL;
+}
+
+int nvn_record_plan(uint64_t handle, NvnRecordPlan *out) {
+    *out = (NvnRecordPlan){0};
+    plat_mutex_lock_shared(&copy_lock);
+    const copy_prefix *pf = nvn_hm_get(&copy_indexed, &handle);
+    if (pf) {
+        const size_t *capture = copy_offsets(pf) + pf->nuniform + pf->ndeferred + pf->npinops;
+        const NvnRecordSpan *spans = (const NvnRecordSpan *)(capture + pf->ncapture);
+        const NvnExecStep *exec = (const NvnExecStep *)(spans + pf->nspans);
+        const NvnFrontStep *front = (const NvnFrontStep *)(exec + pf->nexec);
+        *out = (NvnRecordPlan){.commands = (const uint8_t *)(pf + 1), .bytes = (size_t)pf->bytes,
+                              .capture_offsets = capture, .ncapture = pf->ncapture, .spans = spans,
+                              .nspans = pf->nspans, .exec = exec, .nexec = pf->nexec,
+                              .front = front, .nfront = pf->nfront,
+                              .state_data = (const uint8_t *)(front + pf->nfront), .state_bytes = pf->state_bytes};
+    }
+    plat_mutex_unlock_shared(&copy_lock);
+    return pf != NULL;
+}
 
 static void zombie_add(copy_prefix *pf) {   // copy_lock held
     if (nzombies == cap_zombies) {
@@ -433,7 +507,13 @@ static void zombie_add(copy_prefix *pf) {   // copy_lock held
 }
 
 static void copy_free(copy_prefix *pf) {   // copy_lock not held
-    if (pf->pins) pin_refs((const uint8_t *)(pf + 1), -1);
+    if (pf->indexed) {
+        uint64_t handle = (uintptr_t)(pf + 1);
+        plat_mutex_lock(&copy_lock);
+        nvn_hm_del(&copy_indexed, &handle);
+        plat_mutex_unlock(&copy_lock);
+    }
+    if (pf->pins) copy_pin_refs(pf, -1);
     free(pf);
 }
 
@@ -456,7 +536,7 @@ static void doom_free(copy_prefix *list) {   // copy_lock not held
 
 static copy_prefix *zombie_sweep(uint64_t replayed, copy_prefix *doomed) {   // copy_lock held; returns the doom chain
     for (uint32_t i = 0; i < nzombies;) {
-        if (zombies[i]->used_at <= replayed) {
+        if (!zombies[i]->plan_readers && zombies[i]->used_at <= replayed) {
             doomed = doom(doomed, zombies[i]);
             zombies[i] = zombies[--nzombies];
         } else {
@@ -486,43 +566,589 @@ uint64_t nvn_handle_bytes(uint64_t handle) {
 }
 
 // Marks a live copy used by submission now; its size from OP_BEGIN to OP_END inclusive.
-static uint64_t copy_touch(uint64_t handle, uint64_t now, const char *what) {
+#define PLAN_CHILD_MIN (16u << 10)
+static inline uint64_t copy_touch_id(uint64_t handle, uint64_t now, const char *what, copy_prefix **reader) {
     plat_mutex_lock_shared(&copy_lock);
     copy_prefix *pf = copy_find(handle);
     uint64_t bytes = 0;
     if (pf) __atomic_store_n(&pf->used_at, now, __ATOMIC_RELAXED), bytes = pf->bytes;
+    if (reader) {
+        *reader = pf && pf->nexec && bytes >= PLAN_CHILD_MIN + 2 * sizeof(op_hdr) ? pf : NULL;
+        if (*reader) __atomic_add_fetch(&pf->plan_readers, 1, __ATOMIC_RELAXED);
+    }
     plat_mutex_unlock_shared(&copy_lock);
     if (!pf) rt_fatal("nvn: %s: command handle %#llx is not a live recording (released or never recorded)", what,
                       (unsigned long long)handle);
     return bytes;
 }
 
-// The recording [p, p + n), OP_BEGIN to OP_END (the recording buffer is one block: recording emits no OP_JUMP), copied
-// into one host block of its exact size. One allocation and one copy: growing the copy record by record cost the
-// game's main thread about 1 ms a frame in reallocations and small copies (1.4.3, field).
-static uint8_t *flatten_recording(const uint8_t *p, size_t n) {
-    uint8_t *out = realloc_wait(NULL, sizeof(copy_prefix) + n, "command copy");
-    if (!out) rt_fatal("nvn: command copy allocation");
-    memcpy(out + sizeof(copy_prefix), p, n);
+static uint64_t copy_touch(uint64_t handle, uint64_t now, const char *what) {
+    return copy_touch_id(handle, now, what, NULL);
+}
+
+typedef struct { size_t *v, n, cap; } offset_list;
+typedef struct { NvnRecordSpan *v; size_t n, cap; } span_list;
+typedef struct {
+    NvnExecStep *steps;
+    NvnFrontStep *front;
+    uint8_t *state;
+    size_t n, cap, bytes, state_cap;
+    size_t nfront, front_cap;
+    int failed;
+    unsigned emits;
+} exec_builder;
+typedef struct { p_bind_buf binding; uint64_t stamp; } capture_slot;
+typedef struct { capture_slot *slots; size_t cap, used; uint64_t stamp; } capture_set;
+typedef struct PlanScratch {
+    struct PlanScratch *next;
+    offset_list uniform, deferred, pinops, capture;
+    span_list spans;
+    exec_builder exec;
+    capture_set captured;
+} PlanScratch;
+static PlatMutex plan_scratch_lock = PLAT_MUTEX_INIT;
+static PlanScratch *plan_scratch_free;
+static uint32_t plan_scratch_count;
+static uint64_t plan_scratch_bytes;
+
+static size_t plan_scratch_size(const PlanScratch *s) {
+    return sizeof *s + (s->uniform.cap + s->deferred.cap + s->pinops.cap + s->capture.cap) * sizeof(size_t) +
+           s->spans.cap * sizeof(NvnRecordSpan) + s->captured.cap * sizeof(capture_slot) +
+           s->exec.cap * sizeof(NvnExecStep) + s->exec.front_cap * sizeof(NvnFrontStep) + s->exec.state_cap;
+}
+
+static PlanScratch *plan_scratch_get(void) {
+    plat_mutex_lock(&plan_scratch_lock);
+    PlanScratch *s = plan_scratch_free;
+    if (s) {
+        plan_scratch_free = s->next;
+        plan_scratch_count--;
+        plan_scratch_bytes -= plan_scratch_size(s);
+    }
+    plat_mutex_unlock(&plan_scratch_lock);
+    if (!s && !(s = calloc(1, sizeof *s))) rt_fatal("nvn: command plan scratch allocation");
+    return s;
+}
+
+// Scratch belongs to one builder only while EndRecording runs. A bounded shared pool survives guest worker churn
+// without abandoning thread-local allocations on every exit; unusually large recordings do not permanently grow it.
+static void plan_scratch_put(PlanScratch *s) {
+    size_t bytes = plan_scratch_size(s);
+    plat_mutex_lock(&plan_scratch_lock);
+    if (plan_scratch_count < 8 && bytes <= (4u << 20)) {
+        s->next = plan_scratch_free, plan_scratch_free = s;
+        plan_scratch_count++, plan_scratch_bytes += bytes;
+        s = NULL;
+    }
+    plat_mutex_unlock(&plan_scratch_lock);
+    if (!s) return;
+    free(s->uniform.v);
+    free(s->deferred.v);
+    free(s->pinops.v);
+    free(s->capture.v);
+    free(s->spans.v);
+    free(s->exec.steps);
+    free(s->exec.front);
+    free(s->exec.state);
+    free(s->captured.slots);
+    free(s);
+}
+
+static uint64_t capture_hash(const p_bind_buf *b) {
+    uint64_t x = b->addr ^ (b->size * UINT64_C(0x9e3779b97f4a7c15));
+    x ^= ((uint64_t)(uint32_t)b->stage << 32) | (uint32_t)b->index;
+    x ^= x >> 30;
+    x *= UINT64_C(0xbf58476d1ce4e5b9);
+    x ^= x >> 27;
+    x *= UINT64_C(0x94d049bb133111eb);
+    return x ^ (x >> 31);
+}
+
+static void capture_reset(capture_set *s) {
+    s->used = 0;
+    if (!++s->stamp) {
+        if (s->cap) memset(s->slots, 0, s->cap * sizeof *s->slots);
+        s->stamp = 1;
+    }
+}
+
+// Deduplication concerns capture requests, never command execution: every original bind is still replayed. Keep
+// stage/index as well as address/size because motion reconstruction can request neighbouring blocks for some banks.
+static int capture_add(capture_set *s, const p_bind_buf *b) {
+    if (!s->cap || s->used >= s->cap / 2) {
+        if (s->cap > SIZE_MAX / 2 / sizeof *s->slots) rt_fatal("nvn: uniform capture plan too large");
+        size_t cap = s->cap ? s->cap * 2 : 128;
+        capture_slot *slots = calloc(cap, sizeof *slots);
+        if (!slots) rt_fatal("nvn: uniform capture plan allocation");
+        for (size_t i = 0; i < s->cap; i++) {
+            if (s->slots[i].stamp != s->stamp) continue;
+            size_t at = (size_t)capture_hash(&s->slots[i].binding) & (cap - 1);
+            while (slots[at].stamp == s->stamp) at = (at + 1) & (cap - 1);
+            slots[at] = s->slots[i];
+        }
+        free(s->slots);
+        s->slots = slots, s->cap = cap;
+    }
+    size_t at = (size_t)capture_hash(b) & (s->cap - 1);
+    while (s->slots[at].stamp == s->stamp) {
+        const p_bind_buf *k = &s->slots[at].binding;
+        if (k->addr == b->addr && k->size == b->size && k->stage == b->stage && k->index == b->index) return 0;
+        at = (at + 1) & (s->cap - 1);
+    }
+    s->slots[at] = (capture_slot){*b, s->stamp};
+    s->used++;
+    return 1;
+}
+
+// Isolated draws stay in ordinary spans. Only a run long enough to amortize two extra boundaries retains stride
+// metadata. The last span can be a short candidate until the next operation reveals whether that run continues.
+static void span_finish_draw(span_list *s) {
+    if (!s->n) return;
+    NvnRecordSpan *last = &s->v[s->n - 1];
+    if (!last->draw_stride || last->ops >= 4) return;
+    last->draw_stride = 0;
+    if (s->n > 1) {
+        NvnRecordSpan *prev = last - 1;
+        if (prev->kind == NVN_PLAN_RUN && !prev->draw_stride && prev->ops <= 1024 - last->ops) {
+            prev->end = last->end, prev->ops += last->ops, prev->draws += last->draws;
+            s->n--;
+        }
+    }
+}
+
+static void span_add(span_list *s, const op_hdr *h, size_t at) {
+    uint32_t kind = nvn_record_op_class(h->op);
+    uint32_t draw = h->op == OP_DRAW || h->op == OP_DRAW_IDX || h->op == OP_DRAW_IDX_IND || kind == NVN_PLAN_MESH;
+    uint32_t stride = draw && kind == NVN_PLAN_RUN ? h->size : 0;
+    if (s->n && s->v[s->n - 1].draw_stride != stride) span_finish_draw(s);
+    NvnRecordSpan *last = s->n ? &s->v[s->n - 1] : NULL;
+    // Bounded ordinary spans keep the replay's finite read-ahead limit exact. State-dependent boundaries are
+    // single-operation spans, so replay still inspects the target, mesh mode and update order at their original place.
+    if (kind == NVN_PLAN_RUN && last && last->kind == kind && last->draw_stride == stride && last->ops < 1024) {
+        last->end = at + h->size;
+        last->ops++;
+        last->draws += draw;
+        return;
+    }
+    if (s->n == s->cap) {
+        if (s->cap > SIZE_MAX / 2 / sizeof *s->v) rt_fatal("nvn: replay plan too large");
+        size_t cap = s->cap ? 2 * s->cap : 64;
+        NvnRecordSpan *v = realloc_wait(s->v, cap * sizeof *v, "command replay plan");
+        if (!v) rt_fatal("nvn: command replay plan allocation");
+        s->v = v, s->cap = cap;
+    }
+    s->v[s->n++] = (NvnRecordSpan){at, at + h->size, 1, draw, kind, stride};
+}
+
+static void offset_add(offset_list *a, size_t off) {
+    if (a->n == a->cap) {
+        size_t cap = a->cap ? 2 * a->cap : 64;
+        size_t *v = realloc_wait(a->v, cap * sizeof *v, "command resource index");
+        if (!v) rt_fatal("nvn: command resource index allocation");
+        a->v = v, a->cap = cap;
+    }
+    a->v[a->n++] = off;
+}
+
+static int op_deferred(const op_hdr *h) {
+    if (h->op != OP_BIND_TEX && h->op != OP_BIND_IMG && h->op != OP_BIND_SAMP) return 0;
+    const p_bind_handles *b = nvn_op_payload(h);
+    return b->src && b->n > 0 && b->n <= 32;
+}
+
+// Optional execution metadata has a bounded per-recording footprint. Failure discards the complete executable
+// index, leaving the validated command stream and its existing resource indexes usable by the reference walker.
+#define EXEC_PLAN_BYTES (16u << 20)
+static void exec_emit(void *user, const void *bytes, size_t n) {
+    exec_builder *b = user;
+    b->emits++;
+    if (b->failed) return;
+    if (!n || n > EXEC_PLAN_BYTES - 7 || b->bytes > EXEC_PLAN_BYTES - ((n + 7) & ~(size_t)7)) {
+        b->failed = 1;
+        return;
+    }
+    size_t padded = (n + 7) & ~(size_t)7, need = b->bytes + padded;
+    if (need > b->state_cap) {
+        size_t cap = b->state_cap ? b->state_cap : 4096;
+        while (cap < need) cap *= 2;
+        uint8_t *p = realloc(b->state, cap);
+        if (!p) { b->failed = 1; return; }
+        b->state = p, b->state_cap = cap;
+    }
+    memcpy(b->state + b->bytes, bytes, n);
+    memset(b->state + b->bytes + n, 0, padded - n);
+    b->bytes = need;
+}
+
+static void exec_build(exec_builder *b, const uint8_t *commands, size_t bytes) {
+    b->n = b->nfront = b->bytes = 0, b->failed = 0;
+    for (size_t at = 0; at < bytes && !b->failed;) {
+        const op_hdr *h = (const op_hdr *)(commands + at);
+        NvnExecStep step = {.begin = at, .end = at + h->size, .ops = 1, .opcode = h->op};
+        NvnExecStateSpan span = {0};
+        size_t state_at = b->bytes;
+        b->emits = 0;
+        if ((nvn_record_exec_flags(h->op) & NVN_EXEC_STATE_INPUT) &&
+            nvn_exec_state_compile(commands, at, bytes, exec_emit, b, &span)) {
+            if (b->failed) break;
+            if (b->emits != 1 || span.end <= at || span.end > bytes || (span.end & 7) || !span.ops ||
+                span.ops > (span.end - at) / sizeof(op_hdr))
+                rt_fatal("nvn: invalid compiled state interval");
+            step.end = span.end, step.ops = span.ops, step.opcode = NVN_EXEC_STATE;
+            step.state_offset = (uint32_t)state_at, step.state_bytes = (uint32_t)(b->bytes - state_at);
+        } else {
+            if (b->emits) rt_fatal("nvn: state compiler emitted an unsupported interval");
+            step.run = gfx_exec_prepared_handler(h->op);
+        }
+        step.flags = nvn_record_exec_flags(step.opcode);
+        if (b->bytes > EXEC_PLAN_BYTES || b->n >= (EXEC_PLAN_BYTES - b->bytes) / sizeof step) break;
+        if (b->n == b->cap) {
+            size_t cap = b->cap ? b->cap * 2 : 128;
+            if (cap > EXEC_PLAN_BYTES / sizeof step) cap = EXEC_PLAN_BYTES / sizeof step;
+            NvnExecStep *p = realloc(b->steps, cap * sizeof *p);
+            if (!p) break;
+            b->steps = p, b->cap = cap;
+        }
+        b->steps[b->n++] = step;
+        at = step.end;
+    }
+    if (b->failed || !b->n || b->steps[b->n - 1].end != bytes) b->n = b->bytes = 0, b->failed = 1;
+}
+
+static void front_build(exec_builder *b, const uint8_t *commands, size_t bytes) {
+    if (!b->n) return;
+    size_t primary_state_bytes = b->bytes;
+    for (size_t primary = 0; primary < b->n;) {
+        const NvnExecStep *first = &b->steps[primary];
+        if (first->opcode != NVN_EXEC_STATE && !(first->flags & NVN_EXEC_STATE_INPUT)) {
+            // Pure draw sequences already have structural runs. Summaries begin at state and consume complete
+            // primary steps, reusing their already-folded deltas instead of decoding the source state again.
+            primary++;
+            continue;
+        }
+        size_t at = first->begin;
+        size_t state_at = b->bytes;
+        b->emits = 0, b->failed = 0;
+        NvnExecFrontComposeSpan span = {0};
+        // Appending the summary can reallocate b->state. The composer finishes its reads before invoking exec_emit;
+        // every invocation receives the current pointer, with a bound that excludes previously appended summaries.
+        if (nvn_exec_front_compose(commands, bytes, b->steps, b->n, b->state, primary_state_bytes,
+                                    primary, exec_emit, b, &span)) {
+            if (!b->failed && (b->emits != 1 || span.end <= at || span.end > bytes || (span.end & 7) ||
+                span.end_step <= primary || span.end_step > b->n ||
+                span.end != b->steps[span.end_step - 1].end ||
+                span.draws < 2 || span.draws > 16 || span.ops < span.draws + 2 || span.ops > 1024 ||
+                span.ops > (span.end - at) / sizeof(op_hdr)))
+                rt_fatal("nvn: invalid front-pass summary interval");
+            size_t used = b->n * sizeof(NvnExecStep) + b->bytes;
+            if (b->failed || used > EXEC_PLAN_BYTES || b->nfront >= (EXEC_PLAN_BYTES - used) / sizeof(NvnFrontStep)) {
+                b->bytes = state_at;
+                b->failed = 1;
+                break;
+            }
+            if (b->nfront == b->front_cap) {
+                size_t cap = b->front_cap ? b->front_cap * 2 : 64;
+                NvnFrontStep *p = realloc(b->front, cap * sizeof *p);
+                if (!p) { b->bytes = state_at; b->failed = 1; break; }
+                b->front = p, b->front_cap = cap;
+            }
+            b->front[b->nfront++] = (NvnFrontStep){at, span.end, span.ops, span.draws,
+                                                  (uint32_t)state_at, (uint32_t)(b->bytes - state_at)};
+            primary = span.end_step;
+        } else {
+            if (b->emits) rt_fatal("nvn: front composer emitted an unsupported interval");
+            primary++;
+        }
+    }
+}
+
+static void copy_exec_check(const copy_prefix *pf) {
+    if (!pf->nexec) {
+        if (pf->state_bytes) rt_fatal("nvn: execution state has no index");
+        return;
+    }
+    const uint8_t *commands = (const uint8_t *)(pf + 1);
+    const NvnRecordSpan *spans = (const NvnRecordSpan *)(copy_offsets(pf) + pf->nuniform + pf->ndeferred +
+                                                       pf->npinops + pf->ncapture);
+    const NvnExecStep *steps = (const NvnExecStep *)(spans + pf->nspans);
+    size_t at = 0, state_end = 0;
+    for (size_t i = 0; i < pf->nexec; i++) {
+        const NvnExecStep *s = &steps[i];
+        if (s->begin != at || s->end <= at || s->end > pf->bytes || !s->ops)
+            rt_fatal("nvn: execution plan coverage mismatch");
+        if (s->flags != nvn_record_exec_flags(s->opcode) || s->reserved)
+            rt_fatal("nvn: execution classification mismatch");
+        if (s->opcode == NVN_EXEC_STATE) {
+            if (s->run || s->state_offset != state_end || !s->state_bytes || (s->state_bytes & 7) ||
+                s->state_bytes > pf->state_bytes - state_end)
+                rt_fatal("nvn: execution state storage mismatch");
+            state_end += s->state_bytes;
+        } else if (s->ops != 1 || s->state_bytes || s->state_offset ||
+                   ((const op_hdr *)(commands + at))->op != s->opcode)
+            rt_fatal("nvn: execution operation mismatch");
+        uint32_t ops = 0;
+        while (at < s->end) {
+            const op_hdr *h = (const op_hdr *)(commands + at);
+            // Compiled state cannot cross a draw or any action that can observe intermediate state or guest bytes.
+            if (s->opcode == NVN_EXEC_STATE && (nvn_record_op_class(h->op) != NVN_PLAN_RUN ||
+                h->op == OP_DRAW || h->op == OP_DRAW_IDX || h->op == OP_DRAW_IDX_IND ||
+                h->op == OP_REPORT_COUNTER || h->op == OP_RESET_COUNTER || h->op == OP_RENDER_ENABLE ||
+                h->op == OP_RENDER_COND || h->op == OP_SET_TEX_POOL || h->op == OP_SET_SAMP_POOL))
+                rt_fatal("nvn: compiled state crosses an ordered operation");
+            at += h->size, ops++;
+        }
+        if (at != s->end || ops != s->ops) rt_fatal("nvn: execution operation count mismatch");
+    }
+    if (at != pf->bytes) rt_fatal("nvn: execution plan incomplete");
+    const NvnFrontStep *front = (const NvnFrontStep *)(steps + pf->nexec);
+    size_t front_end = 0;
+    for (size_t i = 0; i < pf->nfront; i++) {
+        const NvnFrontStep *s = &front[i];
+        if (s->begin < front_end || s->end <= s->begin || s->end > pf->bytes ||
+            s->state_offset != state_end || !s->state_bytes || (s->state_bytes & 7) ||
+            s->state_bytes > pf->state_bytes - state_end)
+            rt_fatal("nvn: front summary storage mismatch");
+        uint32_t ops = 0, draws = 0;
+        at = s->begin;
+        while (at < s->end) {
+            const op_hdr *h = (const op_hdr *)(commands + at);
+            if (nvn_record_op_class(h->op) != NVN_PLAN_RUN || h->op == OP_REPORT_COUNTER ||
+                h->op == OP_RESET_COUNTER || h->op == OP_RENDER_ENABLE || h->op == OP_RENDER_COND ||
+                h->op == OP_SET_TEX_POOL || h->op == OP_SET_SAMP_POOL)
+                rt_fatal("nvn: front summary crosses an ordered operation");
+            draws += (nvn_record_exec_flags(h->op) & NVN_EXEC_DRAW) != 0;
+            at += h->size, ops++;
+        }
+        if (at != s->end || ops != s->ops || draws != s->draws || draws < 2 || draws > 16)
+            rt_fatal("nvn: front summary operation count mismatch");
+        state_end += s->state_bytes, front_end = s->end;
+    }
+    if (state_end != pf->state_bytes) rt_fatal("nvn: execution state storage incomplete");
+}
+
+static int capture_compare(const void *aa, const void *bb) {
+    const p_bind_buf *a = aa, *b = bb;
+    if (a->addr != b->addr) return a->addr < b->addr ? -1 : 1;
+    if (a->size != b->size) return a->size < b->size ? -1 : 1;
+    if (a->stage != b->stage) return a->stage < b->stage ? -1 : 1;
+    return a->index < b->index ? -1 : a->index > b->index;
+}
+
+static void copy_plan_check(const copy_prefix *pf) {
+    copy_exec_check(pf);
+    const uint8_t *cmd = (const uint8_t *)(pf + 1);
+    const size_t *off = copy_offsets(pf), *capture = off + pf->nuniform + pf->ndeferred + pf->npinops;
+    const NvnRecordSpan *spans = (const NvnRecordSpan *)(capture + pf->ncapture);
+    size_t at = 0;
+    for (size_t i = 0; i < pf->nspans; i++) {
+        const NvnRecordSpan *s = &spans[i];
+        if (s->begin != at || s->end <= at || s->end > pf->bytes || s->kind > NVN_PLAN_UPDATE)
+            rt_fatal("nvn: replay plan coverage mismatch");
+        uint32_t ops = 0, draws = 0;
+        while (at < s->end) {
+            const op_hdr *h = (const op_hdr *)(cmd + at);
+            if (nvn_record_op_class(h->op) != s->kind) rt_fatal("nvn: replay plan operation mismatch");
+            if (s->draw_stride && (h->size != s->draw_stride ||
+                (h->op != OP_DRAW && h->op != OP_DRAW_IDX && h->op != OP_DRAW_IDX_IND)))
+                rt_fatal("nvn: replay plan draw stride mismatch");
+            ops++;
+            draws += h->op == OP_DRAW || h->op == OP_DRAW_IDX || h->op == OP_DRAW_IDX_IND ||
+                     h->op == OP_DRAW_MESH || h->op == OP_DRAW_MESH_IND;
+            at += h->size;
+        }
+        if (at != s->end || ops != s->ops || draws != s->draws || (s->kind != NVN_PLAN_RUN && ops != 1))
+            rt_fatal("nvn: replay plan count mismatch");
+        if (s->draw_stride && (ops != draws || ops < 4)) rt_fatal("nvn: replay plan draw run mismatch");
+    }
+    if (at != pf->bytes) rt_fatal("nvn: replay plan missing command bytes");
+    // The producer deduplicates with a hash table. The oracle instead sorts complete binding values, then compares
+    // the unique reference set with the plan's set. Both read the finished copy, including a submission clone.
+    if (!pf->nuniform) {
+        if (pf->ncapture) rt_fatal("nvn: capture plan has unexpected bindings");
+        return;
+    }
+    if (!pf->ncapture || pf->ncapture > pf->nuniform) rt_fatal("nvn: capture plan count mismatch");
+    p_bind_buf *ref = malloc(pf->nuniform * sizeof *ref), *got = malloc(pf->ncapture * sizeof *got);
+    if (!ref || !got) rt_fatal("nvn: capture plan check allocation");
+    for (size_t i = 0; i < pf->nuniform; i++) ref[i] = *(const p_bind_buf *)(cmd + off[i] + sizeof(op_hdr));
+    for (size_t i = 0; i < pf->ncapture; i++) {
+        if (capture[i] > pf->bytes - sizeof(op_hdr) - sizeof(p_bind_buf) ||
+            ((const op_hdr *)(cmd + capture[i]))->op != OP_BIND_UBO)
+            rt_fatal("nvn: capture plan binding offset mismatch");
+        got[i] = *(const p_bind_buf *)(cmd + capture[i] + sizeof(op_hdr));
+    }
+    qsort(ref, pf->nuniform, sizeof *ref, capture_compare);
+    qsort(got, pf->ncapture, sizeof *got, capture_compare);
+    size_t nref = 0;
+    for (size_t i = 0; i < pf->nuniform; i++)
+        if (!nref || capture_compare(&ref[nref - 1], &ref[i])) ref[nref++] = ref[i];
+    if (nref != pf->ncapture) rt_fatal("nvn: capture plan unique count mismatch");
+    for (size_t i = 0; i < nref; i++)
+        if (capture_compare(&ref[i], &got[i])) rt_fatal("nvn: capture plan binding mismatch");
+    free(got);
+    free(ref);
+}
+
+// Check the finished copy, including its copied tail. This also checks clones independently of the builder's scratch
+// storage. Only check mode walks all commands again; normal preparation consumes the compact indexes and plans.
+static void copy_index_check(const copy_prefix *pf) {
+    if (!pf->indexed || resource_prep_mode() != 2) return;
+    const uint8_t *cmd = (const uint8_t *)(pf + 1);
+    const size_t *u = copy_offsets(pf), *d = u + pf->nuniform, *p = d + pf->ndeferred;
+    size_t nu = 0, nd = 0, np = 0;
+    for (const op_hdr *h = (const op_hdr *)cmd; h->op != OP_END; h = nvn_op_next(h)) {
+        size_t off = (const uint8_t *)h - cmd;
+        if (h->op == OP_BIND_UBO && (nu >= pf->nuniform || u[nu++] != off))
+            rt_fatal("nvn: uniform command index mismatch");
+        if (op_deferred(h) && (nd >= pf->ndeferred || d[nd++] != off))
+            rt_fatal("nvn: deferred command index mismatch");
+        if (h->op < 64 && (PIN_OPS >> h->op & 1) && (np >= pf->npinops || p[np++] != off))
+            rt_fatal("nvn: texture pin command index mismatch");
+    }
+    if (nu != pf->nuniform || nd != pf->ndeferred || np != pf->npinops)
+        rt_fatal("nvn: command resource index count mismatch");
+    copy_plan_check(pf);
+}
+
+#include "nvn_parent_plan.h"
+
+// Validate newly recorded bytes and build their indexes. Child interiors have already passed this exact walk.
+static inline uint64_t index_range(const uint8_t *p, size_t n, size_t at, size_t end, int indexed,
+                                   offset_list *uniform, offset_list *deferred, offset_list *pinops,
+                                   offset_list *capture, capture_set *captured, span_list *spans) {
     uint64_t pins_named = 0;
-    for (size_t at = 0;;) {   // the records stay checked: a corrupt one stops here, not in the replay
+    while (at < end) {
+        if (end - at < sizeof(op_hdr)) rt_fatal("nvn: recording has no complete end record");
         op_hdr h;
         memcpy(&h, p + at, sizeof h);
-        if (h.size < 8 || (h.size & 7) || h.op >= OP_COUNT_ || h.op == OP_JUMP || h.op == OP_CALL || at + h.size > n ||
+        if (h.size < 8 || (h.size & 7) || h.op >= OP_COUNT_ || h.op == OP_JUMP || h.op == OP_CALL || h.size > end - at ||
             (!at && h.op != OP_BEGIN))
             rt_fatal("nvn: corrupt recording at %p (op %u size %u)", (const void *)(p + at), h.op, h.size);
         const tex_t *pinned[9];
-        int k = PIN_OPS >> h.op & 1 ? op_pins(h.op, out + sizeof(copy_prefix) + at + 8, pinned) : 0;
+        int pinop = h.op < 64 && (PIN_OPS >> h.op & 1);
+        int k = pinop ? op_pins(h.op, p + at + 8, pinned) : 0;
         for (int i = 0; i < k; i++) pin_ref(pinned[i], 1, 0);
         pins_named += (uint64_t)k;
+        if (indexed) {
+            if (h.op == OP_BIND_UBO) {
+                if (h.size < sizeof(op_hdr) + sizeof(p_bind_buf)) rt_fatal("nvn: truncated uniform binding");
+                offset_add(uniform, at);
+                if (capture_add(captured, (const p_bind_buf *)(p + at + sizeof(op_hdr)))) offset_add(capture, at);
+            }
+            if (op_deferred((const op_hdr *)(p + at))) offset_add(deferred, at);
+            if (pinop) offset_add(pinops, at);
+            span_add(spans, &h, at);
+        }
         at += h.size;
         if (h.op == OP_END) {
             if (at != n) rt_fatal("nvn: recording at %p ends at %zu of %zu bytes", (const void *)p, at, n);
-            break;
+            return pins_named;
         }
     }
-    *(copy_prefix *)out = (copy_prefix){.magic = COPY_MAGIC, .bytes = n, .pins = pins_named};
-    return out + sizeof(copy_prefix);
+    if (end == n) rt_fatal("nvn: recording has no complete end record");
+    return pins_named;
+}
+
+// The recording and its resource metadata share one allocation. The validation walk already required at EndRecording
+// produces offsets into the copied bytes; submit, snapshot gathering and pin retirement need not scan unrelated ops.
+// Scratch lists retain their capacity in a bounded builder pool. Command bytes are still copied only once.
+static uint8_t *flatten_planned(const uint8_t *p, size_t n, parent_plan *parent) {
+    int indexed = resource_prep_mode() != 0;
+    PlanScratch *scratch = indexed ? plan_scratch_get() : NULL;
+    offset_list uniform = scratch ? scratch->uniform : (offset_list){0};
+    offset_list deferred = scratch ? scratch->deferred : (offset_list){0};
+    offset_list pinops = scratch ? scratch->pinops : (offset_list){0};
+    offset_list capture = scratch ? scratch->capture : (offset_list){0};
+    span_list spans = scratch ? scratch->spans : (span_list){0};
+    capture_set captured = scratch ? scratch->captured : (capture_set){0};
+    exec_builder executable = scratch ? scratch->exec : (exec_builder){0};
+    uniform.n = deferred.n = pinops.n = capture.n = spans.n = 0;
+    if (indexed) capture_reset(&captured);
+    uint64_t pins_named = 0;
+    int selected = indexed && parent;
+    size_t cursor = 0;
+    if (selected) {
+        for (size_t i = 0; i < parent->eligible; i++) {
+            const plan_piece *part = &parent->interior[i];
+            pins_named += index_range(p, n, cursor, part->first + part->delta, indexed, &uniform, &deferred,
+                                      &pinops, &capture, &captured, &spans);
+            pins_named += import_resources(part, p, &uniform, &deferred, &pinops, &capture, &captured, &spans);
+            cursor = part->end + part->delta;
+        }
+    }
+    pins_named += index_range(p, n, cursor, n, indexed, &uniform, &deferred, &pinops, &capture, &captured, &spans);
+    int imported = selected && parent_plan_build(parent, p, n);
+    // The rare invalid relocation retries only the executable metadata; pin references were already acquired.
+build_metadata:
+    if (indexed && !imported) exec_build(&executable, p, n), front_build(&executable, p, n);
+    size_t ne = imported ? parent->n : executable.n;
+    size_t nf = imported ? parent->nf : executable.nfront;
+    size_t ns = imported ? parent->bytes : executable.bytes;
+    size_t ni = uniform.n + deferred.n + pinops.n + capture.n;
+    if (n > SIZE_MAX - sizeof(copy_prefix)) rt_fatal("nvn: command copy too large");
+    if (ni > (SIZE_MAX - sizeof(copy_prefix) - n) / sizeof(size_t)) rt_fatal("nvn: command resource index too large");
+    size_t bytes = sizeof(copy_prefix) + n + ni * sizeof(size_t);
+    if (spans.n > (SIZE_MAX - bytes) / sizeof(NvnRecordSpan)) rt_fatal("nvn: command replay plan too large");
+    bytes += spans.n * sizeof(NvnRecordSpan);
+    if (ne > (SIZE_MAX - bytes) / sizeof(NvnExecStep)) rt_fatal("nvn: execution plan too large");
+    bytes += ne * sizeof(NvnExecStep);
+    if (nf > (SIZE_MAX - bytes) / sizeof(NvnFrontStep)) rt_fatal("nvn: front summary too large");
+    bytes += nf * sizeof(NvnFrontStep);
+    if (ns > SIZE_MAX - bytes) rt_fatal("nvn: execution state too large");
+    bytes += ns;
+    copy_prefix *pf = realloc_wait(NULL, bytes, "command copy");
+    if (!pf) rt_fatal("nvn: command copy allocation");
+    *pf = (copy_prefix){.magic = COPY_MAGIC, .bytes = n, .pins = pins_named, .indexed = (uint32_t)indexed,
+                       .plan_complete = imported || (indexed && !executable.failed && ne),
+                       .deferred = indexed ? (deferred.n ? 2 : 1) : 0,
+                       .nuniform = uniform.n, .ndeferred = deferred.n, .npinops = pinops.n,
+                       .ncapture = capture.n, .nspans = spans.n, .nexec = ne,
+                       .nfront = nf, .state_bytes = ns};
+    memcpy(pf + 1, p, n);
+    size_t *off = (size_t *)((uint8_t *)(pf + 1) + n);
+    if (uniform.n) memcpy(off, uniform.v, uniform.n * sizeof *off);
+    if (deferred.n) memcpy(off + uniform.n, deferred.v, deferred.n * sizeof *off);
+    if (pinops.n) memcpy(off + uniform.n + deferred.n, pinops.v, pinops.n * sizeof *off);
+    if (capture.n) memcpy(off + uniform.n + deferred.n + pinops.n, capture.v, capture.n * sizeof *off);
+    if (spans.n) memcpy(off + ni, spans.v, spans.n * sizeof *spans.v);
+    NvnExecStep *steps = (NvnExecStep *)((NvnRecordSpan *)(off + ni) + spans.n);
+    if (imported) {
+        if (!parent_plan_write(parent, steps)) {
+            free(pf);
+            imported = 0;
+            goto build_metadata;
+        }
+    } else {
+        if (ne) memcpy(steps, executable.steps, ne * sizeof *steps);
+        NvnFrontStep *front = (NvnFrontStep *)(steps + ne);
+        if (nf) memcpy(front, executable.front, nf * sizeof *front);
+        if (ns) memcpy(front + nf, executable.state, ns);
+    }
+    copy_index_check(pf);
+    if (scratch) {
+        scratch->uniform = uniform, scratch->deferred = deferred, scratch->pinops = pinops, scratch->capture = capture;
+        scratch->spans = spans, scratch->captured = captured;
+        scratch->exec = executable;
+        plan_scratch_put(scratch);
+    }
+    return (uint8_t *)(pf + 1);
+}
+
+static uint8_t *flatten_recording(const uint8_t *p, size_t n) { return flatten_planned(p, n, NULL); }
+
+static __attribute__((noinline)) uint8_t *flatten_parent(cmd_t *o, size_t n) {
+    parent_plan plan = {0};
+    int eligible = parent_plan_select(&plan, n);
+    uint8_t *copy = eligible ? flatten_planned(o->seg, n, &plan) : flatten_recording(o->seg, n);
+    parent_plan_release(&plan);
+    return copy;
+}
+
+static uint8_t *finish_copy(cmd_t *o) {
+    size_t n = (size_t)(o->cur - o->seg);
+    if (n >= PLAN_PARENT_MIN && o->plan_cookie && o->plan_cookie == recording_hints.cookie &&
+        recording_hints.owner == o) return flatten_parent(o, n);
+    return flatten_recording(o->seg, n);
 }
 
 static void copy_add(uintptr_t lo, uintptr_t hi, uint8_t *copy) {
@@ -530,7 +1156,7 @@ static void copy_add(uintptr_t lo, uintptr_t hi, uint8_t *copy) {
     uint64_t handle = (uintptr_t)copy;
     uintptr_t page = lo >> COPY_PAGE_SHIFT;
     plat_mutex_lock(&copy_lock);
-    pf->made_at = nsubmits;
+    pf->made_at = copies_made + 1;  // distinguish recordings even when the allocator recycles a handle
     copy_bucket *b = nvn_hm_get(&copy_pages, &page);
     if (!b) {
         b = calloc(1, sizeof *b);
@@ -544,8 +1170,9 @@ static void copy_add(uintptr_t lo, uintptr_t hi, uint8_t *copy) {
     }
     b->v[b->n++] = (cmd_copy){lo, hi, copy};
     nvn_hm_put(&copy_live, &handle, pf);
+    if (pf->indexed) nvn_hm_put(&copy_indexed, &handle, pf);
     ncopies++;
-    copy_bytes += pf->bytes;
+    copy_bytes += copy_size(pf);
     if (++copies_made % 20000 == 0)
         NVN_LOG("recording copies: %llu made, %llu live, %.1f MiB, submit %llu", (unsigned long long)copies_made,
                 (unsigned long long)ncopies, copy_bytes / 1048576.0, (unsigned long long)nsubmits);
@@ -569,9 +1196,9 @@ static void release_copies(uintptr_t lo, uintptr_t hi) {
             copy_prefix *pf = (copy_prefix *)k->copy - 1;
             nvn_hm_del(&copy_live, &handle);
             ncopies--;
-            copy_bytes -= pf->bytes;
+            copy_bytes -= copy_size(pf);
             pf->magic = 0;
-            if (pf->used_at > replayed) zombie_add(pf);   // a queued submission still reads it
+            if (pf->plan_readers || pf->used_at > replayed) zombie_add(pf);
             else doomed = doom(doomed, pf);
             b->v[i] = b->v[--b->n];
         }
@@ -662,7 +1289,7 @@ NVN_API(nvnCommandBufferBeginRecording) {
     if (o->recording) rt_log("nvn: BeginRecording on command buffer %p while it records", (void *)o);
     o->recording = 1;
     o->cur = o->seg;   // the previous recording was copied at EndRecording
-    o->rec_start = o->cmd_used;
+    o->plan_cookie = 0;
     put_hdr(cmd_alloc(o, 8), OP_BEGIN, 8);
     o->hw_used -= 8;   // BEGIN and END have no hardware equivalent
     o->hw_start = o->hw_used;
@@ -676,7 +1303,7 @@ NVN_API(nvnCommandBufferEndRecording) {
     put_hdr(cmd_alloc(o, 8), OP_END, 8);
     o->hw_used -= 8;
     o->recording = 0;
-    uint8_t *copy = flatten_recording(o->seg, (size_t)(o->cur - o->seg));
+    uint8_t *copy = finish_copy(o);
     // Finalizing the recorder does not retire its handle; only reusing the control memory it was recorded in does.
     uintptr_t lo = (uintptr_t)o->ctl + (o->ctl_used < o->ctl_size ? o->ctl_used : 0);
     uintptr_t hi = o->ctl ? lo + 1 : 0;
@@ -693,11 +1320,14 @@ NVN_API(nvnCommandBufferIsRecording) { ret_x(c, cmd_of(c)->recording != 0); }
 // bytes as record by record.
 static void inline_recording(cmd_t *o, uint64_t handle, const char *what) {
     if (!handle) rt_fatal("nvn: %s with a null handle", what);
-    uint64_t bytes = copy_touch(handle, __atomic_load_n(&nsubmits, __ATOMIC_RELAXED), what);
+    copy_prefix *reader;
+    uint64_t bytes = copy_touch_id(handle, __atomic_load_n(&nsubmits, __ATOMIC_RELAXED), what, &reader);
     if (bytes <= 16) return;
     size_t body = (size_t)bytes - 16;
     cmd_reserve(o, body);
+    if (reader) plan_note_child(o, handle, reader->made_at, body);
     memcpy(o->cur, (const uint8_t *)(uintptr_t)handle + 8, body);
+    if (reader) plan_drop_readers(&reader, 1);
     o->cur += body;
     o->cmd_used += body;
     o->hw_used += body;
@@ -1215,6 +1845,18 @@ NVN_API(nvnCommandBufferSetPatchSize) { (void)c; }
 // as the submit returns). The result is written into the recording copy.
 static uint64_t def_reads, def_changed, n_clones;
 
+static void resolve_handles(p_bind_handles *b) {
+    uint64_t cur[32];
+    memcpy(cur, (const void *)(uintptr_t)b->src, 8 * (size_t)b->n);
+    __atomic_fetch_add(&def_reads, 1, __ATOMIC_RELAXED);
+    if (memcmp(cur, b->h, 8 * (size_t)b->n)) {
+        if (__atomic_fetch_add(&def_changed, 1, __ATOMIC_RELAXED) < 6)
+            NVN_LOG("deferred bind read new handles at submit: stage %d slot %d, %#llx at record -> %#llx",
+                    b->stage, b->first, (unsigned long long)b->h[0], (unsigned long long)cur[0]);
+        memcpy(b->h, cur, 8 * (size_t)b->n);
+    }
+}
+
 static int resolve_deferred(const uint8_t *p, int depth) {   // returns the number of deferred binds
     int nd = 0;
     for (;;) {
@@ -1237,25 +1879,33 @@ static int resolve_deferred(const uint8_t *p, int depth) {   // returns the numb
             p_bind_handles *b = (p_bind_handles *)(uintptr_t)(p + 8);
             if (b->src && b->n > 0 && b->n <= 32) {
                 nd++;
-                uint64_t cur[32];
-                memcpy(cur, (const void *)(uintptr_t)b->src, 8 * (size_t)b->n);
-                __atomic_fetch_add(&def_reads, 1, __ATOMIC_RELAXED);
-                if (memcmp(cur, b->h, 8 * (size_t)b->n)) {
-                    if (__atomic_fetch_add(&def_changed, 1, __ATOMIC_RELAXED) < 6)
-                        NVN_LOG("deferred bind read new handles at submit: stage %d slot %d, %#llx at record -> %#llx",
-                                b->stage, b->first, (unsigned long long)b->h[0], (unsigned long long)cur[0]);
-                    memcpy(b->h, cur, 8 * (size_t)b->n);
-                }
+                resolve_handles(b);
             }
         }
         p += h.size;
     }
 }
 
+static void copy_resolve_deferred(copy_prefix *pf) {
+    if (!pf->indexed) {
+        int nd = resolve_deferred((const uint8_t *)(pf + 1), 0);
+        pf->deferred = nd ? 2 : 1;
+        return;
+    }
+    copy_index_check(pf);
+    const size_t *off = copy_offsets(pf) + pf->nuniform;
+    for (size_t i = 0; i < pf->ndeferred; i++) {
+        p_bind_handles *b = (p_bind_handles *)((uint8_t *)(pf + 1) + off[i] + sizeof(op_hdr));
+        resolve_handles(b);
+    }
+}
+
 void nvn_submit_prepare(const uint64_t *handles, int n) {
+    RP_SCOPE(rp_front_prepare, RP_FRONT_PREPARE);
+    RP_VALUE(RPK_HANDLES, n);
     uint64_t now = __atomic_add_fetch(&nsubmits, 1, __ATOMIC_RELAXED);
     for (int i = 0; i < n; i++) copy_touch(handles[i], now, "QueueSubmitCommands");
-    for (int i = 0; i < n; i++) resolve_deferred((const uint8_t *)(uintptr_t)handles[i], 0);
+    for (int i = 0; i < n; i++) copy_resolve_deferred((copy_prefix *)(uintptr_t)handles[i] - 1);
 }
 
 // Asynchronous replay. A copy a queued submission still reads keeps that submission's deferred binds: when it holds
@@ -1275,15 +1925,17 @@ void nvn_submit_prepare_async(const uint64_t *handles, uint64_t *out, int n) {
         }
         out[i] = handles[i];
         if (pf->used_at > replayed && pf->used_at != now && pf->deferred != 1) {
-            size_t sz = sizeof *pf + pf->bytes;
+            size_t sz = copy_size(pf);
             copy_prefix *cl = malloc(sz);
             if (!cl) rt_fatal("nvn: out of memory (recording clone, %zu bytes)", sz);
             memcpy(cl, pf, sz);
-            if (cl->pins) pin_refs((const uint8_t *)(cl + 1), 1);
+            cl->plan_readers = 0;
+            if (cl->pins) copy_pin_refs(cl, 1);
             cl->magic = 0;   // not a live handle: the game never sees it
             cl->used_at = now;
             zombie_add(cl);
             out[i] = (uintptr_t)(cl + 1);
+            if (cl->indexed) nvn_hm_put(&copy_indexed, &out[i], cl);
             __atomic_fetch_add(&n_clones, 1, __ATOMIC_RELAXED);
         } else {
             pf->used_at = now;
@@ -1291,10 +1943,7 @@ void nvn_submit_prepare_async(const uint64_t *handles, uint64_t *out, int n) {
     }
     plat_mutex_unlock(&copy_lock);
     doom_free(doomed);
-    for (int i = 0; i < n; i++) {
-        int nd = resolve_deferred((const uint8_t *)(uintptr_t)out[i], 0);
-        if (out[i] == handles[i]) ((copy_prefix *)(uintptr_t)out[i] - 1)->deferred = nd ? 2 : 1;
-    }
+    for (int i = 0; i < n; i++) copy_resolve_deferred((copy_prefix *)(uintptr_t)out[i] - 1);
     if (now % 7200 == 0)
         rt_log("nvn: asynchronous replay at submit %llu: %llu recording clones so far, %u copies waiting for the replay",
                (unsigned long long)now, (unsigned long long)__atomic_load_n(&n_clones, __ATOMIC_RELAXED), nzombies);
@@ -1321,7 +1970,7 @@ const char *nvn_op_name(uint32_t op) {
 void nvn_cmd_sizes(PerfSizes *s) {
     plat_mutex_lock_shared(&copy_lock);
     uint64_t nc = ncopies, cb = copy_bytes, nz = nzombies, zb = 0;
-    for (uint32_t i = 0; i < nzombies; i++) zb += zombies[i]->bytes;
+    for (uint32_t i = 0; i < nzombies; i++) zb += copy_size(zombies[i]);
     plat_mutex_unlock_shared(&copy_lock);
     plat_mutex_lock(&pin_lock);
     uint64_t pins = pins_live, pq = pin_qn - pin_qh;
@@ -1335,4 +1984,8 @@ void nvn_cmd_sizes(PerfSizes *s) {
     perf_size(s, "texture pins", pins, 0, PERF_SIZE_NONE);
     perf_size(s, "pin sweep queue", pq, 0, PERF_SIZE_NONE);
     perf_size(s, "recording-buffer pool", np, POOL_SLOTS, pb);
+    plat_mutex_lock(&plan_scratch_lock);
+    uint64_t plan_count = plan_scratch_count, plan_bytes = plan_scratch_bytes;
+    plat_mutex_unlock(&plan_scratch_lock);
+    perf_size(s, "command plan scratch pool", plan_count, 8, plan_bytes);
 }

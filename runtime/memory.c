@@ -15,6 +15,8 @@
 #include "host.h"
 #include "layout.h"
 #include "mem_need.h"
+#include "mem_mapping.h"
+#include "mem_file_read.h"
 #include "platform/platform.h"
 
 #define PAGE 0x1000ull
@@ -67,13 +69,38 @@ static int reserve_at(uint64_t at, uint64_t size, int watch) { return plat_mem_r
 // A 2 MiB region of the watched reservations that nothing wrote for a while can be made read-only (mem_freeze), so the
 // back end's write-watch queries skip it: no page of a frozen region changes before a thaw. The first write faults and
 // thaw_handler makes the region writable again before the write retries. A kernel write into guest memory (a file
-// read) fails on a read-only page instead of faulting, so file reads thaw their buffer first (mem_thaw), and so does
-// every commit, decommit and protection change here. A region stays thawed for FRZ_HOLD_MS after a mem_thaw: a file
-// read still in flight writes its buffer later. frz_lock is a leaf lock: nothing writes guest memory under it.
+// read) fails on a read-only page instead of faulting. mem_file_read_at keeps the buffer thawed for the entire read.
+// Commits, decommits and protection changes also thaw their regions first. FRZ_HOLD_MS avoids repeated protection
+// changes on buffers accessed in close succession. frz_lock is a leaf lock: nothing writes guest memory under it.
 #define FRZ_SHIFT 21
 #define FRZ_SIZE (1ull << FRZ_SHIFT)
 #define FRZ_HOLD_MS 5000u
 static volatile uint8_t frz[RT_ADDRESS_LIMIT >> FRZ_SHIFT];
+static ResourceEvents protection_events;
+static uint64_t protection_regions[RT_ADDRESS_LIMIT >> FRZ_SHIFT];
+static MemMapping protection = {protection_regions, 2, RT_ADDRESS_LIMIT >> FRZ_SHIFT, FRZ_SHIFT, 0,
+                                &protection_events};
+
+// Only frz_lock's owner publishes. Begin precedes any writable transition; completion follows the final state.
+static void protection_publish(uint64_t region, int busy) {
+    mem_mapping_publish(&protection, region << FRZ_SHIFT, FRZ_SIZE, busy);
+}
+
+uint64_t mem_protection_serial(void) { return mem_mapping_clock(&protection); }
+uint64_t mem_protection_region(uint32_t region) { return mem_mapping_version(&protection, region); }
+int mem_protection_range_unchanged(uint64_t addr, uint64_t size, uint64_t observed) {
+    return mem_mapping_unchanged(&protection, addr, size, observed);
+}
+int mem_protection_events(uint64_t *cursor, ResourceEventVisit visit, void *user) {
+    return resource_events_read(&protection_events, cursor, visit, user) && mem_protection_serial() != 0;
+}
+int mem_frozen_stable(uint64_t addr) {
+    if (addr >= RT_ADDRESS_LIMIT) return 0;
+    uint32_t region = (uint32_t)(addr >> FRZ_SHIFT);
+    uint64_t before = mem_protection_region(region);
+    return before && __atomic_load_n(&frz[region], __ATOMIC_ACQUIRE) == 1 &&
+           mem_protection_region(region) == before;
+}
 static uint32_t thaw_ms[RT_ADDRESS_LIMIT >> FRZ_SHIFT];   // frz_lock: GetTickCount of the last thaw request, 0 never
 // Hot regions. A region a write thaws soon after its freeze is one the game keeps writing (the buffers its loaders
 // stream an area into): frozen again as soon as it was idle a moment, it was thawed again moments later. Running
@@ -358,11 +385,27 @@ static int lazy_covered_locked(uint64_t lo, uint64_t hi) {
 // CPU wrote into the range after its write-back reached guest memory and before this arm, and the next sync of the
 // mirror carries that write up; a fetch before it would have copied the mirror's older bytes over it (single frames
 // with another frame's lighting constants, or a black scene).
-static int lazy_protect_locked(uint64_t x, uint64_t e, void *ctx) {
+static int lazy_protect_locked(uint64_t x, uint64_t e, void *ctx, uint64_t arm_end, uint64_t *rw_end) {
     uint64_t run[16][2];
     int k = 0;
     for (uint64_t a = x, b; a < e; a = b) {
-        int st = plat_mem_state(a, e, &b);
+        int st;
+#ifdef _WIN32
+        // VirtualQuery returns the entire homogeneous run. Keep only its as-yet untouched RW suffix as this arm
+        // moves forward under frz_lock. Each protection change and rollback is confined to [x,e).
+        if (a < *rw_end) {
+            b = *rw_end;
+            st = PLAT_PROT_RW;
+        } else {
+            st = plat_mem_state(a, arm_end, &b);
+            if (st == PLAT_PROT_RW) *rw_end = b;
+        }
+        if (b > e) b = e;
+#else
+        (void)arm_end;
+        (void)rw_end;
+        st = plat_mem_state(a, e, &b);
+#endif
         if (st == PLAT_PROT_RW) {
             if (k == 16) return 0;
             run[k][0] = a, run[k][1] = b, k++;
@@ -400,6 +443,7 @@ uint64_t mem_lazy_arm(uint64_t a, uint64_t n, uint64_t h0, uint64_t h1, uint64_t
         return 0;
     }
     uint32_t now = (uint32_t)plat_now_ms();
+    uint64_t rw_end = lo;
     for (uint64_t x = lo, e; x < hi; x = e) {
         uint64_t r = x >> FRZ_SHIFT;
         e = (r + 1) << FRZ_SHIFT;
@@ -421,7 +465,7 @@ uint64_t mem_lazy_arm(uint64_t a, uint64_t n, uint64_t h0, uint64_t h1, uint64_t
         }
         int no = frz[r] ? LZ_NO_FROZEN : prb[r] ? LZ_NO_PAGES : lz_hot[r] && (int32_t)(lz_hot[r] - now) > 0 ? LZ_NO_HOT :
                  thaw_ms[r] && (int32_t)(now - thaw_ms[r]) < (int32_t)FRZ_HOLD_MS ? LZ_NO_THAW :
-                 !lazy_protect_locked(x, e, ctx) ? LZ_NO_PAGES : -1;
+                 !lazy_protect_locked(x, e, ctx, hi, &rw_end) ? LZ_NO_PAGES : -1;
         if (no >= 0) {
             lz_no[no] += e - x;
             continue;
@@ -708,6 +752,7 @@ static void thaw_pages(uint64_t r, int strict) {
 // frz_lock held exclusively: what a thaw does before the pages (the hold, the lazy write-back's ranges, a probe).
 // Returns 1 when the region is frozen.
 static int thaw_begin_locked(uint64_t r, int why) {
+    if (frz[r] == 1) protection_publish(r, 1);
     if (why == 2) thaw_ms[r] = (uint32_t)plat_now_ms() | 1;
     if (lzr[r]) lazy_drop_region_locked(r, why + 1);   // not a fault on an armed page: no hold
     if (prb[r]) unprobe_locked(r);
@@ -720,8 +765,8 @@ static void thaw_end_locked(uint64_t r, int why);
 // A region another thread is thawing (FRZ_THAWING) gets its pages made read-write here too, and is ended here.
 static void thaw_locked(uint64_t r, int why) {
     if (!thaw_begin_locked(r, why) && frz[r] != FRZ_THAWING) return;
-    thaw_pages(r, 1);
     __atomic_store_n(&frz[r], FRZ_THAWING, __ATOMIC_RELEASE);
+    thaw_pages(r, 1);
     thaw_end_locked(r, why);
 }
 
@@ -729,6 +774,7 @@ static void thaw_locked(uint64_t r, int why) {
 static void thaw_end_locked(uint64_t r, int why) {
     if (frz[r] != FRZ_THAWING) return;
     __atomic_store_n(&frz[r], 0, __ATOMIC_RELEASE);
+    protection_publish(r, 0);
     plat_dec32(&nfrz);
     plat_inc64(&frz_count[why]);
     if (why == 1) {   // a write: a quick one makes the region hot, a late one ends its hot time
@@ -786,9 +832,13 @@ static uint64_t heap_lazy_commit_locked(uint64_t a, uint64_t n) {
     for (uint64_t x = lo, y; x < hi; x = y) {
         if (plat_mem_state(x, hi, &y) != PLAT_MEM_RESERVED) continue;
         if (!thawed) thaw_range_locked(lo, hi - lo, 3), thawed = 1;
+        // Lazy commits run under frz_lock, outside the guest mapping lock. Notify this writer domain so a cached
+        // absence cannot survive pages becoming readable without a guest mapping-generation change.
+        mem_mapping_publish(&protection, x, y - x, 1);
         if (!plat_mem_commit(x, y - x))
             rt_fatal("memory: committing the heap's pages %#llx+%#llx on first use failed: the system's commit is "
                      "used up", (unsigned long long)x, (unsigned long long)(y - x));
+        mem_mapping_publish(&protection, x, y - x, 0);
         got += y - x;
     }
     heap_lazy_bytes += got;
@@ -837,8 +887,8 @@ static int heap_lazy_fault(uint64_t a) {
     return got != 0;
 }
 
-void mem_thaw(uint64_t a, uint64_t n) {
-    plat_mutex_lock(&frz_lock);   // also when nothing is frozen: the hold keeps a read's buffer writable
+// Caller owns frz_lock. Release it after preparing the entire range, including asynchronous thaws.
+static void thaw_range_and_unlock(uint64_t a, uint64_t n) {
     if (heap_lazy || !frz_async || !n || a >= RT_ADDRESS_LIMIT) {
         if (heap_lazy) {
             thaw_wait_locked(a, n);   // it commits pages: a mapping change
@@ -875,11 +925,68 @@ void mem_thaw(uint64_t a, uint64_t n) {
     plat_mutex_unlock(&frz_lock);
 }
 
+void mem_thaw(uint64_t a, uint64_t n) {
+    plat_mutex_lock(&frz_lock);
+    thaw_range_and_unlock(a, n);
+}
+
+// A slow host read can outlast the ordinary post-thaw hold. Keep its destination ineligible for
+// freezing for the full I/O lifetime. The caller owns this record until the positional read returns.
+typedef struct ActiveRead {
+    uint32_t first, last;
+    struct ActiveRead *next, *prev;
+} ActiveRead;
+static ActiveRead *active_reads;  // frz_lock
+
+int64_t mem_file_read_at(PlatFile *file, void *buf, uint32_t size, uint64_t offset) {
+    uint64_t addr = (uintptr_t)buf;
+    if (!size || addr >= RT_ADDRESS_LIMIT) return plat_file_pread(file, buf, size, offset);
+    ActiveRead read = {.first = (uint32_t)(addr >> FRZ_SHIFT),
+                       .last = (uint32_t)((addr + size - 1) >> FRZ_SHIFT)};
+    plat_mutex_lock(&frz_lock);
+    read.next = active_reads;
+    if (read.next) read.next->prev = &read;
+    active_reads = &read;
+    thaw_range_and_unlock(addr, size);
+    int64_t got = plat_file_pread(file, buf, size, offset);
+    plat_mutex_lock(&frz_lock);
+    if (read.prev) read.prev->next = read.next;
+    else active_reads = read.next;
+    if (read.next) read.next->prev = read.prev;
+    plat_mutex_unlock(&frz_lock);
+    return got;
+}
+
+static int region_receiving_file_data(uint32_t region) {  // frz_lock
+    for (const ActiveRead *read = active_reads; read; read = read->next)
+        if (region >= read->first && region <= read->last) return 1;
+    return 0;
+}
+
 // frz_lock held exclusively. Makes the committed pages of region r read-only when every one of them is read-write;
 // reserved holes (heap pages given back) stay as they are, and thaw_locked finds the read-only runs again.
+#ifdef _WIN32
+#include "resident_rw.h"
+static unsigned bounded_hits, bounded_fallbacks;  // frz_lock
+#endif
+
 static int freeze_locked(uint64_t r) {
     uint64_t a = r << FRZ_SHIFT, end = a + FRZ_SIZE, run[16][2];
     int n = 0;
+#ifdef _WIN32
+    // The watched region is inside one reservation. Its mapping, active file reads
+    // and thaw eligibility are protected by the caller's freeze lock. A fully
+    // resident read-write region is one run; preserve the usual rollback and thaw.
+    if (freeze_resident_rw(a)) {
+        bounded_hits++;
+        run[0][0] = a;
+        run[0][1] = end;
+        n = 1;
+    } else {
+        bounded_fallbacks++;
+    }
+    if (!n)
+#endif
     for (uint64_t x = a, y; x < end; x = y) {
         int st = plat_mem_state(x, end, &y);
         if (st >= PLAT_PROT_NONE) {
@@ -908,15 +1015,20 @@ int mem_freeze(uint64_t a) {
     int ok = 0;
     plat_mutex_lock(&frz_lock);
     uint32_t now = (uint32_t)plat_now_ms();
-    if (frz[r]) ok = 1;
+    if (region_receiving_file_data((uint32_t)r)) ok = 0;
+    else if (frz[r]) ok = 1;
     else if (thaw_ms[r] && (int32_t)(now - thaw_ms[r]) < (int32_t)FRZ_HOLD_MS) ok = 0;   // |1 may be ahead
     else if (frz_hot_until[r] && (int32_t)(frz_hot_until[r] - now) > 0) ok = 0;         // hot: held thawed
-    else if (freeze_locked(r)) {
-        frz_ms[r] = now | 1;
-        __atomic_store_n(&frz[r], 1, __ATOMIC_RELEASE);
-        plat_inc32(&nfrz);
-        plat_inc64(&frz_count[0]);
-        ok = 1;
+    else {
+        protection_publish(r, 1);
+        if (freeze_locked(r)) {
+            frz_ms[r] = now | 1;
+            __atomic_store_n(&frz[r], 1, __ATOMIC_RELEASE);
+            plat_inc32(&nfrz);
+            plat_inc64(&frz_count[0]);
+            ok = 1;
+        }
+        protection_publish(r, 0);
     }
     plat_mutex_unlock(&frz_lock);
     return ok;
@@ -1025,6 +1137,15 @@ void mem_probe_report(uint64_t frame) {
 
 void mem_freeze_stats(uint64_t *frozen, uint64_t *freezes, uint64_t *fault_thaws, uint64_t *other_thaws,
                       uint64_t *hot_holds) {
+#ifdef _WIN32
+    if (getenv("NX2NAVI_FREEZE_PROBE_STATS")) {
+        plat_mutex_lock(&frz_lock);
+        unsigned hit = bounded_hits, fallback = bounded_fallbacks;
+        bounded_hits = bounded_fallbacks = 0;
+        plat_mutex_unlock(&frz_lock);
+        rt_log("mem: bounded freeze eligibility since previous report: %u full regions, %u fallbacks",hit,fallback);
+    }
+#endif
     *frozen = (uint64_t)__atomic_load_n(&nfrz, __ATOMIC_RELAXED);
     *hot_holds = (uint64_t)plat_xchg64(&frz_hot_holds, 0);
     *freezes = (uint64_t)plat_xchg64(&frz_count[0], 0);
@@ -1216,6 +1337,17 @@ static int inside(uint64_t a, uint64_t n, RtRange r) { return a >= r.base && n <
 // slots over unreadable storage up again only then (and now and then).
 static uint32_t map_gen;
 uint32_t mem_map_gen(void) { return __atomic_load_n(&map_gen, __ATOMIC_ACQUIRE); }
+static uint64_t mapping_regions[RT_ADDRESS_LIMIT >> 21];
+static ResourceEvents mapping_events;
+static MemMapping mapping = {mapping_regions, 2, RT_ADDRESS_LIMIT >> 21, 21, 0, &mapping_events};
+uint64_t mem_mapping_serial(void) { return mem_mapping_clock(&mapping); }
+uint64_t mem_mapping_region(uint32_t region) { return mem_mapping_version(&mapping, region); }
+int mem_mapping_events(uint64_t *cursor, ResourceEventVisit visit, void *user) {
+    return resource_events_read(&mapping_events, cursor, visit, user) && mem_mapping_serial() != 0;
+}
+int mem_mapping_range_unchanged(uint64_t addr, uint64_t size, uint64_t observed) {
+    return mem_mapping_unchanged(&mapping, addr, size, observed);
+}
 
 // ---- 0x01 SetHeapSize
 uint32_t mem_set_heap_size(uint64_t size, uint64_t *addr) {
@@ -1226,10 +1358,12 @@ uint32_t mem_set_heap_size(uint64_t size, uint64_t *addr) {
         return R_INVALID_STATE;
     }
     uint64_t was = heap_size;
+    uint64_t changed = L.heap.base + (size < was ? size : was), moved = size > was ? size - was : was - size;
+    mem_mapping_publish(&mapping, changed, moved, 1);
     if (size > was && !heap_lazy) commit(L.heap.base + was, size - was, "heap");
     __atomic_store_n(&heap_size, size, __ATOMIC_RELEASE);   // before a shrink: no first-use commit past the new end
     if (size < was) decommit(L.heap.base + size, was - size, "heap");   // reserved pages in the range are fine
-    uint64_t moved = size > was ? size - was : was - size;
+    mem_mapping_publish(&mapping, changed, moved, 0);
     __atomic_store_n(&map_gen, map_gen + 1, __ATOMIC_RELEASE);
     plat_mutex_unlock(&lock);
     perf_mark_end(PERF_M_GMEM, t0, moved);
@@ -1286,8 +1420,10 @@ uint32_t mem_set_permission(uint64_t a, uint64_t n, uint32_t perm) {
             plat_mutex_unlock(&lock);
             return R_INVALID_STATE;
         }
+    mem_mapping_publish(&mapping, a, n, 1);
     memset(t, (int)perm, n / PAGE);
     protect(a, n, perm == PERM_RW ? PLAT_PROT_RW : perm == PERM_R ? PLAT_PROT_READ : PLAT_PROT_NONE, "module data");
+    mem_mapping_publish(&mapping, a, n, 0);
     __atomic_store_n(&map_gen, map_gen + 1, __ATOMIC_RELEASE);
     plat_mutex_unlock(&lock);
     rt_log("%s data permission +%#llx size %#llx perm %u", m->name, (unsigned long long)(a - m->base),
@@ -1339,10 +1475,14 @@ static uint32_t stack_move(int unmap, uint64_t dst, uint64_t src, uint64_t n) {
             r = R_INVALID_STATE;
             goto out;
         }
+        mem_mapping_publish(&mapping, src, n, 1);
+        mem_mapping_publish(&mapping, dst, n, 1);
         protect(src, n, PLAT_PROT_RW, "moved stack source");
         memcpy((void *)(uintptr_t)src, (const void *)(uintptr_t)dst, n);
         decommit(dst, n, "moved stack");
         stack_maps[found] = stack_maps[--nstack_maps];
+        mem_mapping_publish(&mapping, src, n, 0);
+        mem_mapping_publish(&mapping, dst, n, 0);
     } else {
         if (nstack_maps == MAX_STACK_MAPS) {
             r = R_INVALID_STATE;
@@ -1354,10 +1494,14 @@ static uint32_t stack_move(int unmap, uint64_t dst, uint64_t src, uint64_t n) {
                 r = R_INVALID_REGION;
                 goto out;
             }
+        mem_mapping_publish(&mapping, src, n, 1);
+        mem_mapping_publish(&mapping, dst, n, 1);
         commit(dst, n, "moved stack");
         memcpy((void *)(uintptr_t)dst, (const void *)(uintptr_t)src, n);
         protect(src, n, PLAT_PROT_NONE, "moved stack source");
         stack_maps[nstack_maps++] = (StackMap){dst, src, n};
+        mem_mapping_publish(&mapping, src, n, 0);
+        mem_mapping_publish(&mapping, dst, n, 0);
     }
 out:
     __atomic_store_n(&map_gen, map_gen + 1, __ATOMIC_RELEASE);
@@ -1377,9 +1521,11 @@ static void alias_runs(uint64_t first, uint64_t count, uint8_t want, int do_comm
         uint64_t j = i;
         while (j < count && alias_pages[first + j] == want) j++;
         uint64_t a = L.alias.base + (first + i) * PAGE, n = (j - i) * PAGE;
+        mem_mapping_publish(&mapping, a, n, 1);
         if (do_commit) commit(a, n, "physical memory");
         else decommit(a, n, "physical memory");
         memset(alias_pages + first + i, !want, j - i);
+        mem_mapping_publish(&mapping, a, n, 0);
         i = j;
     }
 }

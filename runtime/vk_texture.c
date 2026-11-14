@@ -18,6 +18,7 @@
 
 #include "cfg.h"
 #include "flight.h"
+#include "fresh_deps.h"
 #include "gfx.h"
 #include "host.h"
 #include "nvn_api.h"
@@ -127,6 +128,7 @@ typedef struct {
     uint8_t cheld;                // ce is NULL as the texture was evicted by disuse, valid while cgen is (held_out)
     uint8_t cwant;                // a shader sampled its stand-in (vk_pool_marks_read): slot_resolve makes it at once
     uint64_t khash;               // hash of the descriptor key and view, 0 for CPU-written textures (vk_texture_slot_khash_locked)
+    uint64_t absent_mapping, absent_protection; // pool-only absence, bounded by registration/address identity and backing events
     view_t v;
     tex_t t;
 } TexSlot;
@@ -1408,7 +1410,7 @@ static void rel_unlink(Tex *e) {
 // that the check of an entry whose 2 MiB regions took no write since (vk_mem_unchanged_locked, one shared lock for the
 // whole list) touches neither the entry nor the lock: 5,600 entries took 0.77 ms a submission one by one. Texture lock
 // held.
-typedef struct { Tex *e; uint64_t addr, size; uint32_t since; int ok; } PEnt;   // ok: uploaded as of since
+typedef struct { Tex *e; uint64_t addr, size; uint32_t since, dep; int ok; } PEnt;   // ok: uploaded as of since
 static PEnt *pent;
 static int npent, cpent, *pq, cpq;
 static uint64_t n_pool_checks, n_pool_skips;
@@ -1417,9 +1419,170 @@ static uint64_t n_pool_checks, n_pool_skips;
 static uint64_t n_pool_miss[5], n_presnap_q;
 static void make_fresh_snap(Tex *e);
 
+// reference: unchanged discovery; observe: maintain dependencies with the reference consumer; worklist: only dirty
+// entries reach freshness preparation; integrated: draw bindings also use clean certificates; check: compare with
+// the original candidate oracle and check every certified answer. Configuration is fixed for the process.
+static FreshDeps *pool_deps;
+static uint32_t pool_deps_epoch;
+static uint64_t pool_deps_map;
+static uint64_t pool_deps_protection;
+static uint64_t pool_deps_serial;
+static uint64_t pool_map_cursor, pool_protection_cursor, pool_content_cursor;
+static struct {
+    uint64_t calls, entries, regions, notifications, candidates, certificates, misses, verified, attempts;
+    uint64_t reject[5];   // no membership/content, epoch, mapping, observation serial, node state
+    uint64_t regional_checks, regional_hits, node_reject[4];   // metadata, generation, owner, dirty
+    uint64_t observe_ns, select_ns, refresh_ns;
+    uint64_t mapping_regions, mapping_notifications;
+    uint64_t dormant_visits, history_fallbacks, absence_learned, absence_reused;
+} PD;
+
+static int pool_deps_mode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *s = cfg_value("NX2NAVI_RESOURCE_DEPS");
+        mode = !s || !strcmp(s, "reference") || !strcmp(s, "0") ? 0 : !strcmp(s, "observe") ? 1 :
+               !strcmp(s, "worklist") ? 2 : !strcmp(s, "integrated") || !strcmp(s, "1") ? 3 :
+               !strcmp(s, "check") ? 4 : 0;
+        if (mode) {
+            pool_deps = fresh_deps_create((uint32_t)(RT_ADDRESS_LIMIT >> 21), 21);
+            if (!pool_deps) rt_fatal("vk: out of memory for texture dependencies");
+            vk_mem_dependency_watch();
+        }
+        rt_log("vk: resource dependencies mode %d", mode);
+    }
+    return mode;
+}
+
+static int pool_deps_timing(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *s = cfg_get("NX2NAVI_RESOURCE_DEPS_TIME");
+        on = s && !strcmp(s, "1");
+    }
+    return on;
+}
+
+static int pool_deps_original_order(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *s = cfg_get("NX2NAVI_RESOURCE_DEPS_ORDER");
+        on = s && !strcmp(s, "original");
+    }
+    return on;
+}
+
+static void pool_deps_wake(uint32_t first, uint32_t last, void *unused) {
+    (void)unused;
+    if (last >= (RT_ADDRESS_LIMIT >> 21)) {
+        fresh_deps_mark_all(pool_deps);
+        fresh_deps_wake_all(pool_deps);
+        return;
+    }
+    for (uint32_t r = first; r <= last; r++) fresh_deps_wake_region(pool_deps, r);
+}
+
+static void pool_deps_adopt(uint32_t region, void *unused) {
+    (void)unused;
+    PD.dormant_visits++;
+    if (!vk_mem_dependency_adopt_locked(region, submit_epoch)) fresh_deps_wake_region(pool_deps, region);
+}
+
+static void pool_deps_observe(int query) {   // texture lock and exclusive generation lock held
+    uint32_t nr;
+    // Capture before observation: a mapping completed during this pass must not be covered by a certificate whose
+    // content check may precede it. Unsupported/reset tracking keeps the conservative worklist and rejects reuse.
+    pool_deps_map = mem_mapping_serial();
+    pool_deps_protection = mem_protection_serial();
+    int complete = mem_mapping_events(&pool_map_cursor, pool_deps_wake, NULL);
+    complete &= mem_protection_events(&pool_protection_cursor, pool_deps_wake, NULL);
+    complete &= vk_mem_dependency_events_locked(&pool_content_cursor, pool_deps_wake, NULL);
+    if (!complete || !pool_deps_map || !pool_deps_protection) {
+        PD.history_fallbacks++;
+        fresh_deps_mark_all(pool_deps);
+        fresh_deps_wake_all(pool_deps);
+    }
+    // This is a small membership-only pass, not producer polling. It preserves the original once-per-submission
+    // snapshot point for dormant regions before any later draw can use their clean dependency certificate.
+    fresh_deps_visit_sleeping(pool_deps, pool_deps_adopt, NULL);
+    const uint32_t *regions = fresh_deps_poll_regions(pool_deps, &nr);
+    // Preserve batching over contiguous watched regions; do not query gaps solely for this index.
+    for (uint32_t i = 0; query && i < nr;) {
+        uint32_t first = regions[i], last = first;
+        while (++i < nr && regions[i] == last + 1) last = regions[i];
+        n_presnap_q += vk_mem_snap_range_locked((uint64_t)first << 21, (uint64_t)(last - first + 1) << 21,
+                                               submit_epoch);
+    }
+    // Sleeping swap-removes a region. Descending traversal ensures its replacement has already been observed.
+    for (uint32_t i = nr; i-- > 0;) {
+        uint32_t version;
+        int tracked = vk_mem_dependency_region_locked(regions[i], submit_epoch, &version);
+        uint32_t mapped = fresh_deps_observe_mapping(pool_deps, regions[i], mem_mapping_region(regions[i]));
+        PD.mapping_notifications += mapped;
+        PD.notifications += mapped;
+        PD.notifications += fresh_deps_observe(pool_deps, regions[i], version, tracked);
+        if (complete && vk_mem_dependency_sleep_locked(regions[i])) fresh_deps_sleep_region(pool_deps, regions[i]);
+    }
+    PD.regions += nr;
+    PD.mapping_regions += nr;
+    pool_deps_epoch = submit_epoch;
+    pool_deps_serial = vk_mem_dependency_serial();
+}
+
+static int pool_deps_certificate(Tex *e) {   // called only at the ordinary binding's existing freshness boundary
+    int mode = pool_deps_mode();
+    if (mode < 3) return 0;
+    PD.attempts++;
+    if (!e->pidx || !e->uploaded || e->released || e->retiring || e->pub.gpu_owned || !from_storage(e))
+        return PD.reject[0]++, 0;
+    if (pool_deps_epoch != submit_epoch) return PD.reject[1]++, 0;
+    if (!mem_mapping_range_unchanged(e->pub.addr, e->t.L.size, pool_deps_map) ||
+        !mem_protection_range_unchanged(e->pub.addr, e->t.L.size, pool_deps_protection)) return PD.reject[2]++, 0;
+    uint64_t serial = vk_mem_dependency_serial();
+    if (!pool_deps_serial || !serial) return PD.reject[3]++, 0;
+    if (pool_deps_serial != serial) {
+        PD.regional_checks++;
+        if (!vk_mem_dependency_range_unchanged(e->pub.addr, e->t.L.size, pool_deps_serial))
+            return PD.reject[3]++, 0;
+        PD.regional_hits++;
+    }
+    const PEnt *p = &pent[e->pidx - 1];
+    // A direct fallback may advance wgen while an unchanged pool entry retains its earlier since. A clean proof
+    // since the older generation also proves freshness since the newer one; equality would prevent later reuse.
+    int bad = !p->ok || p->e != e || p->addr != e->pub.addr || p->size != e->t.L.size ? 0 :
+              p->since > e->wgen ? 1 : fresh_deps_owner(pool_deps, p->dep) != (uintptr_t)e ? 2 :
+              fresh_deps_dirty(pool_deps, p->dep) ? 3 : -1;
+    if (bad >= 0) {
+        PD.node_reject[bad]++;
+        PD.misses++;
+        PD.reject[4]++;
+        return 0;
+    }
+    if (mode == 4) {
+        // A completion thread can publish an observation after the lock-free certificate read. Check its serial
+        // again under the generation lock, so the verification compares the same logical observation.
+        vk_mem_gen_lock_shared();
+        serial = vk_mem_dependency_serial();
+        int moved = !serial || !mem_mapping_range_unchanged(p->addr, p->size, pool_deps_map) ||
+                    !mem_protection_range_unchanged(p->addr, p->size, pool_deps_protection) ||
+                    (pool_deps_serial != serial &&
+                     !vk_mem_dependency_range_unchanged(p->addr, p->size, pool_deps_serial));
+        int changed = !moved && vk_mem_unchanged_why_locked(p->addr, p->size, p->since, submit_epoch);
+        vk_mem_gen_unlock_shared();
+        if (moved) return 0;
+        if (changed)
+            rt_fatal("vk: texture dependency certificate disagrees with memory freshness");
+        PD.verified++;
+    }
+    e->last_ch = 0;   // preserve the debug view of the freshness answer even though no page check ran
+    PD.certificates++;
+    return 1;
+}
+
 static void pool_unlist(Tex *e) {
     if (!e->pidx) return;
     int i = e->pidx - 1;
+    if (pool_deps) fresh_deps_remove(pool_deps, pent[i].dep);
     pent[i] = pent[--npent];
     pent[i].e->pidx = i + 1;
     e->pidx = 0;
@@ -1502,7 +1665,12 @@ int vk_texture_pool_note_locked(int id, uint32_t *ent) {
             if (!p || !q) rt_fatal("vk: out of memory for the texture pool's entry list");
             pent = p, pq = q, cpent = cpq = n;
         }
-        pent[npent++] = (PEnt){e, e->pub.addr, e->t.L.size, 0, 0};
+        uint32_t dep = 0;
+        if (pool_deps_mode()) {
+            dep = fresh_deps_add(pool_deps, (uintptr_t)e, e->pub.addr, e->t.L.size);
+            if (!dep) rt_fatal("vk: out of memory for texture dependency links");
+        }
+        pent[npent++] = (PEnt){.e = e, .addr = e->pub.addr, .size = e->t.L.size, .dep = dep};
         e->pidx = npent;
     }
     *ent = pool_ref(e);
@@ -1526,17 +1694,60 @@ static int pool_presnap(void) {
 // (vk_texture_new_submit).
 static int pool_by_list;
 
+static int pool_index_compare(const void *a, const void *b) {
+    int x = *(const int *)a, y = *(const int *)b;
+    return (x > y) - (x < y);
+}
+
 int vk_texture_pool_fresh_locked(void) {
     int nq = 0, ps = pool_presnap();
+    int mode = pool_deps_mode(), indexed = mode && ps && vk_mem_dependency_serial();
+    int timing = mode && pool_deps_timing();
+    uint64_t t0 = timing ? kern_now_ns() : 0;
     pool_by_list = 1;
     if (ps) vk_mem_gen_lock();
     else vk_mem_gen_lock_shared();
-    for (int i = 0; i < npent; i++) {
+    if (indexed) {
+        int original = pool_deps_original_order();
+        if (original) for (int i = 0; i < npent; i++)
+            if (pent[i].ok) n_presnap_q += vk_mem_snap_range_locked(pent[i].addr, pent[i].size, submit_epoch);
+        pool_deps_observe(!original);
+        if (!pool_deps_serial) indexed = 0, pool_deps_epoch = 0;
+    }
+    else pool_deps_epoch = 0;
+    uint64_t t1 = timing ? kern_now_ns() : 0;
+    if (mode) PD.calls++, PD.entries += (uint64_t)npent;
+    if (indexed && mode >= 2) {
+        for (uint32_t id = fresh_deps_first(pool_deps); id;) {
+            uint32_t next = fresh_deps_next(pool_deps, id);
+            Tex *e = (Tex *)fresh_deps_owner(pool_deps, id);
+            int i = e->pidx - 1;
+            const PEnt *p = &pent[i];
+            int why = p->ok ? vk_mem_unchanged_why_locked(p->addr, p->size, p->since, submit_epoch) : 0;
+            if (!p->ok || why) {
+                n_pool_miss[p->ok ? why : 0]++;
+                pq[nq++] = i;
+            } else fresh_deps_clean(pool_deps, id);
+            id = next;
+        }
+        if (mode == 4) for (int i = 0; i < npent; i++) {
+            const PEnt *p = &pent[i];
+            int required = !p->ok || vk_mem_unchanged_why_locked(p->addr, p->size, p->since, submit_epoch);
+            if (required && !fresh_deps_dirty(pool_deps, p->dep))
+                rt_fatal("vk: texture dependency worklist omitted a required entry");
+            PD.verified++;
+        }
+        // The original consumer handles highest indices first because removal swaps the last entry into its slot.
+        if (nq > 1) qsort(pq, (size_t)nq, sizeof *pq, pool_index_compare);
+    } else for (int i = 0; i < npent; i++) {
         const PEnt *p = &pent[i];
         if (p->ok) {
             if (ps) n_presnap_q += vk_mem_snap_range_locked(p->addr, p->size, submit_epoch);
             int why = vk_mem_unchanged_why_locked(p->addr, p->size, p->since, submit_epoch);
-            if (!why) continue;
+            if (!why) {
+                if (indexed) fresh_deps_clean(pool_deps, p->dep);
+                continue;
+            }
             n_pool_miss[why]++;
         } else {
             n_pool_miss[0]++;
@@ -1545,6 +1756,8 @@ int vk_texture_pool_fresh_locked(void) {
     }
     if (ps) vk_mem_gen_unlock();
     else vk_mem_gen_unlock_shared();
+    uint64_t t2 = timing ? kern_now_ns() : 0;
+    if (mode) PD.candidates += (uint64_t)nq;
     n_pool_skips += (uint64_t)(npent - nq);
     for (int k = nq; k-- > 0;) {   // from the end: an entry leaving swaps the last one into its place
         int i = pq[k];
@@ -1562,6 +1775,21 @@ int vk_texture_pool_fresh_locked(void) {
         }
         p->since = e->wgen, p->ok = e->uploaded;
     }
+    if (indexed) {
+        vk_mem_gen_lock_shared();
+        // Certify only nodes that passed the authoritative predicate. Untracked or not-yet-uploaded entries remain
+        // on the queue. Later observations require a regional check before a downstream certificate can be used.
+        for (uint32_t id = fresh_deps_first(pool_deps); id;) {
+            uint32_t next = fresh_deps_next(pool_deps, id);
+            Tex *e = (Tex *)fresh_deps_owner(pool_deps, id);
+            const PEnt *p = &pent[e->pidx - 1];
+            if (!e->released && p->ok && !vk_mem_unchanged_why_locked(p->addr, p->size, p->since, submit_epoch))
+                fresh_deps_clean(pool_deps, id);
+            id = next;
+        }
+        vk_mem_gen_unlock_shared();
+    }
+    if (timing) PD.observe_ns += t1 - t0, PD.select_ns += t2 - t1, PD.refresh_ns += kern_now_ns() - t2;
     pool_touch();
     return npent;
 }
@@ -4076,6 +4304,7 @@ void vk_texture_register(int id, const tex_t *t, const view_t *v) {
     s->finalized = 0;
     s->ce = NULL;
     s->cheld = 0;
+    s->absent_mapping = s->absent_protection = 0;
     slots_gen++;
     if (!++reg_serial) reg_serial = 1;
     __atomic_store_n(&sinfo[id], (uint64_t)reg_serial << 16 | agen_idx((uintptr_t)t->mem), __ATOMIC_RELEASE);
@@ -4139,7 +4368,32 @@ static int stale_kept(const Tex *own) {
     return on && own && !own->superseded && !own->overwritten && (own->uploaded || own->pub.gpu_owned);
 }
 
+// Only a lack of readable backing with no alias at the address is reusable. Existing aliases can acquire GPU
+// content without a mapping change, and budget, eviction and allocation failures need their ordinary retries.
+static int slot_storage_readable(TexSlot *s) {
+    uint64_t addr = (uint64_t)(uintptr_t)s->t.mem, size = s->t.L.size;
+    uint64_t mapping = mem_mapping_serial(), protection = mem_protection_serial();
+    int readable = mem_readable(addr, size);
+    if (!readable && !s->finalized && !nvn_hm_get(&by_addr, &addr) &&
+        mem_mapping_range_unchanged(addr, size, mapping) &&
+        mem_protection_range_unchanged(addr, size, protection)) {
+        s->absent_mapping = mapping, s->absent_protection = protection;
+        PD.absence_learned++;
+    }
+    return readable;
+}
+
+static int slot_absence_valid(const TexSlot *s, uint32_t generation) {
+    uint64_t addr = (uint64_t)(uintptr_t)s->t.mem;
+    int valid = !s->ce && !s->finalized && s->cgen == generation && s->absent_mapping &&
+           mem_mapping_range_unchanged(addr, s->t.L.size, s->absent_mapping) &&
+           mem_protection_range_unchanged(addr, s->t.L.size, s->absent_protection);
+    PD.absence_reused += (uint64_t)valid;
+    return valid;
+}
+
 static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view) {
+    s->absent_mapping = s->absent_protection = 0;
     *view = s->v;
     *has_view = s->has_view;
     TexKey k;
@@ -4186,7 +4440,7 @@ static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view) {
         // slot a refresh met with the budget at 0 was noted as left: in a busy frame (its creation time spent) that
         // was about a thousand slots at once, which vk_exec_draw.c pool_sync_entries took for an area load, several
         // times a second in some places, and each time lifted the count budget and the frame's creation time.
-        else if (!mem_readable((uint64_t)(uintptr_t)s->t.mem, s->t.L.size)) e = NULL;
+        else if (!slot_storage_readable(s)) e = NULL;
         else if (!create_budget && !(s->cwant && want_take())) create_deferred = 1;
         else {
             e = entry_of(&s->t);
@@ -4296,7 +4550,8 @@ const VkTexImage *vk_texture_by_id_locked(int id, view_t *view, int *has_view) {
     // resolved again: an entry at its address was created, dropped or released, or the slot registered (s->ce
     // cleared); an empty result is not kept, as image creation may succeed later, except a held one for the pool
     // refresh (cheld): the pool walks every slot each submission, and the hold ends with a generation bump
-    if ((!s->ce || s->cgen != g) && !(s->cheld && s->cgen == g && pool_ctx)) {
+    if ((!s->ce || s->cgen != g) && !(s->cheld && s->cgen == g && pool_ctx) &&
+        !(pool_ctx && slot_absence_valid(s, g))) {
         view_t v;
         int hv;
         resolve_held = 0;
@@ -4320,7 +4575,7 @@ const VkTexImage *vk_texture_by_id_locked(int id, view_t *view, int *has_view) {
         round_checks++;
         // a released entry here is a finalized slot's own (stale_kept): the storage may be the game's to free or reuse
         if (e && !e->released && (!e->uploaded || e->checked != submit_epoch)) {
-            make_fresh_snap(e);
+            if (!pool_deps_certificate(e)) make_fresh_snap(e);
             e->checked = submit_epoch;
             touch(e);
         }
@@ -4377,6 +4632,37 @@ void vk_texture_new_submit(void) {
     sweep_pressure();
     static uint64_t log_at;
     uint64_t f = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) / 60;
+    static uint64_t dep_log_at;
+    if ((rt_trace & RT_TRACE_PERF) && pool_deps && f != dep_log_at) {
+        dep_log_at = f;
+        rt_log("perf: frame %llu: resource-deps mode %d: calls %llu, listed %llu, regions %llu, notifications %llu, "
+               "candidates %llu, certificates %llu, certificate misses %llu, verified %llu; "
+               "observe %.3f ms, select %.3f ms, refresh %.3f ms (timing %d)",
+               (unsigned long long)f * 60, pool_deps_mode(), (unsigned long long)PD.calls,
+               (unsigned long long)PD.entries, (unsigned long long)PD.regions, (unsigned long long)PD.notifications,
+               (unsigned long long)PD.candidates, (unsigned long long)PD.certificates, (unsigned long long)PD.misses,
+               (unsigned long long)PD.verified, PD.observe_ns / 1e6, PD.select_ns / 1e6, PD.refresh_ns / 1e6,
+               pool_deps_timing());
+        rt_log("perf: frame %llu: resource-deps certificate attempts %llu; rejected content %llu, epoch %llu, "
+               "mapping %llu, observation %llu, node %llu; snapshot order %s",
+               (unsigned long long)f * 60, (unsigned long long)PD.attempts, (unsigned long long)PD.reject[0],
+               (unsigned long long)PD.reject[1], (unsigned long long)PD.reject[2], (unsigned long long)PD.reject[3],
+               (unsigned long long)PD.reject[4], pool_deps_original_order() ? "original" : "regions");
+        rt_log("perf: frame %llu: resource-deps detail: regional checked %llu, accepted %llu; "
+               "node rejected metadata %llu, generation %llu, owner %llu, dirty %llu",
+               (unsigned long long)f * 60, (unsigned long long)PD.regional_checks, (unsigned long long)PD.regional_hits,
+               (unsigned long long)PD.node_reject[0], (unsigned long long)PD.node_reject[1],
+               (unsigned long long)PD.node_reject[2], (unsigned long long)PD.node_reject[3]);
+        rt_log("perf: frame %llu: resource-deps mapping: %llu regional observations, %llu dependent notifications",
+               (unsigned long long)f * 60, (unsigned long long)PD.mapping_regions,
+               (unsigned long long)PD.mapping_notifications);
+        rt_log("perf: frame %llu: resource events: dormant metadata visits %llu, history fallbacks %llu; "
+               "missing storage proofs %llu, resolutions avoided %llu",
+               (unsigned long long)f * 60, (unsigned long long)PD.dormant_visits,
+               (unsigned long long)PD.history_fallbacks, (unsigned long long)PD.absence_learned,
+               (unsigned long long)PD.absence_reused);
+        memset(&PD, 0, sizeof PD);
+    }
     if ((rt_trace & RT_TRACE_PERF) && f != log_at && tex_alias > 0) {
         log_at = f;
         rt_log("perf: frame %llu: texture aliases: content copied %llu (%llu from a released texture), filled from storage "

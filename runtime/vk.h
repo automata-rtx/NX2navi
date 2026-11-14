@@ -2,6 +2,7 @@
 #pragma once
 #include <vulkan/vulkan.h>
 #include <stdint.h>
+#include "resource_events.h"
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wnullability-completeness"
 #include "vk_mem_alloc.h"
@@ -322,6 +323,32 @@ void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence);
 void vk_usnap_take(const uint64_t *handles, int n);
 void vk_usnap_end(uint64_t fence);
 int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out);
+// A resolved range of one immutable capture. A region index is only meaningful while capture matches; no region or
+// arena pointer is retained. GPU writes invalidate just their overlapping regions at their position in the stream.
+typedef struct {
+    uint64_t capture, addr, size, align;
+    uint32_t region, reserved;
+} VkUsnapLease;
+int vk_usnap_find_lease(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out, VkUsnapLease *lease);
+int vk_usnap_lease_valid(const VkUsnapLease *lease);
+uint64_t vk_usnap_capture(void);   // active capture identity, 0 without a capture; unrelated drops do not change it
+// A context-owned proof for a set of leases. The region buckets bound storage; collisions only cause revalidation.
+// Begin before collecting the leases, add every one, then end. A failed construction cannot authorize a shortcut.
+// A successful proof lasts within its capture and until a relevant drop becomes effective in the consumer's epoch.
+// valid may advance the cached publication serial after confirming that all dependency buckets are unchanged.
+#define VK_USNAP_PROOF_BUCKETS 64u
+typedef struct {
+    uint64_t capture, serial, epoch, horizon, buckets;
+    uint64_t version[VK_USNAP_PROOF_BUCKETS];
+    uint32_t building, sealed;
+} VkUsnapProof;
+void vk_usnap_proof_begin(VkUsnapProof *proof);
+int vk_usnap_proof_add(VkUsnapProof *proof, const VkUsnapLease *lease);
+int vk_usnap_proof_end(VkUsnapProof *proof);
+int vk_usnap_proof_valid(VkUsnapProof *proof);
+// After begin, inherit a still-valid prior proof without revisiting its leases, then add changed contributions and
+// end. Dependencies are a conservative union; removed members can shorten reuse but never permit stale contents.
+int vk_usnap_proof_inherit(VkUsnapProof *building, const VkUsnapProof *prior);
 const uint8_t *vk_usnap_map(void);   // a host copy of the current arena, at the offsets vk_usnap_find gives
 const uint8_t *vk_usnap_bytes(uint64_t addr, uint64_t n);   // the copy of [addr, addr+n) as of the submit, NULL: none
 void vk_usnap_drop(uint64_t addr, uint64_t n);   // the replay makes the GPU write [addr, addr+n) of guest memory
@@ -662,6 +689,17 @@ int vk_mem_unchanged_why_locked(uint64_t addr, uint64_t size, uint32_t since, ui
 void vk_mem_gen_lock(void);
 void vk_mem_gen_unlock(void);
 uint64_t vk_mem_snap_range_locked(uint64_t addr, uint64_t size, uint32_t epoch);
+// Dependency consumers use the same snapshot and generation tables. Observe while gen_lock is held; it does not
+// take a new snapshot. A serial change requires checking which regions received a later memory observation.
+void vk_mem_dependency_watch(void);
+uint64_t vk_mem_dependency_serial(void);
+int vk_mem_dependency_region_locked(uint32_t region, uint32_t epoch, uint32_t *version);
+int vk_mem_dependency_sleep_locked(uint32_t region);
+int vk_mem_dependency_adopt_locked(uint32_t region, uint32_t epoch); // established sleeping membership; complete event history
+int vk_mem_dependency_events_locked(uint64_t *cursor, ResourceEventVisit visit, void *user);
+// Lock-free preservation of an already established, same-submission tracked proof. Zero refuses reuse. This does
+// not query write watch or prove tracking; it only checks publications since the captured observation watermark.
+int vk_mem_dependency_range_unchanged(uint64_t addr, uint64_t size, uint64_t observed);
 void vk_sampler_dlss_bias(float bias);           // texture LOD bias added for DLSS upscaling (material samplers)
 void vk_sampler_aniso_live(void);                   // each present: NX2NAVI_ANISO after a settings change (tiled samplers)
 uint32_t vk_sampler_gen(void);                      // changes whenever a sampler slot is registered

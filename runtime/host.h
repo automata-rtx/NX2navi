@@ -14,6 +14,7 @@
 
 #include "cpu.h"
 #include "dispatch.h"
+#include "resource_events.h"
 
 // ---- logging and results
 void rt_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));   // "[host] <msg>\n" to the log, one write
@@ -204,6 +205,19 @@ uint32_t mem_unmap(uint64_t dst, uint64_t src, uint64_t n);                     
 uint32_t mem_query(uint64_t a, RtMemoryInfo *out);                              // 0x06
 int mem_readable(uint64_t a, uint64_t n);                                        // every page readable
 uint32_t mem_map_gen(void);   // changes with everything mem_readable answers from (mapping, heap, permissions)
+// Mapping observations cover 2 MiB regions. Zero means an in-progress change or unavailable proof. A completed
+// watermark does not prove readability; it only preserves a prior check across changes outside its address range.
+uint64_t mem_mapping_serial(void);
+uint64_t mem_mapping_region(uint32_t region);
+int mem_mapping_range_unchanged(uint64_t addr, uint64_t size, uint64_t observed);
+int mem_mapping_events(uint64_t *cursor, ResourceEventVisit visit, void *user);
+// Protection observations belong to the freeze lock's independent writer domain. A zero clock/version or a
+// failed event read requires conservative observation. Events do not establish a content snapshot by themselves.
+int mem_protection_events(uint64_t *cursor, ResourceEventVisit visit, void *user);
+uint64_t mem_protection_serial(void);
+uint64_t mem_protection_region(uint32_t region);
+int mem_protection_range_unchanged(uint64_t addr, uint64_t size, uint64_t observed);
+int mem_frozen_stable(uint64_t addr); // strictly frozen with a stable protection version, never a thaw in flight
 int mem_read_hold(uint64_t a, uint64_t n);   // mem_readable that keeps the range mapped until mem_read_release
 void mem_read_release(void);
 uint32_t mem_map_physical(uint64_t a, uint64_t n);                              // 0x2C

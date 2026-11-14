@@ -23,7 +23,9 @@
 
 #include "host.h"
 #include "nvn_api.h"
+#include "resource_prep.h"
 #include "vk.h"
+#include "replay_phase_trace.h"
 #include "vk_dlaa.h"
 #include "platform/platform.h"
 
@@ -51,7 +53,11 @@ typedef struct { uint64_t lo, hi, fence, epoch; } Wrote;
 static struct {
     int mode;                   // rt_knob: 0 off, 1 on, 2 ab
     int on;                     // this submission has a snapshot
-    uint64_t fence, gen;
+    int proofs;                 // aggregate drop publication is used only by the prepared consumer
+    uint64_t fence, gen, capture;
+    // Even serials publish completed drop batches. Odd serials prevent sealing/using an aggregate proof while a
+    // writer changes region epochs. Buckets record the last completed serial that changed any of their regions.
+    uint64_t proof_serial, proof_bucket[VK_USNAP_PROOF_BUCKETS];
     Arena *arena;
     Rng *col;                   // collected ranges
     int ncol, ccol;
@@ -128,7 +134,50 @@ static void arena_done(void *arg) {   // completion thread: the GPU has read it
     plat_mutex_unlock(&free_lock);
 }
 
+static void collect_binding(const p_bind_buf *b) {
+    if (b->addr && b->size) {
+        uint64_t n = b->size < MAX_RANGE ? b->size : MAX_RANGE;
+        // the vertex stage's object and bone blocks: also the game's other copy on either side, which still
+        // holds last frame's (vk_mvprev.c)
+        uint64_t step = vk_mvprev_step(b->stage, b->index, b->size);
+        // which neighbours lie in an imported pool, per block and vk_mem_gen: the same blocks are bound by
+        // many draws, and two resolves for each binding were a quarter of the snapshot's time
+        static struct { uint64_t addr, size, gen; int ok; } nc[1024];
+        uint32_t ci = (uint32_t)((b->addr ^ n << 48) * 0x9E3779B97F4A7C15ull >> 54);
+        uint64_t gen = vk_mem_gen();
+        int known = step && nc[ci].addr == b->addr && nc[ci].size == n && nc[ci].gen == gen, ok = 0;
+        for (int k = step ? -1 : 0; k <= (step ? 1 : 0); k++) {
+            uint64_t at = b->addr + (uint64_t)((int64_t)k * (int64_t)step);
+            if (k < 0 && b->addr < step) continue;
+            // a neighbour past its pool would make the whole merged region fail the pool check below, and
+            // the bindings in it read live memory again
+            VkMemSpan sp;
+            uint64_t lo = at & ~(uint64_t)(ALIGN - 1);
+            if (k && known) {
+                if (!(nc[ci].ok >> (k + 1) & 1)) continue;
+            } else if (k) {
+                if (!vk_mem_lookup(lo, at + n - lo, &sp) || sp.alloc || !sp.pool || sp.avail < at + n - lo ||
+                    (sp.cls != VK_MCLS_HOST_CACHED && sp.cls != VK_MCLS_HOST_UNC))
+                    continue;
+                ok |= 1 << (k + 1);
+            }
+            if (U.ncol == U.ccol) U.col = grow(U.col, &U.ccol, sizeof *U.col);
+            U.col[U.ncol++] = (Rng){at & ~(uint64_t)(ALIGN - 1), at + n};
+        }
+        if (step && !known) nc[ci].addr = b->addr, nc[ci].size = n, nc[ci].gen = gen, nc[ci].ok = ok;
+    }
+}
+
 static void collect(const op_hdr *h, int depth) {
+    NvnRecordPlan plan;
+    if (nvn_record_plan((uintptr_t)h, &plan)) {
+        // These are unique capture inputs, not cached bytes or pool resolutions. Neighbour eligibility, imported
+        // storage and in-flight writes are still determined for this submission at the original capture boundary.
+        for (size_t i = 0; i < plan.ncapture; i++)
+            collect_binding((const p_bind_buf *)(plan.commands + plan.capture_offsets[i] + sizeof(op_hdr)));
+        return;
+    }
+    // Raw probe commands and reference mode retain the complete interpreter, including CALL/JUMP support.
     for (;;) {
         if (h->size < sizeof *h || (h->size & 7) || h->op >= OP_COUNT_)
             rt_fatal("vk_usnap: corrupt command record at %p: op %u size %u", (const void *)h, h->op, h->size);
@@ -139,40 +188,7 @@ static void collect(const op_hdr *h, int depth) {
             continue;
         }
         if (h->op == OP_CALL && depth < CALL_DEPTH) collect(nvn_op_first(((const p_jump *)a)->target), depth + 1);
-        if (h->op == OP_BIND_UBO) {
-            const p_bind_buf *b = a;
-            if (b->addr && b->size) {
-                uint64_t n = b->size < MAX_RANGE ? b->size : MAX_RANGE;
-                // the vertex stage's object and bone blocks: also the game's other copy on either side, which still
-                // holds last frame's (vk_mvprev.c)
-                uint64_t step = vk_mvprev_step(b->stage, b->index, b->size);
-                // which neighbours lie in an imported pool, per block and vk_mem_gen: the same blocks are bound by
-                // many draws, and two resolves for each binding were a quarter of the snapshot's time
-                static struct { uint64_t addr, size, gen; int ok; } nc[1024];
-                uint32_t ci = (uint32_t)((b->addr ^ n << 48) * 0x9E3779B97F4A7C15ull >> 54);
-                uint64_t gen = vk_mem_gen();
-                int known = step && nc[ci].addr == b->addr && nc[ci].size == n && nc[ci].gen == gen, ok = 0;
-                for (int k = step ? -1 : 0; k <= (step ? 1 : 0); k++) {
-                    uint64_t at = b->addr + (uint64_t)((int64_t)k * (int64_t)step);
-                    if (k < 0 && b->addr < step) continue;
-                    // a neighbour past its pool would make the whole merged region fail the pool check below, and
-                    // the bindings in it read live memory again
-                    VkMemSpan sp;
-                    uint64_t lo = at & ~(uint64_t)(ALIGN - 1);
-                    if (k && known) {
-                        if (!(nc[ci].ok >> (k + 1) & 1)) continue;
-                    } else if (k) {
-                        if (!vk_mem_lookup(lo, at + n - lo, &sp) || sp.alloc || !sp.pool || sp.avail < at + n - lo ||
-                            (sp.cls != VK_MCLS_HOST_CACHED && sp.cls != VK_MCLS_HOST_UNC))
-                            continue;
-                        ok |= 1 << (k + 1);
-                    }
-                    if (U.ncol == U.ccol) U.col = grow(U.col, &U.ccol, sizeof *U.col);
-                    U.col[U.ncol++] = (Rng){at & ~(uint64_t)(ALIGN - 1), at + n};
-                }
-                if (step && !known) nc[ci].addr = b->addr, nc[ci].size = n, nc[ci].gen = gen, nc[ci].ok = ok;
-            }
-        }
+        if (h->op == OP_BIND_UBO) collect_binding(a);
         h = nvn_op_next(h);
     }
 }
@@ -377,23 +393,37 @@ static int adopt(const uint64_t *handles, int n) {
 }
 
 void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
+    RP_SCOPE(rp_snapshot, RP_USNAP_BEGIN);
+    RP_VALUE(RPK_HANDLES, n);
+    U.proofs = resource_prep_mode() != 0;   // fixed process mode, established before replay workers start
     if (!U.mode) U.mode = rt_knob("UBO_SNAPSHOT", "1") + 1;   // stored +1: 0 is "not read yet"
-    U.on = 0, U.fence = fence, U.gen++;
+    U.on = 0, U.fence = fence, U.gen++, U.capture++;
+    if (!U.capture) rt_fatal("vk_usnap: capture identity exhausted");
     summary();
     if (!RT_KNOB_ON(U.mode - 1)) {
+        RP_VALUE(RPK_OUTCOME, RPO_DISABLED);
         U.off_subs++;
         wr_prune();   // vk_usnap_drop goes on listing the GPU's writes with snapshots off: without this the list only grew
         return;
     }
-    if (adopt(handles, n)) return;
+    if (RP_CALL(RP_USNAP_ADOPT, adopt(handles, n))) {
+        RP_VALUE(RPK_OUTCOME, RPO_ADOPTED);
+        return;
+    }
     uint64_t t0 = kern_now_ns();
-    plat_mutex_lock(&gather_lock);
+    RP_CALL(RP_USNAP_GATHER_LOCK, plat_mutex_lock(&gather_lock));
+    RP_SCOPE(rp_gather, RP_USNAP_GATHER);
     U.ncol = 0;
     for (int i = 0; i < n; i++)
         if (handles[i]) collect(nvn_op_first(handles[i]), 0);
-    sort_col();
-    wr_prune();
+    RP_VALUE(RPK_REGIONS_IN, U.ncol);
+    RP_END(rp_gather);
+    { RP_SCOPE(rp_sort, RP_USNAP_SORT); sort_col(); wr_prune(); }
     // merge, keeping only what lies wholly in one imported pool and no GPU write in flight touches
+    RP_SCOPE(rp_validate, RP_USNAP_VALIDATE);
+#if NX2NAVI_REPLAY_PHASES
+    uint64_t rp_refused = U.refused, rp_inflight = U.inflight;
+#endif
     U.nreg = 0;
     uint64_t total = 0;
     for (int i = 0; i < U.ncol;) {
@@ -414,10 +444,16 @@ void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
         U.reg[U.nreg++] = (Reg){lo, hi, total, 0};
         total += (hi - lo + ALIGN - 1) & ~(uint64_t)(ALIGN - 1);
     }
+    RP_VALUE(RPK_REGIONS_KEPT, U.nreg);
+    RP_VALUE(RPK_BYTES, total);
+    RP_VALUE(RPK_REFUSED, U.refused - rp_refused);
+    RP_VALUE(RPK_INFLIGHT, U.inflight - rp_inflight);
+    RP_END(rp_validate);
     plat_mutex_unlock(&gather_lock);
-    if (!U.nreg) return;
-    if (!(U.arena = arena_get(total))) return;
-    copy_regions(U.arena, U.reg, U.nreg, total, 1);   // the replay thread at the submission's start
+    if (!U.nreg) { RP_VALUE(RPK_OUTCOME, RPO_NO_REGIONS); return; }
+    if (!(U.arena = RP_CALL(RP_USNAP_ARENA, arena_get(total)))) { RP_VALUE(RPK_OUTCOME, RPO_NO_ARENA); return; }
+    RP_CALL(RP_USNAP_COPY, copy_regions(U.arena, U.reg, U.nreg, total, 1));   // the replay thread at the submission's start
+    RP_VALUE(RPK_OUTCOME, RPO_FRESH_COPY);
     U.on = 1;
     U.subs++, U.regions += (uint64_t)U.nreg, U.bytes += total, U.copy_ns += kern_now_ns() - t0;
 }
@@ -425,6 +461,7 @@ void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
 void vk_usnap_end(uint64_t fence) {
     if (U.arena) vk_completion_add(fence, arena_done, U.arena), U.arena = NULL;
     U.on = 0, U.gen++;
+    // The next begin advances capture even if it reuses the same arena and region indices.
 }
 
 // First region whose end is above a.
@@ -438,8 +475,9 @@ static int first_above(uint64_t a) {
     return lo;
 }
 
-int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out) {
-    if (!U.on || !n) return 0;
+int vk_usnap_find_lease(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out, VkUsnapLease *lease) {
+    if (lease) *lease = (VkUsnapLease){0};
+    if (!U.on || !n || !align || n > UINT64_MAX - addr) return 0;
     // Consecutive bindings mostly name the region the last one did: that one is tried before the binary search. The
     // regions are sorted and disjoint, so the region that holds addr is the one first_above finds.
     static _Thread_local int hint;   // per thread: the replay workers look up at once
@@ -447,12 +485,106 @@ int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferI
     if (i >= U.nreg || addr < U.reg[i].lo || addr >= U.reg[i].hi) i = first_above(addr);
     if (i >= U.nreg) return 0;
     const Reg *r = &U.reg[i];
-    if ((r->dropped && r->dropped <= vk_exec_epoch(0)) || addr < r->lo || addr + n > r->hi) return 0;
+    uint64_t dropped = __atomic_load_n(&r->dropped, __ATOMIC_ACQUIRE);
+    if ((dropped && dropped <= vk_exec_epoch(0)) || addr < r->lo || addr + n > r->hi) return 0;
     uint64_t off = r->off + (addr - r->lo);
     if (off % align) return 0;
     *out = (VkDescriptorBufferInfo){U.arena->buf, off, n};
+    if (lease) *lease = (VkUsnapLease){U.capture, addr, n, align, (uint32_t)i, 0};
     U.hits++;
     hint = i;
+    return 1;
+}
+
+int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out) {
+    return vk_usnap_find_lease(addr, n, align, out, NULL);
+}
+
+static const Reg *lease_region(const VkUsnapLease *lease) {
+    if (!lease || !U.on || !lease->capture || lease->capture != U.capture || lease->region >= (uint32_t)U.nreg)
+        return NULL;
+    const Reg *r = &U.reg[lease->region];
+    return lease->addr >= r->lo && lease->addr < r->hi && lease->size && lease->size <= r->hi - lease->addr &&
+           lease->align && !((r->off + lease->addr - r->lo) % lease->align) ? r : NULL;
+}
+
+int vk_usnap_lease_valid(const VkUsnapLease *lease) {
+    const Reg *r = lease_region(lease);
+    if (!r) return 0;
+    // Capture lifetime is held by the recording context; only dropped may change under replay workers. The check
+    // must use the consumer's epoch every time: an early worker can see a later drop without that drop applying yet.
+    uint64_t dropped = __atomic_load_n(&r->dropped, __ATOMIC_ACQUIRE);
+    return !(dropped && dropped <= vk_exec_epoch(0));
+}
+
+uint64_t vk_usnap_capture(void) { return U.on ? U.capture : 0; }
+
+_Static_assert(VK_USNAP_PROOF_BUCKETS == 64, "snapshot proof buckets must fit the dependency mask");
+
+// The closing acquire fence keeps bucket/region reads before the serial recheck. All concurrently accessed drop
+// fields are atomic; capture and region storage cannot change until the submission's replay workers have joined.
+static uint64_t proof_serial_after(void) {
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    return __atomic_load_n(&U.proof_serial, __ATOMIC_RELAXED);
+}
+
+void vk_usnap_proof_begin(VkUsnapProof *p) {
+    p->sealed = 0, p->buckets = 0, p->horizon = 0;
+    p->capture = vk_usnap_capture();
+    p->epoch = vk_exec_epoch(0);
+    p->serial = __atomic_load_n(&U.proof_serial, __ATOMIC_ACQUIRE);
+    p->building = U.proofs && p->capture && !(p->serial & 1);
+    // Unused bucket entries are intentionally untouched: an immutable mask determines which ones end initializes.
+}
+
+int vk_usnap_proof_add(VkUsnapProof *p, const VkUsnapLease *lease) {
+    if (!p->building) return 0;
+    const Reg *r = lease_region(lease);
+    if (!r || lease->capture != p->capture) return p->building = 0;
+    uint64_t dropped = __atomic_load_n(&r->dropped, __ATOMIC_ACQUIRE);
+    if (dropped && dropped <= vk_exec_epoch(0)) return p->building = 0;
+    if (dropped && (!p->horizon || dropped < p->horizon)) p->horizon = dropped;
+    p->buckets |= 1ull << (lease->region % VK_USNAP_PROOF_BUCKETS);
+    return 1;
+}
+
+int vk_usnap_proof_end(VkUsnapProof *p) {
+    if (!p->building) return 0;
+    p->building = 0;
+    for (uint64_t mask = p->buckets; mask; mask &= mask - 1) {
+        unsigned k = (unsigned)__builtin_ctzll(mask);
+        p->version[k] = __atomic_load_n(&U.proof_bucket[k], __ATOMIC_ACQUIRE);
+    }
+    p->sealed = p->capture == vk_usnap_capture() && p->epoch == vk_exec_epoch(0) && p->serial == proof_serial_after() &&
+                (!p->horizon || vk_exec_epoch(0) < p->horizon);
+    return p->sealed;
+}
+
+int vk_usnap_proof_valid(VkUsnapProof *p) {
+    if (!p->sealed || !p->capture || p->capture != vk_usnap_capture() ||
+        (p->horizon && vk_exec_epoch(0) >= p->horizon)) return 0;
+    uint64_t serial = __atomic_load_n(&U.proof_serial, __ATOMIC_ACQUIRE);
+    if (serial & 1) return 0;
+    if (serial == p->serial) return 1;
+    for (uint64_t mask = p->buckets; mask; mask &= mask - 1) {
+        unsigned k = (unsigned)__builtin_ctzll(mask);
+        if (p->version[k] != __atomic_load_n(&U.proof_bucket[k], __ATOMIC_ACQUIRE)) return 0;
+    }
+    if (serial != proof_serial_after()) return 0;
+    p->serial = serial;
+    return 1;
+}
+
+int vk_usnap_proof_inherit(VkUsnapProof *p, const VkUsnapProof *prior) {
+    if (!p->building) return 0;
+    if (p == prior) return p->building = 0;
+    // valid can advance a proof's publication serial. Use a private copy so renewal cannot mutate the certificate
+    // that ordinary resolution is still relying on for unchanged contributions.
+    VkUsnapProof saved = *prior;
+    if (!vk_usnap_proof_valid(&saved) || saved.capture != p->capture || saved.serial != p->serial ||
+        p->epoch != vk_exec_epoch(0)) return p->building = 0;
+    p->buckets |= saved.buckets;
+    if (saved.horizon && (!p->horizon || saved.horizon < p->horizon)) p->horizon = saved.horizon;
     return 1;
 }
 
@@ -468,16 +600,30 @@ void vk_usnap_drop(uint64_t addr, uint64_t n) {
     if (lk) plat_mutex_lock(&drop_lock);
     if (U.nwr == U.cwr) U.wr = grow(U.wr, &U.cwr, sizeof *U.wr);
     U.wr[U.nwr++] = (Wrote){addr, addr + n, U.fence, ep};
+    uint64_t changed = 0, serial = 0;
     if (U.on)
         for (int i = first_above(addr); i < U.nreg && U.reg[i].lo < addr + n; i++)
-            if (!U.reg[i].dropped || ep < U.reg[i].dropped) {
-                if (!U.reg[i].dropped) U.drops++;
-                U.reg[i].dropped = ep, __atomic_add_fetch(&U.gen, 1, __ATOMIC_RELAXED);
+            if (!__atomic_load_n(&U.reg[i].dropped, __ATOMIC_RELAXED) ||
+                ep < __atomic_load_n(&U.reg[i].dropped, __ATOMIC_RELAXED)) {
+                if (U.proofs && !changed) {
+                    serial = __atomic_load_n(&U.proof_serial, __ATOMIC_RELAXED);
+                    if ((serial & 1) || serial > UINT64_MAX - 2) rt_fatal("vk_usnap: drop publication exhausted");
+                    // The acquire/release exchange keeps the region changes after the odd publication as well as
+                    // ordering it after an earlier writer. drop_lock serializes writers when replay is shared.
+                    __atomic_exchange_n(&U.proof_serial, serial + 1, __ATOMIC_ACQ_REL);
+                }
+                if (U.proofs) changed |= 1ull << ((uint32_t)i % VK_USNAP_PROOF_BUCKETS);
+                if (!__atomic_load_n(&U.reg[i].dropped, __ATOMIC_RELAXED)) U.drops++;
+                __atomic_store_n(&U.reg[i].dropped, ep, __ATOMIC_RELEASE);
+                __atomic_add_fetch(&U.gen, 1, __ATOMIC_RELAXED);
             }
+    for (uint64_t mask = changed; mask; mask &= mask - 1)
+        __atomic_store_n(&U.proof_bucket[(unsigned)__builtin_ctzll(mask)], serial + 2, __ATOMIC_RELEASE);
+    if (changed) __atomic_store_n(&U.proof_serial, serial + 2, __ATOMIC_RELEASE);
     if (lk) plat_mutex_unlock(&drop_lock);
 }
 
-uint64_t vk_usnap_gen(void) { return U.gen; }
+uint64_t vk_usnap_gen(void) { return __atomic_load_n(&U.gen, __ATOMIC_RELAXED); }
 
 // A GPU write of a submission not known to be complete touches [lo, hi). A linear scan: vk_usnap_drop appends after
 // wr_prune sorted the list, so wr_hits's binary search does not hold here; only called on rare paths.

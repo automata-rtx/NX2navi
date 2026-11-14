@@ -17,6 +17,8 @@
 #include "host.h"
 #include "nvn_api.h"
 #include "vk.h"
+#include "replay_phase_trace.h"
+#include "replay_work_trace.h"
 #include "platform/platform.h"
 
 #define WEAK __attribute__((weak))
@@ -83,6 +85,13 @@ static volatile int32_t held_n;       // H.n, for readers without the lock
 static volatile uint64_t held_t0;     // when the oldest held submission was held (kern_now_ns)
 static volatile uint64_t queued_v;    // the newest timeline value handed to the queue
 static int hold_max = -1;
+
+// Diagnostic identities do not affect ordering or lifetime. Ready identities are assigned under sub_lock;
+// held identities and batch identities are accessed under the queue lock.
+static int tl_recording(void);
+static void tl_note_gpu(uint64_t start, uint64_t end, uint64_t ready_at, uint64_t ready_id);
+static uint64_t tl_ready_next, tl_ready_current, tl_batch_next;
+static uint64_t tl_held_ready[HOLD_CAP];
 
 // ---- the executed timeline
 // The wait after a frame's first submission (nvn_api_core.c nvnQueueSubmitCommands) is there so that the GPU has run
@@ -236,7 +245,16 @@ static void hold_flush_locked(VkCtx *c) {
         __atomic_store_n(&held_n, 0, __ATOMIC_RELEASE);
         return;
     }
+    uint64_t tl_batch = tl_recording() ? ++tl_batch_next : 0;
+    uint64_t tl_call_begin = tl_batch ? plat_now_ns() : 0;
     VkResult r = lost_at_due() ? VK_ERROR_DEVICE_LOST : vkQueueSubmit2(c->gfx_queue, (uint32_t)H.n, H.si, VK_NULL_HANDLE);
+    uint64_t tl_call_end = tl_batch ? plat_now_ns() : 0;
+    if (tl_batch) {
+        // Record after the call so diagnostic member notes do not extend the ready-to-call interval.
+        gfx_tl_note('B', tl_call_begin, tl_batch, (uint64_t)H.n);
+        for (int j = 0; j < H.n; j++) gfx_tl_note('M', tl_call_begin, tl_batch, tl_held_ready[j]);
+        gfx_tl_note('b', tl_call_end, tl_batch, (uint64_t)(int64_t)r);
+    }
     if (r != VK_SUCCESS) {
         vk_device_lost_check(r, "the submit of the replay's command buffers");
         rt_fatal("vk: vkQueueSubmit2 of %d held submissions up to value %llu failed (%d)", H.n,
@@ -266,10 +284,13 @@ static void queue_submit(VkCtx *c, const VkSubmitInfo2 *si, uint64_t value) {
     // the submitting thread wait here; counted as a present wait, so the slow-frame line no longer shows such a frame
     // with nothing blocked.
     uint64_t p0 = perf_begin();
+    if (tl_ready_current) gfx_tl_note('L', 0, tl_ready_current, 0);
     vk_queue_lock_raw();
+    if (tl_ready_current) gfx_tl_note('l', 0, tl_ready_current, 0);
     perf_end(PERF_FENCE, p0);
     if (H.n == HOLD_CAP) hold_flush_locked(c);
     int i = H.n++;
+    tl_held_ready[i] = tl_ready_current;
     H.si[i] = *si;
     if (si->commandBufferInfoCount)
         memcpy(H.cbi[i], si->pCommandBufferInfos, sizeof H.cbi[i][0] * si->commandBufferInfoCount);
@@ -282,6 +303,7 @@ static void queue_submit(VkCtx *c, const VkSubmitInfo2 *si, uint64_t value) {
     uint64_t now = kern_now_ns();
     if (i == 0) __atomic_store_n(&held_t0, now, __ATOMIC_RELEASE);
     __atomic_store_n(&held_n, H.n, __ATOMIC_RELEASE);
+    if (tl_ready_current) gfx_tl_note('E', now, tl_ready_current, value);
     // A part of a long submission (no value) goes at once with whatever is held: parts exist to start the GPU early.
     // So do held submissions that have waited HOLD_NS, and a full batch.
     if (H.n >= hold_max || !value || now - __atomic_load_n(&held_t0, __ATOMIC_ACQUIRE) >= HOLD_NS) hold_flush_locked(c);
@@ -321,9 +343,10 @@ static volatile int64_t ts_busy_ns, ts_parts, ts_missed;
 // The same durations, never reset: dynamic resolution differences it across presented frames (the perf window
 // consumes ts_busy_ns, so a reader that sampled it would steal from the perf line and see a reset every window).
 static volatile int64_t ts_busy_all;
-// GPU idle (with calibrated timestamps): the gap before each timed part, split by whether the part was submitted after
-// the previous one had ended (the GPU waited for the CPU: starved) or before (it waited for untimed work or a wait).
-static uint64_t ts_sub_ns[TS_PAIRS];       // CPU time the part was handed to vkQueueSubmit2
+// Gaps before timed GPU parts, split at CPU-ready time. Queue locking and batching happen after that timestamp;
+// the remaining gap can include CPU handoff delay as well as untimed GPU work or synchronization.
+static uint64_t ts_sub_ns[TS_PAIRS];       // CPU-ready time before queue lock and submit batching
+static uint64_t ts_ready_id[TS_PAIRS];     // diagnostic ready identity, protected by the pair's busy lifetime
 // A pair to read at its value. mirror: the copies of a mirror prologue (vk_sync.c prologue), counted apart as well.
 typedef struct { uint32_t pair; int mirror; uint64_t fence; } TsRead;
 static TsRead *ts_unsent[4];               // closed and not yet submitted (sub_lock)
@@ -399,18 +422,22 @@ static void max64(volatile int64_t *m, int64_t v) {
 
 static void ts_read_cb(void *arg);
 
-// Just before vkQueueSubmit2 (sub_lock held): the parts closed since the last submit leave the CPU now. Their reads
+// Before queue_submit (sub_lock held): the parts closed since the last submit are ready for queue locking/batching. Their reads
 // are queued in the order the GPU runs them: a mirror prologue is closed after the part it was made for but runs
 // first. Read after its part, its copies counted neither as busy time nor as a gap of their own: they showed up as
 // idle time with work queued, 7-8 ms a frame over PCIe 3.0 in Kokiri Forest, and the frame as CPU-bound.
 static void ts_submitted(void) {
     uint64_t now = plat_now_ns();
-    gfx_tl_note('S', now, cur_fence, 0);
+    tl_ready_current = tl_recording() ? ++tl_ready_next : 0;
+    gfx_tl_note('S', now, cur_fence, tl_ready_current);
+    RP_READY(tl_ready_current);
+    if (tl_ready_current) gfx_tl_note('T', now, tl_ready_current, (uint64_t)ts_n_unsent);
     for (int pass = 0; pass < 2; pass++)
         for (int i = 0; i < ts_n_unsent; i++) {
             TsRead *t = ts_unsent[i];
             if (!t->mirror != pass) continue;   // the prologues first
             ts_sub_ns[t->pair] = now;
+            ts_ready_id[t->pair] = tl_ready_current;
             vk_completion_add(t->fence, ts_read_cb, t);
         }
     ts_n_unsent = 0;
@@ -433,7 +460,7 @@ static void ts_read_cb(void *arg) {   // completion thread, in submission order
                     max64(&ts_max_gap_ns, gap);
                 }
                 if (sub && sn > sub) plat_add64(&ts_queued_ns, sn - sub);
-                gfx_tl_note('G', (uint64_t)sn, (uint64_t)en, (uint64_t)sub);
+                tl_note_gpu((uint64_t)sn, (uint64_t)en, (uint64_t)sub, ts_ready_id[t->pair]);
                 if (en > ts_last_end_ns) ts_last_end_ns = en;
             }
             uint64_t from = s > ts_last_end ? s : ts_last_end;
@@ -459,19 +486,102 @@ static void ts_read_cb(void *arg) {   // completion thread, in submission order
 // the GPU after a frame's first submission, the replay workers' groups, chunks and the submitting thread's waits for
 // them, and the presents. It tells whether the GPU waits for the replay, for a wait, or for the CPU behind one. Off
 // (and one load per note) without the setting.
-#define TL_CAP 16384
+#define TL_CAP 32768
 #define TL_FRAMES 4
-typedef struct { uint64_t t, a, b; uint32_t tid; int kind; } TlEv;
+typedef struct { uint64_t t, a, b; uint32_t tid; int kind; uint64_t ready_id; } TlEv;
 static TlEv *tl_ev;
-static volatile int32_t tl_n, tl_rec;
+#define TL_CLOSED (1u << 31)
+static volatile uint32_t tl_n;
+static volatile int32_t tl_rec;
+static volatile uint8_t tl_committed[TL_CAP];
 static int tl_on = -1;
 static uint64_t tl_from, tl_frames;
 
+static int tl_recording(void) { return __atomic_load_n(&tl_rec, __ATOMIC_ACQUIRE) != 0; }
+
+// Exactly one capture per process: the ticket counter and committed slots are never reset or reused.
+// Closing the counter prevents a writer that already saw tl_rec from reserving after the snapshot boundary.
+static int32_t tl_reserve(void) {
+    uint32_t n = __atomic_load_n(&tl_n, __ATOMIC_RELAXED);
+    for (;;) {
+        if (n & TL_CLOSED) return -1;
+        if (n > TL_CAP) return -1;   // one extra reservation records saturation without wrapping the closed bit
+        if (__atomic_compare_exchange_n(&tl_n, &n, n + 1, 1, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            return (int32_t)n;
+    }
+}
+
 void gfx_tl_note(int kind, uint64_t t, uint64_t a, uint64_t b) {
     if (!__atomic_load_n(&tl_rec, __ATOMIC_ACQUIRE)) return;
-    int32_t i = plat_inc32(&tl_n) - 1;
-    if (i < TL_CAP) tl_ev[i] = (TlEv){t ? t : plat_now_ns(), a, b, plat_thread_id(), kind};
+    int32_t i = tl_reserve();
+    if (i >= 0 && i < TL_CAP) {
+        tl_ev[i] = (TlEv){t ? t : plat_now_ns(), a, b, plat_thread_id(), kind};
+        __atomic_store_n(&tl_committed[i], 1, __ATOMIC_RELEASE);
+    }
 }
+
+static void tl_note_gpu(uint64_t start, uint64_t end, uint64_t ready_at, uint64_t ready_id) {
+    if (!tl_recording()) return;
+    int32_t i = tl_reserve();
+    if (i >= 0 && i < TL_CAP) {
+        tl_ev[i] = (TlEv){start, end, ready_at, plat_thread_id(), 'G', ready_id};
+        __atomic_store_n(&tl_committed[i], 1, __ATOMIC_RELEASE);
+    }
+}
+
+
+#if NX2NAVI_REPLAY_PHASES
+static _Thread_local uint64_t rp_parent;
+// Only submit/split paths under sub_lock use this link. Own commands clear it before recording.
+static uint64_t rp_submission_replay;
+#define RP_NAME(name, text) text,
+static const char *const rp_phase_names[] = {"unknown", RP_PHASES(RP_NAME)};
+static const char *const rp_key_names[] = {"unknown", RP_KEYS(RP_NAME)};
+#undef RP_NAME
+
+static void rp_note(int kind, uint64_t a, uint64_t b, uint64_t extra) {
+    if (!tl_recording()) return;
+    int32_t i = tl_reserve();
+    if (i < 0 || i >= TL_CAP) return;
+    tl_ev[i] = (TlEv){plat_now_ns(), a, b, plat_thread_id(), kind, extra};
+    __atomic_store_n(&tl_committed[i], 1, __ATOMIC_RELEASE);
+}
+
+RpScope gfx_rp_begin(unsigned phase) {
+    if (phase == RP_REPLAY) rp_submission_replay = 0;
+    RpScope scope = {0};
+    if (!tl_recording()) return scope;
+    int32_t i = tl_reserve();
+    if (i < 0 || i >= TL_CAP) return scope;
+    scope.id = (uint64_t)i + 1;
+    scope.parent = rp_parent;
+    tl_ev[i] = (TlEv){plat_now_ns(), scope.id, scope.parent, plat_thread_id(), '{', phase};
+    __atomic_store_n(&tl_committed[i], 1, __ATOMIC_RELEASE);
+    rp_parent = scope.id;
+    if (phase == RP_REPLAY) rp_submission_replay = scope.id;
+    return scope;
+}
+
+void gfx_rp_end(RpScope *scope) {
+    if (!scope->id) return;
+    if (rp_parent != scope->id) rp_note('!', scope->id, rp_parent, 0);
+    rp_note('}', scope->id, 0, 0);
+    rp_parent = scope->parent;
+    scope->id = 0;
+}
+
+void gfx_rp_value(unsigned key, uint64_t value) {
+    if (rp_parent) rp_note('=', rp_parent, value, key);
+}
+
+void gfx_rp_replay_reset(void) { rp_submission_replay = 0; }
+void gfx_rp_ready(uint64_t ready) { if (ready) rp_note('I', ready, rp_submission_replay, 0); }
+#endif
+
+#if NX2NAVI_REPLAY_WORK
+uint64_t gfx_rp_current(void) { return rp_submission_replay; }
+#endif
+#include "replay_work_impl.h"
 
 static int tl_cmp(const void *x, const void *y) {
     uint64_t a = ((const TlEv *)x)->t, b = ((const TlEv *)y)->t;
@@ -479,21 +589,62 @@ static int tl_cmp(const void *x, const void *y) {
 }
 
 static void tl_dump(void) {
-    int n = tl_n < TL_CAP ? tl_n : TL_CAP;
-    qsort(tl_ev, (size_t)n, sizeof *tl_ev, tl_cmp);
+    uint32_t reserved = __atomic_fetch_or(&tl_n, TL_CLOSED, __ATOMIC_ACQ_REL) & ~TL_CLOSED;
+    uint32_t limit = reserved < TL_CAP ? reserved : TL_CAP;
+    if (reserved > TL_CAP) rt_log("vk: timeline overflow: capacity exceeded; event count saturated; attribution rejected");
+    TlEv *events = malloc((limit ? limit : 1) * sizeof *events);
+    if (!events) {
+        rt_log("vk: timeline incomplete: snapshot allocation failed; attribution rejected");
+        return;
+    }
+    int n = 0;
+    for (uint32_t i = 0; i < limit; i++) {
+        if (__atomic_load_n(&tl_committed[i], __ATOMIC_ACQUIRE)) events[n++] = tl_ev[i];
+    }
+    if ((uint32_t)n != limit)
+        rt_log("vk: timeline incomplete: %u reserved events unpublished at snapshot; attribution rejected", limit - (uint32_t)n);
+    qsort(events, (size_t)n, sizeof *events, tl_cmp);
     uint64_t t0 = 0, t1 = UINT64_MAX;
     for (int i = 0; i < n; i++)
-        if (tl_ev[i].kind == 'P') {
-            if (tl_ev[i].a == tl_from) t0 = tl_ev[i].t;
-            if (tl_ev[i].a == tl_from + TL_FRAMES) t1 = tl_ev[i].t;
+        if (events[i].kind == 'P') {
+            if (events[i].a == tl_from) t0 = events[i].t;
+            if (events[i].a == tl_from + TL_FRAMES) t1 = events[i].t;
         }
+#if NX2NAVI_REPLAY_WORK
+    rwt_dump(t0, t1);
+#endif
     rt_log("vk: timeline of frames %llu-%llu (%d events), ms from the first present:", (unsigned long long)tl_from,
            (unsigned long long)(tl_from + TL_FRAMES), n);
     for (int i = 0; i < n; i++) {
-        const TlEv *e = &tl_ev[i];
+        const TlEv *e = &events[i];
         if (e->t < t0 || e->t > t1) continue;
         double at = (double)(int64_t)(e->t - t0) / 1e6;
         switch (e->kind) {
+#if NX2NAVI_REPLAY_PHASES
+        case '{':
+            rt_log("vk: rp %8.3f t%-5u begin id %llu parent %llu phase %s", at, e->tid,
+                   (unsigned long long)e->a, (unsigned long long)e->b,
+                   e->ready_id < RP_PHASE_COUNT ? rp_phase_names[e->ready_id] : "unknown");
+            break;
+        case '}':
+            rt_log("vk: rp %8.3f t%-5u end id %llu cpu-ns 0 cpu-valid 0", at, e->tid,
+                   (unsigned long long)e->a);
+            break;
+        case '=':
+            rt_log("vk: rp %8.3f t%-5u value id %llu key %s value %llu", at, e->tid,
+                   (unsigned long long)e->a,
+                   e->ready_id < RP_KEY_COUNT ? rp_key_names[e->ready_id] : "unknown",
+                   (unsigned long long)e->b);
+            break;
+        case 'I':
+            rt_log("vk: rp %8.3f t%-5u ready %llu replay %llu", at, e->tid,
+                   (unsigned long long)e->a, (unsigned long long)e->b);
+            break;
+        case '!':
+            rt_log("vk: rp invalid scope id %llu current %llu; attribution rejected",
+                   (unsigned long long)e->a, (unsigned long long)e->b);
+            break;
+#endif
         case 'P': rt_log("vk: tl %8.3f t%-5u present, frame %llu", at, e->tid, (unsigned long long)e->a); break;
         case 'R': rt_log("vk: tl %8.3f t%-5u replay begins: %llu handles, value %llu", at, e->tid,
                          (unsigned long long)e->a, (unsigned long long)e->b); break;
@@ -509,12 +660,35 @@ static void tl_dump(void) {
         case 'c': rt_log("vk: tl %8.3f t%-5u records chunk %llu (%llu ops)", at, e->tid, (unsigned long long)e->a,
                          (unsigned long long)e->b); break;
         case 'd': rt_log("vk: tl %8.3f t%-5u chunk %llu done", at, e->tid, (unsigned long long)e->a); break;
-        case 'S': rt_log("vk: tl %8.3f t%-5u part submitted, value %llu", at, e->tid, (unsigned long long)e->a); break;
-        case 'G': rt_log("vk: tl %8.3f gpu    part runs %.3f ms (submitted %.3f ms before)", at,
-                         (double)(e->a - e->t) / 1e6, (double)(int64_t)(e->t - e->b) / 1e6); break;
+        case 'X': case 'Y': {
+            static const char *names[] = {"unknown", "recorder-finish", "upload-flush", "mirror-prologue"};
+            const char *name = e->a < sizeof names / sizeof names[0] ? names[e->a] : names[0];
+            rt_log("vk: tl %8.3f t%-5u cpu phase %s: %s, value %llu", at, e->tid,
+                   e->kind == 'X' ? "begins" : "ends", name, (unsigned long long)e->b);
+            break;
+        }
+        case 'S': rt_log("vk: tl %8.3f t%-5u part ready, value %llu, ready %llu", at, e->tid,
+                         (unsigned long long)e->a, (unsigned long long)e->b); break;
+        case 'L': rt_log("vk: tl %8.3f t%-5u queue lock begins, ready %llu", at, e->tid, (unsigned long long)e->a); break;
+        case 'l': rt_log("vk: tl %8.3f t%-5u queue lock acquired, ready %llu", at, e->tid, (unsigned long long)e->a); break;
+        case 'E': rt_log("vk: tl %8.3f t%-5u batch enqueue, ready %llu, signal %llu", at, e->tid,
+                         (unsigned long long)e->a, (unsigned long long)e->b); break;
+        case 'T': rt_log("vk: tl %8.3f t%-5u expected timed parts, ready %llu, count %llu", at, e->tid,
+                         (unsigned long long)e->a, (unsigned long long)e->b); break;
+        case 'B': rt_log("vk: tl %8.3f t%-5u queue submit API begins, batch %llu, members %llu", at, e->tid,
+                         (unsigned long long)e->a, (unsigned long long)e->b); break;
+        case 'M': rt_log("vk: tl %8.3f t%-5u batch member, batch %llu, ready %llu", at, e->tid,
+                         (unsigned long long)e->a, (unsigned long long)e->b); break;
+        case 'b': rt_log("vk: tl %8.3f t%-5u queue submit API ends, batch %llu, result %lld", at, e->tid,
+                         (unsigned long long)e->a, (long long)(int64_t)e->b); break;
+
+        case 'G': rt_log("vk: tl %8.3f gpu    part runs %.3f ms (CPU ready %.3f ms before), ready %llu", at,
+                         (double)(e->a - e->t) / 1e6, (double)(int64_t)(e->t - e->b) / 1e6,
+                         (unsigned long long)e->ready_id); break;
         default: break;
         }
     }
+    free(events);
 }
 
 void gfx_tl_present(void) {
@@ -556,6 +730,7 @@ static void ts_close(VkCommandBuffer cb, int pair, uint64_t fence, int mirror) {
     if (pair < 0) return;
     vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ts_pool, 2 * (uint32_t)pair + 1);
     ts_sub_ns[pair] = 0;
+    ts_ready_id[pair] = 0;   // an unsent-capacity fallback must never inherit this pair's earlier diagnostic owner
     TsRead *t = malloc(sizeof *t);
     if (!t) rt_fatal("vk: out of memory");
     *t = (TsRead){(uint32_t)pair, mirror, fence};
@@ -809,7 +984,9 @@ VkCommandBuffer vk_sync_append_later(int n, int *at) {
     if (!vk_sync_append_room(n)) rt_fatal("vk: a submission part of more than %d command buffers", PART_CBS);
     VkCtx *c = vk_ctx();
     VkCommandBuffer cb = slots[cur_slot].cb;
+    gfx_tl_note('X', 0, 1, cur_fence);
     if (!rec_end_cb(cb, 0, 0)) vkEndCommandBuffer(cb);   // every command of it is in cb, ended by its recorder
+    gfx_tl_note('Y', 0, 1, cur_fence);
     part_cbs[npart_cbs++] = cb;
     *at = npart_cbs;
     for (int i = 0; i < n; i++) part_cbs[npart_cbs++] = VK_NULL_HANDLE;
@@ -875,9 +1052,15 @@ static VkCommandBuffer split_part(int exec) {
     VkCommandBuffer cb = slots[cur_slot].cb;
     vk_gpu_passes_part(cb, 1);
     ts_end(cb, cur_fence);
+    gfx_tl_note('X', 0, 1, cur_fence);
     if (!rec_end_cb(cb, 0, 0)) vkEndCommandBuffer(cb);   // every command of the part is in cb, ended by its recorder
+    gfx_tl_note('Y', 0, 1, cur_fence);
+    gfx_tl_note('X', 0, 2, cur_fence);
     vk_upload_flush(0);   // the uploads this part asked for precede it in queue order
+    gfx_tl_note('Y', 0, 2, cur_fence);
+    gfx_tl_note('X', 0, 3, cur_fence);
     VkCommandBuffer pro = prologue(c, cur_fence);
+    gfx_tl_note('Y', 0, 3, cur_fence);
     VkCommandBufferSubmitInfo cbi[PART_CBS + 2];
     VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = part_list(cbi, pro, cb, 1),
                         .pCommandBufferInfos = cbi};
@@ -918,12 +1101,16 @@ typedef struct {
 } OwnCommands;
 
 static uint64_t submit(const uint64_t *handles, int n, const OwnCommands *own) {
+    RP_SCOPE(rp_submit, RP_SUBMIT);
+    RP_VALUE(RPK_HANDLES, n);
     vk_sync_start();
     // The run is ending (vk_device.c vk_device_lost_check): nothing is recorded or submitted and no value is issued.
     // The value returned is the last one issued; a wait for it sleeps until the process ends.
     if (vk_device_is_lost()) return __atomic_load_n(&issued, __ATOMIC_ACQUIRE);
     VkCtx *c = vk_ctx();
-    plat_mutex_lock(&sub_lock);
+    RP_CALL(RP_SUBMIT_LOCK, plat_mutex_lock(&sub_lock));
+    RP_REPLAY_RESET();
+    RP_SCOPE(rp_slot, RP_SLOT_BEGIN);
     vk_mem_dirty_submit();   // NX2NAVI_TRACE=perf: what a mirror would upload before this submit
     uint64_t fence = __atomic_load_n(&issued, __ATOMIC_ACQUIRE) + 1;
     cur_fence = fence;
@@ -940,6 +1127,8 @@ static uint64_t submit(const uint64_t *handles, int n, const OwnCommands *own) {
     ts_begin(s->cb);
     rec_begin(s->cb, fence);
     vk_gpu_passes_part(s->cb, 0);
+    RP_END(rp_slot);
+    RP_VALUE(RPK_FENCE, fence);
     int recorded = 1;
     if (own) own->record(s->cb, own->arg);
     else recorded = vk_exec_record(s->cb, handles, n, fence);
@@ -948,12 +1137,18 @@ static uint64_t submit(const uint64_t *handles, int n, const OwnCommands *own) {
     if (recorded) ts_end(s->cb, fence);
     else ts_drop();
     // The recorder is done with the part: the end-of-submission crumb, then the end, by the recorder when it records.
+    gfx_tl_note('X', 0, 1, cur_fence);
     if (!rec_end_cb(s->cb, VK_CRUMB_SUBMIT_END, fence)) vkEndCommandBuffer(s->cb);
+    gfx_tl_note('Y', 0, 1, cur_fence);
     perf_replay(t0);
     if (cpu0) perf_replay_cpu(plat_thread_cpu_ns(me) - cpu0);
     // After the recording: the uploads it asked for (and every earlier one) precede it in queue order.
+    gfx_tl_note('X', 0, 2, cur_fence);
     vk_upload_flush(0);
+    gfx_tl_note('Y', 0, 2, cur_fence);
+    gfx_tl_note('X', 0, 3, cur_fence);
     VkCommandBuffer pro = prologue(c, fence);
+    gfx_tl_note('Y', 0, 3, cur_fence);
     s = &slots[cur_slot];
     VkCommandBufferSubmitInfo cbi[PART_CBS + 2];
     uint32_t ncbi = part_list(cbi, pro, s->cb, recorded);

@@ -9,6 +9,7 @@
 
 #include "nvn_api.h"
 #include "vk.h"
+#include "vk_pool_publication.h"
 
 // Dynamic state the next draw must record (VkExec.dirty). vk_exec_record sets them all at the start of each command
 // buffer; the state ops set theirs; vk_exec_draw.c clears what it recorded.
@@ -157,7 +158,33 @@ void vk_exec_draw_ctx_use(void *ctx);
 // vk_exec_draw.c, before the chunks of a parallel group are recorded (submitting thread): the stand-ins are made and the
 // texture pool set this submission took is brought up to date, which the chunks then only bind. Returns the inline
 // uniform updates of the submission so far (vk_exec_upd_top).
-uint32_t vk_exec_draw_group_begin(VkExec *ex);
+uint32_t vk_exec_draw_group_begin(VkExec *ex, VkExecPoolView *pool);
+// Scheduling hint for a completed draw that used the bindless pool. It never authorizes shader,
+// descriptor or resource reuse: the canonical leader still performs every normal resolution and validity check.
+// Only chunk zero writes its group's record; the replay thread reads it after retirement and owns the cache.
+typedef struct {
+    const prog_t *program;
+    uint64_t serial;
+    int32_t stages;
+    uint8_t vertex_format[16];
+    int32_t color_format[8];
+    uint8_t valid, direct_mesh;
+} VkExecPoolRequirement;
+VkExecPoolRequirement *vk_exec_pool_requirement_begin(void);
+void vk_exec_draw_pool_learn(const VkExecPoolRequirement *requirement);
+int vk_exec_draw_pool_leader_needed(VkExec *ex);
+void vk_exec_draw_pool_schedule_init(void);
+int vk_exec_draw_pool_requirement_known(VkExec *ex, int direct_mesh);
+void vk_exec_draw_pool_leader_finished(VkExec *ex);
+enum { VK_POOL_REFUSE_PRIOR, VK_POOL_REFUSE_ORDERED, VK_POOL_REFUSE_LIMIT, VK_POOL_REFUSE_INVALID,
+       VK_POOL_REFUSE_FAMILY, VK_POOL_REFUSE_FORMAT, VK_POOL_REFUSE_DISABLED, VK_POOL_REFUSE_SPECIAL,
+       VK_POOL_REFUSE_COUNT };
+void vk_exec_draw_pool_refused(VkExec *ex, int reason);
+void vk_exec_draw_pool_prefix_op(uint32_t opcode); // opt-in bounded diagnostic; replay thread only
+VkExecPoolView *vk_exec_pool_view(void);   // the calling chunk's group, NULL outside parallel recording
+VkExecPoolView *vk_exec_pool_local_view(void);   // owned only by the calling chunk; renewed after a later publication
+uint64_t vk_exec_pool_generation(void);   // zero while pool state is being refreshed or publication is disabled
+int vk_exec_pool_wait(uint64_t fence, uint32_t kinds, VkDescriptorSet *set);   // completed view or ordered first use
 // vk_exec.c: of the submission's inline uniform updates (all), those a draw on the calling thread may read.
 uint32_t vk_exec_upd_top(uint32_t all);
 // vk_exec_xfer.c, parallel groups: vk_exec_xfer_group turns the front pass of the group in slot `group` on (it lists
@@ -180,6 +207,16 @@ uint32_t vk_exec_xfer_slots(uint32_t n);
 // vk_exec_draw.c: forget what the command buffer being recorded has bound (pipeline, sets, dynamic state, vertex
 // buffers): the replay continues in a new one (vk_sync_split).
 void vk_exec_draw_new_cb(void);
+// A copied queue/chunk state becomes the inputs of a recording context. Invalidate its input certificates without
+// discarding immutable recipes or extending the lifetime of submission-owned descriptors.
+void vk_exec_draw_state_adopted(VkExec *ex);
+// Immutable state blocks hold only assignments into queue state and source offsets into this command copy.
+void vk_exec_draw_state_apply(VkExec *ex, const uint8_t *commands, const void *prepared);
+NvnExecFn vk_exec_draw_prepared_handler(uint32_t opcode);
+// Workers publish context-local preparation counters at chunk completion. The replay thread alone collects them
+// into VkExecFrame, so logging/reset never races a worker updating those frame fields.
+void vk_exec_draw_prepared_stats_flush(VkExec *ex);
+void vk_exec_draw_prepared_stats_collect(void);
 // vk_exec_draw.c, before a part of submission fence goes to the queue (vk_exec.c maybe_split): 1 when it may go. The
 // texture pool set it binds is then sealed and the next draw that needs the pools takes another; 0 when every other set
 // is bound by this submission's earlier parts, and the replay keeps recording into the same part.
@@ -231,6 +268,10 @@ typedef struct {
     uint64_t bind_sig_ns;                // of bind_ns, the per-draw binding signature
     uint64_t bind_push_ns;               // of bind_ns, the set packing, pushes and binds after the binding loop
     uint64_t bind_reused, bind_resolved; // descriptors taken from the per-binding reuse (PB) and resolved again
+    uint64_t prep_builds, prep_descriptors, prep_aggregate_skipped, prep_reused, prep_snapshot_reused;
+    uint64_t prep_resolved, prep_ordered, prep_checked, prep_proof_descriptors;
+    uint64_t prep_renewals, prep_renewed_descriptors;
+    uint64_t prep_cache_hits, prep_cache_misses, prep_cache_evictions, prep_cache_probes;
     uint64_t dyn_calls, dyn_left;        // dynamic state calls recorded, and left out as unchanged (B.dyn)
 } VkExecFrame;
 extern VkExecFrame vk_exec_frame;

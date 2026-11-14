@@ -1041,6 +1041,128 @@ static void image_bytes(VkImage image, uint32_t w, uint32_t h, uint8_t *out) {
     vmaDestroyBuffer(c->vma, rb, ra);
 }
 
+static void prepare_texture_entries(void) {
+    vk_texture_new_submit();
+    vk_texture_lock();
+    vk_texture_pool_fresh_locked();
+    vk_texture_unlock();
+}
+
+static int prepared_binding(int slot, int reuse, const VkTexImage **image) {
+    uint64_t checks, calls, untracked;
+    vk_mem_snap_stats(&checks, &calls, &untracked);
+    *image = vk_texture_by_id(slot, NULL, NULL);
+    vk_mem_snap_stats(&checks, &calls, &untracked);
+    GCHECK(*image, "prepared binding resolves its texture");
+    GCHECK(checks == (uint64_t)!reuse, "prepared binding made %llu snapshot checks, expected %d",
+           (unsigned long long)checks, !reuse);
+    return 0;
+}
+
+// Exercise the actual pool preparation and direct-binding boundary, not just the dependency container. Explicit
+// writes after preparation must invalidate reuse; an unflushed write after the frozen snapshot belongs to the next
+// submission. The bytes read from the Vulkan image are compared with the independent storage swizzler's input.
+static int test_prepared_texture(pool_t *pool, uint8_t *unrelated) {
+    enum { W = 32, H = 32, N = W * H * 4, SLOT = 19 };
+    uint8_t *lin[1] = {0}, got[N], previous[N];
+    const char *mode = cfg_value("NX2NAVI_RESOURCE_DEPS");
+    int reuse = mode && (!strcmp(mode, "integrated") || !strcmp(mode, "check") || !strcmp(mode, "1"));
+    int watching = reuse || (mode && (!strcmp(mode, "observe") || !strcmp(mode, "worklist")));
+    tex_t t = make_tex(pool, 0xe0000, 0x25, W, H, 1, 90001);
+    GCHECK((uint64_t)t.off + t.L.size <= pool->size, "prepared texture fits the probe pool");
+    if (fill_storage(&t, lin)) return 1;
+    vk_texture_register(SLOT, &t, NULL);
+    const VkTexImage *image = vk_texture_by_id(SLOT, NULL, NULL);
+    GCHECK(image && image->mirrored, "prepared texture initially resolves to CPU content");
+    uint32_t ent;
+    vk_texture_lock();
+    int listed = vk_texture_pool_note_locked(SLOT, &ent);
+    if (listed) vk_texture_pool_hold_locked(0, ent);
+    vk_texture_unlock();
+    GCHECK(listed && ent, "prepared texture joins the pool entry list");
+    prepare_texture_entries();   // records the uploaded generation in the newly listed entry
+    prepare_texture_entries();   // an unchanged entry can pass preparation without a direct binding check
+    if (prepared_binding(SLOT, reuse, &image)) return 1;
+    image_bytes(image->image, W, H, got);
+    GCHECK(!memcmp(got, lin[0], N), "prepared unchanged texture retained its pixels");
+
+    prepare_texture_entries();
+    uint64_t observed = vk_mem_dependency_serial();
+    *unrelated ^= 0x5a;
+    vk_guest_written((uint64_t)(uintptr_t)unrelated, 1);
+    if (watching) {
+        GCHECK(vk_mem_dependency_serial() > observed, "the unrelated write published its observation");
+        GCHECK(vk_mem_dependency_range_unchanged((uint64_t)(uintptr_t)t.mem, t.L.size, observed),
+               "an observation in another region invalidated the texture's regional proof");
+    }
+    if (prepared_binding(SLOT, reuse, &image)) return 1;
+    image_bytes(image->image, W, H, got);
+    GCHECK(!memcmp(got, lin[0], N), "an unrelated observation changed the prepared image");
+
+    // Without pool preparation in this submission, the ordinary binding advances wgen to the latest observed
+    // generation. The next pool preparation leaves its older clean since untouched; that proof must remain usable.
+    vk_texture_new_submit();
+    if (prepared_binding(SLOT, 0, &image)) return 1;
+    prepare_texture_entries();
+    if (prepared_binding(SLOT, reuse, &image)) return 1;
+    image_bytes(image->image, W, H, got);
+    GCHECK(!memcmp(got, lin[0], N), "the older clean proof retained the image after an ordinary binding");
+
+    prepare_texture_entries();
+    observed = vk_mem_dependency_serial();
+    uint8_t *nearby = t.mem + 0x8000;   // outside this texture, within its 2 MiB observation region and the probe pool
+    *nearby ^= 0x3c;
+    vk_guest_written((uint64_t)(uintptr_t)nearby, 1);
+    if (watching) {
+        GCHECK(vk_mem_dependency_serial() > observed, "the same-region write published its observation");
+        GCHECK(!vk_mem_dependency_range_unchanged((uint64_t)(uintptr_t)t.mem, t.L.size, observed),
+               "a write elsewhere in the same region preserved a regional certificate");
+    }
+    if (prepared_binding(SLOT, 0, &image)) return 1;
+    image_bytes(image->image, W, H, got);
+    GCHECK(!memcmp(got, lin[0], N), "the same-region fallback kept the unchanged texture pixels");
+
+    prepare_texture_entries();
+    prepare_texture_entries();   // the preceding region change is now reflected in the pool's since
+    observed = vk_mem_dependency_serial();
+    if (fill_storage(&t, lin)) return 1;
+    vk_guest_written((uint64_t)(uintptr_t)t.mem, t.L.size);
+    if (watching) {
+        GCHECK(vk_mem_dependency_serial() > observed, "the texture write published its observation");
+        GCHECK(!vk_mem_dependency_range_unchanged((uint64_t)(uintptr_t)t.mem, t.L.size, observed),
+               "a write to the texture failed to invalidate its regional proof");
+    }
+    image = vk_texture_by_id(SLOT, NULL, NULL);
+    GCHECK(image, "explicitly rewritten prepared texture resolves");
+    image_bytes(image->image, W, H, got);
+    GCHECK(!memcmp(got, lin[0], N), "an explicit write after preparation reached the direct binding");
+
+    prepare_texture_entries();   // accounts for the generation advanced by the preceding direct lookup
+    prepare_texture_entries();
+    memcpy(previous, lin[0], N);
+    if (fill_storage(&t, lin)) return 1;   // deliberately no flush: this submission already took its snapshot
+    image = vk_texture_by_id(SLOT, NULL, NULL);
+    GCHECK(image, "texture with a post-snapshot write resolves");
+    image_bytes(image->image, W, H, got);
+    GCHECK(!memcmp(got, previous, N), "an unflushed post-snapshot write did not change this submission's image");
+    prepare_texture_entries();
+    image = vk_texture_by_id(SLOT, NULL, NULL);
+    GCHECK(image, "texture resolves in the following submission");
+    image_bytes(image->image, W, H, got);
+    GCHECK(!memcmp(got, lin[0], N), "the next submission observed the deferred CPU write");
+    vk_texture_lock();
+    vk_texture_pool_hold_locked(ent, 0);
+    vk_texture_unlock();
+    vk_texture_release(&t);
+    free(lin[0]);
+    g_gpu_checks += 7;
+    printf("probe-vkmem: prepared texture: clean and older-proof reuse, unrelated and same-region observations, "
+           "explicit write invalidation, "
+           "snapshot deferral and next-submit "
+           "refresh matched GPU image readback\n");
+    return 0;
+}
+
 // ---- two descriptors on one CPU-written storage (vk_texture.c "split fill", start_at)
 // D1 is a texture the CPU writes. D2 names the same storage with a texture flag for which the cache does not take the
 // content from the CPU (COMPRESSIBLE here), so a slot of D2 shows D1's image for as long as D1 has a live entry.
@@ -1192,7 +1314,7 @@ static int test_gpu(void) {
     int detail_bad = test_detail(&dpool);
     vk_pool_fini(&dpool);
     if (detail_bad) return 1;
-    if (test_split(&tpool)) return 1;
+    if (test_split(&tpool) || test_prepared_texture(&tpool, h + 0xe00000)) return 1;
     VkMemStats st;
     vk_mem_stats(&st);
     GCHECK(st.imported_pools == 2 && st.physical_pools == 1 && st.virtual_pools == 1 && !st.import_failures,
@@ -1205,7 +1327,35 @@ static int test_gpu(void) {
     return test_table_sync(h) || test_table_store(h) || test_remade(h);
 }
 
+static int test_prepared_only(void) {
+    uint64_t heap = 0;
+    GCHECK(mem_set_heap_size(16ull << 20, &heap) == 0 && heap, "SetHeapSize for the prepared-texture probe");
+    uint8_t *h = (uint8_t *)(uintptr_t)heap;
+    pool_t pool = {.magic = NVN_POOL_MAGIC, .flags = 0x22, .mem = h + 0x400000, .size = 0x100000,
+                   .game_mem = h + 0x400000};
+    GCHECK(vk_pool_init(&pool), "prepared-texture probe pool initialization");
+    int bad = test_prepared_texture(&pool, h + 0xe00000);
+    vk_pool_fini(&pool);
+    return bad;
+}
+
 int probe_vkmem(void) {
+    // A focused entry point makes these checks runnable independently of the other format and alias probes. It
+    // changes only this probe's selection; the saved-game renderer follows the ordinary configuration paths.
+    const char *prepared = cfg_get("NX2NAVI_PREPARED_TEXTURE_PROBE");
+    if (prepared && !strcmp(prepared, "1")) {
+        if (!vk_init()) return 1;
+        int bad = test_prepared_only();
+        // The uploads started the completion worker. Join it before destroying the objects its polling uses, as
+        // vk_backend_shutdown does for a game run.
+        vk_sync_shutdown();
+        vk_mem_shutdown();
+        vk_shutdown();
+        long errors = vk_validation_errors_total();
+        printf("probe-vkmem: prepared texture only: %s (%u image checks, %ld validation errors)\n",
+               bad || errors ? "FAILED" : "passed", g_gpu_checks, errors);
+        return bad || errors ? 1 : 0;
+    }
     if (test_deswizzle() || test_box() || test_astc() || test_formats()) return 1;
     printf("probe-vkmem: cpu part passed (%u deswizzle cases, %u astc blocks, formats: %u mapped, %u supported by the GPU, "
            "%u unsupported by the GPU, %u unmapped, %u with a fallback)\n",

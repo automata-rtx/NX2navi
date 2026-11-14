@@ -7,6 +7,7 @@
 #include "gfx.h"
 #include "host.h"
 #include "nvn_obj.h"
+#include "nvn_exec_plan.h"
 
 // NVN_API(nvnX) { body }: the strong nvnp_nvnX(Cpu *c); counts the call in gfx_counters, NX2NAVI_TRACE=gfx logs the first.
 #define NVN_API(n)                                                                                                   \
@@ -112,6 +113,146 @@ static inline const void *nvn_op_payload(const op_hdr *h) { return h + 1; }
 int nvn_handle_live(uint64_t handle);                      // 1 while the handle's copy exists (its control memory was
                                                            // not added again)
 uint64_t nvn_handle_bytes(uint64_t handle);                // bytes of the copy, OP_BEGIN to OP_END; 0 if not live
+// Prepared copies, including queued retired handles and submission clones: the OP_BIND_UBO offsets generated at
+// EndRecording. Returned storage has the command copy's lifetime; the caller must already hold its submit/replay
+// lifetime. Returns 0 for unindexed or raw backend-probe handles, whose commands still need walking.
+int nvn_record_uniform_offsets(uint64_t handle, const size_t **offsets, size_t *count);
+// A recording's structural plan contains no resolved GPU objects or captured memory contents. Offsets survive
+// submission cloning; the arrays share the command copy's retirement lifetime. A RUN span has only ordinary state
+// operations and draws. Target, clear, mesh and update boundaries remain explicit for the replay's dynamic rules.
+enum { NVN_PLAN_SERIAL, NVN_PLAN_RUN, NVN_PLAN_TARGET, NVN_PLAN_CLEAR, NVN_PLAN_MESH, NVN_PLAN_UPDATE };
+typedef struct {
+    size_t begin, end;
+    uint32_t ops, draws, kind, draw_stride;   // nonzero: only ordinary draw records, each this many bytes
+} NvnRecordSpan;
+typedef struct {
+    const uint8_t *commands;
+    size_t bytes;
+    const size_t *capture_offsets;
+    size_t ncapture;
+    const NvnRecordSpan *spans;
+    size_t nspans;
+    const NvnExecStep *exec;
+    size_t nexec;
+    const NvnFrontStep *front;
+    size_t nfront;
+    const uint8_t *state_data;
+    size_t state_bytes;
+} NvnRecordPlan;
+int nvn_record_plan(uint64_t handle, NvnRecordPlan *out);
+// Return the exact instruction beginning at h. An interior continuation cannot apply a complete state block; it
+// follows the reference path until the next instruction boundary. A monotone cursor avoids repeated binary search.
+static inline const NvnExecStep *nvn_record_exec_at(const NvnRecordPlan *plan, const op_hdr *h, size_t *cursor) {
+    if (!plan || !plan->nexec) return NULL;
+    uintptr_t base = (uintptr_t)plan->commands, address = (uintptr_t)h;
+    if (address < base || address - base >= plan->bytes) return NULL;
+    size_t offset = (size_t)(address - base), i = *cursor;
+    if (i == SIZE_MAX || i >= plan->nexec || plan->exec[i].begin > offset) {
+        size_t lo = 0, hi = plan->nexec;
+        while (lo < hi) {
+            size_t m = lo + (hi - lo) / 2;
+            if (plan->exec[m].end <= offset) lo = m + 1;
+            else hi = m;
+        }
+        i = lo;
+    } else while (i < plan->nexec && plan->exec[i].end <= offset) i++;
+    *cursor = i;
+    return i < plan->nexec && plan->exec[i].begin == offset ? &plan->exec[i] : NULL;
+}
+static inline const NvnExecStep *nvn_record_exec_slice(const NvnRecordPlan *plan, const op_hdr *h,
+                                                     const op_hdr *limit, uint32_t ops, size_t *cursor) {
+    const NvnExecStep *step = nvn_record_exec_at(plan, h, cursor);
+    if (!step || step->ops > ops) return NULL;
+    if (limit) {
+        uintptr_t base = (uintptr_t)plan->commands, stop = (uintptr_t)limit;
+        if (stop < base || step->end > stop - base) return NULL;
+    }
+    return step;
+}
+static inline const NvnFrontStep *nvn_record_front_at(const NvnRecordPlan *plan, const op_hdr *h, size_t *cursor) {
+    if (!plan || !plan->nfront) return NULL;
+    uintptr_t base = (uintptr_t)plan->commands, address = (uintptr_t)h;
+    if (address < base || address - base >= plan->bytes) return NULL;
+    size_t offset = (size_t)(address - base), i = *cursor;
+    if (i == SIZE_MAX || i >= plan->nfront || plan->front[i].begin > offset) {
+        size_t lo = 0, hi = plan->nfront;
+        while (lo < hi) {
+            size_t m = lo + (hi - lo) / 2;
+            if (plan->front[m].end <= offset) lo = m + 1;
+            else hi = m;
+        }
+        i = lo;
+    } else while (i < plan->nfront && plan->front[i].end <= offset) i++;
+    *cursor = i;
+    return i < plan->nfront && plan->front[i].begin == offset ? &plan->front[i] : NULL;
+}
+static inline const NvnFrontStep *nvn_record_front_slice(const NvnRecordPlan *plan, const op_hdr *h,
+                                                       const op_hdr *limit, uint32_t draws, size_t *cursor) {
+    const NvnFrontStep *step = nvn_record_front_at(plan, h, cursor);
+    if (!step || step->draws > draws) return NULL;
+    uintptr_t base = (uintptr_t)plan->commands, stop = (uintptr_t)limit;
+    return stop >= base && step->end <= stop - base ? step : NULL;
+}
+// A monotone front-pass cursor over an immutable plan. SIZE_MAX initializes it at the first queried address.
+// Returns only a homogeneous ordinary-draw run, clipped to limit; the recording worker still executes each draw.
+static inline uint32_t nvn_record_draw_run(const NvnRecordPlan *plan, const op_hdr *h, const op_hdr *limit,
+                                         size_t *cursor, uint32_t *stride) {
+    if (!plan || !plan->nspans) return 0;
+    uintptr_t base = (uintptr_t)plan->commands, address = (uintptr_t)h, stop = (uintptr_t)limit;
+    if (address < base || address - base >= plan->bytes || stop < address || stop - base > plan->bytes) return 0;
+    size_t offset = (size_t)(address - base), i = *cursor;
+    if (i == SIZE_MAX) {
+        size_t lo = 0, hi = plan->nspans;
+        while (lo < hi) {
+            size_t m = lo + (hi - lo) / 2;
+            if (plan->spans[m].end <= offset) lo = m + 1;
+            else hi = m;
+        }
+        i = lo;
+    } else while (i < plan->nspans && plan->spans[i].end <= offset) i++;
+    *cursor = i;
+    if (i == plan->nspans) return 0;
+    const NvnRecordSpan *s = &plan->spans[i];
+    if (s->kind != NVN_PLAN_RUN || s->draw_stride < sizeof(op_hdr) || s->begin > offset ||
+        s->end <= s->begin || s->end > plan->bytes || s->draws != s->ops ||
+        (s->end - s->begin) / s->draw_stride != s->ops || (s->end - s->begin) % s->draw_stride ||
+        (offset - s->begin) % s->draw_stride) return 0;
+    size_t end = (size_t)(stop - base);
+    if (s->end < end) end = s->end;
+    *stride = s->draw_stride;
+    return (uint32_t)((end - offset) / s->draw_stride);
+}
+// The producer and consumer use one classification. An unfamiliar operation is serial until its ordering contract
+// is described here; a plan never makes an operation eligible merely because its payload is immutable.
+static inline uint32_t nvn_record_op_class(uint32_t op) {
+    switch (op) {
+    case OP_SET_RT: return NVN_PLAN_TARGET;
+    case OP_CLEAR_COLOR: case OP_CLEAR_DS: return NVN_PLAN_CLEAR;
+    case OP_DRAW_MESH: case OP_DRAW_MESH_IND: return NVN_PLAN_MESH;
+    case OP_UPDATE_UB: return NVN_PLAN_UPDATE;
+    case OP_BEGIN: case OP_VIEWPORTS: case OP_SCISSOR: case OP_DEPTH_RANGE: case OP_STENCIL: case OP_POLY_OFFSET:
+    case OP_BLEND_COLOR: case OP_DEPTH_CLAMP: case OP_RASTER_DISCARD: case OP_PRIM_RESTART: case OP_COPY_STRIDE:
+    case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR:
+    case OP_BIND_VSTREAM: case OP_BIND_VBUF: case OP_BIND_UBO: case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_SAMP:
+    case OP_BIND_IMG: case OP_PUSH_CC: case OP_DRAW: case OP_DRAW_IDX: case OP_DRAW_IDX_IND:
+    case OP_REPORT_COUNTER: case OP_RESET_COUNTER: case OP_RENDER_ENABLE: case OP_RENDER_COND:
+        return NVN_PLAN_RUN;
+    default: return NVN_PLAN_SERIAL;
+    }
+}
+static inline uint32_t nvn_record_exec_flags(uint32_t op) {
+    if (op == NVN_EXEC_STATE) return NVN_EXEC_LINEAR | NVN_EXEC_RUN;
+    uint32_t kind = nvn_record_op_class(op), flags = kind != NVN_PLAN_SERIAL ? NVN_EXEC_RUN : 0;
+    if (kind == NVN_PLAN_RUN || kind == NVN_PLAN_MESH || op == OP_JUMP) flags |= NVN_EXEC_LINEAR;
+    if (op == OP_DRAW || op == OP_DRAW_IDX || op == OP_DRAW_IDX_IND) flags |= NVN_EXEC_DRAW;
+    if (kind == NVN_PLAN_MESH) flags |= NVN_EXEC_MESH;
+    if (op == OP_DISPATCH || op == OP_DISPATCH_IND) flags |= NVN_EXEC_DISPATCH;
+    if (kind == NVN_PLAN_RUN && !(flags & NVN_EXEC_DRAW) && op != OP_BEGIN &&
+        op != OP_SET_TEX_POOL && op != OP_SET_SAMP_POOL && op != OP_REPORT_COUNTER &&
+        op != OP_RESET_COUNTER && op != OP_RENDER_ENABLE && op != OP_RENDER_COND)
+        flags |= NVN_EXEC_STATE_INPUT;
+    return flags;
+}
 uint64_t nvn_submit_count(void);                           // QueueSubmitCommands calls so far
 // Submits a texture pin outlives its last tex_pin and the release of the last recording copy naming it: about 20 s at
 // one submit a frame.

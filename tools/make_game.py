@@ -1425,7 +1425,20 @@ def fast_clang(msys, clang, env):
     return fast if mine and clang_ident(fast, env) == mine else None
 
 
-def runtime_cmd(clang, clangxx, inc, level=0, fast=None, msys=None, first=()):
+# Only these runtime translation units participated in the measured ThinLTO build.
+TUNED_RENDERER_OBJECTS = {'rt_' + name + '.o' for name in (
+    'vk_exec vk_exec_draw vk_exec_xfer vk_memory vk_sync vk_pipeline vk_texture vk_rec vk_usnap '
+    'vk_dlaa vk_mvprev vk_mvsurvey vk_backend vk_bind_recipe nvn_api_cmd nvn_api_core vk_gpa').split()}
+
+
+def renderer_target():
+    target = os.environ.get('NX2NAVI_RENDERER_CPU', 'generic')
+    if target not in ('generic', 'znver4') or (target == 'znver4' and not WIN):
+        fail('NX2NAVI_RENDERER_CPU supports generic, or znver4 for a Windows Zen 4 installation')
+    return target
+
+
+def runtime_cmd(clang, clangxx, inc, level=0, fast=None, msys=None, first=(), target='generic'):
     """fast: fast_clang's compiler for the lifted code, with msys as its sysroot. first: include flags that go
     ahead of inc for the runtime's sources only (vulkan_headers); the lifted code includes none of those headers,
     and its command, which is part of its objects' keys, stays as it was."""
@@ -1440,7 +1453,10 @@ def runtime_cmd(clang, clangxx, inc, level=0, fast=None, msys=None, first=()):
         cc = [str(fast), f'--sysroot={msys}'] if guest and fast else [str(clangxx if cpp else clang)]
         # -fdeclspec: third_party/ffx_api/ffx_api.h declares its entry points __declspec(dllexport) unconditionally
         declspec = ['-fdeclspec'] if cpp and not WIN else []
-        return [*cc, '-c', '-std=gnu++17' if cpp else '-std=gnu11', '-O1' if guest else '-O2',
+        optimization = ['-O1' if guest else '-O2']
+        if target == 'znver4' and dst.name in TUNED_RENDERER_OBJECTS:
+            optimization = ['-O3', '-flto=thin', '-march=znver4', '-ffp-contract=off']
+        return [*cc, '-c', '-std=gnu++17' if cpp else '-std=gnu11', *optimization,
                 *march, '-fno-strict-aliasing', '-w', *declspec, *([] if guest else first), *inc, '-o', str(dst), str(src)]
     return cmd_for
 
@@ -1694,7 +1710,10 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
     if not romfs_job:
         romfs_index(out, gen)
     srcs = [(p, obj / f'{mod}_{p.stem}.o') for mod in ('main', 'sdk', 'subsdk0') for p in sorted((lift / mod).glob('*.c'))]
-    prebuilt = prebuilt_runtime(clang, env)
+    target = renderer_target()
+    if target == 'znver4' and not (msys / 'bin' / 'ld.lld.exe').is_file():
+        fail('The znver4 renderer build requires lld for ThinLTO')
+    prebuilt = prebuilt_runtime(clang, env) if target == 'generic' else None
     runtime = [(p, obj / name) for p, name in runtime_sources()]
     if prebuilt:
         runtime = [(p, o) for p, o in runtime if o.name not in prebuilt[1]]
@@ -1719,7 +1738,7 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
     vulkan = vulkan_headers(clang, env)
     if vulkan:
         say(f'  the Vulkan headers come from {vulkan[1]}')
-    cmd_for = runtime_cmd(clang, clangxx, inc, level, fast, msys, first=vulkan)
+    cmd_for = runtime_cmd(clang, clangxx, inc, level, fast, msys, first=vulkan, target=target)
     # The keys earlier versions gave the same compiles (compile_all alts): 0.6.0's, with the compiler's file time and,
     # with the fast compiler, its id and --sysroot; 0.5.0's and earlier's, with their kit's folder in the paths; and
     # up to 0.7.1 the runtime's without the Vulkan headers' folder ahead of the system's (an object that compiled
@@ -1730,6 +1749,8 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
     kits = earlier_kits()
 
     def alts(src, dst):
+        if target == 'znver4' and dst.name in TUNED_RENDERER_OBJECTS:
+            return [], []
         keys = [object_key(plain(src, dst), src, dst, cache, cid_old, sysroot=True)]
         if vulkan:
             keys.append(object_key(no_vulkan(src, dst), src, dst, cache, cid))
@@ -1789,6 +1810,8 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
         ld = (['-fuse-ld=lld'] if shutil.which('ld.lld') else []) + ['-no-pie', '-Wl,-z,noexecstack', '-Wl,-rpath,$ORIGIN']
     # the link map feeds tools/prof_report.py (symbols for an NX2NAVI_PROFILE sampling profile); both linkers write one.
     # -Xlinker passes the path as one argument; -Wl, would cut it at every comma of the game folder's path (issue #470)
+    if target == 'znver4':
+        ld += ['-flto=thin', '-O3', '-march=znver4']
     ld += ['-Xlinker', '--Map=' + (cache_dir / 'ocarina.map').as_posix()]
     lib = ['-Wl,--whole-archive', str(prebuilt[0]), '-Wl,--no-whole-archive'] if prebuilt else []
     stamp = [[o.name, o.stat().st_size, o.stat().st_mtime_ns] for o in objs]
@@ -2317,7 +2340,7 @@ def step_key(step, identity, out=None):
 
     def compile_of(lift):
         return (f'compile|{lift}|{tree_digest(KIT / "runtime", ("**/*",))}|{sha256_file(Path(__file__))}'
-                f'|{kit_version()}|cpu {cpu_tag()}')
+                f'|{kit_version()}|cpu {cpu_tag()}|renderer {renderer_target()}')
     if step == 'compile':
         return compile_of(lift)
     # shaders: the built game without the mods' code (UNAFFECTED) and the translator that prepared them, the one

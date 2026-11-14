@@ -98,7 +98,7 @@ typedef struct {
     void *ctl; size_t ctl_size;          // NX2NAVI: control memory given by the game; recording copies live as long as it
     size_t game_size;                    // NX2NAVI: command memory the game added (accounting only; not used for storage)
     uintptr_t cmd_base;                  // NX2NAVI: pool storage address + offset of the command memory the game added
-    size_t cmd_used, ctl_used, rec_start;   // rec_start: cmd_used when the current recording began
+    size_t cmd_used, ctl_used, plan_cookie;  // optional recording hints belong to this recording only
     size_t hw_used, last_rec, hw_start;            // NX2NAVI: command memory the real NVN driver would have consumed (what GetCommandMemoryUsed reports; the game sizes resource heaps from it), size of the last record           // NX2NAVI: usage reported to the game since the memory was added (main+0x711e4c submits only non-empty buffers)
 } cmd_t;                                                                                     FITS(cmd_t, NVNcommandBuffer);
 _Static_assert(__builtin_offsetof(cmd_t, guest_flags) == 0x10, "NVN inline dirty flag");

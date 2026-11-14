@@ -23,8 +23,11 @@
 #include "nvn_tex.h"
 #include "platform/platform.h"
 #include "prof.h"
+#include "resource_prep.h"
 #include "tex.h"
 #include "vk.h"
+#include "replay_phase_trace.h"
+#include "replay_work_trace.h"
 #include "vk_exec.h"
 #include "vk_target_frames.h"
 #include "vk_dlaa.h"
@@ -54,7 +57,9 @@ static _Thread_local VkExec *x_cur;
 typedef struct Group Group;
 typedef struct {
     VkExec ex;                          // the state at its first op, then the state it records with
+    VkExecPoolView pool;                // private to this recording chunk, unlike the immutable group publication
     const op_hdr *h;                    // its first op
+    NvnRecordPlan plan;                 // immutable executable metadata under the command copy's replay lifetime
     uint32_t nops;                      // the ops it records (JUMPs not counted)
     uint32_t cond0, ncond;              // its render conditions' decisions in its group's cond
     uint64_t oq;                        // the occlusion counting at its first op (vk_exec_xfer_chunk_state)
@@ -67,7 +72,12 @@ typedef struct {
     volatile int32_t done;
 } Chunk;
 struct Group {
+#if NX2NAVI_REPLAY_WORK
+    uint64_t work_replay;
+#endif
     Chunk c[GROUP_CHUNKS];
+    VkExecPoolView pool;                // one completed pool state, published before peers may consume it
+    VkExecPoolRequirement requirement;
     int n;
     uint8_t *cond;                      // the decisions of the group's render conditions, in stream order
     uint32_t ncond, ccond;
@@ -196,8 +206,29 @@ uint64_t vk_exec_submit_seq;
 void vk_exec_frame_log(const tex_t *p, uint64_t frame) {
     vk_exec_cond_frame_end(frame);   // a frame boundary in replay order (present_image runs on the replay thread)
     runs_frame(frame);
-    if (!(rt_trace & RT_TRACE_GFX)) return;
+    vk_exec_draw_prepared_stats_collect();
     VkExecFrame *f = &vk_exec_frame;
+    if ((f->prep_builds || f->prep_cache_hits || f->prep_cache_misses) &&
+        ((rt_trace & RT_TRACE_GFX) || ((rt_trace & RT_TRACE_PERF) && frame % 60 == 0))) {
+        rt_log("resource prep: frame %llu: builds %llu descriptors %llu aggregate-skipped %llu reused %llu snapshot-reused %llu "
+               "resolved %llu ordered %llu checked %llu proof-descriptors %llu renewals %llu renewed-descriptors %llu",
+               (unsigned long long)frame, (unsigned long long)f->prep_builds,
+               (unsigned long long)f->prep_descriptors, (unsigned long long)f->prep_aggregate_skipped,
+               (unsigned long long)f->prep_reused,
+               (unsigned long long)f->prep_snapshot_reused, (unsigned long long)f->prep_resolved,
+               (unsigned long long)f->prep_ordered, (unsigned long long)f->prep_checked,
+               (unsigned long long)f->prep_proof_descriptors, (unsigned long long)f->prep_renewals,
+               (unsigned long long)f->prep_renewed_descriptors);
+        rt_log("prepared cache: frame %llu: hits %llu misses %llu evictions %llu lookup-probes %llu",
+               (unsigned long long)frame, (unsigned long long)f->prep_cache_hits,
+               (unsigned long long)f->prep_cache_misses, (unsigned long long)f->prep_cache_evictions,
+               (unsigned long long)f->prep_cache_probes);
+        f->prep_builds = f->prep_descriptors = f->prep_aggregate_skipped = f->prep_reused = f->prep_snapshot_reused =
+            f->prep_resolved = f->prep_ordered = f->prep_checked = f->prep_proof_descriptors =
+            f->prep_renewals = f->prep_renewed_descriptors = 0;
+        f->prep_cache_hits = f->prep_cache_misses = f->prep_cache_evictions = f->prep_cache_probes = 0;
+    }
+    if (!(rt_trace & RT_TRACE_GFX)) return;
     uint64_t ew, eu, el, ed;
     vk_exec_event_stats(&ew, &eu, &el, &ed);
     int hit = 0;
@@ -1196,7 +1227,7 @@ int vk_exec_held(void) { return evo_pending; }
 #define ST_LO offsetof(VkExec, rt)
 #define ST_HI offsetof(VkExec, views)
 
-static const op_hdr *walk(VkExec *ex, const op_hdr *h, int depth);
+static const op_hdr *walk(VkExec *ex, const op_hdr *h, int depth, uint64_t owner);
 
 // ---- event order trace (NX2NAVI_EVO_TRACE=1, diagnostics)
 // The order in which a frame's submissions, waits, signals and held parts were replayed, as a string of tokens:
@@ -1336,6 +1367,7 @@ static void st_swap(VkExec *ex, uint8_t *buf) {
     memcpy(tmp, (uint8_t *)ex + ST_LO, sizeof tmp);
     memcpy((uint8_t *)ex + ST_LO, buf, sizeof tmp);
     memcpy(buf, tmp, sizeof tmp);
+    vk_exec_draw_state_adopted(ex);
     ex->rt_resolved = 0;
     ex->dirty = VK_EXEC_DIRTY_ALL;
     ex->tex_serial++;
@@ -1431,6 +1463,10 @@ static int held_sync(void) {
 
 // Walks the continuation from where it stopped; 1 when it stopped at another wait (c->i, c->at updated), 0 when done.
 static int cont_walk(VkExec *ex, Cont *c) {
+    RP_SCOPE(rp_cont_walk, RP_CONT_WALK);
+    RP_VALUE(RPK_CONT_SINCE, c->since);
+    RP_VALUE(RPK_CONT_INDEX, c->i);
+    RP_VALUE(RPK_HANDLES, c->n);
     if (c->at && !vk_exec_event_met(nvn_op_payload(c->at))) {
         evo_forced++;
         vk_exec_evt('F', NULL, 0);
@@ -1442,7 +1478,7 @@ static int cont_walk(VkExec *ex, Cont *c) {
     for (; c->i < c->n; c->i++) {
         const op_hdr *from = c->at ? nvn_op_next(c->at) : nvn_op_first(c->h[c->i]);
         c->at = NULL;
-        const op_hdr *stop = walk(ex, from, 0);
+        const op_hdr *stop = walk(ex, from, 0, c->h[c->i]);
         if (stop) {
             c->at = stop;
             c->since = vk_exec_submit_seq;
@@ -1455,6 +1491,8 @@ static int cont_walk(VkExec *ex, Cont *c) {
 // Runs the held continuations whose wait holds now, in the command buffer being recorded, until none can go on.
 static void evo_resume(VkExec *ex) {
     if (evo_in || !evo_pending) return;
+    RP_SCOPE(rp_resume, RP_CONT_RESUME);
+    RP_VALUE(RPK_HELD_BEFORE, evo_pending);
     vk_exec_signalled = 0;
     uintptr_t run_q = evo_queue;
     for (int progress = 1; progress;) {
@@ -1497,6 +1535,7 @@ static void evo_resume(VkExec *ex) {
             vk_exec_pass_end(ex);
             vk_exec_barrier(ex);
             memcpy((uint8_t *)ex + ST_LO, mine, ST_HI - ST_LO);   // the running stream's state back
+            vk_exec_draw_state_adopted(ex);
             ex->rt_resolved = 0;
             ex->dirty = VK_EXEC_DIRTY_ALL;
             ex->tex_serial++;
@@ -1687,9 +1726,8 @@ int vk_exec_mesh_run(const void *cur, const void **out, int max) {
 }
 
 // One op of the stream other than those that steer the walk (END, JUMP, CALL and WAIT_EVENT: walk).
-static void op_one(VkExec *ex, const op_hdr *h) {
-    const void *a = nvn_op_payload(h);
-    switch (h->op) {
+static inline void op_payload(VkExec *ex, uint32_t op, const void *a) {
+    switch (op) {
     case OP_BEGIN: break;
     case OP_SET_RT: set_rt(ex, a); break;
     case OP_CLEAR_COLOR: clear_color(ex, a); break;
@@ -1740,24 +1778,85 @@ static void op_one(VkExec *ex, const op_hdr *h) {
     case OP_SET_SAMP_POOL: ex->samp_pool = ((const p_set_pool *)a)->pool; break;
     case OP_BARRIER: barrier_to_why(ex, NULL, NULL, 0, BR_GAME); break;
     case OP_DRAW: case OP_DRAW_IDX: case OP_DISPATCH: case OP_UPDATE_UB: case OP_DRAW_IDX_IND: case OP_DISPATCH_IND:
-        if (h->op == OP_DRAW || h->op == OP_DRAW_IDX || h->op == OP_DRAW_IDX_IND) vk_exec_frame.draws_seen++, split_draws++;
-        if (h->op == OP_DISPATCH || h->op == OP_DISPATCH_IND) vk_exec_frame.dispatches++, split_draws++;
+        if (op == OP_DRAW || op == OP_DRAW_IDX || op == OP_DRAW_IDX_IND) vk_exec_frame.draws_seen++, split_draws++;
+        if (op == OP_DISPATCH || op == OP_DISPATCH_IND) vk_exec_frame.dispatches++, split_draws++;
         // fall through
     case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF:
     case OP_BIND_UBO: case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_SAMP: case OP_BIND_IMG: case OP_PUSH_CC:
     case OP_DRAW_MESH: case OP_DRAW_MESH_IND:
-        vk_exec_op_draw(ex, h->op, a);
+        vk_exec_op_draw(ex, op, a);
         break;
     case OP_COPY_B2B: case OP_COPY_B2T: case OP_COPY_T2B: case OP_COPY_T2T: case OP_CLEAR_TEX:
-        if (h->op != OP_CLEAR_TEX) vk_exec_frame.copies++;
-        if (vk_dump_armed) vk_dump_copy(ex, h->op, a);
+        if (op != OP_CLEAR_TEX) vk_exec_frame.copies++;
+        if (vk_dump_armed) vk_dump_copy(ex, op, a);
         // fall through
     case OP_SIGNAL_EVENT: case OP_REPORT_COUNTER: case OP_RESET_COUNTER: case OP_RENDER_ENABLE: case OP_RENDER_COND:
     case OP_CLEAR_BUF:
-        vk_exec_op_xfer(ex, h->op, a);
+        vk_exec_op_xfer(ex, op, a);
         break;
-    default: rt_fatal("vk: op %s has no replay handler", nvn_op_name(h->op));
+    default: rt_fatal("vk: op %s has no replay handler", nvn_op_name(op));
     }
+}
+
+static void op_one(VkExec *ex, const op_hdr *h) { op_payload(ex, h->op, nvn_op_payload(h)); }
+
+// These functions are selected once while the immutable execution plan is built. The draw consumer supplies its
+// own typed entry points; other ordered effects retain their authoritative implementation with a fixed operation.
+#define EXEC_FIXED_OPS(X) \
+    X(OP_BEGIN) X(OP_SET_RT) X(OP_CLEAR_COLOR) X(OP_CLEAR_DS) X(OP_VIEWPORTS) X(OP_SCISSOR) \
+    X(OP_DEPTH_RANGE) X(OP_STENCIL) X(OP_POLY_OFFSET) X(OP_BLEND_COLOR) X(OP_DEPTH_CLAMP) \
+    X(OP_RASTER_DISCARD) X(OP_PRIM_RESTART) X(OP_COPY_STRIDE) X(OP_SET_TEX_POOL) X(OP_SET_SAMP_POOL) \
+    X(OP_BARRIER) X(OP_COPY_B2B) X(OP_COPY_B2T) X(OP_COPY_T2B) X(OP_COPY_T2T) X(OP_CLEAR_TEX) \
+    X(OP_SIGNAL_EVENT) X(OP_REPORT_COUNTER) X(OP_RESET_COUNTER) X(OP_RENDER_ENABLE) X(OP_RENDER_COND) X(OP_CLEAR_BUF)
+#define EXEC_FIXED_DEFINE(op) static void exec_##op(VkExec *ex, const void *a) { op_payload(ex, op, a); }
+EXEC_FIXED_OPS(EXEC_FIXED_DEFINE)
+#undef EXEC_FIXED_DEFINE
+
+NvnExecFn gfx_exec_prepared_handler(uint32_t opcode) {
+    NvnExecFn draw = vk_exec_draw_prepared_handler(opcode);
+    if (draw) return draw;
+    switch (opcode) {
+#define EXEC_FIXED_CASE(op) case op: return exec_##op;
+        EXEC_FIXED_OPS(EXEC_FIXED_CASE)
+#undef EXEC_FIXED_CASE
+    default: return NULL;
+    }
+}
+#undef EXEC_FIXED_OPS
+
+static int exec_plan_enabled(void) {
+    // Per-operation diagnostics need the uncoalesced instruction sequence. Normal/checking execution consumes the
+    // same prepared representation; its state oracle must never repeat draws or resource side effects.
+    return resource_prep_mode() && !vk_dump_armed && RR.on <= 0 && !cfg_bool("NX2NAVI_REPLAY_TIME");
+}
+
+enum { EXEC_MAIN, EXEC_WORKER, EXEC_FRONT, EXEC_PATHS };
+typedef struct { uint64_t blocks, state_ops, direct, reference, front_draws; unsigned path; } ExecPlanStats;
+static ExecPlanStats exec_totals[EXEC_PATHS];
+static void exec_stats_publish(ExecPlanStats *s) {
+    ExecPlanStats *d = &exec_totals[s->path];
+#define EXEC_PUBLISH(field) if (s->field) __atomic_add_fetch(&d->field, s->field, __ATOMIC_RELAXED)
+    EXEC_PUBLISH(blocks); EXEC_PUBLISH(state_ops); EXEC_PUBLISH(direct); EXEC_PUBLISH(reference); EXEC_PUBLISH(front_draws);
+#undef EXEC_PUBLISH
+}
+static void exec_stats_step(ExecPlanStats *s, const NvnExecStep *step) {
+    if (!step || (step->opcode != NVN_EXEC_STATE && !step->run)) s->reference++;
+    else if (step->opcode == NVN_EXEC_STATE) s->blocks++, s->state_ops += step->ops;
+    else s->direct++;
+}
+
+static void exec_step_run(VkExec *ex, const NvnRecordPlan *plan, const NvnExecStep *step) {
+    if (step->opcode == NVN_EXEC_STATE) {
+        vk_exec_draw_state_apply(ex, plan->commands, plan->state_data + step->state_offset);
+        return;
+    }
+    const op_hdr *h = (const op_hdr *)(plan->commands + step->begin);
+    if (!step->run) { op_one(ex, h); return; }
+    // The direct draw entry points preserve their draw-context and publication logic. These two counters belong
+    // to the outer executor; mesh counters remain in the draw consumer, as in the reference path.
+    if (step->flags & NVN_EXEC_DRAW) vk_exec_frame.draws_seen++, split_draws++;
+    if (step->flags & NVN_EXEC_DISPATCH) vk_exec_frame.dispatches++, split_draws++;
+    step->run(ex, nvn_op_payload(h));
 }
 
 // ---- replay workers (NX2NAVI_REPLAY_WORKERS, default 3; 0: the replay records every op on the submitting thread)
@@ -1824,17 +1923,7 @@ static void op_one(VkExec *ex, const op_hdr *h) {
 
 // The ops a run may hold; JUMP is followed.
 static int run_op(uint32_t op) {
-    switch (op) {
-    case OP_BEGIN: case OP_VIEWPORTS: case OP_SCISSOR: case OP_DEPTH_RANGE: case OP_STENCIL: case OP_POLY_OFFSET:
-    case OP_BLEND_COLOR: case OP_DEPTH_CLAMP: case OP_RASTER_DISCARD: case OP_PRIM_RESTART: case OP_COPY_STRIDE:
-    case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR:
-    case OP_BIND_VSTREAM: case OP_BIND_VBUF: case OP_BIND_UBO: case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_SAMP:
-    case OP_BIND_IMG: case OP_PUSH_CC: case OP_DRAW: case OP_DRAW_IDX: case OP_DRAW_IDX_IND: case OP_DRAW_MESH:
-    case OP_DRAW_MESH_IND: case OP_REPORT_COUNTER: case OP_RESET_COUNTER: case OP_RENDER_ENABLE: case OP_RENDER_COND:
-    case OP_UPDATE_UB: case OP_SET_RT: case OP_CLEAR_COLOR: case OP_CLEAR_DS:
-        return 1;
-    default: return 0;
-    }
+    return nvn_record_op_class(op) != NVN_PLAN_SERIAL;
 }
 
 typedef struct {
@@ -1855,6 +1944,7 @@ static struct {
     RwWorker *w[RW_MAX];
     const op_hdr *skip_to[CALL_DEPTH + 1];   // per call depth: the walk read ahead to this op, a group too small
     uint64_t groups, group_draws, chunks, serial_draws, wait_ns;   // since the last perf line
+    uint64_t planned_groups, planned_draws, plan_fallbacks, front_planned_draws;
     uint64_t end_draws[5];              // draws of groups by what ended them (group_peek's GE_*), since the last perf line
     uint64_t small_end[5];              // ... of those too small to split
     uint64_t run_end[OP_COUNT_];        // draws of groups that an op outside groups ended, by that op
@@ -1967,6 +2057,7 @@ static void rw_main(void *arg) {
 }
 
 static void rw_init(void) {
+    vk_exec_draw_pool_schedule_init();
     int n = cfg_int("NX2NAVI_REPLAY_WORKERS");
     RW.n = n < 0 ? 0 : n > RW_MAX ? RW_MAX : n;
     for (int k = 0; k < RW.n; k++) {
@@ -2013,6 +2104,38 @@ int vk_exec_turn_due(void) {
 int vk_exec_in_chunk(void) { return rw_chunk != NULL; }
 int vk_exec_shared(void) { return rw_chunk || rw_behind; }
 int vk_exec_behind(void) { return !rw_chunk && rw_behind; }
+
+VkExecPoolView *vk_exec_pool_view(void) { return rw_chunk ? &rw_chunk->g->pool : NULL; }
+VkExecPoolView *vk_exec_pool_local_view(void) { return rw_chunk ? &rw_chunk->pool : NULL; }
+
+VkExecPoolRequirement *vk_exec_pool_requirement_begin(void) {
+    Chunk *c = rw_chunk;
+    // A failed, skipped or non-pool attempt does not consume learning. Only completed preparation publishes a
+    // valid family hint; chunk zero alone owns this record until retirement.
+    if (!c || c->idx || c->g->requirement.valid) return NULL;
+    return &c->g->requirement;
+}
+
+int vk_exec_pool_wait(uint64_t fence, uint32_t kinds, VkDescriptorSet *set) {
+    Chunk *c = rw_chunk;
+    if (!c) return 0;
+    uint64_t t0 = kern_now_ns();
+    for (;;) {
+        // A preceding consumer may finish the shared refresh before it finishes recording all of its draws.
+        uint64_t generation = vk_exec_pool_generation();
+        if (vk_pool_view_get(&c->g->pool, fence, kinds, generation, set) &&
+            generation == vk_exec_pool_generation()) return 1;
+        if (rw_ordered || chunk_in_turn(c)) {
+            if (!rw_ordered) {
+                rw_ordered = 1;
+                __atomic_add_fetch(&RW.turns, 1, __ATOMIC_RELAXED);
+                __atomic_add_fetch(&RW.turn_ns, kern_now_ns() - t0, __ATOMIC_RELAXED);
+            }
+            return 0;   // this consumer may prepare and publish; never mark an unfinished refresh ready
+        }
+        plat_pause();
+    }
+}
 
 // A chunk of a group comes after the ops before the group and after its group's earlier chunks; the submitting
 // thread after every chunk of the groups it handed out.
@@ -2107,11 +2230,56 @@ static uint32_t group_peek(const VkExec *ex, const op_hdr *h, const op_hdr **end
     return draws;
 }
 
-static Chunk *chunk_open(Group *g, const VkExec *ex, const op_hdr *h, int idx) {
+// Ordinary state/draw stretches have already been counted when the immutable command copy was made. Only the
+// boundaries whose meaning depends on current replay state are inspected here. An interior resume or the read limit
+// landing inside a span uses the original walker; no approximate group length changes scheduling or ordering.
+static int group_peek_plan(const VkExec *ex, const NvnRecordPlan *plan, const op_hdr *h,
+                           const op_hdr **end, int *why, uint32_t *end_op, uint32_t *draws) {
+    if (!plan || !plan->nspans) return 0;
+    uintptr_t base = (uintptr_t)plan->commands, at = (uintptr_t)h;
+    if (at < base || at - base >= plan->bytes) return 0;
+    size_t offset = (size_t)(at - base), lo = 0, hi = plan->nspans;
+    while (lo < hi) {
+        size_t m = lo + (hi - lo) / 2;
+        if (plan->spans[m].begin < offset) lo = m + 1;
+        else hi = m;
+    }
+    if (lo == plan->nspans || plan->spans[lo].begin != offset) return 0;
+    uint32_t ops = 0;
+    *draws = 0, *end_op = 0, *why = GE_LIMIT;
+    int begun = 0, mesh_serial = vk_ctx()->mesh_fallback || vk_gpu_passes_capturing();
+    const p_set_rt *rt = &ex->rt;
+    for (size_t i = lo; i < plan->nspans; i++) {
+        const NvnRecordSpan *s = &plan->spans[i];
+        h = (const op_hdr *)(plan->commands + s->begin);
+        if (ops == GROUP_PEEK) { *end = h; return 1; }
+        if (s->kind == NVN_PLAN_SERIAL) {
+            *why = GE_RUN, *end_op = h->op, *end = h;
+            return 1;
+        }
+        if (s->kind == NVN_PLAN_UPDATE) { *why = GE_UB, *end = h; return 1; }
+        if (s->kind == NVN_PLAN_MESH && mesh_serial) { *why = GE_MESH, *end = h; return 1; }
+        if (s->kind == NVN_PLAN_TARGET) {
+            const p_set_rt *next = nvn_op_payload(h);
+            if (memcmp(rt, next, sizeof *rt)) {
+                if (begun) { *why = GE_TARGET, *end = h; return 1; }
+                rt = next;
+            }
+        }
+        if (s->ops > GROUP_PEEK - ops) return 0;
+        ops += s->ops;
+        *draws += s->draws;
+        if (s->draws || s->kind == NVN_PLAN_CLEAR) begun = 1;
+    }
+    return 0;   // a valid recording has an explicit END boundary; unknown metadata keeps the original path
+}
+
+static Chunk *chunk_open(Group *g, const VkExec *ex, const op_hdr *h, int idx, const NvnRecordPlan *plan) {
     Chunk *c = &g->c[idx];
     memcpy(&c->ex, ex, sizeof *ex);
     c->h = h, c->nops = 0, c->cond0 = g->ncond, c->ncond = 0, c->idx = idx, c->g = g, c->oq = vk_exec_xfer_chunk_state();
     c->nslots = 0, c->brk = 0;
+    c->plan = plan ? *plan : (NvnRecordPlan){0};
     return c;
 }
 
@@ -2138,12 +2306,19 @@ static Chunk *chunk_take(void) {
 // Records chunk c with the command pool `pool` (a worker's index; the submitting thread's is RW.n).
 static void chunk_record(Chunk *c, int pool) {
     Group *g = c->g;
+    RWT_UNIT(work_chunk, pool == RW.n ? RWT_ROLE_HELP : RWT_ROLE_WORKER,
+             c->ex.fence, g->work_replay, g->seq, (unsigned)c->idx);
+    RP_SCOPE(rp_hook_wait, RP_CHUNK_HOOK);
+    RP_VALUE(RPK_WORK_UNIT, gfx_rwt_current_id());
     if (c->idx)
         while (!__atomic_load_n(&g->hooks, __ATOMIC_ACQUIRE)) plat_pause();
     else if (!groups_before_done(g)) {   // the pass hooks follow the frame pass by pass: after the group before's
         const Group *p = &GQ[(g->seq - 1) % LIVE_GROUPS];   // not done, so not put in its part yet: still its slot
         while (!__atomic_load_n(&p->hooks, __ATOMIC_ACQUIRE)) plat_pause();
     }
+    RP_END(rp_hook_wait);
+    RP_SCOPE(rp_chunk_setup, RP_CHUNK_SETUP);
+    RP_VALUE(RPK_WORK_UNIT, gfx_rwt_current_id());
     uint64_t t0 = kern_now_ns();
     gfx_tl_note('c', t0, (uint64_t)c->idx, (uint64_t)c->nops);
     VkExec *ex = &c->ex, *was = x_cur;
@@ -2152,6 +2327,7 @@ static void chunk_record(Chunk *c, int pool) {
     if (pool < RW.n) ex->dc = RW.w[pool]->dc;
     else if (help) ex->dc = RW.help_dc, vk_exec_draw_ctx_use(RW.help_dc);
     x_cur = ex, rw_chunk = c, rw_ordered = !c->idx && groups_before_done(g);
+    vk_exec_draw_state_adopted(ex);
     vk_exec_xfer_worker(1, g->cond + c->cond0, c->ncond, c->oq, c->slot0, c->nslots, c->idx, (int)(g - GQ));
     ex->cb = vk_sync_worker_begin(pool);
     // the replay's command buffer before the group ended behind a full barrier, with every image in GENERAL
@@ -2160,24 +2336,39 @@ static void chunk_record(Chunk *c, int pool) {
     ex->views = NULL, ex->nviews = ex->cap_views = 0;
     vk_exec_draw_new_cb();
     const op_hdr *o = c->h;
+    size_t exec_cursor = SIZE_MAX;
+    int executable = exec_plan_enabled();
+    ExecPlanStats stats __attribute__((cleanup(exec_stats_publish))) = {.path = EXEC_WORKER};
+    RP_END(rp_chunk_setup);
+    RP_SCOPE(rp_chunk_body, RP_CHUNK_BODY);
+    RP_VALUE(RPK_WORK_UNIT, gfx_rwt_current_id());
     for (uint32_t k = 0; k < c->nops;) {
         if (o->op == OP_JUMP) {
             o = (const op_hdr *)(uintptr_t)((const p_jump *)nvn_op_payload(o))->target;
             continue;
         }
-        if (!op_linear(o->op)) c->brk++;
+        const NvnExecStep *step = executable ? nvn_record_exec_slice(&c->plan, o, NULL, c->nops - k, &exec_cursor) : NULL;
+        if (step ? !(step->flags & NVN_EXEC_LINEAR) : !op_linear(o->op)) c->brk++;
         rw_op = o;
-        op_one(ex, o);
+        if (step) exec_step_run(ex, &c->plan, step);
+        else op_one(ex, o);
+        if (c->plan.nexec) exec_stats_step(&stats, step);
         if (vk_texture_deferred_take()) {   // a lookup would have made or taken back a texture entry: in turn, again
             vk_exec_pass_end(ex);
             ex->rt_resolved = 0, ex->dirty = VK_EXEC_DIRTY_ALL;
             vk_exec_draw_new_cb();
             vk_exec_turn();
             __atomic_add_fetch(&RW.redos, 1, __ATOMIC_RELAXED);
-            op_one(ex, o);
+            if (step) exec_step_run(ex, &c->plan, step);
+            else op_one(ex, o);
+            if (c->plan.nexec) exec_stats_step(&stats, step);
         }
-        k++, o = nvn_op_next(o);
+        if (step) k += step->ops, o = (const op_hdr *)(c->plan.commands + step->end);
+        else k++, o = nvn_op_next(o);
     }
+    RP_END(rp_chunk_body);
+    RP_SCOPE(rp_chunk_teardown, RP_CHUNK_TEARDOWN);
+    RP_VALUE(RPK_WORK_UNIT, gfx_rwt_current_id());
     if (!c->idx) __atomic_store_n(&g->hooks, 1, __ATOMIC_RELEASE);   // a chunk 0 that began no pass
     vk_exec_barrier(ex);   // the next command buffer starts after it, every image back in GENERAL
     vk_sync_worker_end(ex->cb);
@@ -2186,8 +2377,10 @@ static void chunk_record(Chunk *c, int pool) {
     ex->views = NULL;
     c->cb = ex->cb, c->recorded = ex->recorded;
     vk_exec_xfer_worker(0, NULL, 0, 0, 0, 0, 0, 0);
+    vk_exec_draw_prepared_stats_flush(ex);
     x_cur = was, rw_chunk = NULL;
     if (help) vk_exec_draw_ctx_use(NULL);
+    if (was) vk_exec_draw_state_adopted(was);   // helping may have used the original stream's DrawCtx
     __atomic_add_fetch(&RW.chunk_ns, kern_now_ns() - t0, __ATOMIC_RELAXED);
     gfx_tl_note('d', 0, (uint64_t)c->idx, 0);
     __atomic_store_n(&c->done, 1, __ATOMIC_RELEASE);
@@ -2206,7 +2399,7 @@ static void group_wait(int why, int help) {
     int done = __atomic_load_n(&Q.done, __ATOMIC_ACQUIRE) >= Q.out;
     if (!done) {
         gfx_tl_note('q', t0, (uint64_t)(uintptr_t)pw_name[why], 0);
-        if (help) group_take(RW.n);
+        if (help) RP_CALL(RP_OWNER_HELP, group_take(RW.n));
         while (__atomic_load_n(&Q.done, __ATOMIC_ACQUIRE) < Q.out) plat_pause();
         gfx_tl_note('u', 0, 0, 0);
     }
@@ -2218,6 +2411,7 @@ static void group_wait(int why, int help) {
 
 // A done group's command buffers into their places in the part, its closed query slots into their segments.
 static void group_put(VkExec *ex, Group *g) {
+    vk_exec_draw_pool_learn(&g->requirement);
     vk_exec_xfer_group_merge((int)(g - GQ), g->n);
     VkCommandBuffer cbs[GROUP_CHUNKS];
     int rec = 0;
@@ -2250,7 +2444,7 @@ static void group_room(VkExec *ex) {
     if (__atomic_load_n(&Q.done, __ATOMIC_ACQUIRE) < want) {
         uint64_t t0 = kern_now_ns();
         gfx_tl_note('q', t0, (uint64_t)(uintptr_t)pw_name[PW_NEXT], 0);
-        group_take(RW.n);
+        RP_CALL(RP_OWNER_HELP, group_take(RW.n));
         while (__atomic_load_n(&Q.done, __ATOMIC_ACQUIRE) < want) plat_pause();
         gfx_tl_note('u', 0, 0, 0);
         RW.pw_n[PW_NEXT]++, RW.pw_ns[PW_NEXT] += kern_now_ns() - t0;
@@ -2278,14 +2472,76 @@ static void op_again(VkExec *ex, const op_hdr *h) {
     op_one(ex, h);
 }
 
+// Predict a known pool-consuming draw family from bounded immutable command metadata. No resolver, shader lookup
+// or draw runs on this copy. The hint only chooses where the real draw executes; it proves no resource reuse.
+static const op_hdr *pool_leader_draw(const VkExec *ex, const op_hdr *h, const op_hdr *end) {
+    static VkExec state; // replay-thread owned; the large state does not consume a worker's stack
+    state = *ex;
+    // A pure render-enable operation may replace the already resolved outcome before the draw. New conditional
+    // operations still refuse prediction and retain their ordinary execution point.
+    for (unsigned count = 0; h != end && count < 128; count++, h = nvn_op_next(h)) {
+        if (h->size < sizeof *h || (h->size & 7) || h->op >= OP_COUNT_)
+            return vk_exec_draw_pool_refused(&state, VK_POOL_REFUSE_INVALID), NULL;
+        const void *payload = nvn_op_payload(h);
+        if (h->op == OP_DRAW || h->op == OP_DRAW_IDX || h->op == OP_DRAW_IDX_IND)
+            return vk_exec_draw_pool_requirement_known(&state, 0) ? h : NULL;
+        if (h->op == OP_DRAW_MESH && h->size >= sizeof *h + sizeof(p_draw_mesh) &&
+            ((const p_draw_mesh *)payload)->count && vk_exec_draw_pool_requirement_known(&state, 1)) return h;
+        if (h->op == OP_SET_RT) ahead_set_rt(&state, payload);
+        else if (h->op == OP_RENDER_ENABLE) state.render_disabled = !((const p_flag *)payload)->value;
+        // These effects do not select a shader family. Prediction performs none of them: the canonical prefix
+        // executes their query/contact/clear work once, in stream order, before the consuming draw.
+        else if (h->op == OP_REPORT_COUNTER || h->op == OP_RESET_COUNTER || h->op == OP_CLEAR_DS) continue;
+        else if (h->op == OP_BEGIN || h->op == OP_SET_TEX_POOL || h->op == OP_SET_SAMP_POOL) continue;
+        else if (nvn_record_exec_flags(h->op) & NVN_EXEC_STATE_INPUT)
+            vk_exec_ahead_op(&state, h->op, payload); // state cases only; never its draw/translation case
+        else {
+            vk_exec_draw_pool_prefix_op(h->op);
+            return vk_exec_draw_pool_refused(&state, VK_POOL_REFUSE_ORDERED), NULL;
+        }
+    }
+    return vk_exec_draw_pool_refused(&state, VK_POOL_REFUSE_LIMIT), NULL;
+}
+
+static const op_hdr *pool_leader_run(VkExec *ex, const op_hdr *h, const op_hdr *end, uint32_t *draws) {
+    if (*draws <= 2 * CHUNK_DRAWS) return h;
+    if (Q.drained != Q.out) return vk_exec_draw_pool_refused(ex, 0), h;
+    if (!vk_exec_draw_pool_leader_needed(ex)) return h;
+    const op_hdr *leader = pool_leader_draw(ex, h, end);
+    if (!leader) return h;
+    // Preserve the original group-entry pass boundary before the first draw's pass-begin hooks. The remaining
+    // workers receive a second boundary after this canonical draw has completed its resource preparation.
+    vk_exec_barrier(ex);
+    // Execute this draw, not a speculative refresh. Pass hooks, shader selection, resource resolution and uploads
+    // retain their original order. The remaining draws use the same completed publication as any later group.
+    const op_hdr *after = nvn_op_next(leader);
+    for (const op_hdr *o = h; o != after; o = nvn_op_next(o)) op_one(ex, o);
+    vk_exec_draw_pool_leader_finished(ex);
+    (*draws)--;
+    RW.serial_draws++;
+    return after;
+}
+
 // The submitting thread, at op h of the walk: when a group large enough to split starts here, it is recorded by the
 // workers and this thread, and the walk goes on with the op that ended it, which is returned; otherwise h (the walk
 // replays the group itself, without reading ahead again before its end).
-static const op_hdr *group_start(VkExec *ex, const op_hdr *h, int depth) {
+static const op_hdr *group_start(VkExec *ex, const op_hdr *h, int depth, const NvnRecordPlan *plan) {
     const op_hdr *end;
     int why;
     uint32_t end_op;
-    uint32_t draws = group_peek(ex, h, &end, &why, &end_op);
+    uint32_t draws;
+    int planned = group_peek_plan(ex, plan, h, &end, &why, &end_op, &draws);
+    if (!planned) {
+        if (plan) RW.plan_fallbacks++;
+        draws = group_peek(ex, h, &end, &why, &end_op);
+    } else if (resource_prep_mode() == 2) {
+        const op_hdr *ref_end;
+        int ref_why;
+        uint32_t ref_op, ref_draws = group_peek(ex, h, &ref_end, &ref_why, &ref_op);
+        if (draws != ref_draws || end != ref_end || why != ref_why || end_op != ref_op)
+            rt_fatal("vk: prepared command group differs from reference walk");
+    }
+    if (planned) RW.planned_groups++, RW.planned_draws += draws;
     if (why == GE_RUN && end_op < OP_COUNT_) RW.run_end[end_op] += draws;
     if (end == h) return h;   // an op the submitting thread replays itself
     RW.end_draws[why] += draws;
@@ -2302,24 +2558,83 @@ static const op_hdr *group_start(VkExec *ex, const op_hdr *h, int depth) {
         if (split_draws && split_wanted()) group_drain(ex, PW_SPLIT), maybe_split(ex);
         group_room(ex);
     }
+    h = pool_leader_run(ex, h, end, &draws);
+    n = (int)(draws / CHUNK_DRAWS);
+    if (n > RW.n + 1) n = RW.n + 1;
+    if (n > GROUP_CHUNKS) n = GROUP_CHUNKS;
     Group *g = &GQ[(Q.out + 1) % LIVE_GROUPS];
+#if NX2NAVI_REPLAY_WORK
+    g->work_replay = gfx_rwt_replay();
+#endif
+    RP_SCOPE(rp_group_front, RP_GROUP_FRONT);
+    RP_VALUE(RPK_WORK_UNIT, gfx_rwt_current_id());
     uint64_t t0 = kern_now_ns();
     gfx_tl_note('g', 0, draws, (uint64_t)n);
     vk_exec_barrier(ex);         // the command buffer so far ends behind a full barrier, every image back in GENERAL
-    g->upd = vk_exec_draw_group_begin(ex);
+    vk_pool_view_reset(&g->pool);   // group_room/ordered replay has retired this group's previous consumers
+    g->requirement.valid = 0;
+    g->upd = vk_exec_draw_group_begin(ex, &g->pool);
     // the front pass
     uint32_t per = (draws + (uint32_t)n - 1) / (uint32_t)n, cd = 0;
     int nc = 1, cut = 0;
     g->ncond = 0;
     vk_exec_xfer_group((int)(g - GQ));
-    Chunk *c = chunk_open(g, ex, h, 0);
+    Chunk *c = chunk_open(g, ex, h, 0, plan);
+    size_t front_cursor = SIZE_MAX;
+    size_t exec_cursor = SIZE_MAX;
+    size_t summary_cursor = SIZE_MAX;
+    int executable = exec_plan_enabled();
+    ExecPlanStats stats __attribute__((cleanup(exec_stats_publish))) = {.path = EXEC_FRONT};
     for (const op_hdr *o = h; o != end;) {
         const void *a = nvn_op_payload(o);
         if (o->op == OP_JUMP) {
             o = (const op_hdr *)(uintptr_t)((const p_jump *)a)->target;
             continue;
         }
-        if (cut) c = chunk_open(g, ex, o, nc++), cd = 0, cut = 0;
+        if (cut) c = chunk_open(g, ex, o, nc++, plan), cd = 0, cut = 0;
+        const NvnFrontStep *summary = executable ?
+            nvn_record_front_slice(plan, o, end, nc >= n ? UINT32_MAX : per - cd, &summary_cursor) : NULL;
+        if (summary) {
+            // The front pass needs only final state at the next chunk/ordered boundary. It never emits these draws,
+            // so intermediate assignments superseded inside this summary need not be applied to its queue state.
+            vk_exec_draw_state_apply(ex, plan->commands, plan->state_data + summary->state_offset);
+            if (vk_exec_xfer_counting() && !ex->render_disabled) c->nslots += summary->draws;
+            c->nops += summary->ops, cd += summary->draws;
+            stats.blocks++, stats.state_ops += summary->ops - summary->draws, stats.front_draws += summary->draws;
+            if (cd == per && nc < n) cut = 1;
+            o = (const op_hdr *)(plan->commands + summary->end);
+            continue;
+        }
+        const NvnExecStep *step = executable ? nvn_record_exec_slice(plan, o, end, UINT32_MAX, &exec_cursor) : NULL;
+        if (step && step->opcode == NVN_EXEC_STATE) {
+            exec_step_run(ex, plan, step);
+            exec_stats_step(&stats, step);
+            c->nops += step->ops;
+            o = (const op_hdr *)(plan->commands + step->end);
+            continue;
+        }
+        if (o->op == OP_DRAW || o->op == OP_DRAW_IDX || o->op == OP_DRAW_IDX_IND) {
+            uint32_t stride = 0, count = nvn_record_draw_run(plan, o, end, &front_cursor, &stride);
+            if (count) {
+                // No bind, query state, render condition or ordered operation lies inside this span. Only the front
+                // pass is compressed: each chunk retains the original first record and exact operation count.
+                if (nc < n && count > per - cd) count = per - cd;
+                const op_hdr *next = (const op_hdr *)((const uint8_t *)o + (size_t)count * stride);
+                if (resource_prep_mode() == 2) {
+                    const op_hdr *ref = o;
+                    for (uint32_t k = 0; k < count; k++, ref = nvn_op_next(ref))
+                        if ((ref->op != OP_DRAW && ref->op != OP_DRAW_IDX && ref->op != OP_DRAW_IDX_IND) ||
+                            ref->size != stride) rt_fatal("vk: prepared front-pass draw run differs from records");
+                    if (ref != next) rt_fatal("vk: prepared front-pass draw run end differs from records");
+                }
+                if (vk_exec_xfer_counting() && !ex->render_disabled) c->nslots += count;
+                c->nops += count, cd += count;
+                RW.front_planned_draws += count;
+                if (cd == per && nc < n) cut = 1;
+                o = next;
+                continue;
+            }
+        }
         switch (o->op) {
         case OP_DRAW: case OP_DRAW_IDX: case OP_DRAW_IDX_IND: case OP_DRAW_MESH: case OP_DRAW_MESH_IND:
             if (vk_exec_xfer_counting() && !ex->render_disabled) c->nslots++;   // at most one query each
@@ -2338,7 +2653,11 @@ static const op_hdr *group_start(VkExec *ex, const op_hdr *h, int depth) {
             }
             break;
         }
-        default: op_one(ex, o); break;   // state, binds, render targets
+        default:
+            if (step && step->opcode != NVN_EXEC_STATE) exec_step_run(ex, plan, step);
+            else op_one(ex, o);
+            if (plan && plan->nexec) exec_stats_step(&stats, step && step->opcode != NVN_EXEC_STATE ? step : NULL);
+            break;   // state, binds, render targets
         }
         c->nops++;
         o = nvn_op_next(o);
@@ -2346,7 +2665,10 @@ static const op_hdr *group_start(VkExec *ex, const op_hdr *h, int depth) {
     vk_exec_xfer_group(-1);   // the segments stay listed for the workers until the group is put in its part
     for (int i = 0; i < nc; i++) g->c[i].slot0 = vk_exec_xfer_slots(g->c[i].nslots);   // in the order of the stream
     // handed out: the workers (and without RW.pipe this thread) take the chunks in order
-    for (int i = 0; i < nc; i++) g->c[i].done = 0;
+    for (int i = 0; i < nc; i++) {
+        g->c[i].done = 0;
+        vk_pool_view_reset(&g->c[i].pool);
+    }
     g->hooks = 0, g->ndone = 0, g->n = nc;
     __atomic_store_n(&g->seq, ++Q.out, __ATOMIC_RELEASE);
     // the replay's command buffer so far goes into the part, then the chunks' places, and the replay goes on in a new
@@ -2362,18 +2684,22 @@ static const op_hdr *group_start(VkExec *ex, const op_hdr *h, int depth) {
     ex->in_pass = 0, ex->nfbl = 0, ex->mark = NULL, ex->dirty = VK_EXEC_DIRTY_ALL, ex->rt_resolved = 0, ex->fb_fs = NULL;
     vk_exec_draw_new_cb();
     RW.groups++, RW.group_draws += draws, RW.chunks += (uint64_t)nc;
+    RP_END(rp_group_front);
     if (RW.pipe) {
         // the submitting thread takes chunks too, as the workers wake up, and goes on once none is left to take: the
         // GPU waits for the group's part until its last chunk is done
         rw_behind = 1;
-        group_take(RW.n);
+        RP_CALL(RP_OWNER_HELP, group_take(RW.n));
         uint64_t to = kern_now_ns();
         RW.front_ns += tf - t0, RW.own_ns += to - tf, RW.wait_ns += to - t0;
         return end;
     }
-    group_take(RW.n);
+    RP_CALL(RP_OWNER_HELP, group_take(RW.n));
     uint64_t to = kern_now_ns();
+    RP_SCOPE(rp_final_spin, RP_FINAL_SPIN);
+    RP_VALUE(RPK_WORK_UNIT, gfx_rwt_current_id());
     while (__atomic_load_n(&Q.done, __ATOMIC_ACQUIRE) < g->seq) plat_pause();
+    RP_END(rp_final_spin);
     uint64_t tw = kern_now_ns();
     RW.front_ns += tf - t0, RW.own_ns += to - tf, RW.spin_ns += tw - to;
     groups_put_done(ex);
@@ -2382,15 +2708,22 @@ static const op_hdr *group_start(VkExec *ex, const op_hdr *h, int depth) {
     return end;
 }
 
-static const op_hdr *walk(VkExec *ex, const op_hdr *h, int depth) {
+static const op_hdr *walk(VkExec *ex, const op_hdr *h, int depth, uint64_t owner) {
+    NvnRecordPlan plan;
+    int prepared = nvn_record_plan(owner, &plan);
+    int executable = prepared && exec_plan_enabled();
+    size_t exec_cursor = SIZE_MAX;
+    ExecPlanStats stats __attribute__((cleanup(exec_stats_publish))) = {.path = EXEC_MAIN};
     RW.skip_to[depth] = NULL;
     for (;;) {
-        if (h->size < sizeof *h || (h->size & 7) || h->op >= OP_COUNT_)
+        const NvnExecStep *step = executable ? nvn_record_exec_at(&plan, h, &exec_cursor) : NULL;
+        if (!step && (h->size < sizeof *h || (h->size & 7) || h->op >= OP_COUNT_))
             rt_fatal("vk: corrupt command record at %p: op %u size %u", (const void *)h, h->op, h->size);
         if (RW.skip_to[depth] == h) RW.skip_to[depth] = NULL;   // the small group read ahead is behind
         if (Q.drained < Q.out && Q.drained < __atomic_load_n(&Q.done, __ATOMIC_ACQUIRE)) groups_put_done(ex);
-        if (RW.n > 0 && !RW.skip_to[depth] && !evo_in && h->op != OP_JUMP && run_op(h->op)) {
-            const op_hdr *stop = group_start(ex, h, depth);
+        if (RW.n > 0 && !RW.skip_to[depth] && !evo_in && h->op != OP_JUMP &&
+            (step ? (step->flags & NVN_EXEC_RUN) : run_op(h->op))) {
+            const op_hdr *stop = group_start(ex, h, depth, prepared ? &plan : NULL);
             if (stop != h) {
                 if (split_draws && split_wanted()) maybe_split(ex);
                 h = stop;
@@ -2398,15 +2731,17 @@ static const op_hdr *walk(VkExec *ex, const op_hdr *h, int depth) {
             }
         }
         const void *a = nvn_op_payload(h);
+        if (step && step->opcode == NVN_EXEC_STATE && RW.skip_to[depth])
+            step = nvn_record_exec_slice(&plan, h, RW.skip_to[depth], UINT32_MAX, &exec_cursor);
         AH.at[depth] = h, AH.depth = depth;   // where vk_exec_ahead reads on from
         if (RR.on > 0) runs_op(h->op);
-        if (!op_linear(h->op)) vk_exec_brk++;
+        if (step ? !(step->flags & NVN_EXEC_LINEAR) : !op_linear(h->op)) vk_exec_brk++;
         switch (h->op) {
         case OP_END: return NULL;
         case OP_JUMP: h = (const op_hdr *)(uintptr_t)((const p_jump *)a)->target; continue;
         case OP_CALL:
             if (depth >= CALL_DEPTH) rt_fatal("vk: command buffer calls nested deeper than %d", CALL_DEPTH);
-            walk(ex, nvn_op_first(((const p_jump *)a)->target), depth + 1);
+            walk(ex, nvn_op_first(((const p_jump *)a)->target), depth + 1, ((const p_jump *)a)->target);
             break;
         case OP_WAIT_EVENT: {
             int met = vk_exec_wait_event(a);
@@ -2422,15 +2757,18 @@ static const op_hdr *walk(VkExec *ex, const op_hdr *h, int depth) {
                 if (Q.drained < Q.out && !pipe_op(h->op)) RW.pd_op[h->op]++, group_drain(ex, PW_OP);
                 int k = ser_kind(h->op);
                 uint64_t t = kern_now_ns();
-                op_one(ex, h);
+                if (step) exec_step_run(ex, &plan, step);
+                else op_one(ex, h);
                 if (vk_texture_deferred_take()) op_again(ex, h);
-                RW.ser_n[k]++, RW.ser_ns[k] += kern_now_ns() - t;
-            } else op_one(ex, h);
+                RW.ser_n[k] += step ? step->ops : 1, RW.ser_ns[k] += kern_now_ns() - t;
+            } else if (step) exec_step_run(ex, &plan, step);
+            else op_one(ex, h);
+            if (plan.nexec) exec_stats_step(&stats, step);
             break;
         }
         if (vk_exec_signalled && depth == 0 && !evo_in) evo_resume(ex);   // their ops go through this walk's checks
         if (split_draws && split_wanted()) maybe_split(ex);
-        h = nvn_op_next(h);
+        h = step ? (const op_hdr *)(plan.commands + step->end) : nvn_op_next(h);
     }
 }
 
@@ -2486,6 +2824,12 @@ static void rec_claim(void) {
 
 int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t fence) {
     if (vk_device_is_lost()) return 0;   // the run is ending (vk_device.c vk_device_lost_check): nothing is recorded
+    RP_SCOPE(rp_replay, RP_REPLAY);
+    RWT_UNIT(work_replay, RWT_ROLE_OWNER, fence, gfx_rp_current(), 0, 0);
+    RP_VALUE(RPK_FENCE, fence);
+    RP_VALUE(RPK_HANDLES, n);
+    RP_VALUE(RPK_HELD_BEFORE, evo_pending);
+    RP_SCOPE(rp_setup, RP_SETUP);
     uint64_t in_ns = kern_now_ns();
     gfx_tl_note('R', 0, (uint64_t)n, fence);
     perf_lock_timing_here();   // NX2NAVI_LOCK_TIME
@@ -2520,11 +2864,14 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
     int slot = evo ? evq_slot(gfx_submit_queue) : -1;
     if (evo && slot < 0) evo = 0;
     vk_exec_evt('|', (const void *)gfx_submit_queue, (uint32_t)n);
-    vk_exec_event_sync(1);   // before the mirror sync and the uniform copy: a CPU signal after this point came after them
+    RP_CALL(RP_EVENT_SYNC, vk_exec_event_sync(1));   // before the mirror sync and the uniform copy: a CPU signal after this point came after them
+    RP_END(rp_setup);
+    RP_VALUE(RPK_REPLAY_SEQ, vk_exec_submit_seq);
     int synced = n || (evo_pending && held_sync() && vk_exec_held_ready());   // held_sync
     if (synced) {
         vk_mem_mirror_begin();
         if (evo_pending) {   // the uniform snapshot covers what held submissions bind too: they may go on here
+            RP_SCOPE(rp_held_handles, RP_HELD_HANDLES);
             int tot = n;
             for (int s = 0; s < EVO_QUEUES; s++)
                 for (Cont *c = evq[s].head; c; c = c->next) tot += c->n;
@@ -2534,6 +2881,8 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
             int k = n;
             for (int s = 0; s < EVO_QUEUES; s++)
                 for (Cont *c = evq[s].head; c; c = c->next) memcpy(all + k, c->h, sizeof *all * (size_t)c->n), k += c->n;
+            RP_VALUE(RPK_HELD_HANDLES, tot - n);
+            RP_END(rp_held_handles);
             vk_usnap_begin(all, tot, fence);
             free(all);
         } else vk_usnap_begin(handles, n, fence);
@@ -2546,9 +2895,10 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
     } else {
         evo_queue = evo ? gfx_submit_queue : 0;
         AH.handles = handles, AH.n = n, AH.live = 1;
+        RP_SCOPE(rp_walk, RP_COMMAND_WALK);
         for (int i = 0; i < n; i++) {
             AH.i = i;
-            const op_hdr *stop = walk(ex, nvn_op_first(handles[i]), 0);
+            const op_hdr *stop = walk(ex, nvn_op_first(handles[i]), 0, handles[i]);
             if (!stop) continue;
             cont_push(slot, cont_new(handles, n, i, stop));   // the rest of this submission waits for its signal
             evo_held++;
@@ -2558,9 +2908,11 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
         AH.live = 0;
         evo_queue = 0;
     }
-    group_drain(ex, PW_END);
+    RP_CALL(RP_GROUP_DRAIN, group_drain(ex, PW_END));
+    RP_SCOPE(rp_teardown, RP_TEARDOWN);
     vk_exec_pass_end(ex);
     if (RR.on > 0) runs_break(RB_SUBMIT);
+    vk_exec_draw_prepared_stats_flush(ex);
     x_cur = NULL;
     vk_exec_event_sync(0);
     if (ex->recorded) vk_exec_barrier(ex), vk_exec_pool_marks(ex);   // later submissions see this one's writes
@@ -2597,6 +2949,20 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
         char cbs[1600];
         vk_sync_cb_stats(cbs, sizeof cbs);
         rt_log("perf: completion thread since the last line, by callback (distance from vk_completion_add):%s", cbs);
+        for (unsigned i = 0; i < EXEC_PATHS; i++) {
+            static const char *const names[] = {"main", "workers", "front"};
+            ExecPlanStats *s = &exec_totals[i];
+            uint64_t blocks = __atomic_exchange_n(&s->blocks, 0, __ATOMIC_RELAXED);
+            uint64_t state_ops = __atomic_exchange_n(&s->state_ops, 0, __ATOMIC_RELAXED);
+            uint64_t direct = __atomic_exchange_n(&s->direct, 0, __ATOMIC_RELAXED);
+            uint64_t reference = __atomic_exchange_n(&s->reference, 0, __ATOMIC_RELAXED);
+            uint64_t front_draws = __atomic_exchange_n(&s->front_draws, 0, __ATOMIC_RELAXED);
+            if (blocks || direct || reference)
+                rt_log("execution plans: %s: %llu state blocks cover %llu original operations; %llu typed operations; "
+                       "%llu reference operations; %llu draws covered by front summaries", names[i],
+                       (unsigned long long)blocks, (unsigned long long)state_ops, (unsigned long long)direct,
+                       (unsigned long long)reference, (unsigned long long)front_draws);
+        }
         if (RW.n > 0) {
             uint64_t turns = __atomic_exchange_n(&RW.turns, 0, __ATOMIC_RELAXED);
             uint64_t turn_ns = __atomic_exchange_n(&RW.turn_ns, 0, __ATOMIC_RELAXED);
@@ -2607,6 +2973,13 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
                    RW.groups ? (double)RW.chunks / (double)RW.groups : 0.0,
                    RW.groups ? (double)RW.wait_ns / 1e6 / (double)RW.groups : 0.0, (double)RW.serial_draws / (double)n_subs,
                    (double)turns / (double)n_subs, (double)turn_ns / 1e6 / (double)n_subs, (double)redos / (double)n_subs);
+            if (RW.planned_groups || RW.plan_fallbacks)
+                rt_log("perf: command plans: per submission %.1f group searches covering %.0f draws, %.1f fallback walks",
+                       (double)RW.planned_groups / (double)n_subs, (double)RW.planned_draws / (double)n_subs,
+                       (double)RW.plan_fallbacks / (double)n_subs);
+            if (RW.front_planned_draws)
+                rt_log("perf: command front pass: %.0f draws per submission consumed through structural runs",
+                       (double)RW.front_planned_draws / (double)n_subs);
             char e[512];
             int o = 0;
             for (int k = 0; k < GE_N; k++)
@@ -2672,11 +3045,16 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
             }
         }
         RW.groups = RW.group_draws = RW.chunks = RW.serial_draws = RW.wait_ns = 0;
+        RW.planned_groups = RW.planned_draws = RW.plan_fallbacks = 0;
+        RW.front_planned_draws = 0;
         evo_held = evo_resumed = evo_forced = evo_switches = 0;
         n_subs = n_parts = n_idle_parts = n_pass_splits = 0;
     }
     rec_spent_ns += kern_now_ns() - in_ns;
     if (rec_spent_ns >= REC_CLAIM_NS) rec_claim();
+    RP_END(rp_teardown);
+    RP_VALUE(RPK_HELD_AFTER, evo_pending);
+    RP_VALUE(RPK_RECORDED_LAST, ex->recorded - part_start);
     gfx_tl_note('r', 0, (uint64_t)(ex->recorded - part_start), 0);
     return ex->recorded - part_start;   // what the last part holds
 }

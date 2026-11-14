@@ -28,6 +28,7 @@
 #include "nvn_api.h"
 #include "perfmon.h"
 #include "vk.h"
+#include "replay_phase_trace.h"
 #include "vk_exec.h"
 #include "platform/platform.h"
 #include "vk_dlaa.h"
@@ -381,14 +382,16 @@ static void ph_flush(uint64_t *why) {
 }
 
 static uint64_t submit_sync(const uint64_t *handles, int n) {
+    RP_SCOPE(rp_request, RP_REQUEST);
+    RP_VALUE(RPK_HANDLES, n);
     vk_sync_start();
     if (PH.on && n) {   // a present waits: what can go on goes first, then the present, then this submission
         held_resume();
         if (!vk_exec_held()) ph_flush(&PH.after);
     }
-    vk_present_drain();
-    vk_exec_gate_wait(handles, n);   // a submission that begins with a wait for the CPU's signal: before its copies
-    vk_texture_new_submit();
+    RP_CALL(RP_PRESENT_DRAIN, vk_present_drain());
+    RP_CALL(RP_GATE_WAIT, vk_exec_gate_wait(handles, n));   // a submission that begins with a wait for the CPU's signal: before its copies
+    RP_CALL(RP_TEXTURE_SUBMIT, vk_texture_new_submit());
     uint64_t f = vk_sync_submit(handles, n);
     // The submission stopped at a wait whose signal the CPU gave while it was being replayed (vk_exec_xfer.c "events
     // the CPU signals"): it goes on now, in a submission of its own with copies taken after the signal, and that

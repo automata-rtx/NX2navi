@@ -18,6 +18,7 @@
 #include "nvn_api.h"
 #include "nvn_pool_index.h"
 #include "vk.h"
+#include "replay_phase_trace.h"
 #include "vk_dlaa.h"
 #include "vk_exec.h"
 #include "vk_gpa.h"
@@ -32,7 +33,7 @@ static double qpc_ms(uint64_t ticks) { return (double)ticks / 1e6; }
 
 // ---------------------------------------------------------------- pools
 enum { POOL_IMPORT = 1, POOL_PHYS, POOL_VIRT };
-enum { MS_NONE, MS_ON, MS_REFUSED };
+enum { MS_NONE, MS_ON, MS_REFUSED, MS_CREATING };
 
 typedef struct { struct PoolRec *phys; uint64_t off; } VPage;   // virtual page -> physical pool and offset
 
@@ -56,8 +57,8 @@ typedef struct PoolRec {
     uint32_t synced_gen;               // page generation its lazy-mirror count covers; DIRTY_UNSYNCED until scanned
     uint8_t bufbound;                  // ever bound as a vertex, index, uniform, storage or indirect buffer
     uint8_t untracked;                 // the last dirty scan found no write watch over it
-    // VRAM mirror (POOL_IMPORT, "VRAM mirror" below). mstate and mbuf change on the replay thread only.
-    uint8_t mstate;                    // MS_NONE until the first buffer use, then MS_ON or MS_REFUSED
+    // Parallel replay creates mirrors under use_lock. Publish a final state only after all backing fields are ready.
+    _Atomic uint8_t mstate;            // MS_CREATING makes another worker wait instead of retaining an imported span
     uint32_t gpa_rec;                  // POOL_IMPORT: its record in the device address table (vk_gpa.c), 0 none
     struct GpaMap { uint64_t lo, hi; uint32_t rec; } *vmaps;   // POOL_VIRT: its mapped ranges in the table
     int nvmaps, cvmaps;
@@ -888,12 +889,54 @@ static uint32_t *slot_in(uint32_t **tab, uint64_t page_addr, int create) {
 
 static uint32_t *gen_slot(uint64_t page_addr, int create) { return slot_in(gen_chunk, page_addr, create); }
 
+static uint64_t dependency_serial = 1;
+static uint64_t dependency_region_serial[RT_ADDRESS_LIMIT >> REG_SHIFT];
+static ResourceEvents dependency_events;
+static int dependency_watch, dependency_reset;
+
+void vk_mem_dependency_watch(void) { __atomic_store_n(&dependency_watch, 1, __ATOMIC_RELEASE); }
+uint64_t vk_mem_dependency_serial(void) {
+    return __atomic_load_n(&dependency_reset, __ATOMIC_ACQUIRE) ? 0 :
+           __atomic_load_n(&dependency_serial, __ATOMIC_ACQUIRE);
+}
+static void dependency_changed(uint32_t region) {   // gen_lock held exclusively by every publisher
+    uint64_t next = __atomic_load_n(&dependency_serial, __ATOMIC_RELAXED) + 1;
+    if (!next)
+        __atomic_store_n(&dependency_reset, 1, __ATOMIC_RELEASE);
+    // Publish the affected region before the global watermark. A captured watermark under gen_lock includes every
+    // earlier regional publication. Zero in the regional table means no observation since the watcher was enabled.
+    __atomic_store_n(&dependency_region_serial[region], next, __ATOMIC_RELEASE);
+    __atomic_store_n(&dependency_serial, next, __ATOMIC_RELEASE);
+    resource_events_publish(&dependency_events, region, region);
+}
+
+int vk_mem_dependency_events_locked(uint64_t *cursor, ResourceEventVisit visit, void *user) {
+    return resource_events_read(&dependency_events, cursor, visit, user) && vk_mem_dependency_serial() != 0;
+}
+
+int vk_mem_dependency_range_unchanged(uint64_t addr, uint64_t size, uint64_t observed) {
+    if (!observed || !size || addr >= RT_ADDRESS_LIMIT || size > RT_ADDRESS_LIMIT - addr ||
+        !vk_mem_dependency_serial()) return 0;
+    uint64_t first = addr >> REG_SHIFT, last = (addr + size - 1) >> REG_SHIFT;
+    for (uint64_t r = first; r <= last; r++)
+        if (__atomic_load_n(&dependency_region_serial[r], __ATOMIC_ACQUIRE) > observed) return 0;
+    // The caller already established tracked snapshots in this submission. This check only preserves that proof
+    // across observations elsewhere; it never establishes freshness or tracking by itself.
+    return vk_mem_dependency_serial() != 0;
+}
+
 // gen_lock held exclusively; g is the newest generation handed out. back: a mirror's write-back, which leaves the
 // CPU-side tables alone.
 static void stamp_page_as(uint64_t a, uint32_t g, int back) {
     uint32_t *s = gen_slot(a, 1);
     if (!s) return;
     *s = g;
+    if (reg_max[a >> REG_SHIFT] != g && __atomic_load_n(&dependency_watch, __ATOMIC_RELAXED)) {
+        // The reference uses 32-bit ordered generations. A wrap/reset invalidates this experiment permanently for
+        // the process; it must not turn a previously clean certificate into evidence across that discontinuity.
+        if (g < reg_max[a >> REG_SHIFT]) __atomic_store_n(&dependency_reset, 1, __ATOMIC_RELEASE);
+        dependency_changed((uint32_t)(a >> REG_SHIFT));
+    }
     reg_max[a >> REG_SHIFT] = g;
     reg_last[a >> REG_SHIFT] = ww_ep;
     if (back) return;
@@ -947,7 +990,139 @@ int vk_mem_changed(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now) 
 #define SNAP_REGIONS (RT_ADDRESS_LIMIT >> SNAP_SHIFT)
 static uint32_t snap_at[SNAP_REGIONS];      // epoch of the region's last snapshot; 0 never
 static uint8_t snap_untracked[SNAP_REGIONS];
+static uint64_t snap_protection[SNAP_REGIONS], snap_mapping[SNAP_REGIONS];
 static uint64_t n_snap_checks, n_snap_calls, n_snap_untracked;
+static uint64_t freeze_snap_renewals;      // gen_lock: clean post-freeze observations made reusable
+
+
+// Clean scans are hints about which regions to protect. They never satisfy a consumer's snapshot.
+// All state below is private to gen_lock after mirror_mode initializes it.
+#define CLEAN_SPANS 8
+#define CLEAN_FRESH 24u
+#define CLEAN_MIN_IDLE 48u
+#define CLEAN_MIN_REGIONS 32u
+#define CLEAN_MIN_NS 32000ull
+typedef struct {
+    uint32_t lo, hi;                 // unattempted intersection, exclusive end
+    uint32_t first, last, repeats;
+    uint64_t protection, mapping;    // oldest pre-query observations for this intersection
+    int high;
+} CleanSpan;
+static CleanSpan clean_spans[CLEAN_SPANS];
+static uint32_t *clean_attempt;      // exact last attempted freeze, including the normal queue
+static unsigned clean_cursor, clean_live;
+static int clean_normal_first;       // one pass reserved for the normal queue after priority goes first
+typedef struct {
+    uint64_t expensive, ready, full, examined, skipped, attempts, successes;
+} CleanStats;
+static CleanStats clean_stats;
+
+static int clean_recent(uint32_t now, uint32_t before, uint32_t age) {
+    return before && now >= before && now - before < age;
+}
+
+static void clean_drop(CleanSpan *span) {
+    span->repeats = 0;
+    clean_live--;
+}
+
+static void clean_observe(uint32_t lo, uint32_t hi, int zero, uint64_t ns, uint64_t protection, uint64_t mapping) {
+    int expensive = zero && hi - lo >= CLEAN_MIN_REGIONS && ns >= CLEAN_MIN_NS;
+    int tail = zero && hi - lo < CLEAN_MIN_REGIONS;
+    if (!expensive && (!clean_live || (zero && !tail))) return;
+    clean_stats.expensive += expensive;
+    int vacant = -1, best = -1;
+    uint32_t best_overlap = 0;
+    for (int i = 0; i < CLEAN_SPANS; i++) {
+        CleanSpan *s = &clean_spans[i];
+        if (s->repeats && !clean_recent(ww_ep, s->last, CLEAN_FRESH + 1)) clean_drop(s);
+        if (s->repeats && lo < s->hi && s->lo < hi) {
+            if (!zero) {
+                // A dirty, failed or saturated query cannot extend evidence, even after a clean final drain.
+                clean_drop(s);
+            } else {
+                if (tail && (s->repeats != 3 || s->hi - s->lo >= CLEAN_MIN_REGIONS)) continue;
+                uint32_t left = lo > s->lo ? lo : s->lo, right = hi < s->hi ? hi : s->hi;
+                uint32_t overlap = right - left;
+                if (overlap * 4 >= (s->hi - s->lo) * 3 && overlap > best_overlap) {
+                    best = i;
+                    best_overlap = overlap;
+                }
+            }
+        }
+        if (!s->repeats && vacant < 0) vacant = i;
+    }
+    if ((!expensive && best < 0) || !ww_ep || !protection || !mapping) return;
+    if (best >= 0) {
+        CleanSpan *s = &clean_spans[best];
+        if (lo > s->lo) s->lo = lo;
+        if (hi < s->hi) s->hi = hi;
+        if (s->last != ww_ep && s->repeats < 3 && ++s->repeats == 3) clean_stats.ready++;
+        s->last = ww_ep;
+    } else if (vacant >= 0) {
+        clean_spans[vacant] = (CleanSpan){lo, hi, ww_ep, ww_ep, 1, protection, mapping, 0};
+        clean_live++;
+    } else clean_stats.full++;   // leave current evidence intact and fall back to normal scanning
+}
+
+// Selection is bounded independently of the extent length and normal queue length.
+// Progress through a confirmed span survives shrinking query endpoints until its recent demand expires.
+static int clean_next(uint32_t *region) {
+    unsigned rejected = 0;
+    for (unsigned visited = 0; visited < CLEAN_SPANS && clean_live && rejected < 4; visited++) {
+        CleanSpan *s = &clean_spans[clean_cursor++ % CLEAN_SPANS];
+        if (!s->repeats) continue;
+        if (!clean_recent(ww_ep, s->last, CLEAN_FRESH + 1)) { clean_drop(s); continue; }
+        while (s->repeats == 3 && rejected < 4) {
+            uint32_t j = s->high ? --s->hi : s->lo++;
+            s->high = !s->high;
+            uint32_t first = s->first;
+            uint64_t p = s->protection, m = s->mapping;
+            if (s->lo == s->hi) clean_drop(s);
+            clean_stats.examined++;
+            if (reg_last[j] < first && ww_ep - reg_last[j] >= CLEAN_MIN_IDLE &&
+                !clean_recent(ww_ep, clean_attempt[j], (uint32_t)freeze_idle) &&
+                snap_at[j] && !snap_untracked[j] && !mem_frozen((uint64_t)j << REG_SHIFT)) {
+                uint64_t pv = mem_protection_region(j), mv = mem_mapping_region(j);
+                if (pv && pv <= p && mv && mv <= m) { *region = j; return 1; }
+            }
+            clean_stats.skipped++;
+            rejected++;
+        }
+    }
+    return 0;
+}
+
+// A snapshot predating a freeze cannot prove that writes immediately before protection were collected. Retain the
+// watermarks from before the OS query: a later thaw/refreeze revokes cross-submission reuse, while the first content
+// observation inside one submission remains fixed for all of its consumers.
+static int snap_lease_valid(uint32_t region) {
+    uint64_t protection = mem_protection_region(region), mapping = mem_mapping_region(region);
+    return protection && protection <= snap_protection[region] && mapping && mapping <= snap_mapping[region];
+}
+
+int vk_mem_dependency_sleep_locked(uint32_t region) {
+    return region < SNAP_REGIONS && snap_at[region] && !snap_untracked[region] &&
+           mem_frozen_stable((uint64_t)region << SNAP_SHIFT) && snap_lease_valid(region);
+}
+
+static int snap_current(uint32_t region, uint32_t epoch) {
+    return epoch && snap_at[region] == epoch;
+}
+
+int vk_mem_dependency_adopt_locked(uint32_t region, uint32_t epoch) {
+    // Caller owns a sleeping membership and has consumed all three notification domains without a gap. Events
+    // after that cutoff belong after this submission's logical snapshot; they wake the region for a later one.
+    if (!epoch || region >= SNAP_REGIONS || !snap_at[region] || snap_untracked[region]) return 0;
+    snap_at[region] = epoch;
+    return 1;
+}
+
+int vk_mem_dependency_region_locked(uint32_t region, uint32_t epoch, uint32_t *version) {
+    if (region >= SNAP_REGIONS) { *version = 0; return 0; }
+    *version = reg_max[region];
+    return snap_current(region, epoch) && !snap_untracked[region];
+}
 
 // gen_lock held exclusively. Queries the regions r0..r1 that were not snapped in epoch, one query per run of them;
 // returns the number of queries.
@@ -955,27 +1130,36 @@ static uint64_t snap_regions(uint64_t r0, uint64_t r1, uint32_t epoch) {
     uint32_t g = 0;
     uint64_t calls = 0;
     for (uint64_t r = r0; r <= r1;) {
-        if (snap_at[r] == epoch) { r++; continue; }
-        if (mem_frozen(r << SNAP_SHIFT)) {   // nothing in it changed since its freeze
-            snap_at[r] = epoch, snap_untracked[r] = 0;
-            r++;
+        if (snap_current((uint32_t)r, epoch)) { r++; continue; }
+        if (vk_mem_dependency_sleep_locked((uint32_t)r)) {
+            snap_at[r++] = epoch;
             continue;
         }
         uint64_t k = r;   // one query over a run of regions not seen in this epoch
-        while (k + 1 <= r1 && snap_at[k + 1] != epoch && !mem_frozen((k + 1) << SNAP_SHIFT)) k++;
+        while (k + 1 <= r1 && !snap_current((uint32_t)(k + 1), epoch) &&
+               !vk_mem_dependency_sleep_locked((uint32_t)(k + 1))) k++;
         uint64_t a = r << SNAP_SHIFT, b = (k + 1) << SNAP_SHIFT;
-        int tracked = 1;
+        uint64_t protection = mem_protection_serial(), mapping = mem_mapping_serial();
+        int tracked = 1, all_zero = 1;
+        uint64_t ticks_before = ww_ticks;
         if (!g) g = ++gen_now;
         for (;;) {
             uint64_t n = ww_query(a, b - a);
+            if (n) all_zero = 0;
             if (n == UINT64_MAX) { tracked = 0; break; }
             for (uint64_t j = 0; j < n; j++) stamp_page(gen_pages[j], g);
             if (n < sizeof gen_pages / sizeof *gen_pages) break;
         }
+        if (clean_attempt)
+            clean_observe((uint32_t)r, (uint32_t)(k + 1), all_zero && tracked, ww_ticks - ticks_before, protection, mapping);
         calls++;
         for (uint64_t j = r; j <= k; j++) {
-            snap_at[j] = epoch, snap_untracked[j] = (uint8_t)!tracked;
-            if (tracked && freeze_idle && ww_ep - reg_last[j] >= (uint32_t)freeze_idle &&
+            snap_protection[j] = protection, snap_mapping[j] = mapping;
+            int valid = tracked && snap_lease_valid((uint32_t)j);
+            if (snap_untracked[j] != (uint8_t)!valid && __atomic_load_n(&dependency_watch, __ATOMIC_RELAXED))
+                dependency_changed((uint32_t)j);
+            snap_at[j] = epoch, snap_untracked[j] = (uint8_t)!valid;
+            if (valid && !mem_frozen_stable(j << SNAP_SHIFT) && freeze_idle && ww_ep - reg_last[j] >= (uint32_t)freeze_idle &&
                 ww_ep - reg_tried[j] >= (uint32_t)freeze_idle) {
                 reg_tried[j] = ww_ep;
                 if (nfcand == cfcand) grow((void **)&fcand, &cfcand, sizeof *fcand);
@@ -995,14 +1179,14 @@ int vk_mem_changed_snap(uint64_t addr, uint64_t size, uint32_t since, uint32_t e
     int excl = 0;
     plat_mutex_lock_shared(&gen_lock);
     for (uint64_t r = r0; r <= r1; r++)
-        if (snap_at[r] != epoch) { excl = 1; break; }
+        if (!snap_current((uint32_t)r, epoch)) { excl = 1; break; }
     if (excl) {
         plat_mutex_unlock_shared(&gen_lock);
         plat_mutex_lock(&gen_lock);
         n_snap_calls += snap_regions(r0, r1, epoch);
     }
     int untracked = 0, changed = 0;
-    for (uint64_t r = r0; r <= r1; r++) untracked |= snap_untracked[r];
+    for (uint64_t r = r0; r <= r1; r++) untracked |= snap_untracked[r] || !snap_current((uint32_t)r, epoch);
     // Pages only in regions stamped after since (reg_max; REG_SHIFT is SNAP_SHIFT): an unchanged texture of 4 MiB was
     // 1,024 page reads, at about 1,100 texture checks a frame.
     for (uint64_t r = r0; !untracked && r <= r1 && !changed; r++) {
@@ -1033,7 +1217,7 @@ int vk_mem_unchanged_why_locked(uint64_t addr, uint64_t size, uint32_t since, ui
     uint64_t r0 = lo >> SNAP_SHIFT, r1 = (hi - 1) >> SNAP_SHIFT;
     if (r1 >= SNAP_REGIONS) return 4;
     for (uint64_t r = r0; r <= r1; r++) {   // REG_SHIFT is SNAP_SHIFT: reg_max is the newest stamp in the region
-        if (snap_at[r] != epoch) return 1;
+        if (!snap_current((uint32_t)r, epoch)) return 1;
         if (snap_untracked[r]) return 2;
         if (reg_max[r] > since) return 3;
     }
@@ -1050,7 +1234,7 @@ uint64_t vk_mem_snap_range_locked(uint64_t addr, uint64_t size, uint32_t epoch) 
     uint64_t r0 = lo >> SNAP_SHIFT, r1 = (hi - 1) >> SNAP_SHIFT;
     if (r1 >= SNAP_REGIONS) return 0;
     for (uint64_t r = r0; r <= r1; r++)
-        if (snap_at[r] != epoch) {
+        if (!snap_current((uint32_t)r, epoch)) {
             uint64_t q = snap_regions(r0, r1, epoch);
             n_snap_calls += q;
             return q;
@@ -1109,13 +1293,34 @@ void vk_mem_bound_note(void *pool) {
 static uint64_t page_lo(const PoolRec *r) { return r->lo & ~0xfffull; }
 static uint64_t page_hi(const PoolRec *r) { return (r->lo + r->size + 0xfff) & ~0xfffull; }
 
-// gen_lock held exclusively. 0: the range is not write-watched.
-static int query_stamp(uint64_t lo, uint64_t hi, uint32_t g) {
+enum StampResult { STAMP_UNTRACKED, STAMP_DIRTY, STAMP_CLEAN };
+
+// gen_lock held exclusively. Only a complete drain with no written page is clean.
+static enum StampResult query_stamp(uint64_t lo, uint64_t hi, uint32_t g) {
+    enum StampResult result = STAMP_CLEAN;
     for (;;) {
         uint64_t n = ww_query(lo, hi - lo);
-        if (n == UINT64_MAX) return 0;
+        if (n == UINT64_MAX) return STAMP_UNTRACKED;
+        if (n) result = STAMP_DIRTY;
         for (uint64_t k = 0; k < n; k++) stamp_page(gen_pages[k], g);
-        if (n < sizeof gen_pages / sizeof *gen_pages) return 1;
+        if (n < sizeof gen_pages / sizeof *gen_pages) return result;
+    }
+}
+
+// Collect writes pending when the region became read-only. A clean drain under the same mapping and
+// protection renews an existing tracked snapshot. Leave its epoch alone so that a thaw before the next
+// submission's first use still forces that submission to observe the newly writable pages.
+static void observe_after_freeze(uint32_t region) {
+    uint64_t addr = (uint64_t)region << REG_SHIFT;
+    uint64_t protection = mem_protection_region(region), mapping = mem_mapping_region(region);
+    int eligible = protection && mapping && mapping <= snap_mapping[region] &&
+                   snap_at[region] && !snap_untracked[region] && mem_frozen_stable(addr);
+    enum StampResult result = query_stamp(addr, addr + (1ull << REG_SHIFT), ++gen_now);
+    if (eligible && result == STAMP_CLEAN && mem_frozen_stable(addr) &&
+        mem_protection_region(region) == protection && mem_mapping_region(region) == mapping) {
+        snap_protection[region] = protection;
+        snap_mapping[region] = mapping;
+        freeze_snap_renewals++;
     }
 }
 
@@ -1509,7 +1714,8 @@ static void shadow_sync_pool(PoolRec *r, uint32_t epoch, int cpu) {
     uint64_t t0 = qpc();
     if (epoch && r1 < SNAP_REGIONS) {
         s_queries += snap_regions(r0, r1, epoch);
-        for (uint64_t k = r0; k <= r1 && tracked; k++) tracked = !snap_untracked[k];
+        for (uint64_t k = r0; k <= r1 && tracked; k++)
+            tracked = !snap_untracked[k] && snap_current((uint32_t)k, epoch);
     } else {   // outside the snapshot regions, or before the first guest submission: one query per unfrozen run
         uint32_t g = ++gen_now;
         for (uint64_t a = lo; a < hi;) {
@@ -2082,6 +2288,13 @@ static void mirror_mode(int discrete, int nvidia_own) {
     const char *fi = cfg_get("NX2NAVI_FREEZE_IDLE");
     freeze_idle = fi && *fi ? atoi(fi) : 1800;
     if (freeze_idle < 0) freeze_idle = 0;
+#ifdef _WIN32
+    const char *priority = cfg_get("NX2NAVI_FREEZE_CLEAN_PRIORITY");
+    if (freeze_idle && priority && !strcmp(priority, "1") && !clean_attempt) {
+        clean_attempt = calloc(SNAP_REGIONS, sizeof *clean_attempt);
+        if (!clean_attempt) rt_log("mem: clean-scan freeze selection unavailable: no attempt history");
+    }
+#endif
     const char *sh = cfg_get("NX2NAVI_SHADOW");
 #ifdef _WIN32
     shadow_on = sh && *sh ? strcmp(sh, "0") != 0 : plat_is_wine();
@@ -2167,8 +2380,7 @@ static void mbarrier(VkCommandBuffer cb, VkPipelineStageFlags2 ss, VkAccessFlags
     vkCmdPipelineBarrier2(cb, &di);
 }
 
-static void refuse(PoolRec *r, int why, const char *what) {
-    r->mstate = MS_REFUSED;
+static int refuse(PoolRec *r, int why, const char *what) {
     // A failed device-local allocation is asked again as a budget refusal is: memory that was short at the pool's
     // first use may be there 600 submissions later, and a pool never asked again was read over the bus until the game
     // finalized it. Untracked and overlapping pools stay refused: nothing about them changes.
@@ -2184,6 +2396,7 @@ static void refuse(PoolRec *r, int why, const char *what) {
                f, what);
     }
     plat_add64(&m_refused_bytes[why], (int64_t)n);
+    return 0;
 }
 
 // ---- eviction (NX2NAVI_MIRROR_EVICT, default on; 0 = a pool over the budget stays imported, as before)
@@ -2309,20 +2522,18 @@ static int twin_wanted(const PoolRec *r) {
     return !twin_max || (int64_t)(r->import_hi - r->import_lo) <= twin_max;
 }
 
-// Replay thread: the pool's mirror on its first buffer use.
-static void mirror_create(PoolRec *r) {
+// The creation owner prepares the complete backing while other workers still see MS_CREATING.
+static int mirror_create_backing(PoolRec *r) {
     VkCtx *c = vk_ctx();
     uint64_t n = r->import_hi - r->import_lo;
-    r->mstate = MS_REFUSED;
-    __atomic_add_fetch(&mirror_gen, 1, __ATOMIC_RELEASE);
-    if (r->kind != POOL_IMPORT || !r->buf || !n) return;
+    if (r->kind != POOL_IMPORT || !r->buf || !n) return 0;
     plat_mutex_lock_shared(&pool_lock);
     int i = pidx_upper(&pool_index, r->lo) - 1;
     while (i >= 0 && pool_index.e[i].buf != r) i--;
     int alone = i >= 0 && (i == 0 || pool_index.maxhi[i - 1] <= pool_index.e[i].lo) &&
                 (i + 1 == pool_index.n || pool_index.e[i + 1].lo >= pool_index.e[i].hi);
     plat_mutex_unlock_shared(&pool_lock);
-    if (i < 0) return;   // finalized meanwhile
+    if (i < 0) return 0;   // finalized meanwhile
     if (!alone) return refuse(r, MR_OVERLAP, "it overlaps another pool");
     uint64_t r0 = r->import_lo >> SNAP_SHIFT, r1 = (r->import_hi - 1) >> SNAP_SHIFT;
     if (r1 >= SNAP_REGIONS) return refuse(r, MR_UNTRACKED, "outside the write-watched address space");
@@ -2368,14 +2579,14 @@ static void mirror_create(PoolRec *r) {
                     r->retry_sub = msub + RETRY_SOON ? msub + RETRY_SOON : 1;
                     r->asked_room = 1;   // later refusals wait RETRY_SUBS: the textures had nothing to give
                 }
-                return;
+                return 0;
             }
         }
     }
     plat_mutex_lock(&gen_lock);
     mrep.sync_queries += snap_regions(r0, r1, mepoch);
     int untracked = 0;
-    for (uint64_t k = r0; k <= r1; k++) untracked |= snap_untracked[k];
+    for (uint64_t k = r0; k <= r1; k++) untracked |= snap_untracked[k] || !snap_current((uint32_t)k, mepoch);
     r->mgen = gen_now;   // the whole-range copy below holds every write observed so far
     plat_mutex_unlock(&gen_lock);
     if (untracked) return refuse(r, MR_UNTRACKED, "its range is not write-watched");
@@ -2399,7 +2610,6 @@ static void mirror_create(PoolRec *r) {
     nm++;
     plat_mutex_unlock(&pool_lock);
     r->acc_sub = msub;
-    r->mstate = MS_ON;
     r->asked_room = 0;
     // The device address table names the mirror from now on: the GPU's writes go there, and the sync copies the CPU's.
     // With a twin they also go to the imported buffer; without one (twin_wanted) the record names the mirror twice.
@@ -2415,6 +2625,17 @@ static void mirror_create(PoolRec *r) {
     mrep.first_n++, mrep.first_bytes += n;
     plat_inc64(&m_live_n);
     plat_add64(&m_live_bytes, (int64_t)n);
+    return 1;
+}
+
+static void mirror_create(PoolRec *r) {
+    r->mstate = MS_CREATING;
+    __atomic_add_fetch(&mirror_gen, 1, __ATOMIC_RELEASE);
+    int ready = mirror_create_backing(r);
+    // A generation observed during construction must not validate a descriptor after publication. The final
+    // atomic state also publishes mbuf, the address-table remap, retry fields and the initial upload together.
+    __atomic_add_fetch(&mirror_gen, 1, __ATOMIC_RELEASE);
+    r->mstate = ready ? MS_ON : MS_REFUSED;
 }
 
 static void mirror_forget(PoolRec *r) {
@@ -2460,7 +2681,7 @@ static void mirror_sync(PoolRec *r) {
     int excl = 0;
     plat_mutex_lock_shared(&gen_lock);
     for (uint64_t k = r0; k <= r1; k++)
-        if (snap_at[k] != mepoch) { excl = 1; break; }
+        if (!snap_current((uint32_t)k, mepoch)) { excl = 1; break; }
     if (excl) {
         plat_mutex_unlock_shared(&gen_lock);
         plat_mutex_lock(&gen_lock);
@@ -2469,7 +2690,7 @@ static void mirror_sync(PoolRec *r) {
     uint32_t since = r->mgen;
     int untracked = 0;
     for (uint64_t k = r0; k <= r1; k++) {
-        untracked |= snap_untracked[k];
+        untracked |= snap_untracked[k] || !snap_current((uint32_t)k, mepoch);
         if (creg_max[k] <= since) continue;
         uint64_t a = k << SNAP_SHIFT, b = a + (1ull << SNAP_SHIFT);
         if (a < lo) a = lo;
@@ -2542,7 +2763,7 @@ static int shadow_pool_clean(const PoolRec *r, uint32_t epoch, int cpu) {
     if (!epoch || r1 >= SNAP_REGIONS) return 0;
     const uint32_t *mx = cpu ? creg_max : reg_max;
     for (uint64_t k = r0; k <= r1; k++)
-        if (snap_at[k] != epoch || snap_untracked[k] || mx[k] > r->sgen) return 0;
+        if (!snap_current((uint32_t)k, epoch) || snap_untracked[k] || mx[k] > r->sgen) return 0;
     return 1;
 }
 
@@ -2632,7 +2853,13 @@ static void mem_use_locked(VkMemSpan *sp) {
 
 void vk_mem_pick(VkMemSpan *sp) {
     PoolRec *r = sp->pool;
-    if (!r || r->mstate != MS_ON) return;
+    if (!r) return;
+    if (r->mstate == MS_CREATING && vk_exec_shared()) {
+        // A pick does not create a mirror, but it must observe the completed choice of another worker.
+        plat_mutex_lock(&use_lock);
+        plat_mutex_unlock(&use_lock);
+    }
+    if (r->mstate != MS_ON) return;
     if (r->acc_sub != msub) {
         int lk = vk_exec_shared();
         if (lk) plat_mutex_lock(&use_lock);
@@ -3364,15 +3591,25 @@ static void freeze_pass(void) {
         if (nfcand) frz_held_passes++;
         return;
     }
-    for (int done = 0; nfcand && done < FREEZE_PER_SUB;) {
-        uint64_t j = fcand[--nfcand], a = j << REG_SHIFT;
-        if (ww_ep - reg_last[j] < (uint32_t)freeze_idle || mem_frozen(a)) continue;
+    uint32_t preferred = 0;
+    int priority = clean_attempt && freeze_budget_ns && clean_live && (!nfcand || !clean_normal_first) &&
+                   clean_next(&preferred);
+    if (clean_attempt) clean_normal_first = priority && nfcand;
+    for (int done = 0; (priority || nfcand) && done < FREEZE_PER_SUB;) {
+        int selected = priority;
+        uint64_t j = selected ? preferred : fcand[--nfcand], a = j << REG_SHIFT;
+        priority = 0;
+        if (!selected && (ww_ep - reg_last[j] < (uint32_t)freeze_idle || mem_frozen(a) ||
+                          (clean_attempt && clean_recent(ww_ep, clean_attempt[j], (uint32_t)freeze_idle)))) continue;
+        if (clean_attempt) clean_attempt[j] = ww_ep;
+        if (selected) clean_stats.attempts++;
         done++;
         uint64_t t0 = qpc();
         int ok = mem_freeze(a);
         uint64_t t1 = qpc();
+        if (selected && ok) clean_stats.successes++;
         slow_mem_call("freeze", a, 1ull << REG_SHIFT, 0, t1 - t0);
-        if (ok) query_stamp(a, a + (1ull << REG_SHIFT), ++gen_now);
+        if (ok) observe_after_freeze((uint32_t)j);
         else n_frz_refused++;
         if (!freeze_budget_ns) continue;
         if (t1 - t0 >= FREEZE_SLOW_NS) {
@@ -3393,11 +3630,13 @@ static void freeze_pass(void) {
 }
 
 void vk_mem_mirror_begin(void) {
+    RP_SCOPE(rp_mirror, RP_MIRROR_BEGIN);
     if (!vk_mirror_on) {   // import mode: the texture checks' snapshots still skip frozen regions
+        RP_VALUE(RPK_OUTCOME, RPO_IMPORTED);
         if (!freeze_idle) return;
-        plat_mutex_lock(&gen_lock);
+        RP_CALL(RP_MIRROR_LOCK, plat_mutex_lock(&gen_lock));
         ww_ep++;
-        freeze_pass();
+        RP_CALL(RP_MIRROR_FREEZE, freeze_pass());
         plat_mutex_unlock(&gen_lock);
         return;
     }
@@ -3409,13 +3648,16 @@ void vk_mem_mirror_begin(void) {
     mepoch = vk_texture_epoch();
     uint64_t q = 0, run0 = 0, run1 = 0;
     int have = 0;
+    RP_SCOPE(rp_mirror_locks, RP_MIRROR_LOCK);
     plat_mutex_lock_shared(&pool_lock);
     plat_mutex_lock(&gen_lock);
+    RP_END(rp_mirror_locks);
     ww_ep++;
     uint64_t b0 = ww_bytes;
     int pl = sub_place(), pp = presnap_place();
     if (pl <= pplace) pframe++;   // a new frame, though its first submissions may have had nothing to record
     pplace = pl;
+    RP_SCOPE(rp_queries, RP_MIRROR_QUERY);
     for (int i = 0; i < nm; i++) {
         const PoolRec *r = mlist[i];
         if (pp ? !(pm_last(r) >> pl & 1) : r->acc_sub != prev) continue;
@@ -3428,10 +3670,14 @@ void vk_mem_mirror_begin(void) {
         run0 = a, run1 = b, have = 1;
     }
     if (have) q += snap_regions(run0, run1, mepoch);
+    RP_VALUE(RPK_QUERIES, q);
+    RP_VALUE(RPK_WW_BYTES, ww_bytes - b0);
+    RP_END(rp_queries);
     mrep.presnap_bytes += ww_bytes - b0;
-    if (freeze_idle) freeze_pass();
+    if (freeze_idle) RP_CALL(RP_MIRROR_FREEZE, freeze_pass());
     plat_mutex_unlock(&gen_lock);
     plat_mutex_unlock_shared(&pool_lock);
+    RP_VALUE(RPK_OUTCOME, RPO_MIRRORED);
     mrep.subs++;
     mrep.presnap_queries += q;
     mrep.presnap_t += qpc() - t0;
@@ -3751,14 +3997,27 @@ static void mirror_log(uint64_t frame) {
     static uint64_t last, ww_last;
     plat_mutex_lock(&gen_lock);
     uint64_t wc = ww_calls, wb = ww_bytes, wt = ww_ticks, dc = ww_dirty_calls, dt = ww_dirty_ticks, wp = ww_pages;
+    uint64_t renewals = freeze_snap_renewals;
+    freeze_snap_renewals = 0;
     ww_pages = 0;
     uint64_t nr = n_frz_refused;
+    CleanStats clean = clean_stats;
+    clean_stats = (CleanStats){0};
     ww_calls = ww_bytes = ww_ticks = ww_dirty_calls = ww_dirty_ticks = n_frz_refused = 0;
     plat_mutex_unlock(&gen_lock);
     double wf = frame > ww_last ? (double)(frame - ww_last) : 1.0;
     ww_last = frame;
     uint64_t fz, ff, ft, fo, fh;
     mem_freeze_stats(&fz, &ff, &ft, &fo, &fh);
+    if (renewals && (rt_trace & RT_TRACE_PERF))
+        rt_log("mem: clean snapshots renewed after freeze at frame %llu: %llu", (unsigned long long)frame,
+               (unsigned long long)renewals);
+    if (clean_attempt && (rt_trace & RT_TRACE_PERF))
+        rt_log("mem: clean-scan frame %llu: expensive %llu, newly confirmed %llu, full %llu, edges examined %llu, "
+               "rejected %llu, priority attempts %llu, freeze successes %llu",
+               (unsigned long long)frame, (unsigned long long)clean.expensive, (unsigned long long)clean.ready,
+               (unsigned long long)clean.full, (unsigned long long)clean.examined, (unsigned long long)clean.skipped,
+               (unsigned long long)clean.attempts, (unsigned long long)clean.successes);
     mem_probe_report(frame);
     mem_lazy_report(frame, lz_skipped);
     lz_skipped = 0;
