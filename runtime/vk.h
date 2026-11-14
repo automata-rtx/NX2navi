@@ -581,6 +581,9 @@ int vk_exec_behind(void);
 // [0, n) in slices of grain, on the workers and the calling thread at once; returns when every slice is done. Without
 // workers, or for one slice, the caller runs it alone.
 void vk_exec_par(void (*fn)(void *arg, int lo, int hi), void *arg, int n, int grain);
+// Inside a recording chunk, run both halves and join. A recorder waiting on the group can take half 1.
+// Returns zero without calling fn when unavailable. Each half must be independent of renderer locks.
+int vk_exec_chunk_pair(void (*fn)(void *arg, unsigned half), void *arg);
 void vk_exec_hooks_wait(void);
 // A pass hook (vk_contact_pass_begin, vk_dlaa_pass) about to change what draws read or to record: the submitting
 // thread past a group waits for the group first; a group's hooks run in its first chunk, in turn already.

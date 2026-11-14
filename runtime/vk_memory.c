@@ -1110,6 +1110,40 @@ static int snap_current(uint32_t region, uint32_t epoch) {
     return epoch && snap_at[region] == epoch;
 }
 
+#ifdef _WIN32
+typedef struct {
+    uint64_t start[3];
+    uint64_t found[2];
+} SnapshotPeek;
+
+static void peek_snapshot_half(void *arg, unsigned half) {
+    SnapshotPeek *p = arg;
+    uint64_t page;
+    p->found[half] = mem_written_peek(p->start[half], p->start[half + 1] - p->start[half], &page, 1);
+}
+
+// A recent empty scan selects a range worth dividing. Only two successful, empty OS observations certify
+// the current snapshot. A write after either observation stays armed for the next submission. A dirty or
+// failed peek clears no bits, so the ordinary drain can still publish every page under the generation lock.
+// Other pools can be queried between two visits to the same span. Collisions only lose a scheduling hint.
+typedef struct { uint64_t lo, hi; } EmptySpan;
+static EmptySpan empty_spans[16];   // gen_lock
+static int snapshot_pair_enabled;
+static uint64_t peek_pairs, peek_clean, peek_wall;
+static int peek_large_snapshot(uint64_t lo, uint64_t hi) {
+    uint64_t mid = lo + (((hi - lo) >> (SNAP_SHIFT + 1)) << SNAP_SHIFT);
+    SnapshotPeek p = {.start = {lo, mid, hi}};
+    uint64_t t0 = qpc();
+    if (!vk_exec_chunk_pair(peek_snapshot_half, &p)) return 0;
+    uint64_t dt = qpc() - t0;
+    ww_calls += 2, ww_bytes += hi - lo, ww_ticks += dt;
+    peek_pairs++, peek_wall += dt;
+    if (p.found[0] || p.found[1]) return 0;
+    peek_clean++;
+    return 1;
+}
+#endif
+
 int vk_mem_dependency_adopt_locked(uint32_t region, uint32_t epoch) {
     // Caller owns a sleeping membership and has consumed all three notification domains without a gap. Events
     // after that cutoff belong after this submission's logical snapshot; they wake the region for a later one.
@@ -1126,7 +1160,7 @@ int vk_mem_dependency_region_locked(uint32_t region, uint32_t epoch, uint32_t *v
 
 // gen_lock held exclusively. Queries the regions r0..r1 that were not snapped in epoch, one query per run of them;
 // returns the number of queries.
-static uint64_t snap_regions(uint64_t r0, uint64_t r1, uint32_t epoch) {
+static uint64_t snap_regions_for(uint64_t r0, uint64_t r1, uint32_t epoch, int texture_list) {
     uint32_t g = 0;
     uint64_t calls = 0;
     for (uint64_t r = r0; r <= r1;) {
@@ -1143,13 +1177,26 @@ static uint64_t snap_regions(uint64_t r0, uint64_t r1, uint32_t epoch) {
         int tracked = 1, all_zero = 1;
         uint64_t ticks_before = ww_ticks;
         if (!g) g = ++gen_now;
-        for (;;) {
+        int observed_clean = 0;
+#ifdef _WIN32
+        int large_texture = snapshot_pair_enabled && texture_list && b - a >= (256ull << 20);
+        EmptySpan *hint = &empty_spans[(r ^ k ^ (r >> 4)) % 16];
+        if (large_texture && hint->lo == a && hint->hi == b) observed_clean = peek_large_snapshot(a, b);
+#else
+        (void)texture_list;
+#endif
+        while (!observed_clean) {
             uint64_t n = ww_query(a, b - a);
             if (n) all_zero = 0;
             if (n == UINT64_MAX) { tracked = 0; break; }
             for (uint64_t j = 0; j < n; j++) stamp_page(gen_pages[j], g);
             if (n < sizeof gen_pages / sizeof *gen_pages) break;
         }
+#ifdef _WIN32
+        if (large_texture) {
+            *hint = (EmptySpan){a, all_zero && tracked ? b : 0};
+        }
+#endif
         if (clean_attempt)
             clean_observe((uint32_t)r, (uint32_t)(k + 1), all_zero && tracked, ww_ticks - ticks_before, protection, mapping);
         calls++;
@@ -1169,6 +1216,10 @@ static uint64_t snap_regions(uint64_t r0, uint64_t r1, uint32_t epoch) {
         r = k + 1;
     }
     return calls;
+}
+
+static uint64_t snap_regions(uint64_t r0, uint64_t r1, uint32_t epoch) {
+    return snap_regions_for(r0, r1, epoch, 0);
 }
 
 int vk_mem_changed_snap(uint64_t addr, uint64_t size, uint32_t since, uint32_t epoch, uint32_t *now) {
@@ -1235,7 +1286,7 @@ uint64_t vk_mem_snap_range_locked(uint64_t addr, uint64_t size, uint32_t epoch) 
     if (r1 >= SNAP_REGIONS) return 0;
     for (uint64_t r = r0; r <= r1; r++)
         if (!snap_current((uint32_t)r, epoch)) {
-            uint64_t q = snap_regions(r0, r1, epoch);
+            uint64_t q = snap_regions_for(r0, r1, epoch, 1);
             n_snap_calls += q;
             return q;
         }
@@ -2289,6 +2340,8 @@ static void mirror_mode(int discrete, int nvidia_own) {
     freeze_idle = fi && *fi ? atoi(fi) : 1800;
     if (freeze_idle < 0) freeze_idle = 0;
 #ifdef _WIN32
+    const char *pair = cfg_get("NX2NAVI_TEXTURE_SNAPSHOT_PAIR");
+    snapshot_pair_enabled = !pair || strcmp(pair, "0");
     const char *priority = cfg_get("NX2NAVI_FREEZE_CLEAN_PRIORITY");
     if (freeze_idle && priority && !strcmp(priority, "1") && !clean_attempt) {
         clean_attempt = calloc(SNAP_REGIONS, sizeof *clean_attempt);
@@ -4003,10 +4056,19 @@ static void mirror_log(uint64_t frame) {
     uint64_t nr = n_frz_refused;
     CleanStats clean = clean_stats;
     clean_stats = (CleanStats){0};
+#ifdef _WIN32
+    uint64_t pairs = peek_pairs, empty = peek_clean, pair_ns = peek_wall;
+    peek_pairs = peek_clean = peek_wall = 0;
+#endif
     ww_calls = ww_bytes = ww_ticks = ww_dirty_calls = ww_dirty_ticks = n_frz_refused = 0;
     plat_mutex_unlock(&gen_lock);
     double wf = frame > ww_last ? (double)(frame - ww_last) : 1.0;
     ww_last = frame;
+#ifdef _WIN32
+    if (pairs && (rt_trace & RT_TRACE_PERF))
+        rt_log("mem: texture snapshot pairs %llu, empty %llu, elapsed %.3f ms/frame",
+               (unsigned long long)pairs, (unsigned long long)empty, qpc_ms(pair_ns) / wf);
+#endif
     uint64_t fz, ff, ft, fo, fh;
     mem_freeze_stats(&fz, &ff, &ft, &fo, &fh);
     if (renewals && (rt_trace & RT_TRACE_PERF))

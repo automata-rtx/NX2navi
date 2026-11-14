@@ -1013,7 +1013,7 @@ void vk_sync_append_fill(int at, const VkCommandBuffer *cbs, int n) {
 // on the worker while the submitting thread holds sub_lock and records on (NX2NAVI_REPLAY_PIPE) or waits for it: the
 // part with the worker's command buffer is not submitted before it is done, so cur_fence stays put.
 #define SYNC_WORKERS 17                // the replay workers (at most 16) and the submitting thread
-static struct { VkCommandPool pool; CmdSlot *slots; int n; } WP[SYNC_WORKERS];
+static struct { VkCommandPool pool; CmdSlot *slots; int n, next; uint64_t completed; } WP[SYNC_WORKERS];
 
 VkCommandBuffer vk_sync_worker_begin(int w) {
     VkCtx *c = vk_ctx();
@@ -1025,11 +1025,21 @@ VkCommandBuffer vk_sync_worker_begin(int w) {
                                       .queueFamilyIndex = c->gfx_family};
         if (vkCreateCommandPool(c->device, &pi, NULL, &p->pool) != VK_SUCCESS) rt_fatal("vk: replay worker command pool");
     }
-    uint64_t gpu = 0;
-    vkGetSemaphoreCounterValue(c->device, c->timeline, &gpu);
     CmdSlot *s = NULL;
-    for (int i = 0; i < p->n && !s; i++)
-        if (p->slots[i].fence <= gpu) s = &p->slots[i];
+    // One worker owns this pool. A confirmed timeline value can retire several buffers. Consume those
+    // first, then refresh the value before allocating. The fence assigned below covers every split part.
+    for (int pass = 0; pass < 2 && !s && p->n; pass++) {
+        if (pass) {
+            uint64_t gpu = 0;
+            if (vkGetSemaphoreCounterValue(c->device, c->timeline, &gpu) != VK_SUCCESS || gpu <= p->completed) break;
+            p->completed = gpu;
+        }
+        for (int checked = 0; checked < p->n; checked++) {
+            int i = p->next;
+            if (++p->next == p->n) p->next = 0;
+            if (p->slots[i].fence <= p->completed) { s = &p->slots[i]; break; }
+        }
+    }
     if (!s) {
         CmdSlot *m = realloc(p->slots, sizeof *m * (size_t)(p->n + 1));
         if (!m) rt_fatal("vk: out of memory (command buffers)");

@@ -56,6 +56,11 @@ static _Thread_local VkExec *x_cur;
 #define LIVE_GROUPS 4                   // groups handed out whose command buffers are not in their part yet, at most
 typedef struct Group Group;
 typedef struct {
+    void (*run)(void *, unsigned);
+    void *arg;
+    int done;
+} ChunkPair;
+typedef struct {
     VkExec ex;                          // the state at its first op, then the state it records with
     VkExecPoolView pool;                // private to this recording chunk, unlike the immutable group publication
     const op_hdr *h;                    // its first op
@@ -72,6 +77,7 @@ typedef struct {
     volatile int32_t done;
 } Chunk;
 struct Group {
+    ChunkPair *pair;                    // optional independent memory query offered to a waiting recorder
 #if NX2NAVI_REPLAY_WORK
     uint64_t work_replay;
 #endif
@@ -1778,12 +1784,16 @@ static inline void op_payload(VkExec *ex, uint32_t op, const void *a) {
     case OP_SET_SAMP_POOL: ex->samp_pool = ((const p_set_pool *)a)->pool; break;
     case OP_BARRIER: barrier_to_why(ex, NULL, NULL, 0, BR_GAME); break;
     case OP_DRAW: case OP_DRAW_IDX: case OP_DISPATCH: case OP_UPDATE_UB: case OP_DRAW_IDX_IND: case OP_DISPATCH_IND:
-        if (op == OP_DRAW || op == OP_DRAW_IDX || op == OP_DRAW_IDX_IND) vk_exec_frame.draws_seen++, split_draws++;
+        if (!rw_chunk && (op == OP_DRAW || op == OP_DRAW_IDX || op == OP_DRAW_IDX_IND))
+            vk_exec_frame.draws_seen++, split_draws++;
         if (op == OP_DISPATCH || op == OP_DISPATCH_IND) vk_exec_frame.dispatches++, split_draws++;
         // fall through
     case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF:
     case OP_BIND_UBO: case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_SAMP: case OP_BIND_IMG: case OP_PUSH_CC:
+        vk_exec_op_draw(ex, op, a);
+        break;
     case OP_DRAW_MESH: case OP_DRAW_MESH_IND:
+        if (!rw_chunk) vk_exec_frame.draws_seen++;
         vk_exec_op_draw(ex, op, a);
         break;
     case OP_COPY_B2B: case OP_COPY_B2T: case OP_COPY_T2B: case OP_COPY_T2T: case OP_CLEAR_TEX:
@@ -1852,9 +1862,11 @@ static void exec_step_run(VkExec *ex, const NvnRecordPlan *plan, const NvnExecSt
     }
     const op_hdr *h = (const op_hdr *)(plan->commands + step->begin);
     if (!step->run) { op_one(ex, h); return; }
-    // The direct draw entry points preserve their draw-context and publication logic. These two counters belong
-    // to the outer executor; mesh counters remain in the draw consumer, as in the reference path.
-    if (step->flags & NVN_EXEC_DRAW) vk_exec_frame.draws_seen++, split_draws++;
+    // The submitting thread already counted a recording group's draws, including any that need a retry.
+    if (!rw_chunk && (step->flags & (NVN_EXEC_DRAW | NVN_EXEC_MESH))) {
+        vk_exec_frame.draws_seen++;
+        if (step->flags & NVN_EXEC_DRAW) split_draws++;
+    }
     if (step->flags & NVN_EXEC_DISPATCH) vk_exec_frame.dispatches++, split_draws++;
     step->run(ex, nvn_op_payload(h));
 }
@@ -1939,6 +1951,7 @@ static const char *const pw_name[PW_N] = {"next group", "op", "pass hooks", "tur
 
 static struct {
     int n;                              // workers; 0 off, -1 not read yet
+    int extra_chunks;
     int pipe;                           // NX2NAVI_REPLAY_PIPE: the groups out at once at most, 0 none
     void *help_dc;                      // the submitting thread's draw context for chunks it takes while it waits
     RwWorker *w[RW_MAX];
@@ -1984,6 +1997,31 @@ static struct {
     volatile uint32_t seq;
 } PJ;
 static PlatMutex pj_lock = PLAT_MUTEX_INIT;
+
+// Only a thread already waiting on this group takes the second half. Claim the pointer before reading it.
+// The publisher holds the generation lock. The callback must use only its own output and take no renderer locks.
+static void chunk_pair_help(Group *g) {
+    if (!__atomic_load_n(&g->pair, __ATOMIC_RELAXED)) return;
+    ChunkPair *job = __atomic_exchange_n(&g->pair, NULL, __ATOMIC_ACQ_REL);
+    if (!job) return;
+    job->run(job->arg, 1);
+    __atomic_store_n(&job->done, 1, __ATOMIC_RELEASE);
+}
+
+int vk_exec_chunk_pair(void (*run)(void *, unsigned), void *arg) {
+    if (!rw_chunk || rw_chunk->g->n < 2) return 0;
+    Group *g = rw_chunk->g;
+    ChunkPair job = {.run = run, .arg = arg};
+    ChunkPair *empty = NULL;
+    if (!__atomic_compare_exchange_n(&g->pair, &empty, &job, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) return 0;
+    // Busy peers keep recording. Withdraw an unclaimed offer and let the caller use a single OS query.
+    for (unsigned i = 0; i < 16 && __atomic_load_n(&g->pair, __ATOMIC_RELAXED); i++) plat_pause();
+    ChunkPair *offered = &job;
+    if (__atomic_compare_exchange_n(&g->pair, &offered, NULL, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) return 0;
+    run(arg, 0);
+    while (!__atomic_load_n(&job.done, __ATOMIC_ACQUIRE)) plat_pause();
+    return 1;
+}
 
 static void par_slices(void) {
     for (;;) {
@@ -2058,6 +2096,8 @@ static void rw_main(void *arg) {
 
 static void rw_init(void) {
     vk_exec_draw_pool_schedule_init();
+    const char *waves = cfg_get("NX2NAVI_RECORD_EXTRA_CHUNKS");
+    RW.extra_chunks = !waves || strcmp(waves, "0");
     int n = cfg_int("NX2NAVI_REPLAY_WORKERS");
     RW.n = n < 0 ? 0 : n > RW_MAX ? RW_MAX : n;
     for (int k = 0; k < RW.n; k++) {
@@ -2133,6 +2173,7 @@ int vk_exec_pool_wait(uint64_t fence, uint32_t kinds, VkDescriptorSet *set) {
             }
             return 0;   // this consumer may prepare and publish; never mark an unfinished refresh ready
         }
+        chunk_pair_help(c->g);
         plat_pause();
     }
 }
@@ -2173,7 +2214,7 @@ void vk_exec_turn(void) {
     }
     if (rw_ordered) return;
     uint64_t t0 = kern_now_ns();
-    while (!chunk_in_turn(c)) plat_pause();
+    while (!chunk_in_turn(c)) { chunk_pair_help(c->g); plat_pause(); }
     rw_ordered = 1;
     __atomic_add_fetch(&RW.turns, 1, __ATOMIC_RELAXED);
     __atomic_add_fetch(&RW.turn_ns, kern_now_ns() - t0, __ATOMIC_RELAXED);
@@ -2311,7 +2352,7 @@ static void chunk_record(Chunk *c, int pool) {
     RP_SCOPE(rp_hook_wait, RP_CHUNK_HOOK);
     RP_VALUE(RPK_WORK_UNIT, gfx_rwt_current_id());
     if (c->idx)
-        while (!__atomic_load_n(&g->hooks, __ATOMIC_ACQUIRE)) plat_pause();
+        while (!__atomic_load_n(&g->hooks, __ATOMIC_ACQUIRE)) { chunk_pair_help(g); plat_pause(); }
     else if (!groups_before_done(g)) {   // the pass hooks follow the frame pass by pass: after the group before's
         const Group *p = &GQ[(g->seq - 1) % LIVE_GROUPS];   // not done, so not put in its part yet: still its slot
         while (!__atomic_load_n(&p->hooks, __ATOMIC_ACQUIRE)) plat_pause();
@@ -2522,6 +2563,19 @@ static const op_hdr *pool_leader_run(VkExec *ex, const op_hdr *h, const op_hdr *
     return after;
 }
 
+static int group_chunks(uint32_t draws) {
+    int lanes = RW.n + 1;
+    int n = (int)(draws / CHUNK_DRAWS);
+    if (n <= lanes) return n;
+    // At 256 draws per recorder a single slow chunk can hold the entire group. Leave a second
+    // wave on the existing queue so recorders that finish early can take more of the same pass.
+    if (RW.extra_chunks && draws / (uint32_t)lanes >= 256 && lanes < GROUP_CHUNKS) {
+        int target = 2 * lanes < GROUP_CHUNKS ? 2 * lanes : GROUP_CHUNKS;
+        if (vk_sync_append_room(target)) return target;
+    }
+    return lanes;
+}
+
 // The submitting thread, at op h of the walk: when a group large enough to split starts here, it is recorded by the
 // workers and this thread, and the walk goes on with the op that ended it, which is returned; otherwise h (the walk
 // replays the group itself, without reading ahead again before its end).
@@ -2545,9 +2599,7 @@ static const op_hdr *group_start(VkExec *ex, const op_hdr *h, int depth, const N
     if (why == GE_RUN && end_op < OP_COUNT_) RW.run_end[end_op] += draws;
     if (end == h) return h;   // an op the submitting thread replays itself
     RW.end_draws[why] += draws;
-    int n = (int)(draws / CHUNK_DRAWS);
-    if (n > RW.n + 1) n = RW.n + 1;
-    if (n > GROUP_CHUNKS) n = GROUP_CHUNKS;
+    int n = group_chunks(draws);
     if (n < 2 || vk_dump_armed || !vk_sync_append_room(n)) {
         RW.skip_to[depth] = end, RW.serial_draws += draws, RW.small_end[why] += draws;
         return h;
@@ -2559,9 +2611,7 @@ static const op_hdr *group_start(VkExec *ex, const op_hdr *h, int depth, const N
         group_room(ex);
     }
     h = pool_leader_run(ex, h, end, &draws);
-    n = (int)(draws / CHUNK_DRAWS);
-    if (n > RW.n + 1) n = RW.n + 1;
-    if (n > GROUP_CHUNKS) n = GROUP_CHUNKS;
+    n = group_chunks(draws);
     Group *g = &GQ[(Q.out + 1) % LIVE_GROUPS];
 #if NX2NAVI_REPLAY_WORK
     g->work_replay = gfx_rwt_replay();
@@ -2577,6 +2627,7 @@ static const op_hdr *group_start(VkExec *ex, const op_hdr *h, int depth, const N
     // the front pass
     uint32_t per = (draws + (uint32_t)n - 1) / (uint32_t)n, cd = 0;
     int nc = 1, cut = 0;
+    uint32_t mesh_draws = 0;
     g->ncond = 0;
     vk_exec_xfer_group((int)(g - GQ));
     Chunk *c = chunk_open(g, ex, h, 0, plan);
@@ -2636,7 +2687,10 @@ static const op_hdr *group_start(VkExec *ex, const op_hdr *h, int depth, const N
             }
         }
         switch (o->op) {
-        case OP_DRAW: case OP_DRAW_IDX: case OP_DRAW_IDX_IND: case OP_DRAW_MESH: case OP_DRAW_MESH_IND:
+        case OP_DRAW_MESH: case OP_DRAW_MESH_IND:
+            mesh_draws++;
+            // fall through
+        case OP_DRAW: case OP_DRAW_IDX: case OP_DRAW_IDX_IND:
             if (vk_exec_xfer_counting() && !ex->render_disabled) c->nslots++;   // at most one query each
             if (++cd == per && nc < n) cut = 1;
             break;
@@ -2663,6 +2717,10 @@ static const op_hdr *group_start(VkExec *ex, const op_hdr *h, int depth, const N
         o = nvn_op_next(o);
     }
     vk_exec_xfer_group(-1);   // the segments stay listed for the workers until the group is put in its part
+    // A group is indivisible for submission splitting. Count it once in stream order before publishing its
+    // chunks. Recording workers can retry a draw and finish out of order without racing the split threshold.
+    vk_exec_frame.draws_seen += draws;
+    split_draws += (int)(draws - mesh_draws);
     for (int i = 0; i < nc; i++) g->c[i].slot0 = vk_exec_xfer_slots(g->c[i].nslots);   // in the order of the stream
     // handed out: the workers (and without RW.pipe this thread) take the chunks in order
     for (int i = 0; i < nc; i++) {
@@ -2698,7 +2756,7 @@ static const op_hdr *group_start(VkExec *ex, const op_hdr *h, int depth, const N
     uint64_t to = kern_now_ns();
     RP_SCOPE(rp_final_spin, RP_FINAL_SPIN);
     RP_VALUE(RPK_WORK_UNIT, gfx_rwt_current_id());
-    while (__atomic_load_n(&Q.done, __ATOMIC_ACQUIRE) < g->seq) plat_pause();
+    while (__atomic_load_n(&Q.done, __ATOMIC_ACQUIRE) < g->seq) { chunk_pair_help(g); plat_pause(); }
     RP_END(rp_final_spin);
     uint64_t tw = kern_now_ns();
     RW.front_ns += tf - t0, RW.own_ns += to - tf, RW.spin_ns += tw - to;

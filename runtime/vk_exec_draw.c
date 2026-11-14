@@ -7229,8 +7229,8 @@ static void op_draw_impl(VkExec *ex, uint32_t op, const void *payload) {
     case OP_UPDATE_UB: op_update_ub(ex, payload); break;
     case OP_PUSH_CC: op_push_cc(ex, payload); break;
     case OP_DRAW: op_draw(ex, payload); break;
-    case OP_DRAW_MESH: vk_exec_frame.draws_seen++; op_draw_mesh(ex, payload); break;
-    case OP_DRAW_MESH_IND: vk_exec_frame.draws_seen++; op_draw_mesh_ind(ex, payload); break;
+    case OP_DRAW_MESH: op_draw_mesh(ex, payload); break;
+    case OP_DRAW_MESH_IND: op_draw_mesh_ind(ex, payload); break;
     case OP_DRAW_IDX: op_draw_idx(ex, payload); break;
     case OP_DISPATCH: op_dispatch(ex, payload); break;
     case OP_DRAW_IDX_IND: op_draw_idx_ind(ex, payload); break;
@@ -7291,8 +7291,8 @@ EXEC_HANDLER(op_push_cc, op_push_cc(ex, payload), OP_PUSH_CC, 0)
 EXEC_HANDLER(op_draw, op_draw(ex, payload), OP_DRAW, 1)
 EXEC_HANDLER(op_draw_idx, op_draw_idx(ex, payload), OP_DRAW_IDX, 1)
 EXEC_HANDLER(op_draw_idx_ind, op_draw_idx_ind(ex, payload), OP_DRAW_IDX_IND, 1)
-EXEC_HANDLER(op_draw_mesh, (vk_exec_frame.draws_seen++, op_draw_mesh(ex, payload)), OP_DRAW_MESH, 1)
-EXEC_HANDLER(op_draw_mesh_ind, (vk_exec_frame.draws_seen++, op_draw_mesh_ind(ex, payload)), OP_DRAW_MESH_IND, 1)
+EXEC_HANDLER(op_draw_mesh, op_draw_mesh(ex, payload), OP_DRAW_MESH, 1)
+EXEC_HANDLER(op_draw_mesh_ind, op_draw_mesh_ind(ex, payload), OP_DRAW_MESH_IND, 1)
 EXEC_HANDLER(op_dispatch, op_dispatch(ex, payload), OP_DISPATCH, 1)
 EXEC_HANDLER(op_dispatch_ind, op_dispatch_ind(ex, payload), OP_DISPATCH_IND, 1)
 EXEC_HANDLER(op_update_ub, op_update_ub(ex, payload), OP_UPDATE_UB, 1)
