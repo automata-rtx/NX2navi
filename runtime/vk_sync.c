@@ -59,6 +59,11 @@ static Pending *rqueue;
 static int rqhead, rqn, rqcap;
 static PlatMutex res_lock = PLAT_MUTEX_INIT;   // the runner; taken before st_lock
 static void results_run(uint64_t upto);
+enum { RESULT_BATCH = 64 };
+// Only the submitting thread records these results. They must be visible to a guest
+// waiter before any queue submission can signal the associated executed timeline value.
+static _Thread_local struct { uint64_t fence; unsigned n; Pending items[RESULT_BATCH]; } recording_results;
+static void publish_recording_results(void);
 
 // ---- submit batching
 // Every game submission used to be its own vkQueueSubmit2, about 150 a frame, each a trip into the driver on the render
@@ -1066,8 +1071,11 @@ static VkCommandBuffer split_part(int exec) {
                         .pCommandBufferInfos = cbi};
     VkSemaphoreSubmitInfo esig = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = exec_tl,
                                   .value = cur_fence, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
-    if (exec && exec_tl && exec_sig < cur_fence)
+    if (exec && exec_tl && exec_sig < cur_fence) {
+        publish_recording_results();
+        recording_results.fence = 0;
         si.signalSemaphoreInfoCount = 1, si.pSignalSemaphoreInfos = &esig, exec_sig = cur_fence;
+    }
     ts_submitted();
     queue_submit(c, &si, 0);         // held or handed to the queue (submit batching)
     vk_mem_lazy_handed();
@@ -1130,8 +1138,11 @@ static uint64_t submit(const uint64_t *handles, int n, const OwnCommands *own) {
     RP_END(rp_slot);
     RP_VALUE(RPK_FENCE, fence);
     int recorded = 1;
+    recording_results.fence = fence;
     if (own) own->record(s->cb, own->arg);
     else recorded = vk_exec_record(s->cb, handles, n, fence);
+    publish_recording_results();
+    recording_results.fence = 0;
     s = &slots[cur_slot];   // the last part (vk_sync_split)
     vk_gpu_passes_part(s->cb, 1);
     if (recorded) ts_end(s->cb, fence);
@@ -1217,7 +1228,22 @@ void vk_completion_add(uint64_t fence, void (*fn)(void *), void *arg) {
 
 // A side effect the game's CPU reads once the GPU has run submission fence's own commands: it runs before the other
 // side effects of the values reached, and a wait after a submit runs it itself (vk_sync_exec_wait).
+static void publish_recording_results(void) {
+    if (!recording_results.n) return;
+    plat_mutex_lock(&st_lock);
+    for (unsigned i = 0; i < recording_results.n; i++)
+        pending_push(&rqueue, &rqhead, &rqn, &rqcap, recording_results.items[i]);
+    plat_mutex_unlock(&st_lock);
+    recording_results.n = 0;
+}
+
 void vk_completion_add_result(uint64_t fence, void (*fn)(void *), void *arg) {
+    if (fence && recording_results.fence == fence) {
+        recording_results.items[recording_results.n++] = (Pending){fence, fn, arg};
+        if (recording_results.n == RESULT_BATCH) publish_recording_results();
+        return;
+    }
+    publish_recording_results();
     plat_mutex_lock(&st_lock);
     pending_push(&rqueue, &rqhead, &rqn, &rqcap, (Pending){fence, fn, arg});
     if (fence <= done) plat_cond_broadcast(&cv_work);
@@ -1230,12 +1256,21 @@ static void results_run(uint64_t upto) {
     plat_mutex_lock(&res_lock);
     plat_mutex_lock(&st_lock);
     while (rqn && rqueue[rqhead].fence <= upto && !vk_device_is_lost()) {
-        Pending p = rqueue[rqhead++];
-        rqn--;
+        // res_lock keeps the drained entries ahead of every later callback. Copy them
+        // before dropping st_lock since a concurrent producer may resize the queue.
+        Pending items[RESULT_BATCH];
+        unsigned n = 0;
+        while (n < RESULT_BATCH && rqn && rqueue[rqhead].fence <= upto) {
+            items[n++] = rqueue[rqhead++];
+            rqn--;
+        }
         plat_mutex_unlock(&st_lock);
-        __atomic_store_n(&cb_late, p.fence <= __atomic_load_n(&exw_value, __ATOMIC_ACQUIRE), __ATOMIC_RELAXED);
-        p.fn(p.arg);
-        __atomic_store_n(&cb_late, 0, __ATOMIC_RELAXED);
+        for (unsigned i = 0; i < n && !vk_device_is_lost(); i++) {
+            Pending p = items[i];
+            __atomic_store_n(&cb_late, p.fence <= __atomic_load_n(&exw_value, __ATOMIC_ACQUIRE), __ATOMIC_RELAXED);
+            p.fn(p.arg);
+            __atomic_store_n(&cb_late, 0, __ATOMIC_RELAXED);
+        }
         plat_mutex_lock(&st_lock);
     }
     plat_mutex_unlock(&st_lock);
