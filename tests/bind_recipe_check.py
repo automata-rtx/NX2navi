@@ -70,6 +70,7 @@ static void *prepared_test_memset(void *, int, size_t);
     start = prepared.index("enum { PREP_LIVE")
     selected += "\n" + prepared[start:prepared.index(";", start) + 1]
     selected += "\n" + "\n".join(function(prepared, n) for n in (
+        "same_binding_interface", "shared_binding_recipe",
         "prepared_watch", "prepared_watch_recipe", "prepared_bucket", "prepared_hot", "prepared_directory_init",
         "prepared_fixed_bytes", "prepared_total_bytes", "prepared_forget", "prepared_evict", "prepared_make_room",
         "prepared_same_epoch", "prepared_demote", "prepared_dormant_find", "prepared_dormant_admit", "prepared_promote",

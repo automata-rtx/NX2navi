@@ -957,7 +957,36 @@ static void maximum_recipe_resolution(void) {
     puts("maximum recipe: 128 operations and 1024 descriptors preserve fresh-resolution bytes, order and census");
 }
 
+static void pipeline_variants(void) {
+    GfxShaderRes reflections[2] = {{.slot = 3}, {.slot = 4}};
+    VkPipeBinding bindings[2] = {{.stage = GFX_STAGE_VS, .kind = GFX_RES_UBO,
+                                  .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .res = reflections}};
+    bindings[1] = bindings[0];
+    VkPipeInfo a = {.bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS, .n_bindings = 1, .bindings = bindings};
+    VkPipeInfo b = a;
+    b.bindings = bindings + 1;
+    b.pipeline = (VkPipeline)(uintptr_t)1;
+    b.vs_inputs = 15;
+    VkBindRecipe *r = shared_binding_recipe(&a, 0);
+    assert(r && shared_binding_recipe(&b, 0) == r);
+    assert(shared_binding_recipe(&b, 6) != r);
+    bindings[1].res = reflections + 1;
+    assert(!same_binding_interface(&a, &b));
+    bindings[1] = bindings[0];
+    b.set_layout = (VkDescriptorSetLayout)(uintptr_t)2;
+    assert(!same_binding_interface(&a, &b));
+    for (size_t i = 0; i < BIND_FAMILY_BUCKETS; i++) {
+        while (binding_families[i]) {
+            BindingFamily *f = binding_families[i];
+            binding_families[i] = f->next;
+            free(f->recipe);
+            free(f);
+        }
+    }
+}
+
 int main(void) {
+    pipeline_variants();
     lifetimes_and_watchers();
     ordered_and_partial_sets();
     proofs_and_texture_sealing();

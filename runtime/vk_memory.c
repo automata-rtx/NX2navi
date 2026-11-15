@@ -1222,7 +1222,9 @@ static uint64_t snap_regions(uint64_t r0, uint64_t r1, uint32_t epoch) {
     return snap_regions_for(r0, r1, epoch, 0);
 }
 
-int vk_mem_changed_snap(uint64_t addr, uint64_t size, uint32_t since, uint32_t epoch, uint32_t *now) {
+int vk_mem_changed_snap(uint64_t addr, uint64_t size, uint32_t since, uint32_t epoch, uint32_t *now,
+                        VkDirtyPages *dirty) {
+    if (dirty) *dirty = (VkDirtyPages){0};
     if (!size) { *now = since; return 0; }
     uint64_t lo = addr & ~0xfffull, hi = (addr + size + 0xfff) & ~0xfffull;
     uint64_t r0 = lo >> SNAP_SHIFT, r1 = (hi - 1) >> SNAP_SHIFT;
@@ -1245,7 +1247,22 @@ int vk_mem_changed_snap(uint64_t addr, uint64_t size, uint32_t since, uint32_t e
         uint64_t a = r << REG_SHIFT > lo ? r << REG_SHIFT : lo, b = (r + 1) << REG_SHIFT < hi ? (r + 1) << REG_SHIFT : hi;
         for (; a < b && !changed; a += 1ull << GEN_PAGE_SHIFT) {
             uint32_t *s = gen_slot(a, 0);
-            if (s && *s > since) changed = 1;
+            if (s && *s > since) {
+                changed = 1;
+                if (dirty) dirty->lo = a;
+            }
+        }
+    }
+    // A changed large resident image can refresh individual subresources. Find
+    // the other end starting at the last page, skipping clean regions in bulk.
+    if (changed && dirty && gen_now >= since) {
+        uint64_t page = 1ull << GEN_PAGE_SHIFT;
+        for (uint64_t end = hi; end > dirty->lo;) {
+            uint64_t a = end - page, region = a >> REG_SHIFT;
+            if (reg_max[region] <= since) { end = region << REG_SHIFT; continue; }
+            uint32_t *s = gen_slot(a, 0);
+            if (s && *s > since) { dirty->hi = end; break; }
+            end = a;
         }
     }
     *now = gen_now;   // every observation so far is in the table
@@ -3961,12 +3978,23 @@ int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence) {
     if (!vk_mirror_on) return 0;
     int rec = 0;
     lazy_part_check();   // before the merges are recorded: what the last part skipped and has to write back after all
+    int timing = vk_gpu_passes_capturing();
     if (nsnl) {
+        if (timing) {
+            vk_gpu_gap_boundary(cb);
+            vk_gpu_gap_note(VK_GAP_WB_BEFORE, 0);
+        }
         // the merge reads the mirror the submission's shaders wrote and writes the imported buffers
         mbarrier(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
                  VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
-        vk_gpu_gap_note(VK_GAP_WB_MERGE, 0);
+        uint64_t before = mrep.merge_bytes;
+        if (timing) vk_gpu_gap_boundary(cb);
         int m = wb_merge_record(cb);
+        if (timing) {
+            vk_gpu_gap_note(VK_GAP_WB_MERGE, mrep.merge_bytes - before);
+            vk_gpu_gap_boundary(cb);
+            vk_gpu_gap_note(VK_GAP_WB_AFTER, 0);
+        }
         if (!m) {   // no range list: copy them plainly
             for (int i = 0; i < nsnl; i++) range_add(&wbl, &nwbl, &cwbl, snl[i].r, snl[i].off, snl[i].size);
         }
@@ -3975,6 +4003,7 @@ int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence) {
         mbarrier(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                  VK_PIPELINE_STAGE_2_HOST_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                  VK_ACCESS_2_HOST_READ_BIT | VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+        if (timing) vk_gpu_gap_boundary(cb);
     }
     if (shadow_on && (nswl || nwbl)) swb_job(fence);   // before snap_free takes back the marks' chunk
     if (nchunks) {   // the last part's prologue still records snapshot copies into them; back to the pool at the fence
@@ -3985,16 +4014,27 @@ int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence) {
         vk_completion_add(fence, snap_free, f);
     }
     if (nwbl) {
+        if (timing) {
+            vk_gpu_gap_boundary(cb);
+            vk_gpu_gap_note(VK_GAP_WB_BEFORE, 0);
+        }
         mbarrier(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
                  VK_ACCESS_2_TRANSFER_READ_BIT);
         for (int i = 0; i < nwbl; i++) wbl[i].r->wb_sub = msub, wbl[i].r->wb_fence = fence;
-        vk_gpu_gap_note(VK_GAP_WB_COPY, 0);
+        uint64_t before = mrep.wb_bytes;
+        if (timing) vk_gpu_gap_boundary(cb);
         mrep.wb_ranges += (uint64_t)nwbl;
         rec += copy_ranges(cb, wbl, nwbl, 0, &mrep.wb_bytes, &mrep.wb_copies) + 2;
+        if (timing) {
+            vk_gpu_gap_note(VK_GAP_WB_COPY, mrep.wb_bytes - before);
+            vk_gpu_gap_boundary(cb);
+            vk_gpu_gap_note(VK_GAP_WB_AFTER, 0);
+        }
         mbarrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                  VK_PIPELINE_STAGE_2_HOST_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                  VK_ACCESS_2_HOST_READ_BIT | VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
         nwbl = 0;
+        if (timing) vk_gpu_gap_boundary(cb);
     }
     if (mirror_verify) rec += verify_record(cb, fence);
     plat_mutex_lock(&mirror_stat_lock);

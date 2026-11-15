@@ -154,7 +154,8 @@ static uint64_t gp_kind_n[VK_GAP_N], gp_kind_units[VK_GAP_N];
 static const char *const gp_kind_names[VK_GAP_N] = {
     "buffer copies", "buffer to texture copies", "texture to buffer copies", "texture copies", "buffer fills",
     "texture clears", "target clears", "the temporal upscaler", "write-back merges", "write-back copies",
-    "depth twin copies", "texture pool marks", "mesh draw counts", "block-compressed target copies"};
+    "depth twin copies", "texture pool marks", "mesh draw counts", "block-compressed target copies",
+    "write-back input dependency", "write-back output dependency"};
 static VkQueryPool gp_pool, gp_prims;   // gp_prims: mesh primitives generated per pass (with meshShaderQueries)
 static VkQueryPool gp_stats;            // fragment shader invocations per pass
 static int gp_state, gp_phase, gp_capture;   // state 0 not set up, 1 on, -1 off; phase 0 idle, 1 capturing, 2 waiting
@@ -190,6 +191,16 @@ void vk_gpu_gap_note(int kind, uint64_t units) {
     if (!gp_capture || gp_part == UINT32_MAX || kind < 0 || kind >= VK_GAP_N) return;
     gp_gap_kinds |= 1u << kind;
     gp_kind_n[kind]++, gp_kind_units[kind] += units;
+}
+
+// A shared endpoint keeps consecutive intervals disjoint, including the work before the first barrier.
+void vk_gpu_gap_boundary(VkCommandBuffer cb) {
+    if (!gp_capture || gp_part == UINT32_MAX || gp_in_mark || gp_n >= GP_SLOTS) return;
+    uint32_t q = gp_n * 2;
+    gp_labels[gp_n++] = (GpLabel){.kind = GP_KIND_PART};
+    vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, gp_pool, q);
+    gp_gap_close(q);
+    gp_gap_from = q;
 }
 
 void vk_gpu_passes_part(VkCommandBuffer cb, int end) {

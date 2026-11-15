@@ -745,22 +745,28 @@ static int image_is_color(VkImage image, uint32_t w, uint32_t h, const uint8_t w
 // the RGBA8 decode and its BC3 encoding both hold it exactly. The colour says which level and layer it is.
 static void detail_color(unsigned lv, unsigned layer, unsigned round, uint8_t c[4]) {
     unsigned k = 1 + (lv * 3 + layer + round * 2) % 7;   // never black: 1 to 7
-    c[0] = k & 1 ? 255 : 0, c[1] = k & 2 ? 255 : 0, c[2] = k & 4 ? 255 : 0, c[3] = 255;
+    c[0] = k & 1 ? 255 : 0, c[1] = k & 2 ? 255 : 0, c[2] = k & 4 ? 255 : 0;
+    c[3] = layer & 1 ? 0 : 255;   // keep arrays on the alpha-capable decode path
+}
+
+static int detail_fill_level(const tex_t *t, unsigned lv, unsigned ly, unsigned round) {
+    uint32_t rb, rows, sl, bpb; uint64_t base; unsigned th, td;
+    GCHECK(!nvn_deswizzle_geom(&t->d, lv, ly, &rb, &rows, &sl, &base, &th, &td, &bpb), "ASTC geometry of level %u", lv);
+    size_t n = (size_t)rb * rows;
+    uint8_t *tight = malloc(n), c[4];
+    detail_color(lv, ly, round, c);
+    for (size_t i = 0; i < n; i += 16)
+        void_block(tight + i, (uint16_t)(c[0] * 257), (uint16_t)(c[1] * 257), (uint16_t)(c[2] * 257),
+                   (uint16_t)(c[3] * 257), 0);
+    ref_swizzle(tight, t->mem + base, rb, rows, 1, th, td);
+    free(tight);
+    return 0;
 }
 
 static int detail_fill(const tex_t *t, unsigned layers, unsigned round) {
     for (unsigned lv = 0; lv < t->d.levels; lv++)
-        for (unsigned ly = 0; ly < layers; ly++) {
-            uint32_t rb, rows, sl, bpb; uint64_t base; unsigned th, td;
-            GCHECK(!nvn_deswizzle_geom(&t->d, lv, ly, &rb, &rows, &sl, &base, &th, &td, &bpb), "ASTC geometry of level %u", lv);
-            size_t n = (size_t)rb * rows;
-            uint8_t *tight = malloc(n), c[4];
-            detail_color(lv, ly, round, c);
-            for (size_t i = 0; i < n; i += 16)
-                void_block(tight + i, (uint16_t)(c[0] * 257), (uint16_t)(c[1] * 257), (uint16_t)(c[2] * 257), 0xFFFF, 0);
-            ref_swizzle(tight, t->mem + base, rb, rows, 1, th, td);
-            free(tight);
-        }
+        for (unsigned ly = 0; ly < layers; ly++)
+            if (detail_fill_level(t, lv, ly, round)) return 1;
     return 0;
 }
 
@@ -793,7 +799,7 @@ static int detail_level_is(const VkTexImage *img, uint32_t lv, uint32_t ly, uint
         for (size_t i = 0; i < n; i += 16) {
             uint16_t e0, e1;
             memcpy(&e0, r + i + 8, 2), memcpy(&e1, r + i + 10, 2);
-            same &= e0 == e && e1 == e;
+            same &= e0 == e && e1 == e && r[i] == want[3] && r[i + 1] == want[3];
         }
     } else {
         for (size_t i = 0; i < n; i += 4) same &= !memcmp(r + i, want, 4);
@@ -813,9 +819,20 @@ static int detail_case(pool_t *pool, uint64_t off, uint64_t room, uint32_t size,
     }
     GCHECK(t.L.size <= room && off + room <= pool->size, "ASTC %ux%u storage of %llu bytes does not fit its %llu in the "
            "probe's pool", size, size, (unsigned long long)t.L.size, (unsigned long long)room);
-    for (unsigned round = 0; round < 2; round++) {
-        if (detail_fill(&t, layers, round)) return 1;
-        const VkTexImage *img = vk_texture_get(&t);
+    unsigned changed_lv = want_skip, changed_ly = layers - 1;
+    for (unsigned round = 0; round < (layers > 1 ? 3u : 2u); round++) {
+        const VkTexImage *img;
+        if (round < 2) {
+            if (detail_fill(&t, layers, round)) return 1;
+            img = vk_texture_get(&t);
+        } else {
+            // Refresh through a draw binding after changing one resident layer.
+            // The readback below checks every other level and layer as well.
+            if (detail_fill_level(&t, changed_lv, changed_ly, round)) return 1;
+            vk_texture_register(23, &t, NULL);
+            vk_texture_new_submit();
+            img = vk_texture_by_id(23, NULL, NULL);
+        }
         GCHECK(img && img->mirrored, "ASTC %ux%u texture image", size, size);
         if (img->format != VK_FORMAT_R8G8B8A8_UNORM && img->format != VK_FORMAT_BC3_UNORM_BLOCK) return 0;   // native ASTC
         GCHECK(img->skip == want_skip && img->levels == levels - want_skip && img->width == size >> want_skip &&
@@ -826,7 +843,8 @@ static int detail_case(pool_t *pool, uint64_t off, uint64_t room, uint32_t size,
             for (uint32_t ly = 0; ly < layers; ly++) {
                 uint8_t want[4];
                 uint32_t w = size >> (lv + img->skip) ? size >> (lv + img->skip) : 1;
-                detail_color(lv + img->skip, ly, round, want);
+                unsigned expected = round == 2 && (lv + img->skip != changed_lv || ly != changed_ly) ? 1 : round;
+                detail_color(lv + img->skip, ly, expected, want);
                 GCHECK(detail_level_is(img, lv, ly, w, w, want),
                        "ASTC %ux%u made without %u levels: image level %u layer %u is not the game's level %u (%s)", size, size,
                        img->skip, lv, ly, lv + img->skip, round ? "after a rewrite of the storage" : "first upload");

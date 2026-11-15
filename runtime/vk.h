@@ -143,10 +143,12 @@ void vk_gpu_passes_frame(uint64_t frame);   // vk_crumbs.c, each present: NX2NAV
 enum {
     VK_GAP_COPY_B2B, VK_GAP_COPY_B2T, VK_GAP_COPY_T2B, VK_GAP_COPY_T2T, VK_GAP_CLEAR_BUF, VK_GAP_CLEAR_TEX,
     VK_GAP_CLEAR_TARGET, VK_GAP_UPSCALER, VK_GAP_WB_MERGE, VK_GAP_WB_COPY, VK_GAP_TWIN, VK_GAP_POOL_MARKS,
-    VK_GAP_MESH_RING, VK_GAP_BC_BACK, VK_GAP_N
+    VK_GAP_MESH_RING, VK_GAP_BC_BACK, VK_GAP_WB_BEFORE, VK_GAP_WB_AFTER, VK_GAP_N
 };
 void vk_gpu_passes_part(VkCommandBuffer cb, int end);
 void vk_gpu_gap_note(int kind, uint64_t units);
+void vk_gpu_gap_boundary(VkCommandBuffer cb);
+int vk_gpu_passes_capturing(void);
 // Pass marks wanted and possible (NX2NAVI_PASS_CRUMBS and the extensions): set by vk_crumbs_init.
 extern int vk_pass_marks_on;
 // vk_device.c create_device, before vkCreateDevice: 1 when NX2NAVI_PASS_CRUMBS asks for NVIDIA checkpoints.
@@ -437,7 +439,10 @@ uint64_t vk_mem_gen(void);
 int vk_mem_changed(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now);
 // The same answer from per-epoch write-watch snapshots of 2 MiB regions: no system call once the regions were queried in
 // this epoch (a guest submission). For checks that may see writes made during the epoch one epoch late.
-int vk_mem_changed_snap(uint64_t addr, uint64_t size, uint32_t since, uint32_t epoch, uint32_t *now);
+// Optional guest page bounds [lo, hi) enclosing all observed writes. Empty when unavailable.
+typedef struct { uint64_t lo, hi; } VkDirtyPages;
+int vk_mem_changed_snap(uint64_t addr, uint64_t size, uint32_t since, uint32_t epoch, uint32_t *now,
+                        VkDirtyPages *dirty);
 void vk_mem_snap_stats(uint64_t *checks, uint64_t *calls, uint64_t *untracked);   // since the last call
 
 // Upload batch: one command buffer on gfx_queue that texture uploads and texel copies record into. begin/end bracket

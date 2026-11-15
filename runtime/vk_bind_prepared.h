@@ -2,20 +2,60 @@
 // Included by vk_exec_draw.c after its authoritative resource resolvers and PB helpers. Recipes supply fixed
 // decisions; prepared instances hold their final packed descriptors. Ordered resolvers are shared with mode 0.
 
+// Fixed-function pipeline variants may consume exactly the same shader bindings. Compare the full
+// immutable interfaces once at discovery. Resources and packets still belong to the recording context.
+static int same_binding_interface(const VkPipeInfo *a, const VkPipeInfo *b) {
+    if (a->layout != b->layout || a->bind_point != b->bind_point || a->n_bindings != b->n_bindings ||
+        a->n_sets != b->n_sets || a->pool != b->pool || a->push != b->push || a->push1 != b->push1 ||
+        a->set_layout != b->set_layout || a->set_layout1 != b->set_layout1 ||
+        a->tpl[0] != b->tpl[0] || a->tpl[1] != b->tpl[1]) return 0;
+    for (uint32_t i = 0; i < a->n_bindings; i++) {
+        const VkPipeBinding *x = &a->bindings[i], *y = &b->bindings[i];
+        if (x->res != y->res || x->binding != y->binding || x->set != y->set || x->kind != y->kind ||
+            x->stage != y->stage || x->stages != y->stages || x->type != y->type || x->count != y->count) return 0;
+    }
+    return 1;
+}
+
+static VkBindRecipe *shared_binding_recipe(const VkPipeInfo *info, int stage) {
+    uintptr_t hash = (uintptr_t)info->layout;
+    if (info->n_bindings && info->bindings)
+        hash ^= (uintptr_t)info->bindings[info->n_bindings - 1].res;
+    BindingFamily **bucket = &binding_families[((hash >> 4) ^ (hash >> 17)) & (BIND_FAMILY_BUCKETS - 1)];
+    if (info->n_bindings && !info->bindings) return NULL;
+    for (BindingFamily *f = *bucket; f; f = f->next)
+        if (stage == f->recipe->stage_override && same_binding_interface(info, f->recipe->info))
+            return f->recipe;
+    VkBindRecipe *recipe = vk_bind_recipe_create(info, stage);
+    if (!recipe) return NULL;
+    BindingFamily *f = malloc(sizeof *f);
+    if (!f) { free(recipe); return NULL; }
+    *f = (BindingFamily){.next = *bucket, .recipe = recipe};
+    *bucket = f;
+    return recipe;
+}
+
 static const VkBindRecipe *binding_recipe(VkExec *ex, const VkPipeInfo *info) {
     DrawCtx *cx = ex->dc;
     RecipeKey key = {.info = info, .stage = cx->mfb_stage};
     if (cx->recipe_last_p && !memcmp(&key, &cx->recipe_last, sizeof key)) return cx->recipe_last_p;
+    uintptr_t ptr = (uintptr_t)info;
+    LocalRecipe *local = &cx->recipe_cache[((ptr >> 4) ^ (ptr >> 12) ^ (unsigned)key.stage) & 63];
+    if (local->recipe && local->key.info == info && local->key.stage == key.stage) {
+        cx->recipe_last = key;
+        return cx->recipe_last_p = local->recipe;
+    }
     int locked = vk_exec_shared();
     if (locked) plat_mutex_lock(&rs_lock);
     if (!binding_recipes.klen) nvn_hm_init(&binding_recipes, sizeof key);
     VkBindRecipe *p = nvn_hm_get(&binding_recipes, &key);
     if (!p) {
-        p = vk_bind_recipe_create(info, cx->mfb_stage);
+        p = shared_binding_recipe(info, cx->mfb_stage);
         if (p) nvn_hm_put(&binding_recipes, &key, p);
     }
     if (locked) plat_mutex_unlock(&rs_lock);
     cx->recipe_last = key, cx->recipe_last_p = p;
+    *local = (LocalRecipe){.key = key, .recipe = p};
     return p;
 }
 
@@ -236,6 +276,7 @@ static void prepared_dispose(DrawCtx *cx) {
     cx->prep_bytes = cx->prep_metadata_bytes = cx->prep_alloc_failed = cx->prep_dormant_failed = 0;
     cx->prepared_last = NULL;
     cx->recipe_last_p = NULL;
+    memset(cx->recipe_cache, 0, sizeof cx->recipe_cache);
     memset(&cx->recipe_last, 0, sizeof cx->recipe_last);
 }
 

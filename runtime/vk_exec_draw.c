@@ -380,6 +380,16 @@ typedef struct {
     uint32_t pad;
 } RecipeKey;
 static nvn_hmap binding_recipes;
+typedef struct BindingFamily {
+    struct BindingFamily *next;
+    VkBindRecipe *recipe;
+} BindingFamily;
+#define BIND_FAMILY_BUCKETS 2048
+static BindingFamily *binding_families[BIND_FAMILY_BUCKETS];
+typedef struct {
+    RecipeKey key;
+    const VkBindRecipe *recipe;
+} LocalRecipe;
 typedef struct {
     uint64_t builds, descriptors, reused, snapshot_reused, resolved, ordered, checked, aggregate_skipped, proof_descriptors;
     uint64_t renewals, renewed_descriptors;
@@ -456,6 +466,7 @@ typedef struct DrawCtx {
     PreparedBindings *prepared_last;    // most recent prepared packet; cleared when its entry is evicted or state copied
     RecipeKey recipe_last;
     const VkBindRecipe *recipe_last_p;
+    LocalRecipe recipe_cache[64];
     VkUsnapLease *prep_capture;          // ubo_info publishes the proof only when it used a submit snapshot
     RWT_HISTORY_FIELD
 } DrawCtx;
@@ -991,7 +1002,17 @@ void vk_exec_draw_shutdown(void) {
     }
     memset(SD, 0, sizeof SD);
     nvn_hm_clear(&rs_lists, free);
-    nvn_hm_clear(&binding_recipes, free);
+    nvn_hm_clear(&binding_recipes, NULL);
+    for (size_t i = 0; i < BIND_FAMILY_BUCKETS; i++) {
+        BindingFamily *f = binding_families[i];
+        while (f) {
+            BindingFamily *next = f->next;
+            free(f->recipe);
+            free(f);
+            f = next;
+        }
+        binding_families[i] = NULL;
+    }
     pool_requirement_reset();
     dc_main.rs_last = NULL, dc_main.rs_last_l = NULL;   // the replay's context: no other records now
     for (int i = 0; i < nspare_pool; i++) vkDestroyDescriptorPool(c->device, spare_pool[i], NULL);

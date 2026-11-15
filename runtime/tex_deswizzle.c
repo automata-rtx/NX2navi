@@ -55,8 +55,7 @@ int nvn_deswizzle_geom(const nvn_texdesc *d, unsigned level, unsigned layer,
     uint32_t w = mip(d->width, level), h = one_d ? 1 : mip(d->height, level);
     *slices = d->target == 2 ? mip(d->depth ? d->depth : 1, level) : 1;
     *row_bytes = (w + bw - 1) / bw * *bpb; *rows = (h + bh - 1) / bh;
-    *base = (uint64_t)layer * L.layer_size + nvn_tex_level_offset(d, level);
-    nvn_tex_level_tiles(d, level, th, td);
+    *base = (uint64_t)layer * L.layer_size + nvn_tex_level_geometry(d, &L, level, th, td);
     return 0;
 }
 

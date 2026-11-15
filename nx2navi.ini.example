@@ -54,6 +54,9 @@
 # step_steady = 1
 
 [performance]
+# The fork's field benchmark uses wb_local_hold = 1 with lazy write-back enabled and
+# wb_lazy_chunk = 0. This keeps recently CPU-touched regions local. Read at startup.
+# wb_local_hold = 1
 # The keys of this section and of [diagnostics] are for testing and troubleshooting, and take effect at the next start.
 # The Advanced tab of the settings menu (F1) shows all of them except zstd_native and zstd_check.
 

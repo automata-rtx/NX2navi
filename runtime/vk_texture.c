@@ -50,6 +50,7 @@ typedef struct Tex {
     uint64_t bytes;               // the size of alloc (0 without own memory), for the released entries' total
     VmaAllocation bound_to;       // the pool memory it is bound into
     uint32_t wgen;                // page generation of the last upload check
+    uint64_t upload_mapping, upload_protection; // guest mapping and tracking state when resident mip contents were copied
     uint32_t checked;             // submit_epoch of the last check from a draw binding
     uint32_t use_round;           // look_round when a lookup last reached it (touch)
     uint64_t use_frame;           // gfx_counters.frames then
@@ -152,6 +153,7 @@ static Tex *rel_head, *rel_tail;   // released entries in release order (sweep_r
 static uint64_t n_uploads, n_reuploads;
 // Re-uploads since the last perf line (tex_lock): all, and those of textures a WriteTexels wrote since their last upload.
 static uint64_t ru_n, ru_bytes, ru_ns, ru_wt_n, ru_wt_bytes, ru_wt_ns;
+static uint64_t ru_partial, ru_regions_saved, ru_staging_saved;
 static uint64_t ru_same_n, ru_same_bytes;   // re-uploads skipped: the pages were written, the texture's bytes were not
 // NX2NAVI_TEX_ALIAS (default on; =0: a new image over live storage starts empty): a new descriptor over the storage of a
 // live image that the GPU wrote gets that image's content (alias_copy). Counts since the last log line.
@@ -829,6 +831,7 @@ static VkDeviceSize image_size(const VkImageCreateInfo *ci) {
 // A reused image (create_tex) was another texture's: the transition waits for every earlier command, which may still
 // read or write it.
 static void init_image(Tex *e, VkCommandBuffer cb) {
+    e->upload_mapping = 0;
     VkImageMemoryBarrier2 ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
                                 .srcStageMask = e->reused ? VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_2_NONE,
                                 .srcAccessMask = e->reused ? VK_ACCESS_2_MEMORY_WRITE_BIT : 0,
@@ -1066,7 +1069,8 @@ static uint32_t detail_skip(const tex_t *t, const TexKey *k, const TexVkFormat *
 // thread keeps ahead (vk_headroom.c). Render targets keep vmaCreateImage and the driver's preference (vma_image).
 // VK_NULL_HANDLE when the image does not take that memory.
 enum { SUBALLOC_MAX = 32 << 20 };
-static VkImage suballoc_image(VkCtx *c, const VkImageCreateInfo *ci, VmaAllocation *alloc) {
+static VkImage suballoc_image_limit(VkCtx *c, const VkImageCreateInfo *ci, VmaAllocation *alloc,
+                                    VkDeviceSize limit, VmaAllocationCreateFlags flags) {
     VkImage img;
     if (vkCreateImage(c->device, ci, NULL, &img) != VK_SUCCESS) return VK_NULL_HANDLE;
     // an image the driver requires (not only prefers) dedicated memory for keeps it: vma_image
@@ -1075,8 +1079,8 @@ static VkImage suballoc_image(VkCtx *c, const VkImageCreateInfo *ci, VmaAllocati
     VkImageMemoryRequirementsInfo2 ri = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2, .image = img};
     vkGetImageMemoryRequirements2(c->device, &ri, &mr2);
     VkMemoryRequirements mr = mr2.memoryRequirements;
-    VmaAllocationCreateInfo ai = {.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT};
-    int ok = !dr.requiresDedicatedAllocation && mr.size <= SUBALLOC_MAX &&
+    VmaAllocationCreateInfo ai = {.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, .flags = flags};
+    int ok = !dr.requiresDedicatedAllocation && mr.size <= limit &&
              vmaAllocateMemory(c->vma, &mr, &ai, alloc, NULL) == VK_SUCCESS;
     if (ok && vmaBindImageMemory(c->vma, *alloc, img) != VK_SUCCESS) {
         vmaFreeMemory(c->vma, *alloc);
@@ -1088,6 +1092,12 @@ static VkImage suballoc_image(VkCtx *c, const VkImageCreateInfo *ci, VmaAllocati
     }
     return img;
 }
+
+static VkImage suballoc_image(VkCtx *c, const VkImageCreateInfo *ci, VmaAllocation *alloc) {
+    return suballoc_image_limit(c, ci, alloc, SUBALLOC_MAX, 0);
+}
+
+#include "vk_stream_images.h"
 
 // An image made with vmaCreateImage. One of DEDICATED_MIN or more gets memory of its own: freed inside one of VMA's
 // 256 MiB blocks it left a hole the driver went on counting, with the rest of the block, against the budget and the
@@ -1226,7 +1236,11 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
                         (unsigned long long)k->addr, w, h, d->format);
         }
     }
-    if (!img && tex_mirrored(t) && samples == 1) img = suballoc_image(c, &ci, &e->alloc);
+    if (!img && tex_mirrored(t) && samples == 1) {
+        if (stream_images_enabled() && !nvn_gpu_only(k->addr))
+            img = stream_image_take(d, &ci, &e->ik, &e->alloc);
+        if (!img) img = suballoc_image(c, &ci, &e->alloc);
+    }
     int gpu_only = !tex_mirrored(t);
     // an entry split fill is to fill gets a new image: start_at uploads into it in the upload batch (see "split fill")
     int to_fill = gpu_only && split_wants(t, &f) && L.size <= SPLIT_FILL_MAX;
@@ -1412,7 +1426,7 @@ static void rel_unlink(Tex *e) {
 // held.
 typedef struct { Tex *e; uint64_t addr, size; uint32_t since, dep; int ok; } PEnt;   // ok: uploaded as of since
 static PEnt *pent;
-static int npent, cpent, *pq, cpq;
+static int npent, cpent, *pq;
 static uint64_t n_pool_checks, n_pool_skips;
 // The region check's misses (vk_mem_unchanged_why_locked): not uploaded, a region without this epoch's snapshot yet, one
 // untracked, one written since, nothing to check; and the snapshot queries its own pass made (NX2NAVI_POOL_PRESNAP).
@@ -1588,6 +1602,14 @@ static void pool_unlist(Tex *e) {
     e->pidx = 0;
 }
 
+// A released image can remain resident and keep its slot references. Its CPU storage is
+// checked again only after the game takes the image back. New dependency nodes start dirty.
+static void pool_watch_storage(PEnt *p) {
+    if (!pool_deps_mode()) return;
+    p->dep = fresh_deps_add(pool_deps, (uintptr_t)p->e, p->addr, p->size);
+    if (!p->dep) rt_fatal("vk: out of memory for texture dependency links");
+}
+
 // The entries the pool's slots hold: for each, how many slots' last fill resolved to it (vk_exec_draw.c pool_hold; a fill
 // that shared another slot's lookup counts for the entry that lookup found). The walk over every slot looked each slot
 // up in each submission, which left its entry's use stamp (touch): the idle clock reads it, and start_at's alias rule
@@ -1661,17 +1683,15 @@ int vk_texture_pool_note_locked(int id, uint32_t *ent) {
         if (npent == cpent) {
             int n = cpent ? cpent * 2 : 1024;
             PEnt *p = realloc(pent, sizeof *p * (size_t)n);
-            int *q = realloc(pq, sizeof *q * (size_t)n);
+            // The tail holds one bit per entry for ordering dense worklists.
+            int *q = realloc(pq, sizeof *q * ((size_t)n + ((size_t)n + 31) / 32));
             if (!p || !q) rt_fatal("vk: out of memory for the texture pool's entry list");
-            pent = p, pq = q, cpent = cpq = n;
+            pent = p, pq = q, cpent = n;
         }
-        uint32_t dep = 0;
-        if (pool_deps_mode()) {
-            dep = fresh_deps_add(pool_deps, (uintptr_t)e, e->pub.addr, e->t.L.size);
-            if (!dep) rt_fatal("vk: out of memory for texture dependency links");
-        }
-        pent[npent++] = (PEnt){.e = e, .addr = e->pub.addr, .size = e->t.L.size, .dep = dep};
+        PEnt *p = &pent[npent++];
+        *p = (PEnt){.e = e, .addr = e->pub.addr, .size = e->t.L.size};
         e->pidx = npent;
+        if (!e->released) pool_watch_storage(p);
     }
     *ent = pool_ref(e);
     return 1;
@@ -1697,6 +1717,26 @@ static int pool_by_list;
 static int pool_index_compare(const void *a, const void *b) {
     int x = *(const int *)a, y = *(const int *)b;
     return (x > y) - (x < y);
+}
+
+// Resolve highest indices first: unlisting an image can move the last entry into its slot.
+// Each selected entry has exactly one dependency node. For dense lists, enumerate bits in
+// index order instead of repeatedly comparing the same indices under the texture lock.
+static void pool_order_candidates(int count) {
+    if (count < 2) return;
+    size_t words = ((size_t)npent + 31) / 32;
+    if (count <= 32 || (size_t)count < words) {
+        qsort(pq, (size_t)count, sizeof *pq, pool_index_compare);
+        return;
+    }
+    unsigned *bits = (unsigned *)(pq + cpent);
+    memset(bits, 0, words * sizeof *bits);
+    for (int i = 0; i < count; i++)
+        bits[pq[i] >> 5] |= 1u << (pq[i] & 31);
+    int out = 0;
+    for (size_t w = 0; w < words; w++)
+        for (unsigned v = bits[w]; v; v &= v - 1)
+            pq[out++] = (int)(w * 32 + __builtin_ctz(v));
 }
 
 int vk_texture_pool_fresh_locked(void) {
@@ -1732,15 +1772,15 @@ int vk_texture_pool_fresh_locked(void) {
         }
         if (mode == 4) for (int i = 0; i < npent; i++) {
             const PEnt *p = &pent[i];
+            if (p->e->released) continue;
             int required = !p->ok || vk_mem_unchanged_why_locked(p->addr, p->size, p->since, submit_epoch);
             if (required && !fresh_deps_dirty(pool_deps, p->dep))
                 rt_fatal("vk: texture dependency worklist omitted a required entry");
             PD.verified++;
         }
-        // The original consumer handles highest indices first because removal swaps the last entry into its slot.
-        if (nq > 1) qsort(pq, (size_t)nq, sizeof *pq, pool_index_compare);
     } else for (int i = 0; i < npent; i++) {
         const PEnt *p = &pent[i];
+        if (p->e->released) continue;
         if (p->ok) {
             if (ps) n_presnap_q += vk_mem_snap_range_locked(p->addr, p->size, submit_epoch);
             int why = vk_mem_unchanged_why_locked(p->addr, p->size, p->since, submit_epoch);
@@ -1756,6 +1796,7 @@ int vk_texture_pool_fresh_locked(void) {
     }
     if (ps) vk_mem_gen_unlock();
     else vk_mem_gen_unlock_shared();
+    if (indexed && mode >= 2) pool_order_candidates(nq);
     uint64_t t2 = timing ? kern_now_ns() : 0;
     if (mode) PD.candidates += (uint64_t)nq;
     n_pool_skips += (uint64_t)(npent - nq);
@@ -3216,21 +3257,25 @@ static int astc_bl_regions(const Tex *e, uint32_t levels, uint32_t layers, int b
         if (!on) rt_log("vk: ASTC blocks deswizzled on the CPU (NX2NAVI_ASTC_GPU_DESWIZZLE=0)");
     }
     const nvn_texdesc *d = &e->t.d;
-    if (!on || nvn_tex_is_linear(d)) return 0;
+    if (!on || nvn_tex_is_linear(d) || d->samples > 1 || d->target == NVN_TEXTURE_TARGET_2D_MULTISAMPLE ||
+        d->target == NVN_TEXTURE_TARGET_2D_MULTISAMPLE_ARRAY || d->target == NVN_TEXTURE_TARGET_BUFFER) return 0;
     uint32_t k = 0, sk = e->pub.skip;
-    for (uint32_t lv = 0; lv < levels; lv++)
+    if (layers > e->t.L.layers || levels + sk > umax(d->levels, 1)) return 0;
+    for (uint32_t lv = 0; lv < levels; lv++) {
+        unsigned th, td;
+        uint64_t first = nvn_tex_level_geometry(d, &e->t.L, lv + sk, &th, &td);
+        uint32_t slices = d->target == NVN_TEXTURE_TARGET_3D ? mip(d->depth, lv + sk) : 1;
+        if (th > 5 || td > 5) return 0;
+        VkAstcRegion region = {.w = mip(d->width, lv + sk), .h = mip(d->height, lv + sk), .slices = slices,
+                               .level = lv, .bl = 1, .th = (uint8_t)th, .td = (uint8_t)td};
+        VkDeviceSize bytes = vk_astc_region_bytes(&region, (uint32_t)bw, (uint32_t)bh);
         for (uint32_t ly = 0; ly < layers; ly++) {
-            uint32_t row_bytes, rows, slices, bpb;
-            uint64_t base;
-            unsigned th, td;
-            if (nvn_deswizzle_geom(d, lv + sk, ly, &row_bytes, &rows, &slices, &base, &th, &td, &bpb) || (base & 15) ||
-                th > 5 || td > 5)
-                return 0;
-            ar[k] = (VkAstcRegion){.src = base, .w = mip(d->width, lv + sk), .h = mip(d->height, lv + sk), .slices = slices,
-                                   .level = lv, .layer = ly, .bl = 1, .th = (uint8_t)th, .td = (uint8_t)td};
-            if (base + vk_astc_region_bytes(&ar[k], (uint32_t)bw, (uint32_t)bh) > e->t.L.size) return 0;
-            k++;
+            region.src = first + (uint64_t)ly * e->t.L.layer_size;
+            region.layer = ly;
+            if ((region.src & 15) || region.src > e->t.L.size || bytes > e->t.L.size - region.src) return 0;
+            ar[k++] = region;
         }
+    }
     return 1;
 }
 
@@ -3334,11 +3379,14 @@ static int astc_copy_opaque(const Tex *e, uint8_t *dst, const uint8_t *src, uint
     return ok;
 }
 
-static void upload(Tex *e) {
+static void upload(Tex *e, const VkDirtyPages *dirty, int tracked) {
     static volatile int32_t n_bad, n_undecoded, n_split;
     int no_mem = 0;   // a part's ASTC decode had no memory: the texture is uploaded again later
     const tex_t *t = &e->t;
     const nvn_texdesc *d = &t->d;
+    uint64_t prior_map = e->upload_mapping, prior_protection = e->upload_protection;
+    uint64_t mapping = 0, protection = 0;
+    e->upload_mapping = 0;
     int bw, bh, bpb = nvn_fmt_bpb(d->format, &bw, &bh);
     if (!bpb || !t->mem) return;
     // A stale slot (the bindless pools look every slot up): no upload; a later write to mapped storage uploads it
@@ -3369,11 +3417,14 @@ static void upload(Tex *e) {
     int astc = e->f.astc_bw != 0, rgb = e->f.expand_rgb;
     int agpu = astc && vk_astc_gpu(), acheck = agpu && vk_astc_mode() == VK_ASTC_CHECK;   // raw blocks to the GPU
     uint32_t n = levels * layers, k = 0, sk = linear ? 0 : e->pub.skip;
-    VkBufferImageCopy *rg = calloc(n, sizeof *rg);
     VkAstcRegion *ar = agpu ? calloc(n, sizeof *ar) : NULL;
+    if (agpu && !ar) rt_fatal("vk: out of memory for ASTC upload regions");
+    int gdsw = agpu && !acheck && !one_d && astc_bl_regions(e, levels, layers, bw, bh, ar);
+    VkBufferImageCopy *rg = gdsw ? NULL : calloc(n, sizeof *rg);
+    if (!gdsw && !rg) rt_fatal("vk: out of memory for texture upload regions");
     VkDeviceSize total = 0, decoded = 0;
     uint64_t src_bytes = 0;   // the storage bytes the image's levels take (all of the storage unless levels are left out)
-    for (uint32_t lv = 0; lv < levels; lv++)
+    for (uint32_t lv = 0; !gdsw && lv < levels; lv++)
         for (uint32_t ly = 0; ly < layers; ly++) {
             uint32_t w = mip(d->width, lv + sk), h = one_d ? 1 : mip(d->height, lv + sk), sl = is3d ? mip(d->depth, lv + sk) : 1;
             uint64_t texels = (uint64_t)w * h * sl, raw = (uint64_t)(w + bw - 1) / bw * bpb * ((h + bh - 1) / bh) * sl;
@@ -3389,8 +3440,6 @@ static void upload(Tex *e) {
     VmaAllocation ralloc = NULL;
     uint8_t *rmap = NULL, *raw_copy = NULL;
     int checked = 0, parts = 1;
-    // The GPU decoder reads the blocks in place (astc_bl_regions); the check mode compares against tight blocks.
-    int gdsw = agpu && !acheck && !one_d && astc_bl_regions(e, levels, layers, bw, bh, ar);
     // ASTC as BC1: a BC1 image takes opaque content only, and a BC3 one that may turn BC1 (bc1_try) does at its
     // first upload when the content is opaque (astc_reformat). The blocks the GPU decoder takes as they lie (gdsw) are
     // checked as they are copied; the others are checked here first. Without memory for a BC3 image the upload waits as
@@ -3411,18 +3460,49 @@ static void upload(Tex *e) {
         bc1 = try1 = 0;
     }
     int check = bc1 || try1;
+    uint32_t all_regions = n;
+    uint64_t full_bytes = src_bytes;
+    int can_retain = tracked && gdsw && !bc1 && n > 1 && t->L.size > CHASH_MAX &&
+                     e->pub.mirrored && !e->sfill && !e->released && !e->retiring && !e->pub.gpu_owned;
+    int partial = 0;
+    if (can_retain && !check && dirty && dirty->hi > dirty->lo && prior_map) {
+        uint32_t keep = 0;
+        uint64_t included = 0, packed = 0;
+        for (k = 0; k < n; k++) {
+            uint64_t start = e->pub.addr + ar[k].src;
+            VkDeviceSize bytes = vk_astc_region_bytes(&ar[k], bw, bh);
+            packed += bytes;
+            if (start < dirty->hi && dirty->lo < start + bytes) {
+                included += bytes;
+                keep++;
+            }
+        }
+        // Packing individual mips can include tile padding. Use it only when
+        // it leaves both transfer work and decoder work out of this upload.
+        if (sk) full_bytes = packed;
+        if (keep && keep < n && included < full_bytes) {
+            keep = 0;
+            for (k = 0; k < n; k++) {
+                uint64_t start = e->pub.addr + ar[k].src;
+                if (start >= dirty->hi || dirty->lo >= start + vk_astc_region_bytes(&ar[k], bw, bh)) continue;
+                ar[keep++] = ar[k];
+            }
+            n = keep;
+            partial = 1;
+        }
+    }
     // A CPU decode or copy stages at most UPLOAD_PART bytes per staging buffer (a region larger than that alone) and
     // records one copy per buffer; every part stays in the same upload batch, submitted as before. The GPU decoder
     // takes the raw blocks of every region from one buffer.
     for (uint32_t k0 = 0, k1; k0 < n; k0 = k1) {
-        VkDeviceSize base = rg[k0].bufferOffset, size;
-        for (k1 = k0 + 1; k1 < n && (agpu || (k1 + 1 < n ? rg[k1 + 1].bufferOffset : total) - base <= UPLOAD_PART);) k1++;
-        size = (k1 < n ? rg[k1].bufferOffset : total) - base;
-        if (gdsw) size = t->L.size;   // the storage as it is (one part: the GPU decoder takes every region at once)
+        VkDeviceSize base = gdsw ? 0 : rg[k0].bufferOffset;
+        k1 = agpu ? n : k0 + 1;
+        while (k1 < n && (k1 + 1 < n ? rg[k1 + 1].bufferOffset : total) - base <= UPLOAD_PART) k1++;
+        VkDeviceSize size = gdsw ? t->L.size : (k1 < n ? rg[k1].bufferOffset : total) - base;
         // Without its top levels, only the levels the image has: each region's blocks as they lie in the storage, one
         // after the other (the top level is three quarters of the bytes, and an array keeps each layer's levels
         // together, so the kept levels are no single range).
-        if (gdsw && sk) {
+        if (gdsw && (sk || partial)) {
             size = 0;
             for (k = 0; k < n; k++) size += vk_astc_region_bytes(&ar[k], (uint32_t)bw, (uint32_t)bh);
             src_bytes = size;
@@ -3442,8 +3522,21 @@ static void upload(Tex *e) {
         // memory on its own thread, and a decommit in the middle of a copy faulted (tex_bl_copy). Only the copies run
         // held, so a waiting unmap and the guest's memory calls behind it never wait for the staging block or a decode.
         // Storage released since the check above uploads as zeros, as the game no longer has that texture.
-        uint8_t **tmps = calloc(k1 - k0, sizeof *tmps);
+        uint8_t **tmps = gdsw ? NULL : calloc(k1 - k0, sizeof *tmps);
         int held = mem_read_hold(e->pub.addr, e->t.L.size);
+        if (held && can_retain) {
+            mapping = mem_mapping_serial();
+            protection = mem_protection_serial();
+        }
+        if (partial && (!held || !mem_mapping_range_unchanged(e->pub.addr, t->L.size, prior_map) ||
+                        !mem_protection_range_unchanged(e->pub.addr, t->L.size, prior_protection))) {
+            if (held) mem_read_release();
+            vk_upload_end();
+            free(ar);
+            free(rg);
+            upload(e, NULL, tracked);
+            return;
+        }
         if (held) plat_crash_context(ctx);
         else {
             static volatile int32_t n_gone;
@@ -3452,7 +3545,7 @@ static void upload(Tex *e) {
             // the image holds zeros, not the bytes hashed above: the same bytes mapped back there upload again
             e->chash_ok = 0;
         }
-        if (gdsw && !sk) {
+        if (gdsw && !sk && !partial) {
             if (held && check) opq = astc_copy_opaque(e, stg, t->mem, size, &bc1_dec);
             else if (held) memcpy(stg, t->mem, size);
             else memset(stg, 0, size);
@@ -3557,6 +3650,15 @@ static void upload(Tex *e) {
     free(raw_copy);
     free(ar);
     free(rg);
+    if (checked > 0 && can_retain && protection && e->f.astc_bc != 2) {
+        e->upload_mapping = mapping;
+        e->upload_protection = protection;
+    }
+    if (partial && checked > 0) {
+        ru_partial++;
+        ru_regions_saved += all_regions - n;
+        ru_staging_saved += full_bytes - src_bytes;
+    }
     uint64_t dt = kern_now_ns() - u0;
     if (e->uploaded) {
         n_reuploads++, perf_count(PERF_CNT_TEX_REUP);
@@ -3645,15 +3747,15 @@ static void make_fresh(Tex *e) {
     uint64_t size = e->t.L.size;
     if (!e->uploaded) {
         if (up_wait(e)) return;
-        vk_mem_changed(e->pub.addr, size, 0, &e->wgen);   // resets the write bits before the storage is read
-        upload(e);
+        int ch = vk_mem_changed(e->pub.addr, size, 0, &e->wgen);   // resets the write bits before the storage is read
+        upload(e, NULL, ch >= 0);
         return;
     }
     uint32_t now;
     int ch = vk_mem_changed(e->pub.addr, size, e->wgen, &now);
     e->wgen = now;
     e->last_ch = ch;
-    if (ch && !same_content(e)) upload(e);   // 1 written, -1 not tracked: both upload again, unless the bytes match
+    if (ch && !same_content(e)) upload(e, NULL, ch > 0);
 }
 
 // make_fresh for draw bindings: the page check answers from this submission's write-watch snapshot (vk_memory.c
@@ -3664,11 +3766,13 @@ static void make_fresh_snap(Tex *e) {
     if (!e->uploaded && up_wait(e)) return;
     uint32_t now;
     n_checks++;
-    int ch = vk_mem_changed_snap(e->pub.addr, e->t.L.size, e->uploaded ? e->wgen : 0, submit_epoch, &now);
+    VkDirtyPages dirty = {0};
+    VkDirtyPages *range = e->upload_mapping && e->uploaded && !e->wt_n ? &dirty : NULL;
+    int ch = vk_mem_changed_snap(e->pub.addr, e->t.L.size, e->uploaded ? e->wgen : 0, submit_epoch, &now, range);
     e->wgen = now;
-    if (!e->uploaded) { upload(e); return; }
     e->last_ch = ch;
-    if (ch && !same_content(e)) upload(e);
+    if (!e->uploaded || (ch && !same_content(e)))
+        upload(e, range, ch >= 0);
 }
 
 // ---------------------------------------------------------------- aliases (NX2NAVI_TEX_ALIAS)
@@ -3869,6 +3973,7 @@ static int depth_alias_log(void) {   // NX2NAVI_DEPTH_ALIAS_LOG=1: start_at logs
 // the console still holds what it drew, and a new descriptor made for that picture after the old one was let go read
 // it there (a black frame with FSR 3.1 and its frame generation, two presents long).
 static void start_at(Tex *e, const TexKey *k, int taken_back) {
+    e->upload_mapping = 0;
     int alias = 0;
     int trace = (rt_trace & RT_TRACE_PERF) != 0;
     int gone = 0, rel_other = 0;   // released entries at the address: CPU-written ones destroyed here, others superseded
@@ -4085,6 +4190,10 @@ static Tex *entry_of(const tex_t *t) {
             n_restarts++;
             start_at(e, &k, 1);
         }
+        if (e->pidx) {
+            e->checked = 0;
+            pool_watch_storage(&pent[e->pidx - 1]);
+        }
     }
     e->t = *t;
     touch(e);
@@ -4138,8 +4247,15 @@ static void wb_cfg_init(void) {
 static int wb_wanted(const Tex *e) { return e->t.L.size <= wb_limit || e->run < WB_RUN; }
 
 static void mark_released(Tex *e) {   // tex_lock held; e is not released
+    e->upload_mapping = 0;
     flight_ev(e, FLIGHT_TEX_RELEASE, 0, 0);
     e->released = 1;
+    if (e->pidx) {
+        PEnt *p = &pent[e->pidx - 1];
+        if (p->dep) fresh_deps_remove(pool_deps, p->dep);
+        p->dep = 0;
+        p->ok = 0;
+    }
     e->rel_epoch = submit_epoch;
     e->rel_frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
     nreleased++;
@@ -4181,6 +4297,7 @@ void vk_texture_gpu_written(const tex_t *t) {
         pool_gpu_owned(e);
         e->pub.gpu_owned = 1;
         e->chash_ok = 0;   // the image now holds the GPU's content: matching storage bytes no longer mean "unchanged"
+        e->upload_mapping = 0;
         if (e->pub.skip) {   // texture detail leaves out what the GPU can write (detail_skip); said if it ever does
             static volatile int32_t n_skip_written;
             log_limited(&n_skip_written, "texture %#llx (fmt %#x %ux%u), made without its top %u levels, was written by "
@@ -4324,6 +4441,8 @@ void vk_texture_register(int id, const tex_t *t, const view_t *v) {
         s->khash = (h ^ s->has_view) | 1;
     }
     slot_place(id, agen_idx((uintptr_t)t->mem), s->khash);
+    if (id < VK_POOL_TEX && !s->khash && t->mem && stream_images_enabled() && !nvn_gpu_only((uintptr_t)t->mem))
+        stream_image_request(t);
     unlock();
 }
 
@@ -4635,6 +4754,7 @@ void vk_texture_new_submit(void) {
     static uint64_t dep_log_at;
     if ((rt_trace & RT_TRACE_PERF) && pool_deps && f != dep_log_at) {
         dep_log_at = f;
+        if (stream_images_enabled()) stream_image_report(f * 60);
         rt_log("perf: frame %llu: resource-deps mode %d: calls %llu, listed %llu, regions %llu, notifications %llu, "
                "candidates %llu, certificates %llu, certificate misses %llu, verified %llu; "
                "observe %.3f ms, select %.3f ms, refresh %.3f ms (timing %d)",
@@ -4685,6 +4805,11 @@ void vk_texture_new_submit(void) {
                (unsigned long long)f * 60, (unsigned long long)ru_n, ru_bytes / 1048576.0, ru_ns / 1e6,
                (unsigned long long)ru_wt_n, ru_wt_bytes / 1048576.0, ru_wt_ns / 1e6, (unsigned long long)ru_same_n,
                ru_same_bytes / 1048576.0);
+        if (ru_n)
+            rt_log("perf: frame %llu: partial texture refreshes %llu, skipped %llu mip/layer decodes and %.2f MiB of staging",
+                   (unsigned long long)f * 60, (unsigned long long)ru_partial,
+                   (unsigned long long)ru_regions_saved, ru_staging_saved / 1048576.0);
+        ru_partial = ru_regions_saved = ru_staging_saved = 0;
         ru_n = ru_bytes = ru_ns = ru_wt_n = ru_wt_bytes = ru_wt_ns = ru_same_n = ru_same_bytes = 0;
         uint64_t ck, calls, untr;
         vk_mem_snap_stats(&ck, &calls, &untr);
@@ -5661,6 +5786,7 @@ void vk_texture_census_log(uint64_t frame) {
 void vk_texture_shutdown(void) {
     VkCtx *c = vk_ctx();
     lock();
+    stream_images_stop(c);
     Tex **list = malloc(sizeof *list * (size_t)(by_key.n + 1));
     int n = 0;
     for (uint32_t i = 0; i < by_key.cap; i++)

@@ -174,15 +174,29 @@ uint64_t nvn_tex_level_offset(const nvn_texdesc *d, unsigned level) {
     return level_offset(d, level, dpl, w, h, z, L.tileH, L.tileD, t);
 }
 
-void nvn_tex_level_tiles(const nvn_texdesc *d, unsigned level, unsigned *tileH, unsigned *tileD) {
-    fmt_t t = fmt_of(d->format);
-    unsigned dpl; int layered; uint32_t w, h, z;
-    shape(d, &dpl, &layered, &w, &h, &z);
+static void level_tiles(const nvn_texdesc *d, const nvn_texlayout *layout, unsigned level, unsigned dpl,
+                        uint32_t h, uint32_t z, fmt_t t, unsigned *tileH, unsigned *tileD) {
     uint32_t sx, sy; samples_xy(d->samples, &sx, &sy);
-    nvn_texlayout L; nvn_tex_layout(d, &L);
     uint64_t lh = dpl >= 2 ? blk(mip((uint64_t)h * sy, level), t.bh) : 1;
     uint64_t ld = dpl >= 3 ? mip(z, level) : 1;
-    *tileH = adj_tile(L.tileH, 8, lh);
-    *tileD = adj_tile(L.tileD, 1, ld);
+    *tileH = adj_tile(layout->tileH, 8, lh);
+    *tileD = adj_tile(layout->tileD, 1, ld);
+}
+
+void nvn_tex_level_tiles(const nvn_texdesc *d, unsigned level, unsigned *tileH, unsigned *tileD) {
+    unsigned dpl; int layered; uint32_t w, h, z;
+    shape(d, &dpl, &layered, &w, &h, &z);
+    nvn_texlayout layout;
+    nvn_tex_layout(d, &layout);
+    level_tiles(d, &layout, level, dpl, h, z, fmt_of(d->format), tileH, tileD);
+}
+
+uint64_t nvn_tex_level_geometry(const nvn_texdesc *d, const nvn_texlayout *layout, unsigned level,
+                                unsigned *tileH, unsigned *tileD) {
+    unsigned dpl; int layered; uint32_t w, h, z;
+    shape(d, &dpl, &layered, &w, &h, &z);
+    fmt_t t = fmt_of(d->format);
+    level_tiles(d, layout, level, dpl, h, z, t, tileH, tileD);
+    return level_offset(d, level, dpl, w, h, z, layout->tileH, layout->tileD, t);
 }
 

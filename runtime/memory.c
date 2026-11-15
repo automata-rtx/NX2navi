@@ -241,6 +241,7 @@ static uint32_t lz_touch_ms[RT_ADDRESS_LIMIT >> FRZ_SHIFT];   // frz_lock: plat_
 static uint8_t lz_touch_n[RT_ADDRESS_LIMIT >> FRZ_SHIFT];     // frz_lock: pieces given back in that run
 static uint32_t lz_heavy_ms[RT_ADDRESS_LIMIT >> FRZ_SHIFT];   // frz_lock: ... of its last touch taken as a reader's
 static int lz_chunk;                    // the setting, read in mem_init
+static int lz_local_hold;               // return the full segment, limit the cooldown to the address touched
 static uint64_t lz_pieces, lz_piece_bytes, lz_heavy;   // frz_lock, since the last report
 static uint64_t lz_foreign;             // frz_lock, since the start: segments of another buffer mem_lazy_skip gave back
 // frz_lock: the first faults on armed pages since the last report, for its lines (trace perf)
@@ -269,7 +270,8 @@ static void lazy_flags_locked(uint64_t lo, uint64_t hi) {
 // frz_lock held exclusively. Segment i goes: its bytes come down first when the mirror's are newer, then its pages
 // are read-write again. why: 0 a read fault, 1 a write fault (both hold the regions back), else a thaw or the mirror
 // going away.
-static void lazy_drop_locked(int i, int why) {
+static void lazy_hold_piece_locked(uint64_t a, uint32_t now);
+static void lazy_drop_locked(int i, int why, uint64_t local_touch) {
     LzSeg s = lzs[i];
     if (s.stale && lz_fetch) {
         uint64_t t0 = plat_now_ns();
@@ -290,6 +292,10 @@ static void lazy_drop_locked(int i, int why) {
     if (why > 1) { lz_other++; return; }
     lz_faults[why]++;
     uint32_t now = (uint32_t)plat_now_ms();
+    if (local_touch) {
+        lazy_hold_piece_locked(local_touch, now);
+        return;
+    }
     for (uint64_t r = s.lo >> FRZ_SHIFT; r <= (s.hi - 1) >> FRZ_SHIFT; r++) {
         int again = lz_hot[r] && (int32_t)(now - lz_hot[r]) < 60000;   // touched again within a minute of its last hold
         uint8_t b = again ? (uint8_t)(lz_back[r] < 32 ? lz_back[r] * 2 : 32) : 1;
@@ -318,6 +324,13 @@ static int lazy_chunk_held_locked(uint64_t c, uint32_t now) {
     if (!lz_nhots) return 0;
     const LzHot *e = lazy_hot_locked(c, 0);
     return e && e->until && (int32_t)(e->until - now) > 0;
+}
+
+static void lazy_hold_piece_locked(uint64_t a, uint32_t now) {
+    LzHot *e = lazy_hot_locked(a >> LZ_CHUNK_SHIFT, 1);
+    int again = e->until && (int32_t)(now - e->until) < 60000;
+    e->back = again && e->back ? (e->back < 32 ? 2 * e->back : 32) : 1;
+    e->until = (now + (uint32_t)e->back * 1000u) | 1;
 }
 
 static void lazy_push_locked(LzSeg s) {
@@ -357,18 +370,14 @@ static uint64_t lazy_piece_locked(int i, uint64_t a, int write) {
     lazy_flags_locked(s.lo, s.hi);
     lz_faults[write != 0]++, lz_pieces++, lz_piece_bytes += c1 - c0;
     uint32_t now = (uint32_t)plat_now_ms();
-    LzHot *e = lazy_hot_locked(a >> LZ_CHUNK_SHIFT, 1);
-    int again = e->until && (int32_t)(now - e->until) < 60000;   // touched again within a minute of its last hold
-    e->back = again ? (uint8_t)(e->back < 32 ? e->back * 2 : 32) : 1;
-    if (!e->back) e->back = 1;
-    e->until = (now + (uint32_t)e->back * 1000u) | 1;
+    lazy_hold_piece_locked(a, now);
     return c1 - c0;
 }
 
 // frz_lock held exclusively: every segment that reaches into region r goes.
 static void lazy_drop_region_locked(uint64_t r, int why) {
     for (int i = lz_n; i-- > 0;)
-        if (lzs[i].lo < ((r + 1) << FRZ_SHIFT) && lzs[i].hi > (r << FRZ_SHIFT)) lazy_drop_locked(i, why);
+        if (lzs[i].lo < ((r + 1) << FRZ_SHIFT) && lzs[i].hi > (r << FRZ_SHIFT)) lazy_drop_locked(i, why, 0);
 }
 
 static int lazy_covered_locked(uint64_t lo, uint64_t hi) {
@@ -504,7 +513,7 @@ int mem_lazy_skip(uint64_t a, uint64_t n, uint64_t h0, int64_t delta, uint64_t o
         if (lzs[i].lo < a + n && lzs[i].hi > a && (lzs[i].h0 != h0 || lzs[i].delta != delta)) {
             lzs[i].stale = 0;
             lz_foreign++;
-            lazy_drop_locked(i, 4);
+            lazy_drop_locked(i, 4, 0);
         }
     for (int i = 0; i < lz_n && k < max; i++) {
         uint64_t lo = lzs[i].lo > a ? lzs[i].lo : a, hi = lzs[i].hi < a + n ? lzs[i].hi : a + n;
@@ -560,7 +569,7 @@ void mem_lazy_release(uint64_t a, uint64_t n) {
     if (!__atomic_load_n(&lz_on, __ATOMIC_RELAXED) || !n) return;
     plat_mutex_lock(&frz_lock);
     for (int i = lz_n; i-- > 0;)
-        if (lzs[i].lo < a + n && lzs[i].hi > a) lazy_drop_locked(i, 4);
+        if (lzs[i].lo < a + n && lzs[i].hi > a) lazy_drop_locked(i, 4, 0);
     plat_mutex_unlock(&frz_lock);
 }
 
@@ -611,7 +620,7 @@ static int lazy_fault(uint64_t a, int write) {
         uint64_t r = a >> FRZ_SHIFT, out = lzs[i].hi - lzs[i].lo;
         uint32_t now = (uint32_t)plat_now_ms();
         int reader = lz_heavy_ms[r] && (int32_t)(now - lz_heavy_ms[r]) < LZ_HEAVY_KEEP_MS;
-        if (lz_chunk && !reader) {
+        if ((lz_chunk || lz_local_hold) && !reader) {
             if (lz_touch_ms[r] && (int32_t)(now - lz_touch_ms[r]) < LZ_HEAVY_MS) {
                 if (++lz_touch_n[r] > LZ_HEAVY_N) reader = 1, lz_heavy++;
             } else {
@@ -623,8 +632,11 @@ static int lazy_fault(uint64_t a, int write) {
             out = lazy_piece_locked(i, a, write != 0);
             if (k >= 0) lz_note[k].hold = lazy_hot_locked(a >> LZ_CHUNK_SHIFT, 1)->back;
         } else {
-            lazy_drop_locked(i, write != 0);
-            if (k >= 0) lz_note[k].hold = lz_back[r];
+            // Release and fetch the entire original segment before retrying the CPU access.
+            // Its other pages can qualify again only after a subsequent completed write-back.
+            int local = lz_local_hold && !reader;
+            lazy_drop_locked(i, write != 0, local ? a : 0);
+            if (k >= 0) lz_note[k].hold = local ? lazy_hot_locked(a >> LZ_CHUNK_SHIFT, 1)->back : lz_back[r];
         }
         if (k >= 0) lz_note[k].out = out;
         plat_mutex_unlock(&frz_lock);
@@ -1261,6 +1273,8 @@ void mem_init(void) {
         plat_mem_access_hook(access_fault);
         lz_want = 1;
         lz_chunk = cfg_bool("NX2NAVI_WB_LAZY_CHUNK");
+        const char *hold = cfg_get("NX2NAVI_WB_LOCAL_HOLD");
+        lz_local_hold = !lz_chunk && hold && !strcmp(hold, "1");
     }
     const char *fa = cfg_get("NX2NAVI_FREEZE_ASYNC");   // thaws outside frz_lock (FRZ_THAWING); unset: on
     frz_async = !fa || !*fa || atoi(fa) != 0;
@@ -1449,10 +1463,10 @@ uint32_t mem_set_attribute(uint64_t a, uint64_t n, uint32_t mask, uint32_t at) {
 // ---- 0x04/0x05 MapMemory, UnmapMemory: thread stacks move from heap or alias into the stack region by copy; the
 // source is inaccessible while moved and gets the contents back on unmap.
 static int alias_all_mapped(uint64_t a, uint64_t n) {   // under lock
+    if (!n) return 1;
     uint64_t first = (a - L.alias.base) / PAGE;
-    for (uint64_t i = 0; i < n / PAGE; i++)
-        if (!alias_pages[first + i]) return 0;
-    return 1;
+    uint64_t last = (a + n - 1 - L.alias.base) / PAGE;
+    return memchr(alias_pages + first, 0, (size_t)(last - first + 1)) == NULL;
 }
 
 static uint32_t stack_move(int unmap, uint64_t dst, uint64_t src, uint64_t n) {
@@ -1514,20 +1528,25 @@ uint32_t mem_unmap(uint64_t dst, uint64_t src, uint64_t n) { return stack_move(1
 
 // ---- 0x2C/0x2D MapPhysicalMemory, UnmapPhysicalMemory. Horizon maps only the still-unmapped pages of the range and
 // leaves mapped pages and their contents alone; NX2navi's heaps grow by re-mapping ranges they partly own.
-static void alias_runs(uint64_t first, uint64_t count, uint8_t want, int do_commit) {   // under lock
-    uint64_t i = 0;
-    while (i < count) {
-        if (alias_pages[first + i] != want) { i++; continue; }
-        uint64_t j = i;
-        while (j < count && alias_pages[first + j] == want) j++;
-        uint64_t a = L.alias.base + (first + i) * PAGE, n = (j - i) * PAGE;
+static uint64_t alias_runs(uint64_t first, uint64_t count, int do_commit) {   // under lock
+    uint8_t want = do_commit ? 0 : 1;
+    uint8_t *p = alias_pages + first, *end = p + count;
+    uint64_t changed = 0;
+    while (p < end) {
+        p = memchr(p, want, (size_t)(end - p));
+        if (!p) break;
+        uint8_t *next = memchr(p, !want, (size_t)(end - p));
+        if (!next) next = end;
+        uint64_t a = L.alias.base + (uint64_t)(p - alias_pages) * PAGE, n = (uint64_t)(next - p) * PAGE;
         mem_mapping_publish(&mapping, a, n, 1);
         if (do_commit) commit(a, n, "physical memory");
         else decommit(a, n, "physical memory");
-        memset(alias_pages + first + i, !want, j - i);
+        memset(p, !want, (size_t)(next - p));
         mem_mapping_publish(&mapping, a, n, 0);
-        i = j;
+        changed += n;
+        p = next;
     }
+    return changed;
 }
 
 static uint32_t alias_map(int unmap, uint64_t a, uint64_t n) {
@@ -1538,28 +1557,32 @@ static uint32_t alias_map(int unmap, uint64_t a, uint64_t n) {
     uint64_t first = (a - L.alias.base) / PAGE, count = n / PAGE, t0 = perf_mark_begin();
     plat_mutex_lock(&lock);
     uint32_t r = R_OK;
+    uint64_t changed = 0;
     if (unmap) {
         for (unsigned i = 0; i < nstack_maps; i++)
             if (overlaps(a, n, stack_maps[i].src, stack_maps[i].size)) {
                 r = R_INVALID_REGION;
                 goto out;
             }
-        uint64_t released = 0;
-        for (uint64_t i = 0; i < count; i++) released += alias_pages[first + i];
-        alias_runs(first, count, 1, 0);
-        alias_bytes -= released * PAGE;
+        changed = alias_runs(first, count, 0);
+        alias_bytes -= changed;
     } else {
-        uint64_t fresh = 0;
-        for (uint64_t i = 0; i < count; i++) fresh += !alias_pages[first + i];
-        if (fresh * PAGE + alias_bytes + heap_size + image_bytes() > L.pool) {
-            r = R_LIMIT_REACHED;   // the SDK maps LimitReached to its recoverable out-of-memory result
-            goto out;
+        uint64_t used = alias_bytes + heap_size + image_bytes();
+        if (used > L.pool || n > L.pool - used) {
+            // Only a request close to the pool limit needs the exact count
+            // before committing. A rejected request must leave every page alone.
+            uint64_t fresh = 0;
+            for (uint64_t i = 0; i < count; i++) fresh += !alias_pages[first + i];
+            if (used > L.pool || fresh * PAGE > L.pool - used) {
+                r = R_LIMIT_REACHED;
+                goto out;
+            }
         }
-        alias_runs(first, count, 0, 1);
-        alias_bytes += fresh * PAGE;
+        changed = alias_runs(first, count, 1);
+        alias_bytes += changed;
     }
 out:
-    __atomic_store_n(&map_gen, map_gen + 1, __ATOMIC_RELEASE);
+    if (changed) __atomic_store_n(&map_gen, map_gen + 1, __ATOMIC_RELEASE);
     plat_mutex_unlock(&lock);
     perf_mark_end(PERF_M_GMEM, t0, n);
     if (r) rt_log("%sMapPhysicalMemory %#llx+%#llx failed %#x (alias %#llx used, heap %#llx)", unmap ? "Un" : "",
@@ -1611,6 +1634,18 @@ static uint64_t run_start(const uint8_t *p, uint64_t i, uint8_t v) {   // first 
 static void query_locked(uint64_t a, RtMemoryInfo *out);
 
 static int readable_locked(uint64_t a, uint64_t n) {
+    if (!n) return 1;
+    if (a >= RT_ADDRESS_LIMIT || n > RT_ADDRESS_LIMIT - a) return 0;
+    // Streaming uploads need only the pages they will copy. Finding the ends of
+    // the entire surrounding alias mapping can walk far beyond a small texture.
+    if (inside(a, n, L.alias) && a >= L.aslr.base + LOW_SIZE) {
+        unsigned i = 0;
+        for (; i < nstack_maps; i++) {
+            const StackMap *m = &stack_maps[i];
+            if (overlaps(a, n, m->dst, m->size) || overlaps(a, n, m->src, m->size)) break;
+        }
+        if (i == nstack_maps) return alias_all_mapped(a, n);
+    }
     for (uint64_t end = a + n; a < end;) {
         RtMemoryInfo r;
         query_locked(a, &r);
