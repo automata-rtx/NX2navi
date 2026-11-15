@@ -347,6 +347,8 @@ typedef struct {
 void vk_usnap_proof_begin(VkUsnapProof *proof);
 int vk_usnap_proof_add(VkUsnapProof *proof, const VkUsnapLease *lease);
 int vk_usnap_proof_end(VkUsnapProof *proof);
+// Finish into an exclusively owned destination. On failure its previous contents cannot be reused.
+int vk_usnap_proof_end_into(VkUsnapProof *building, VkUsnapProof *destination);
 int vk_usnap_proof_valid(VkUsnapProof *proof);
 // After begin, inherit a still-valid prior proof without revisiting its leases, then add changed contributions and
 // end. Dependencies are a conservative union; removed members can shorten reuse but never permit stale contents.

@@ -548,43 +548,61 @@ int vk_usnap_proof_add(VkUsnapProof *p, const VkUsnapLease *lease) {
     return 1;
 }
 
-int vk_usnap_proof_end(VkUsnapProof *p) {
+int vk_usnap_proof_end_into(VkUsnapProof *p, VkUsnapProof *dst) {
     if (!p->building) return 0;
     p->building = 0;
     for (uint64_t mask = p->buckets; mask; mask &= mask - 1) {
         unsigned k = (unsigned)__builtin_ctzll(mask);
-        p->version[k] = __atomic_load_n(&U.proof_bucket[k], __ATOMIC_ACQUIRE);
+        dst->version[k] = __atomic_load_n(&U.proof_bucket[k], __ATOMIC_ACQUIRE);
     }
-    p->sealed = p->capture == vk_usnap_capture() && p->epoch == vk_exec_epoch(0) && p->serial == proof_serial_after() &&
-                (!p->horizon || vk_exec_epoch(0) < p->horizon);
-    return p->sealed;
+    dst->sealed = p->capture == vk_usnap_capture() && p->epoch == vk_exec_epoch(0) && p->serial == proof_serial_after() &&
+                  (!p->horizon || vk_exec_epoch(0) < p->horizon);
+    if (dst->sealed && p != dst) {
+        dst->capture = p->capture;
+        dst->serial = p->serial;
+        dst->epoch = p->epoch;
+        dst->horizon = p->horizon;
+        dst->buckets = p->buckets;
+        dst->building = 0;
+    }
+    return dst->sealed;
 }
 
-int vk_usnap_proof_valid(VkUsnapProof *p) {
+int vk_usnap_proof_end(VkUsnapProof *p) { return vk_usnap_proof_end_into(p, p); }
+
+// Return the publication serial verified by this read. Inheritance needs that serial without changing
+// the retained proof. The ordinary guard also caches it after a successful comparison.
+static int proof_read_valid(const VkUsnapProof *p, uint64_t *verified) {
     if (!p->sealed || !p->capture || p->capture != vk_usnap_capture() ||
         (p->horizon && vk_exec_epoch(0) >= p->horizon)) return 0;
     uint64_t serial = __atomic_load_n(&U.proof_serial, __ATOMIC_ACQUIRE);
     if (serial & 1) return 0;
-    if (serial == p->serial) return 1;
-    for (uint64_t mask = p->buckets; mask; mask &= mask - 1) {
-        unsigned k = (unsigned)__builtin_ctzll(mask);
-        if (p->version[k] != __atomic_load_n(&U.proof_bucket[k], __ATOMIC_ACQUIRE)) return 0;
+    if (serial != p->serial) {
+        for (uint64_t mask = p->buckets; mask; mask &= mask - 1) {
+            unsigned k = (unsigned)__builtin_ctzll(mask);
+            if (p->version[k] != __atomic_load_n(&U.proof_bucket[k], __ATOMIC_ACQUIRE)) return 0;
+        }
+        if (serial != proof_serial_after()) return 0;
     }
-    if (serial != proof_serial_after()) return 0;
-    p->serial = serial;
+    *verified = serial;
+    return 1;
+}
+
+int vk_usnap_proof_valid(VkUsnapProof *p) {
+    uint64_t serial;
+    if (!proof_read_valid(p, &serial)) return 0;
+    if (p->serial != serial) p->serial = serial;
     return 1;
 }
 
 int vk_usnap_proof_inherit(VkUsnapProof *p, const VkUsnapProof *prior) {
     if (!p->building) return 0;
     if (p == prior) return p->building = 0;
-    // valid can advance a proof's publication serial. Use a private copy so renewal cannot mutate the certificate
-    // that ordinary resolution is still relying on for unchanged contributions.
-    VkUsnapProof saved = *prior;
-    if (!vk_usnap_proof_valid(&saved) || saved.capture != p->capture || saved.serial != p->serial ||
+    uint64_t serial;
+    if (!proof_read_valid(prior, &serial) || prior->capture != p->capture || serial != p->serial ||
         p->epoch != vk_exec_epoch(0)) return p->building = 0;
-    p->buckets |= saved.buckets;
-    if (saved.horizon && (!p->horizon || saved.horizon < p->horizon)) p->horizon = saved.horizon;
+    p->buckets |= prior->buckets;
+    if (prior->horizon && (!p->horizon || prior->horizon < p->horizon)) p->horizon = prior->horizon;
     return 1;
 }
 

@@ -872,7 +872,8 @@ static int freeze_idle;                       // 0: off
 static uint32_t ww_ep = 1;                    // gen_lock: the submission being recorded (vk_mem_mirror_begin)
 static uint32_t reg_last[RT_ADDRESS_LIMIT >> REG_SHIFT];    // gen_lock: ww_ep of the region's last stamp
 static uint32_t reg_tried[RT_ADDRESS_LIMIT >> REG_SHIFT];   // gen_lock: ww_ep of its last freeze candidacy
-static uint32_t *fcand;                       // gen_lock: regions to try at the next freeze pass
+typedef struct { uint32_t region, idle; } FreezeCandidate;
+static FreezeCandidate *fcand;                       // gen_lock: regions to try at the next freeze pass
 static int nfcand, cfcand;
 static uint64_t n_frz_refused;                // gen_lock: candidates mem_freeze refused
 
@@ -988,6 +989,35 @@ int vk_mem_changed(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now) 
 // the next query over it (at the latest the next epoch's snapshot).
 #define SNAP_SHIFT 21
 #define SNAP_REGIONS (RT_ADDRESS_LIMIT >> SNAP_SHIFT)
+static uint32_t texture_empty_epoch[SNAP_REGIONS]; // previous costly clean texture observation under gen_lock
+static uint8_t texture_queued[SNAP_REGIONS];
+static uint64_t texture_offers, texture_tries, texture_protected;
+// Schedule protection only after repeated authoritative scans have already cost this region about
+// as much as protecting one. The estimate includes the follow-up write-watch drain. It is a scheduling
+// hint under gen_lock. Only a successful freeze followed by observation can put a region to sleep.
+typedef struct { uint32_t first, last, scan_ns; } TextureScanCost;
+static TextureScanCost texture_cost[SNAP_REGIONS];
+enum { TEXTURE_MIN_IDLE = 96, TEXTURE_HISTORY_GAP = 24, TEXTURE_MIN_COST_NS = 16000,
+       TEXTURE_MAX_COST_NS = 128000, TEXTURE_MAX_SAMPLE_NS = 4000 };
+static uint32_t texture_freeze_ns = 32000;
+static uint64_t texture_cost_tries, texture_cost_protected;
+
+static int texture_cost_ready(const TextureScanCost *cost) {
+    return cost->first && ww_ep >= cost->last && ww_ep - cost->last <= TEXTURE_HISTORY_GAP &&
+           cost->last - cost->first >= TEXTURE_HISTORY_GAP && cost->scan_ns >= texture_freeze_ns;
+}
+
+static void texture_cost_observe(uint32_t region, int continuity, uint32_t share_ns) {
+    TextureScanCost *cost = &texture_cost[region];
+    if (!continuity || ww_ep < cost->last || ww_ep - cost->last > TEXTURE_HISTORY_GAP ||
+        reg_last[region] >= cost->first) {
+        if (cost->first) *cost = (TextureScanCost){0};
+    }
+    if (!share_ns || !ww_ep || cost->last == ww_ep) return;
+    if (!cost->first) cost->first = ww_ep;
+    cost->last = ww_ep;
+    if (cost->scan_ns < TEXTURE_MAX_COST_NS) cost->scan_ns += share_ns;
+}
 static uint32_t snap_at[SNAP_REGIONS];      // epoch of the region's last snapshot; 0 never
 static uint8_t snap_untracked[SNAP_REGIONS];
 static uint64_t snap_protection[SNAP_REGIONS], snap_mapping[SNAP_REGIONS];
@@ -1200,17 +1230,38 @@ static uint64_t snap_regions_for(uint64_t r0, uint64_t r1, uint32_t epoch, int t
         if (clean_attempt)
             clean_observe((uint32_t)r, (uint32_t)(k + 1), all_zero && tracked, ww_ticks - ticks_before, protection, mapping);
         calls++;
+        int costly_empty = texture_list && all_zero && tracked && b - a >= (64ull << 20) &&
+                          ww_ticks - ticks_before >= 32000;
+        uint64_t share = texture_list && all_zero && tracked ? (ww_ticks - ticks_before) / (k - r + 1) : 0;
+        uint32_t share_ns = share < TEXTURE_MAX_SAMPLE_NS ? (uint32_t)share : TEXTURE_MAX_SAMPLE_NS;
         for (uint64_t j = r; j <= k; j++) {
+            uint64_t pv = tracked ? mem_protection_region((uint32_t)j) : 0;
+            uint64_t mv = tracked ? mem_mapping_region((uint32_t)j) : 0;
+            int valid = tracked && pv && pv <= protection && mv && mv <= mapping;
+            if ((share_ns || texture_cost[j].first) && freeze_idle > TEXTURE_MIN_IDLE) {
+                int continuity = valid && all_zero && !snap_untracked[j] &&
+                                 pv <= snap_protection[j] && mv <= snap_mapping[j];
+                texture_cost_observe((uint32_t)j, continuity, valid ? share_ns : 0);
+            }
             snap_protection[j] = protection, snap_mapping[j] = mapping;
-            int valid = tracked && snap_lease_valid((uint32_t)j);
             if (snap_untracked[j] != (uint8_t)!valid && __atomic_load_n(&dependency_watch, __ATOMIC_RELAXED))
                 dependency_changed((uint32_t)j);
             snap_at[j] = epoch, snap_untracked[j] = (uint8_t)!valid;
-            if (valid && !mem_frozen_stable(j << SNAP_SHIFT) && freeze_idle && ww_ep - reg_last[j] >= (uint32_t)freeze_idle &&
-                ww_ep - reg_tried[j] >= (uint32_t)freeze_idle) {
-                reg_tried[j] = ww_ep;
+            uint32_t idle = (uint32_t)freeze_idle;
+            uint32_t previous = texture_empty_epoch[j];
+            if (costly_empty && valid && previous && previous != ww_ep && ww_ep - previous <= 24 &&
+                !texture_queued[j] && reg_last[j] < previous && idle > 600 &&
+                ww_ep - reg_last[j] < idle) idle = 600;
+            if (valid && share_ns && !texture_queued[j] && idle > TEXTURE_MIN_IDLE &&
+                ww_ep - reg_last[j] < idle && texture_cost_ready(&texture_cost[j]))
+                idle = TEXTURE_MIN_IDLE;
+            texture_empty_epoch[j] = costly_empty && valid ? ww_ep : 0;
+            if (valid && !mem_frozen_stable(j << SNAP_SHIFT) && idle && ww_ep - reg_last[j] >= idle &&
+                (!reg_tried[j] || ww_ep - reg_tried[j] >= (uint32_t)freeze_idle)) {
+                if (idle < (uint32_t)freeze_idle) texture_queued[j] = 1, texture_offers++;
+                else reg_tried[j] = ww_ep;
                 if (nfcand == cfcand) grow((void **)&fcand, &cfcand, sizeof *fcand);
-                fcand[nfcand++] = (uint32_t)j;
+                fcand[nfcand++] = (FreezeCandidate){(uint32_t)j, idle};
             }
         }
         r = k + 1;
@@ -3642,7 +3693,7 @@ void nvn_pool_flushed(const pool_t *p, uint64_t off, uint64_t size) {
 // load, while the loaders write and the driver imports and locks new memory, each took 8 to 17 ms. The newly loaded
 // regions all go idle together, so 32 of them came up in one submission: its mirror begin took 70.5 ms and the frame
 // 78 ms, and one freeze of 9 ms followed in each of the next 20 frames. A freeze only saves later write-watch queries
-// (about a microsecond per MiB per submission), so it can wait: a pass stops once it has spent freeze_budget_ns, and a
+// (about a microsecond per MiB per submission), so it can wait. Submissions share a budget between presents, and a
 // freeze over FREEZE_SLOW_NS holds the passes for FREEZE_BACKOFF_NS, doubled for each slow one in a row up to 2 s.
 // NX2NAVI_FREEZE_BUDGET_US (default 1000; 0: no budget and no backoff, as before).
 #define FREEZE_SLOW_NS 2000000ull
@@ -3650,6 +3701,9 @@ void nvn_pool_flushed(const pool_t *p, uint64_t off, uint64_t size) {
 #define FREEZE_BACKOFF_MAX_NS 2000000000ull
 static uint64_t freeze_budget_ns = ~0ull;   // ~0: not read yet
 static uint64_t frz_hold_until, frz_backoff, frz_held_passes, frz_slow;   // gen_lock
+// All freeze passes run under gen_lock. A frame can submit several command
+// buffers. Charge their maintenance work to the same present interval.
+static uint64_t freeze_frame, freeze_spent_ns;
 
 static void freeze_pass(void) {
     if (freeze_budget_ns == ~0ull) {
@@ -3661,16 +3715,34 @@ static void freeze_pass(void) {
         if (nfcand) frz_held_passes++;
         return;
     }
+    uint64_t available = freeze_budget_ns;
+    if (available) {
+        uint64_t frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+        if (frame != freeze_frame) {
+            freeze_frame = frame;
+            freeze_spent_ns = 0;
+        }
+        if (freeze_spent_ns >= available) return;
+        available -= freeze_spent_ns;
+    }
     uint32_t preferred = 0;
     int priority = clean_attempt && freeze_budget_ns && clean_live && (!nfcand || !clean_normal_first) &&
                    clean_next(&preferred);
     if (clean_attempt) clean_normal_first = priority && nfcand;
-    for (int done = 0; (priority || nfcand) && done < FREEZE_PER_SUB;) {
+    for (int done = 0, inspected = 0; (priority || nfcand) && done < FREEZE_PER_SUB;) {
+        // Expired offers also consume the present interval's maintenance budget.
+        if ((++inspected % 16) == 0 && available && qpc() - start >= available) break;
         int selected = priority;
-        uint64_t j = selected ? preferred : fcand[--nfcand], a = j << REG_SHIFT;
+        FreezeCandidate candidate = selected ? (FreezeCandidate){preferred, 0} : fcand[--nfcand];
+        uint64_t j = candidate.region, a = j << REG_SHIFT;
+        if (!selected && candidate.idle < (uint32_t)freeze_idle) texture_queued[j] = 0;
         priority = 0;
-        if (!selected && (ww_ep - reg_last[j] < (uint32_t)freeze_idle || mem_frozen(a) ||
+        if (!selected && (ww_ep - reg_last[j] < candidate.idle || mem_frozen(a) ||
+                          (candidate.idle < (uint32_t)freeze_idle && (!snap_lease_valid((uint32_t)j) ||
+                           (candidate.idle == TEXTURE_MIN_IDLE ? !texture_cost_ready(&texture_cost[j]) :
+                            (!texture_empty_epoch[j] || ww_ep - texture_empty_epoch[j] > 24)))) ||
                           (clean_attempt && clean_recent(ww_ep, clean_attempt[j], (uint32_t)freeze_idle)))) continue;
+        if (!selected && candidate.idle < (uint32_t)freeze_idle) reg_tried[j] = ww_ep;
         if (clean_attempt) clean_attempt[j] = ww_ep;
         if (selected) clean_stats.attempts++;
         done++;
@@ -3678,9 +3750,25 @@ static void freeze_pass(void) {
         int ok = mem_freeze(a);
         uint64_t t1 = qpc();
         if (selected && ok) clean_stats.successes++;
+        if (!selected && candidate.idle < (uint32_t)freeze_idle) {
+            texture_tries++;
+            texture_protected += ok != 0;
+        }
         slow_mem_call("freeze", a, 1ull << REG_SHIFT, 0, t1 - t0);
         if (ok) observe_after_freeze((uint32_t)j);
         else n_frz_refused++;
+        if (!selected && candidate.idle < (uint32_t)freeze_idle) {
+            if (candidate.idle == TEXTURE_MIN_IDLE) {
+                texture_cost_tries++;
+                texture_cost_protected += ok != 0;
+            }
+            if (ok) {
+                uint64_t ns = qpc() - t0;
+                if (ns < TEXTURE_MIN_COST_NS) ns = TEXTURE_MIN_COST_NS;
+                if (ns > TEXTURE_MAX_COST_NS) ns = TEXTURE_MAX_COST_NS;
+                texture_freeze_ns = (uint32_t)((texture_freeze_ns * 15 + ns) / 16);
+            }
+        }
         if (!freeze_budget_ns) continue;
         if (t1 - t0 >= FREEZE_SLOW_NS) {
             frz_slow++;
@@ -3695,8 +3783,9 @@ static void freeze_pass(void) {
             break;
         }
         frz_backoff = 0;
-        if (qpc() - start >= freeze_budget_ns) break;
+        if (qpc() - start >= available) break;
     }
+    if (freeze_budget_ns) freeze_spent_ns += qpc() - start;
 }
 
 void vk_mem_mirror_begin(void) {
@@ -4094,6 +4183,10 @@ static void mirror_log(uint64_t frame) {
     freeze_snap_renewals = 0;
     ww_pages = 0;
     uint64_t nr = n_frz_refused;
+    uint64_t offers = texture_offers, tries = texture_tries, protected_count = texture_protected;
+    uint64_t cost_tries = texture_cost_tries, cost_ok = texture_cost_protected;
+    texture_cost_tries = texture_cost_protected = 0;
+    texture_offers = texture_tries = texture_protected = 0;
     CleanStats clean = clean_stats;
     clean_stats = (CleanStats){0};
 #ifdef _WIN32
@@ -4120,6 +4213,11 @@ static void mirror_log(uint64_t frame) {
                (unsigned long long)frame, (unsigned long long)clean.expensive, (unsigned long long)clean.ready,
                (unsigned long long)clean.full, (unsigned long long)clean.examined, (unsigned long long)clean.skipped,
                (unsigned long long)clean.attempts, (unsigned long long)clean.successes);
+    if (offers || tries) rt_log("mem: earlier texture protection frame %llu: offered %llu, tried %llu, protected %llu",
+        (unsigned long long)frame, (unsigned long long)offers, (unsigned long long)tries, (unsigned long long)protected_count);
+    if (cost_tries && (rt_trace & RT_TRACE_PERF))
+        rt_log("mem: repeat scan protection frame %llu: tried %llu, protected %llu",
+               (unsigned long long)frame, (unsigned long long)cost_tries, (unsigned long long)cost_ok);
     mem_probe_report(frame);
     mem_lazy_report(frame, lz_skipped);
     lz_skipped = 0;

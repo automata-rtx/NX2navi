@@ -218,10 +218,10 @@ int main(void) {
     assert(vk_usnap_find_lease((uintptr_t)guest + 768, 128, 256, &bi, &added));
     vk_usnap_proof_begin(&proof);
     assert(vk_usnap_proof_add(&proof, &lease) && vk_usnap_proof_end(&proof));
-    VkUsnapProof renewal;
-    vk_usnap_proof_begin(&renewal);
-    assert(vk_usnap_proof_inherit(&renewal, &proof));
-    assert(vk_usnap_proof_add(&renewal, &added) && vk_usnap_proof_end(&renewal));
+    VkUsnapProof renewal = {0}, building;
+    vk_usnap_proof_begin(&building);
+    assert(vk_usnap_proof_inherit(&building, &proof));
+    assert(vk_usnap_proof_add(&building, &added) && vk_usnap_proof_end_into(&building, &renewal));
     assert(renewal.buckets == (proof.buckets | (1ull << (added.region % VK_USNAP_PROOF_BUCKETS))));
     uint64_t old_serial = proof.serial;
     vk_usnap_proof_begin(&invalid_proof);
@@ -229,7 +229,7 @@ int main(void) {
     assert(!vk_usnap_proof_inherit(&invalid_proof, &proof) && !vk_usnap_proof_end(&invalid_proof));
     vk_usnap_proof_begin(&invalid_proof);
     assert(vk_usnap_proof_inherit(&invalid_proof, &proof) && vk_usnap_proof_end(&invalid_proof));
-    assert(proof.serial == old_serial);   // validating a private copy must not advance the donor
+    assert(proof.serial == old_serial);   // inheritance must not advance the donor's publication serial
     assert(vk_usnap_proof_valid(&renewal));
     epoch = 3;
     vk_usnap_drop((uintptr_t)guest + 768, 4);

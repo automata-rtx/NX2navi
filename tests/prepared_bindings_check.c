@@ -45,6 +45,11 @@ int vk_usnap_proof_end(VkUsnapProof *p) {
     p->building = 0;
     return p->sealed;
 }
+int vk_usnap_proof_end_into(VkUsnapProof *building, VkUsnapProof *destination) {
+    if (!vk_usnap_proof_end(building)) return 0;
+    *destination = *building;
+    return 1;
+}
 int vk_usnap_proof_valid(VkUsnapProof *p) {
     semantic_event(4);
     return p->sealed && p->capture == test_capture && p->serial == test_serial &&

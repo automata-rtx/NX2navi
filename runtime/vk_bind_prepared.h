@@ -761,12 +761,12 @@ static int prepared_census_adjust(PreparedGroup *group, const PbCount *count, in
 
 // Validate one refreshed descriptor in the same order under either immutable membership walk.
 static inline int prepared_renew_member(VkExec *ex, PreparedBindings *p, uint32_t i, uint32_t j,
-                                        PreparedGroup *next, VkUsnapProof *proof) {
+                                        PreparedGroup *census, uint32_t *flags, VkUsnapProof *proof) {
     const VkBindRecipeInput *in = &p->recipe->input[j];
     PreparedSlot *slot = &p->slot[j];
     ex->dc->prep_stats.proof_descriptors++;
     if (in->reuse == VK_BR_SAMPLED) {
-        next->flags |= PREP_TEXTURE;
+        *flags |= PREP_TEXTURE;
         if (!prepared_texture_valid(ex, in, slot, &p->desc[j])) return 0;
     } else if (in->reuse != VK_BR_ZERO) {
         if (!prepared_buffer_valid(ex, in, slot)) return 0;
@@ -776,23 +776,26 @@ static inline int prepared_renew_member(VkExec *ex, PreparedBindings *p, uint32_
         }
         if (slot->lease.capture) {
             p->snapshot_count[i]++;
-            next->flags |= PREP_SNAPSHOT;
+            *flags |= PREP_SNAPSHOT;
             if (!vk_usnap_proof_add(proof, &slot->lease)) return 0;
-        } else next->flags |= PREP_LIVE;
-        if (in->reuse == VK_BR_CONSTANT) next->flags |= PREP_PROGRAM;
-        if (!prepared_census_adjust(next, &slot->previous_count, 0) ||
-            !prepared_census_adjust(next, &slot->count, 1)) return 0;
+        } else *flags |= PREP_LIVE;
+        if (in->reuse == VK_BR_CONSTANT) *flags |= PREP_PROGRAM;
+        const PbCount *old = &slot->previous_count, *now = &slot->count;
+        if (old->has != now->has || (old->has &&
+            (old->cls != now->cls || old->use != now->use || old->n != now->n))) {
+            if (!prepared_census_adjust(census, old, 0) || !prepared_census_adjust(census, now, 1)) return 0;
+        }
     }
     return 1;
 }
 
 // The old aggregate proves untouched contributions only if it remains valid across the ordinary resolvers.
 // Changed contributions are revalidated here. Retained snapshot buckets can reject extra reuse, never admit it.
-// Keep the working aggregate off the common resolver's stack and copy it only on a genuine renewal attempt.
+// The recording context owns the census. Its caller has consumed the old counts, and rebuilds them from
+// every member on any failure. Only the old validity fields must survive unchanged until the final guard.
 static __attribute__((noinline)) int prepared_try_renew(VkExec *ex, PreparedBindings *p, uint32_t set, unsigned group,
                                                        const PreparedStamp *before, VkUsnapProof *proof) {
     PreparedGroup *prior = &p->set[set].group[group];
-    if (!prepared_group_valid(ex, prior)) return 0;
     if (NX2NAVI_PREP_PARTIAL_REUSE && !(p->refreshed_groups & (1u << (set * VK_BR_GROUPS + group)))) {
         PC_COUNT(ex->dc, PC_EMPTY_RENEW_TRY);
         PreparedStamp after = prepared_stamp(ex, group);
@@ -804,7 +807,8 @@ static __attribute__((noinline)) int prepared_try_renew(VkExec *ex, PreparedBind
         PC_COUNT(ex->dc, PC_EMPTY_RENEW_OK);
         return 1;
     }
-    PreparedGroup next = *prior;
+    if (!prepared_group_valid(ex, prior)) return 0;
+    uint32_t flags = prior->flags;
     uint64_t renewed = 0;
     if ((prior->flags & PREP_SNAPSHOT) && !vk_usnap_proof_inherit(proof, &prior->proof)) return 0;
 #if NX2NAVI_PREP_COMPILED_RESOLVE
@@ -812,7 +816,7 @@ static __attribute__((noinline)) int prepared_try_renew(VkExec *ex, PreparedBind
     VkBindRecipeRefreshWalk walk = {.members = members, .refreshed = p->refreshed, .words = members->words};
     for (uint32_t j; (j = vk_bind_recipe_next_refreshed(&walk)) < VK_BR_MAX_DESC;) {
         uint32_t i = p->recipe->input[j].owner_op;
-        if (!prepared_renew_member(ex, p, i, j, &next, proof)) return 0;
+        if (!prepared_renew_member(ex, p, i, j, prior, &flags, proof)) return 0;
         renewed++;
     }
 #else
@@ -826,20 +830,19 @@ static __attribute__((noinline)) int prepared_try_renew(VkExec *ex, PreparedBind
             if (word == (end - 1) / 64 && (end % 64)) mask &= (1ull << (end % 64)) - 1;
             for (; mask; mask &= mask - 1) {
                 uint32_t j = word * 64 + (uint32_t)__builtin_ctzll(mask);
-                if (!prepared_renew_member(ex, p, i, j, &next, proof)) return 0;
+                if (!prepared_renew_member(ex, p, i, j, prior, &flags, proof)) return 0;
                 renewed++;
             }
         }
     }
 #endif
     PreparedStamp after = prepared_stamp(ex, group);
-    if (!prepared_stamp_equal(before, &after, next.flags) || !prepared_group_valid(ex, prior)) return 0;
-    if (next.flags & PREP_SNAPSHOT) {
-        if (!vk_usnap_proof_end(proof)) return 0;
-        next.proof = *proof;
+    if (!prepared_stamp_equal(before, &after, flags) || !prepared_group_valid(ex, prior)) return 0;
+    if (flags & PREP_SNAPSHOT) {
+        if (!vk_usnap_proof_end_into(proof, &prior->proof)) return 0;
     }
-    next.stamp = after, next.sealed = 1;
-    *prior = next;
+    prior->flags = flags;
+    prior->stamp = after;
     ex->dc->prep_stats.renewals++;
     ex->dc->prep_stats.renewed_descriptors += renewed;
     return 1;
@@ -914,7 +917,7 @@ static void prepared_seal(VkExec *ex, PreparedBindings *p, uint32_t set, unsigne
             }
         }
     }
-    int snapshot_ok = group == VK_BR_GROUP_BUFFER ? vk_usnap_proof_end(proof) : 1;
+    int snapshot_ok = !(s->flags & PREP_SNAPSHOT) || vk_usnap_proof_end_into(proof, &s->proof);
     PreparedStamp after = prepared_stamp(ex, group);
     if (!ok || !prepared_stamp_equal(before, &after, s->flags) ||
         ((s->flags & PREP_SNAPSHOT) && !snapshot_ok)) {
@@ -922,7 +925,6 @@ static void prepared_seal(VkExec *ex, PreparedBindings *p, uint32_t set, unsigne
         PC_COUNT(ex->dc, PC_SEAL_FAIL);
         return;
     }
-    if (s->flags & PREP_SNAPSHOT) memcpy(&s->proof, proof, sizeof s->proof);
     s->stamp = after, s->sealed = 1;
     PC_TIME(ex->dc, PCT_FULL_SEAL, prep_seal_start);
     PC_COUNT(ex->dc, PC_SEAL_OK);
