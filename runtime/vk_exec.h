@@ -42,6 +42,8 @@ void vk_exec_cond_frame_end(uint64_t frame);   // vk_exec_xfer.c: a present, in 
 extern unsigned vk_cond_clears_run, vk_cond_clears_skip, vk_cond_draws_skip, vk_cond_depth_run;
 void vk_exec_cond_why(const p_render_cond *c, char *buf, size_t cap);   // NX2NAVI_LOG_RCOND=ab
 
+#define NVN_STAGE_FS 1
+
 // The replay state. One instance lives for the run: NVN state is queue state and carries over from one submission to
 // the next. The "per command buffer" fields are reset by vk_exec_record.
 typedef struct VkExec {
@@ -51,6 +53,8 @@ typedef struct VkExec {
     VkCommandBuffer cb;                  // being recorded
     uint64_t fence;                      // timeline value the submission signals (vk_completion_add)
     int recorded;                        // Vulkan commands recorded so far; every handler adds the ones it records
+    int tonemap_drawn;                   // the full-screen tonemap draw was actually issued in this pass
+    VkExtent2D tonemap_extent;           // nonzero while drawing the guest tonemap at DLSS output size
     int in_pass;                         // inside vkCmdBeginRendering
     uint32_t dirty;                      // VK_EXEC_DIRTY_*
     // Pass marks (vk.h vk_pass_mark_begin): the open pass's record (NULL: none or marks off), vk_exec_frame.draws when

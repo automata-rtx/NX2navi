@@ -46,7 +46,6 @@
 #define SUPPORT_BYTES 1456u   // the translator's SupportBuffer (std140): alpha_test, is_bgra[8], viewport_inverse, viewport_size, ...;
                               // 1408 pcss and 1424 shadow_spread (translator patches 0010, 0011), 1440..1455 HDR (support_fill)
 #define NVN_STAGE_VS 0
-#define NVN_STAGE_FS 1
 #define NVN_STAGE_CS 5
 #define NVN_STAGE_TASK 6   // NVN2
 #define NVN_STAGE_MESH 7
@@ -3517,7 +3516,7 @@ static Twin *twin_update(VkExec *ex, const VkTexImage *img) {
 static void tex_info(VkExec *ex, const GfxShaderRes *r, uint64_t h, int storage, int separate, VkDescriptorImageInfo *out,
                      VkImage *img_out) {
     tex_info_lookup(ex, r, h, storage, separate, out, img_out);
-    if (h && !storage && vk_dlaa_swap_img && ex->in_pass && ex->pass_w > vk_dlaa_swap_img->width + 1 &&
+    if (h && !storage && vk_dlaa_swap_img && vk_dlaa_swap_active(ex) &&
         vk_texture_by_id_locked((int)(h & 0xfffff), NULL, NULL) == vk_dlaa_swap_img)
         out->imageView = vk_dlaa_swap_view, out->imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     if (!twin_dispatch || storage || separate || !h || !(r->type & 0x400)) return;
@@ -3871,7 +3870,7 @@ static int pb_on(void) {
 
 // Everything besides its own bound slot that a kept descriptor's resolution read.
 static void pb_globals(const VkExec *ex, uint64_t g[PB_G]) {
-    int swap = vk_dlaa_swap_img && ex->in_pass && ex->pass_w > vk_dlaa_swap_img->width + 1;
+    int swap = vk_dlaa_swap_img && vk_dlaa_swap_active(ex);
     memset(g, 0, sizeof(uint64_t) * PB_G);
     g[0] = (uintptr_t)ex->cb;
     g[1] = (uintptr_t)ex->prog;
@@ -4007,7 +4006,10 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
     VkBufferView *bv = cx->bind_bv;
     if (info->n_bindings > MAX_BINDINGS) rt_fatal("vk: %u descriptor bindings exceed the replay's %d", info->n_bindings, MAX_BINDINGS);
     bind_stats(info);
-    int prep_mode = resource_prep_mode();
+    // This fullscreen draw binds the reconstructed scene view chosen during replay.
+    // Resolve its descriptors here even if a packet was prepared against the guest view.
+    int prep_mode = ex->tonemap_extent.width ? 0 : resource_prep_mode();
+    if (ex->tonemap_extent.width) cx->B.res_valid = 0;
     // Establish the completion owner before resolving or inspecting pointers retained from a previous submission.
     if (prep_mode) cb_res(ex);
     int gfx = info->bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS;
@@ -4025,7 +4027,7 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
     if (recipe && !prepared) recipe = NULL;
     DescriptorState *state = &cx->B.descriptors[!gfx];
     DsSig *sig = &cx->DS[!gfx];
-    int skip = gfx && !recipe ? bind_skip_on() : 0, same = 0, was_valid = cx->B.res_valid;
+    int skip = gfx && !recipe && !ex->tonemap_extent.width ? bind_skip_on() : 0, same = 0, was_valid = cx->B.res_valid;
     if (recipe) cx->B.res_valid = 0, cx->RS.rec = 0;
     if (skip) {
         uint64_t sig_t0 = bt_now();
@@ -4320,6 +4322,10 @@ static VkViewport draw_viewport(VkExec *ex) {
     }
     if (w < 1) w = 1;
     if (h < 1) h = 1;
+    if (ex->tonemap_extent.width) {
+        float sx = (float)ex->tonemap_extent.width / ex->pass_w, sy = (float)ex->tonemap_extent.height / ex->pass_h;
+        x *= sx, w *= sx, y *= sy, h *= sy;
+    }
     VkViewport v = {x, y + h, w, -h, ex->depth_range[0], ex->depth_range[1]};   // the y flip: negative height
     vk_dlaa_viewport(ex, &v);   // the scene's draws move by the DLAA jitter
     return v;
@@ -6467,6 +6473,7 @@ static void op_draw(VkExec *ex, const p_draw *d) {
     } else {
         vkCmdDraw(ex->cb, n, inst, first, (uint32_t)d->base_instance);
     }
+    if (ex->tonemap_extent.width) ex->tonemap_drawn = 1;
     ex->recorded++;
 }
 
@@ -6525,6 +6532,7 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
     vkCmdDrawIndexed(ex->cb, (uint32_t)d->count, d->instances > 0 ? (uint32_t)d->instances : 1, 0, d->base_vertex,
                      (uint32_t)d->base_instance);
     ex->recorded++;
+    if (ex->tonemap_extent.width) ex->tonemap_drawn = 1;
     if (RT_V111) shield_capture(ex,d);
     if (d->itype != NVN_INDEX_TYPE_UNSIGNED_BYTE) mvobj_draw(ex, d, sp.buffer, sp.offset);
 }
@@ -6547,6 +6555,7 @@ static void op_draw_idx_ind(VkExec *ex, const p_draw_idx_ind *d) {
     VK_MEM_USE(ib);
     vkCmdBindIndexBuffer(ex->cb, ib.buffer, ib.offset, d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
     vkCmdDrawIndexedIndirect(ex->cb, ip.buffer, ip.offset, 1, sizeof(VkDrawIndexedIndirectCommand));
+    if (ex->tonemap_extent.width) ex->tonemap_drawn = 1;
     ex->recorded += 2;
     vk_mem_count(ip.cls, VK_MUSE_IND, sizeof(VkDrawIndexedIndirectCommand));
     VK_MEM_BOUND(ip);

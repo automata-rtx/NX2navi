@@ -65,6 +65,11 @@ int64_t vk_dlaa_vram(void);
 // frame (vk_dlaa_frame).
 typedef struct VkExec VkExec;
 void vk_dlaa_pass(VkExec *ex);
+int vk_dlaa_swap_active(const VkExec *ex);
+int vk_dlaa_tonemap_target(const VkExec *ex);
+void vk_dlaa_tonemap_begin(VkExec *ex, VkRenderingAttachmentInfo *color, VkRenderingAttachmentInfo *depth,
+                           VkRenderingInfo *ri);
+void vk_dlaa_tonemap_end(VkExec *ex);
 // The forward scene's compute upscaler. Returns 1 when temporal reconstruction filled its output.
 int vk_dlaa_scene_upscale(VkExec *ex, uint32_t sw, uint32_t sh, const VkTexImage *dst);
 void vk_dlaa_frame(void);

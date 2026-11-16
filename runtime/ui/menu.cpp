@@ -1282,6 +1282,8 @@ static void tab_screen(float scale) {
     if (wide_available()) opt_choice("NX2NAVI_GAME_ASPECT", UI_MENU_GAME_ASPECT, wide, 4, UI_MENU_GAME_ASPECT_DESC);
     if (wide_available()) row_resolution();
     row_upscaling();
+    if (cfg_bool("NX2NAVI_DLAA") && !strcmp(cfg_value("NX2NAVI_TAA"), "dlss"))
+        opt_toggle("NX2NAVI_DLSS_BEFORE_BLOOM", UI_MENU_DLSS_BEFORE_BLOOM, UI_MENU_DLSS_BEFORE_BLOOM_DESC);
     row_aa();
     row_framegen();
     row_hdr();

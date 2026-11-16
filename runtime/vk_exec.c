@@ -859,7 +859,9 @@ void vk_exec_pass_begin(VkExec *ex) {
     VkImageAspectFlags wasp[9];
     int nwant = 0;
     uint32_t fbl = 0;
-    for (uint32_t i = 0; i < 9; i++) {
+    // The output-sized tonemap binds private attachments. Its guest targets stay in GENERAL for the copy back.
+    int tonemap = vk_dlaa_tonemap_target(ex);
+    for (uint32_t i = 0; !tonemap && i < 9; i++) {
         const VkExecTarget *t = i < 8 ? &ex->color[i] : &ex->depth;
         if ((i < 8 && i >= ex->pass_ncolor) || !t->image || !t->img || !t->img->fb_learned) continue;
         fbl |= 1u << i;
@@ -910,6 +912,7 @@ void vk_exec_pass_begin(VkExec *ex) {
                           .pColorAttachments = ca,
                           .pDepthAttachment = ex->pass_depth ? &da : NULL,
                           .pStencilAttachment = ex->pass_stencil ? &sa : NULL};
+    if (tonemap) vk_dlaa_tonemap_begin(ex, ca, &da, &ri);
     vkCmdBeginRendering(ex->cb, &ri);
     vk_exec_frame.passes++;
     ex->recorded++;
@@ -923,6 +926,7 @@ void vk_exec_pass_end(VkExec *ex) {
     vkCmdEndRendering(ex->cb);
     ex->recorded++;
     ex->in_pass = 0;
+    if (ex->tonemap_extent.width) vk_dlaa_tonemap_end(ex);
     if (ex->mark) {
         // vk_exec_frame_log resets the frame counters at a present (NX2NAVI_TRACE=gfx): then only the draws since it count
         uint64_t d = vk_exec_frame.draws, d0 = ex->mark_draws0;
@@ -990,7 +994,10 @@ VkBuffer vk_exec_inline_buffer(VkDeviceSize size) {
 
 VkRect2D vk_exec_scissor(const VkExec *ex) {
     int64_t w = ex->pass_w, h = ex->pass_h;
-    if (!ex->has_scissor) return (VkRect2D){{0, 0}, {(uint32_t)w, (uint32_t)h}};
+    if (!ex->has_scissor) {
+        VkExtent2D size = ex->tonemap_extent.width ? ex->tonemap_extent : (VkExtent2D){(uint32_t)w, (uint32_t)h};
+        return (VkRect2D){{0, 0}, size};
+    }
     int64_t k = ex->pass_scale > 1 ? ex->pass_scale : 1;
     int64_t x0 = ex->scissor.x * k, y0 = ex->scissor.y * k;
     int64_t x1 = x0 + (int64_t)ex->scissor.w * k, y1 = y0 + (int64_t)ex->scissor.h * k;
@@ -999,6 +1006,10 @@ VkRect2D vk_exec_scissor(const VkExec *ex) {
     if (x1 > w) x1 = w;
     if (y1 > h) y1 = h;
     if (x1 <= x0 || y1 <= y0) return (VkRect2D){{0, 0}, {0, 0}};
+    if (ex->tonemap_extent.width) {
+        x0 = x0 * ex->tonemap_extent.width / w, x1 = x1 * ex->tonemap_extent.width / w;
+        y0 = y0 * ex->tonemap_extent.height / h, y1 = y1 * ex->tonemap_extent.height / h;
+    }
     return (VkRect2D){{(int32_t)x0, (int32_t)y0}, {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
 }
 

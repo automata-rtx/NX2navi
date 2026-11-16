@@ -371,7 +371,10 @@ static int utf8_to_wide(const char *in, wchar_t *out, size_t cap) {
 }
 #endif
 
+static int before_bloom;
+
 void vk_dlaa_init(void) {
+    before_bloom = cfg_bool("NX2NAVI_DLSS_BEFORE_BLOOM");
     if (vk_dlaa_wanted() && fsr3()) {
         fsr_frame = 1;
         N.available = vk_ffx_load();
@@ -468,6 +471,11 @@ static struct {
     VkExecTarget color, depth;   // the armed pair, valid in the frame it was armed
     int armed, done, gbuf;       // this frame: armed on the light target, DLAA ran, the G-buffer was drawn
     int ended, up;               // this frame: the scene is drawn (jitter over), DLSS wrote the scaled output
+    int early, previous_early;   // the colour domain of this frame and of the current temporal history
+    int promoted;                // this frame has an output-sized tonemap result
+    int debug_image;             // evaluate wrote a diagnostic in place of reconstructed colour
+    uint64_t early_outputs, full_size_outputs;
+    VkImage composite;           // guest tonemap destination for this frame
     struct Size {                // a DLSS feature and its work images per scene size (dynamic resolution flips it)
         uint32_t w, h, ow, oh;   // render size, output size
         VkImage out, mv;
@@ -653,8 +661,56 @@ static int image2d(uint32_t w, uint32_t h, VkFormat f, VkImageUsageFlags usage, 
     if (vmaCreateImage(c->vma, &ii, &ai, img, mem, NULL) != VK_SUCCESS) return 0;
     VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = *img,
                                 .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = f,
-                                .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+                                .subresourceRange = {f == VK_FORMAT_D32_SFLOAT ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
     return vkCreateImageView(c->device, &vi, NULL, view) == VK_SUCCESS;
+}
+
+// The guest draws its tonemap at scene size. Give that same draw output-sized attachments
+// so its scene sample retains DLSS detail. The depth attachment matches the pipeline
+// format; this fullscreen pass has depth testing and writes disabled.
+static struct {
+    VkImage color, depth;
+    VkImageView cv, zv;
+    VmaAllocation cm, zm;
+    VkExtent2D size;
+    int ready;
+} post;
+
+static void release_post(void) {
+    const VkCtx *c = vk_ctx();
+    if (post.cv) vkDestroyImageView(c->device, post.cv, NULL);
+    if (post.zv) vkDestroyImageView(c->device, post.zv, NULL);
+    if (post.color) vmaDestroyImage(c->vma, post.color, post.cm);
+    if (post.depth) vmaDestroyImage(c->vma, post.depth, post.zm);
+    memset(&post, 0, sizeof post);
+}
+
+static int post_images(VkCommandBuffer cb, VkExtent2D size) {
+    if (size.width == post.size.width && size.height == post.size.height) return post.ready;
+    if (post.color || post.depth) {
+        vk_queue_lock(), vkDeviceWaitIdle(vk_ctx()->device), vk_queue_unlock();
+        release_post();
+    }
+    post.size = size;
+    if (!image2d(size.width, size.height, VK_FORMAT_B10G11R11_UFLOAT_PACK32,
+                 VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                 &post.color, &post.cm, &post.cv) ||
+        !image2d(size.width, size.height, VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                 &post.depth, &post.zm, &post.zv)) {
+        rt_log("dlaa: output-sized tonemap attachments unavailable at %ux%u", size.width, size.height);
+        return 0;
+    }
+    VkImageMemoryBarrier2 ib[2];
+    for (int i = 0; i < 2; i++)
+        ib[i] = (VkImageMemoryBarrier2){.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+            .dstStageMask = VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT, .dstAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = i ? post.depth : post.color,
+            .subresourceRange = {i ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 2, .pImageMemoryBarriers = ib};
+    vkCmdPipelineBarrier2(cb, &di);
+    return post.ready = 1;
 }
 
 // Which features may stay alive when another is made (NX2NAVI_DLSS_IDLE_FREE). A feature made while one with a larger
@@ -1532,6 +1588,7 @@ void vk_dlaa_release(void) {
     for (int i = 0; i < 5; i++) destroy_size(&D.sizes[i]);
     for (int i = 0; i < SNAPS; i++) destroy_snap(&R.s[i]);
     hl_destroy();
+    release_post();
     if (D.mv_pipe) vkDestroyPipeline(c->device, D.mv_pipe, NULL);
     if (D.mv_layout) vkDestroyPipelineLayout(c->device, D.mv_layout, NULL);
     if (D.mv_dsl) vkDestroyDescriptorSetLayout(c->device, D.mv_dsl, NULL);
@@ -1764,7 +1821,7 @@ static void window_line(void) {
 }
 
 // dst: the target DLSS's picture goes to, NULL for the light target itself (DLAA in place).
-static void hudless(VkCommandBuffer cb, struct Size *e, uint32_t w, uint32_t h);
+static void hudless(VkCommandBuffer cb, VkImage source, uint32_t w, uint32_t h);
 
 // Another light target than last frame's. The game draws its scene into one of a few pooled targets of the same size
 // and moves to another whenever its pass list changes, in the middle of play with the camera and the scene carrying
@@ -1875,6 +1932,9 @@ static int evaluate(VkExec *ex, const VkExecTarget *dst) {
     const VkExecTarget *t = &D.color, *z = &D.depth;
     if (!dst) dst = t;
     uint32_t w = t->width, h = t->height, ow = dst->width, oh = dst->height;
+    if (D.early) wide_picture(&ow, &oh);
+    if (D.early != D.previous_early) D.reset = 1;
+    D.previous_early = D.early;
     VkCommandBuffer cb = ex->cb;
     vk_exec_barrier(ex);   // what drew the scene is done (no pass is open here)
     vk_gpu_gap_note(VK_GAP_UPSCALER, (uint64_t)ow * oh);
@@ -2022,7 +2082,7 @@ evaluated:
     VkImageBlit b = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                      .srcOffsets = {{0, 0, 0}, {(int32_t)ow, (int32_t)oh, 1}},
                      .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, dst->level, dst->base_layer, 1},
-                     .dstOffsets = {{0, 0, 0}, {(int32_t)ow, (int32_t)oh, 1}}};
+                     .dstOffsets = {{0, 0, 0}, {(int32_t)dst->width, (int32_t)dst->height, 1}}};
     // NX2NAVI_DLAA_MVDEBUG=1 (test): the motion vectors in place of the picture, x in red and y in green, render pixels
     // as scene light (the post passes still run over them)
     static int mvdebug = -1;
@@ -2031,14 +2091,16 @@ evaluated:
     if (maskdebug < 0) maskdebug = rt_knob("DLAA_MASKDEBUG", "0");
     // (NX2NAVI_DLAA_MASKDEBUG=1 shows whichever bias mask DLSS got: the reactive one, or the characters')
     VkImage shown = mvdebug ? e->mv : maskdebug && mk ? mk->mask : maskdebug && masked ? e->mask : e->out;
-    if (shown != e->out) b.srcOffsets[1] = (VkOffset3D){(int32_t)w, (int32_t)h, 1};
-    vkCmdBlitImage(cb, shown, VK_IMAGE_LAYOUT_GENERAL, dst->image, VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_NEAREST);
+    D.debug_image = shown != e->out;
+    if (D.debug_image) b.srcOffsets[1] = (VkOffset3D){(int32_t)w, (int32_t)h, 1};
+    vkCmdBlitImage(cb, shown, VK_IMAGE_LAYOUT_GENERAL, dst->image, VK_IMAGE_LAYOUT_GENERAL, 1, &b,
+                   D.early && ow != w ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     full_barrier(cb);
     if (dst != t) vk_dlaa_swap_img = t->img, vk_dlaa_swap_view = e->out_view;   // the scaling draw reads DLSS's picture
-    // The forward scene has already been tonemapped here. In the deferred path later
-    // bloom and tonemapping would change the scene even in pixels without any UI.
-    if (vk_dlaa_hudless_wanted && (!vk_dlssg_active() || (D.cam_size == OCAM_BLOCK && !D.gbuf)))
-        hudless(cb, e, ow, oh);
+    // Frame generation needs the tonemapped scene. The early forward resolve takes
+    // that copy in vk_dlaa_scene_upscale after the game composites bloom.
+    if (!D.early && vk_dlaa_hudless_wanted && (!vk_dlssg_active() || (D.cam_size == OCAM_BLOCK && !D.gbuf)))
+        hudless(cb, e->out, ow, oh);
     ex->recorded += 4;
     vk_exec_draw_new_cb();   // NGX bound pipelines and descriptor sets of its own: the next draw binds everything again
     D.jdepth = z->image, D.jw = z->width, D.jh = z->height;
@@ -2072,7 +2134,7 @@ evaluated:
 // (vk_hdr_encode): DLSS's output is kept as RGBA16F for the same encode. The game's own HDR (native) encodes inside the
 // game, which this cannot follow: no HUD-less picture there.
 int vk_dlaa_hudless_wanted;
-static void hudless(VkCommandBuffer cb, struct Size *e, uint32_t w, uint32_t h) {
+static void hudless(VkCommandBuffer cb, VkImage source, uint32_t w, uint32_t h) {
     const VkCtx *c = vk_ctx();
     int hdr = vk_hdr_wanted() && !vk_hdr_native();
     if (vk_hdr_native()) return;
@@ -2112,7 +2174,7 @@ static void hudless(VkCommandBuffer cb, struct Size *e, uint32_t w, uint32_t h) 
     }
     VkImageBlit b = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .srcOffsets = {{0, 0, 0}, {(int32_t)w, (int32_t)h, 1}},
                      .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstOffsets = {{0, 0, 0}, {(int32_t)w, (int32_t)h, 1}}};
-    vkCmdBlitImage(cb, e->out, VK_IMAGE_LAYOUT_GENERAL, hdr ? D.hl : D.hl_srgb, VK_IMAGE_LAYOUT_GENERAL, 1, &b,
+    vkCmdBlitImage(cb, source, VK_IMAGE_LAYOUT_GENERAL, hdr ? D.hl : D.hl_srgb, VK_IMAGE_LAYOUT_GENERAL, 1, &b,
                    VK_FILTER_NEAREST);
     full_barrier(cb);
     if (hdr) {
@@ -2130,14 +2192,100 @@ static int scene_color(VkFormat f) {
     return f == VK_FORMAT_B10G11R11_UFLOAT_PACK32 || f == VK_FORMAT_R16G16B16A16_SFLOAT;
 }
 
+static int samples_scene(const VkExec *ex, int with_bloom) {
+    uint64_t scene = ex->tex[NVN_STAGE_FS][0], bloom = ex->tex[NVN_STAGE_FS][1];
+    if (!scene || (with_bloom && !bloom)) return 0;
+    vk_texture_lock();
+    int match = vk_texture_by_id_locked(NVN_HANDLE_TEX(scene), NULL, NULL) == D.color.img;
+    if (match && with_bloom) {
+        const VkTexImage *b = vk_texture_by_id_locked(NVN_HANDLE_TEX(bloom), NULL, NULL);
+        match = b && b->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && b->width < D.color.width && b->height < D.color.height;
+    }
+    vk_texture_unlock();
+    return match;
+}
+
+int vk_dlaa_swap_active(const VkExec *ex) {
+    return ex->in_pass &&
+           (D.early ? ex->tonemap_extent.width != 0 : ex->pass_w > vk_dlaa_swap_img->width + 1);
+}
+
+static void blit_scene(VkCommandBuffer cb, VkImage src, uint32_t sw, uint32_t sh, VkImage dst, uint32_t dw, uint32_t dh) {
+    VkImageBlit region = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                          .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                          .srcOffsets = {{0, 0, 0}, {(int32_t)sw, (int32_t)sh, 1}},
+                          .dstOffsets = {{0, 0, 0}, {(int32_t)dw, (int32_t)dh, 1}}};
+    vkCmdBlitImage(cb, src, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_GENERAL, 1, &region,
+                   sw == dw && sh == dh ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
+}
+
+int vk_dlaa_tonemap_target(const VkExec *ex) {
+    return D.composite && vk_dlaa_swap_img && ex->color[0].image == D.composite && D.last &&
+           (D.last->ow != D.color.width || D.last->oh != D.color.height) &&
+           ex->pass_ncolor == 1 && ex->depth.image == D.depth.image && post.ready &&
+           !ex->pipe.ds.dt && !ex->pipe.ds.dw && !(ex->pipe.color.blend_en & 1) && samples_scene(ex, 1);
+}
+
+void vk_dlaa_tonemap_begin(VkExec *ex, VkRenderingAttachmentInfo *color, VkRenderingAttachmentInfo *depth,
+                           VkRenderingInfo *ri) {
+    VkRect2D sc = vk_exec_scissor(ex);
+    // The viewport can extend beyond the guest target. A clipped or letterboxed
+    // composite keeps the guest colours in the portion the draw will not cover.
+    int covers = sc.extent.width == ex->pass_w && sc.extent.height == ex->pass_h &&
+                 (!ex->has_vp || (ex->vp[0][0] <= 0 && ex->vp[0][1] <= 0 &&
+                  ex->vp[0][0] + ex->vp[0][2] >= ex->pass_w && ex->vp[0][1] + ex->vp[0][3] >= ex->pass_h));
+    if (!covers) {
+        full_barrier(ex->cb);
+        blit_scene(ex->cb, ex->color[0].image, ex->pass_w, ex->pass_h, post.color, post.size.width, post.size.height);
+        full_barrier(ex->cb);
+        ex->recorded += 3;
+    }
+    ex->tonemap_drawn = 0;
+    color->loadOp = covers ? VK_ATTACHMENT_LOAD_OP_DONT_CARE : VK_ATTACHMENT_LOAD_OP_LOAD;
+    color->imageView = post.cv;
+    depth->imageView = post.zv;
+    depth->loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    depth->storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    ri->renderArea.extent = ex->tonemap_extent = post.size;
+}
+
+void vk_dlaa_tonemap_end(VkExec *ex) {
+    ex->tonemap_extent = (VkExtent2D){0};
+    if (!ex->tonemap_drawn) return;
+    // Keep the original guest target current for copies and alternate present paths.
+    full_barrier(ex->cb);
+    blit_scene(ex->cb, post.color, post.size.width, post.size.height, ex->color[0].image, ex->pass_w, ex->pass_h);
+    full_barrier(ex->cb);
+    D.promoted = 1;
+    ex->recorded += 3;
+}
+
 // The final encode samples the compute upscaler's output even on frames that skip the HUD pass.
 int vk_dlaa_scene_upscale(VkExec *ex, uint32_t sw, uint32_t sh, const VkTexImage *dst) {
     if (!dl_active()) return 0;
     vk_exec_hooks_wait();
-    if (!D.armed || D.gbuf || D.done || sw != D.color.width || sh != D.color.height ||
+    if (!D.armed || D.gbuf || (D.done && !D.early) || sw != D.color.width || sh != D.color.height ||
         dst->image == D.color.image || dst->width < sw || dst->height < sh)
         return 0;
     vk_exec_hook_turn();
+    if (D.early) {
+        if (!D.composite || D.up) return 0;
+        vk_exec_barrier(ex);
+        VkImage src = D.promoted ? post.color : D.composite;
+        blit_scene(ex->cb, src, D.promoted ? post.size.width : sw, D.promoted ? post.size.height : sh,
+                   dst->image, dst->width, dst->height);
+        full_barrier(ex->cb);
+        if (vk_dlaa_hudless_wanted) hudless(ex->cb, dst->image, dst->width, dst->height);
+        D.up = 1;
+        ex->recorded += 2;
+        D.early_outputs++;
+        if (D.promoted || (sw == dst->width && sh == dst->height)) D.full_size_outputs++;
+        if (D.early_outputs == 1 || D.early_outputs == 300 || D.early_outputs % 3600 == 0)
+            rt_log("dlaa: before bloom on %llu of %llu reconstructed frames; %llu tonemapped at output size; scene %ux%u, tonemap %ux%u, output %ux%u",
+                   (unsigned long long)D.early_outputs, (unsigned long long)D.evals, (unsigned long long)D.full_size_outputs, sw, sh,
+                   D.promoted ? post.size.width : sw, D.promoted ? post.size.height : sh, dst->width, dst->height);
+        return 1;
+    }
     VkExecTarget out = {.image = dst->image, .format = dst->format, .width = dst->width, .height = dst->height, .img = dst};
     if (!evaluate(ex, &out)) return 0;
     D.ended = D.done = D.up = 1;
@@ -2170,6 +2318,21 @@ double wide_dlss_share(void);   // widescreen.c: the DLSS mode's share of the pi
 void vk_dlaa_pass(VkExec *ex) {
     const VkExecTarget *c = &ex->color[0], *z = &ex->depth;
     if (!dl_active()) return;
+    if (D.early) {
+        if (!D.composite && ex->pass_ncolor == 1 && ex->pass_layers == 1 && c->image && c->image != D.color.image &&
+            c->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && c->width == D.color.width && c->height == D.color.height &&
+            !c->level && !c->base_layer && c->samples <= 1 && z->image == D.depth.image && !ex->pipe.ds.dt &&
+            !ex->pipe.ds.dw && !(ex->pipe.color.blend_en & 1) && samples_scene(ex, 1)) {
+            vk_exec_hook_turn();
+            D.composite = c->image;
+            if (!D.debug_image && (D.last->ow != c->width || D.last->oh != c->height) &&
+                post_images(ex->cb, (VkExtent2D){D.last->ow, D.last->oh})) {
+                vk_dlaa_swap_img = D.color.img;
+                vk_dlaa_swap_view = D.last->out_view;
+            }
+        }
+        return;
+    }
     if (D.done) {   // diagnostics: another scene drawn into a light target in the same present interval
         if (ex->pass_ncolor == 1 && c->image && scene_color(c->format) && z->image && z->format == VK_FORMAT_D32_SFLOAT &&
             c->width == D.color.width && c->height == D.color.height && z->width == c->width)
@@ -2217,6 +2380,19 @@ void vk_dlaa_pass(VkExec *ex) {
         return;
     }
     if (!D.armed) return;
+    if (before_bloom && !deferred && !use_fsr() && ex->pass_ncolor == 2 && !z->image &&
+        c->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && ex->color[1].format == c->format &&
+        c->width == ex->color[1].width && c->height == ex->color[1].height &&
+        c->width < D.color.width && c->height < D.color.height && samples_scene(ex, 0)) {
+        // Bloom extraction writes the bright scene to two small float targets.
+        // Earlier low-resolution effects have other inputs or attachments.
+        vk_exec_hook_turn();
+        D.early = 1;
+        D.hl_fresh = 0;
+        if (evaluate(ex, NULL)) D.done = D.ended = 1;
+        else D.early = 0;
+        return;
+    }
     if (!deferred) {   // Ocarina's shape: the output pass ends the scene and runs DLSS
         int one = ex->pass_ncolor == 1 && c->image && !z->image && c->image != D.color.image && c->samples <= 1 &&
                   !c->is3d;
@@ -2352,6 +2528,7 @@ void vk_dlaa_frame(void) {
     else if (setting_presents) setting_presents--;
     cfg_seen = v, cfg_known = 1;
     vk_dlaa_swap_img = NULL, vk_dlaa_swap_view = VK_NULL_HANDLE;
+    D.early = D.promoted = 0, D.composite = VK_NULL_HANDLE;
     dlss_mode();
     preset_check();
     if (!N.ngx_up) {   // FSR 3.1 follows the setting

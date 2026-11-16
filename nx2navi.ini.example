@@ -472,6 +472,9 @@
 # to match). They apply only with dlaa = 1 and the DLSS model next to the executable; otherwise the scene follows
 # render_scale. Changes while the game runs take effect at once.
 # dlss = dlaa
+# Reconstruct the HDR scene before bloom and tonemapping with NVIDIA DLSS or DLAA. Restart after changing.
+# 0 uses the original placement. 1 enables the early placement.
+# dlss_before_bloom = 0
 # AMD FSR in DLSS's place, on any GPU (Windows): with taa = fsr3 and dlaa = 1 the scene is scaled by AMD FSR 3.1 in the
 # mode dlss names (dlaa is FSR's Native AA). The menu's Upscaling row sets all of these. Changes while the game runs
 # take effect at once.
