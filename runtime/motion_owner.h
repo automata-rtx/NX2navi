@@ -26,3 +26,4 @@ void motion_owner_forget(uint64_t buffer);
 void motion_owner_forget_range(uint64_t address, uint64_t size);
 int vk_usnap_motion_owner(uint64_t address, uint64_t size, MotionOwner *out);
 int motion_owner_enabled(void);
+int motion_owner_player_camera_interpolating(void);

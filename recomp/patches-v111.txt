@@ -172,3 +172,10 @@ site zstd main f5c2c  94000015 9536acd5   # bl the stream feed -> page+0xf80
 # on the patch page (+0xf70), which puts the free camera's vectors into those registers and does the instruction's
 # own work.
 site freecam main 4c4e50 1e624011 95277048   # fcvt s17, d0 -> bl page+0xf70
+
+# Observe the final view history decision, the completion of the camera notification check,
+# and its accepted branch. Each callback performs the displaced memory access.
+set camera_continuity NX2NAVI_CAMERA_CONTINUITY 1
+site camera_continuity main 4c6258 39004a60 95276b3e
+site camera_continuity main 31d33d4 39790a88 947336db
+site camera_continuity main 31d3398 f945fa88 947336e6

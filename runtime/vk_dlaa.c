@@ -23,6 +23,7 @@
 #include <wchar.h>
 
 #include "cfg.h"
+#include "camera_history.h"
 #include "gfx.h"
 #include "host.h"
 #include "nvn_api.h"
@@ -538,6 +539,8 @@ static struct {
     uint64_t cam_at_draw;        // camera taken from the bytes the draw read, where the evaluating submission lacks them
     uint64_t cam_kept, cam_kept_max;   // no camera, history kept with zero motion / runs cut short at KEEP_MAX
     float cut_pos[3], cut_fwd[3];      // last frame's camera position and direction (cam_cut)
+    float cut_view[12];
+    uint64_t cut_frame;
     uint64_t cut_ns, cuts;             // when it was read; camera cuts that started a new history
     int cut_ok, cut_logged;
     int keep_run;                // frames in a row kept without a camera
@@ -1160,6 +1163,7 @@ static void cam_cut(const float *v) {
         pos[i] = -(v[i] * v[3] + v[4 + i] * v[7] + v[8 + i] * v[11]);
     }
     uint64_t now = plat_now_ns();
+    uint64_t frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1;
     if (on && D.cut_ok) {
         double dot = fwd[0] * D.cut_fwd[0] + fwd[1] * D.cut_fwd[1] + fwd[2] * D.cut_fwd[2];
         double turn = acos(dot > 1 ? 1 : dot < -1 ? -1 : dot) * (180.0 / 3.14159265358979);
@@ -1168,7 +1172,8 @@ static void cam_cut(const float *v) {
         double k = (now - D.cut_ns) / 1e6 / (1000.0 / 60);   // 60 Hz frames since the last camera
         if (k < 0.25) k = 0.25;
         if (k > 4) k = 4;
-        if (move > 5.0 * k || (turn > 10.0 * k && move > 0.5 * k)) {
+        int jumped = move > 5.0 * k || (turn > 10.0 * k && move > 0.5 * k);
+        if (jumped && !(D.cam_prev_ok && frame == D.cut_frame + 1 && camera_history_continuous(frame, D.cut_view, v))) {
             D.reset = 1, D.cuts++;
             if (D.cut_logged < 24)
                 D.cut_logged++, rt_log("dlaa: frame %llu: camera cut (moved %.2f m, turned %.1f degrees in %.1f ms): new "
@@ -1178,6 +1183,8 @@ static void cam_cut(const float *v) {
         }
     }
     memcpy(D.cut_pos, pos, sizeof pos), memcpy(D.cut_fwd, fwd, sizeof fwd);
+    memcpy(D.cut_view, v, sizeof D.cut_view);
+    D.cut_frame = frame;
     D.cut_ns = now, D.cut_ok = 1;
 }
 
@@ -1589,6 +1596,7 @@ static void fcam_probe(VkCommandBuffer cb, const struct Size *e, uint32_t w, uin
 }
 
 void vk_dlaa_release(void) {
+    camera_history_enable(0);
 #ifndef _WIN32
     const VkCtx *c = vk_ctx();
     if (!c) return;
@@ -2639,6 +2647,7 @@ void vk_dlaa_frame(void) {
     if (on != D.on) {
         rt_log("dlaa: %s", on ? "on" : "off");
         D.on = on;
+        camera_history_enable(on);
         // either way the next DLAA frame starts a new history from an unjittered frame
         D.reset = 1, D.cam_prev_ok = 0, D.jit_ok = D.jit_used = D.armed = D.done = D.gbuf = D.ended = D.up = 0;
         D.hold = 0;

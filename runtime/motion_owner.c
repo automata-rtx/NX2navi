@@ -57,6 +57,12 @@ static uint64_t player_actor(void) {
     char name[7];
     return p && read_at(field(p, 0x20), name, sizeof name) && !memcmp(name, "Player", 7) ? p : 0;
 }
+// Ocarina's player query follows this component to determine whether a recenter is blending.
+int motion_owner_player_camera_interpolating(void) {
+    uint64_t camera = component(player_actor(), 0x368);
+    uint8_t blending;
+    return camera && read_at(camera + 0x43c, &blending, sizeof blending) && blending == 1;
+}
 static int actor_link(uint64_t link, OwnerActor *out) {
     struct {
         uint64_t table;
