@@ -24,6 +24,7 @@
 #include "cfg.h"
 #include "flight.h"
 #include "gfx.h"
+#include "motion_owner.h"
 #include "host.h"
 #include "nvn_api.h"
 #include "perfmon.h"
@@ -538,6 +539,7 @@ void gfx_exit_log(void) {
 }
 
 static void vk_be_present(const tex_t *t, const int crop[4], uint64_t at_ns) {
+    motion_owner_present();
     vk_sync_start();
     gfx_tl_present();
     vk_dlssg_game_present();
@@ -630,6 +632,8 @@ static uint64_t vk_be_submit(const uint64_t *handles, int n) {
         if (!it.h) rt_fatal("vk: out of memory (replay queue)");
         memcpy(it.h, handles, sizeof *it.h * (size_t)n);
     }
+    // The game may still be filling uniforms until it opens the leading CPU event.
+    vk_exec_gate_wait(handles, n);
     vk_usnap_take(handles, n);   // the uniform blocks as they are now: the game writes on once this returns
     return replay_enqueue(&it);
 }

@@ -35,6 +35,7 @@ extern "C" {
 #else
 #define NX2SL_API
 #endif
+typedef void (*PFN_nx2sl_present_rect)(const int rect[4]);
 typedef int (*PFN_nx2sl_version)(void);
 // slInit with DLSS-G, Reflex and PCL for Vulkan; dir: the folder of sl.interposer.dll and the plugins (the game's)
 typedef int (*PFN_nx2sl_init)(const wchar_t *dir, Nx2SlLog log);

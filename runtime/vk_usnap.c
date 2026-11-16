@@ -25,6 +25,7 @@
 #include "nvn_api.h"
 #include "resource_prep.h"
 #include "vk.h"
+#include "motion_owner.h"
 #include "replay_phase_trace.h"
 #include "vk_dlaa.h"
 #include "platform/platform.h"
@@ -52,6 +53,7 @@ typedef struct { uint64_t lo, hi, fence, epoch; } Wrote;
 
 static struct {
     int mode;                   // rt_knob: 0 off, 1 on, 2 ab
+    MotionOwnerSnapshot *owners;
     int on;                     // this submission has a snapshot
     int proofs;                 // aggregate drop publication is used only by the prepared consumer
     uint64_t fence, gen, capture;
@@ -78,6 +80,7 @@ static PlatMutex gather_lock = PLAT_MUTEX_INIT;
 // A copy taken at the submit call for the replay thread (vk_usnap_take), in submission order.
 typedef struct Taken {
     struct Taken *next;
+    MotionOwnerSnapshot *owners;
     Arena *arena;
     Reg *reg;
     int nreg, n;
@@ -144,7 +147,7 @@ static void collect_binding(const p_bind_buf *b) {
         // many draws, and two resolves for each binding were a quarter of the snapshot's time
         static struct { uint64_t addr, size, gen; int ok; } nc[1024];
         uint32_t ci = (uint32_t)((b->addr ^ n << 48) * 0x9E3779B97F4A7C15ull >> 54);
-        uint64_t gen = vk_mem_gen();
+        uint64_t gen = step ? vk_mem_gen() : 0;
         int known = step && nc[ci].addr == b->addr && nc[ci].size == n && nc[ci].gen == gen, ok = 0;
         for (int k = step ? -1 : 0; k <= (step ? 1 : 0); k++) {
             uint64_t at = b->addr + (uint64_t)((int64_t)k * (int64_t)step);
@@ -326,6 +329,7 @@ void vk_usnap_take(const uint64_t *handles, int n) {
     Taken *t = calloc(1, sizeof *t);
     if (!t) rt_fatal("vk_usnap: out of memory");
     t->n = n, t->first = handles[0];
+    t->owners = motion_owner_acquire();
     int creg = 0;
     plat_mutex_lock(&gather_lock);
     U.ncol = 0;
@@ -358,6 +362,7 @@ void vk_usnap_take(const uint64_t *handles, int n) {
 
 static void taken_free(Taken *t) {
     if (t->arena) arena_done(t->arena);
+    motion_owner_release(t->owners);
     free(t->reg);
     free(t);
 }
@@ -386,6 +391,7 @@ static int adopt(const uint64_t *handles, int n) {
             if (wr_hits(U.reg[i].lo, U.reg[i].hi)) U.reg[i].dropped = 1, U.inflight++;
         U.arena = t->arena, t->arena = NULL;
         U.on = 1;
+        U.owners = t->owners, t->owners = NULL;
         U.subs++, U.regions += (uint64_t)U.nreg, U.bytes += t->total, U.copy_ns += t->ns;
     }
     taken_free(t);
@@ -397,6 +403,7 @@ void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
     RP_VALUE(RPK_HANDLES, n);
     U.proofs = resource_prep_mode() != 0;   // fixed process mode, established before replay workers start
     if (!U.mode) U.mode = rt_knob("UBO_SNAPSHOT", "1") + 1;   // stored +1: 0 is "not read yet"
+    motion_owner_release(U.owners), U.owners = NULL;
     U.on = 0, U.fence = fence, U.gen++, U.capture++;
     if (!U.capture) rt_fatal("vk_usnap: capture identity exhausted");
     summary();
@@ -410,6 +417,7 @@ void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
         RP_VALUE(RPK_OUTCOME, RPO_ADOPTED);
         return;
     }
+    if (!gfx_replay_async()) U.owners = motion_owner_acquire();
     uint64_t t0 = kern_now_ns();
     RP_CALL(RP_USNAP_GATHER_LOCK, plat_mutex_lock(&gather_lock));
     RP_SCOPE(rp_gather, RP_USNAP_GATHER);
@@ -460,6 +468,7 @@ void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
 
 void vk_usnap_end(uint64_t fence) {
     if (U.arena) vk_completion_add(fence, arena_done, U.arena), U.arena = NULL;
+    motion_owner_release(U.owners), U.owners = NULL;
     U.on = 0, U.gen++;
     // The next begin advances capture even if it reuses the same arena and region indices.
 }
@@ -658,17 +667,32 @@ static int cpu_written(uint64_t addr, uint64_t n) {   // the same test vk_usnap_
            (sp.cls == VK_MCLS_HOST_CACHED || sp.cls == VK_MCLS_HOST_UNC);
 }
 
-int vk_usnap_read(uint64_t addr, uint64_t n, void *dst) {
+static int readable_source(uint64_t addr, uint64_t n, const uint8_t **src) {
     const uint8_t *s = vk_usnap_bytes(addr, n);
-    if (s) return memcpy(dst, s, n), 1;
+    if (s) return *src = s, 1;
     if (!n || !cpu_written(addr, n)) return 0;
     int lk = vk_exec_shared();   // a chunk's drop may grow the list
     if (lk) plat_mutex_lock(&drop_lock);
     int w = wr_overlaps(addr, addr + n);
     if (lk) plat_mutex_unlock(&drop_lock);
     if (w) return 0;
-    memcpy(dst, (const void *)(uintptr_t)addr, n);
+    *src = (const uint8_t *)(uintptr_t)addr;
     return 2;
+}
+
+int vk_usnap_read(uint64_t addr, uint64_t n, void *dst) {
+    const uint8_t *src;
+    int origin = readable_source(addr, n, &src);
+    if (origin) memcpy(dst, src, n);
+    return origin;
+}
+
+int vk_usnap_equal_tail(uint64_t addr, uint64_t size, uint64_t skip, const void *expected) {
+    const uint8_t *src;
+    // Resolve the full original binding so the submission snapshot and pending-write
+    // checks use the same range as the initial capture.
+    return skip < size && readable_source(addr, size, &src) &&
+           !memcmp(src + skip, (const uint8_t *)expected + skip, size - skip);
 }
 
 int vk_usnap_why(uint64_t addr, uint64_t n) {
@@ -693,6 +717,8 @@ const uint8_t *vk_usnap_bytes(uint64_t addr, uint64_t n) {
 
 // The arenas back on the free list (vk_exec_draw_shutdown: the device is idle, every completion ran).
 void vk_usnap_shutdown(void) {
+    motion_owner_shutdown();
+    motion_owner_release(U.owners), U.owners = NULL;
     plat_mutex_lock(&free_lock);
     for (Arena *a = free_arenas, *next; a; a = next) next = a->next, vmaDestroyBuffer(vk_ctx()->vma, a->buf, a->alloc), free(a->cpu), free(a);
     free_arenas = NULL;
@@ -708,4 +734,37 @@ void vk_usnap_sizes(PerfSizes *s) {
     plat_mutex_unlock(&free_lock);
     perf_size(s, "free uniform snapshot arenas", n, 0, b);
     perf_size(s, "uniform snapshot GPU writes", (uint64_t)__atomic_load_n(&U.nwr, __ATOMIC_RELAXED), 0, PERF_SIZE_NONE);
+}
+
+// The producer publishes sorted, disjoint ranges. Zero means this binding has no owner.
+static unsigned motion_owner_slot(uint64_t address, uint64_t size) {
+    unsigned lo = 0, hi = U.owners->count;
+    if (!hi || address < U.owners->bindings[0].address) return 0;
+    const MotionOwnerBinding *last = &U.owners->bindings[hi - 1];
+    if (address >= last->address && address - last->address >= last->size) return 0;
+    while (lo < hi) {
+        unsigned mid = lo + (hi - lo) / 2;
+        if (U.owners->bindings[mid].address <= address) lo = mid + 1;
+        else hi = mid;
+    }
+    if (!lo) return 0;
+    const MotionOwnerBinding *b = &U.owners->bindings[lo - 1];
+    if (size > b->size || address - b->address > b->size - size) return 0;
+    return lo;
+}
+
+int vk_usnap_motion_owner(uint64_t address, uint64_t size, MotionOwner *out) {
+    if (!U.on || !U.owners || !size || address > UINT64_MAX - size) return 0;
+    // Consecutive scene draws often bind the same camera, material and shape data.
+    // Ownership is immutable within a capture. Readability is checked separately at the draw's epoch.
+    typedef struct { uint64_t capture, address, size; unsigned slot; } OwnerHint;
+    static _Thread_local OwnerHint hints[64];
+    unsigned index = (unsigned)(((address >> 8) * UINT64_C(0x9e3779b97f4a7c15)) >> 58);
+    OwnerHint *hint = &hints[index];
+    if (hint->capture != U.capture || hint->address != address || hint->size != size) {
+        *hint = (OwnerHint){U.capture, address, size, motion_owner_slot(address, size)};
+    }
+    if (!hint->slot) return 0;
+    *out = U.owners->bindings[hint->slot - 1].owner;
+    return 1;
 }

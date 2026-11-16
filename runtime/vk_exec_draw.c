@@ -978,7 +978,10 @@ static void mesh_ring_release(VkCtx *c);
 static void pool_marks_release(VkCtx *c);
 static void pool_requirement_reset(void);
 
+static void player_mesh_shutdown(void);
+
 void vk_exec_draw_shutdown(void) {
+    player_mesh_shutdown();
     // Shutdown already requires that no context is recording. The worker shells persist, but no prepared entry
     // may retain a recipe or a CbRes association after their backing tables are destroyed below.
     plat_mutex_lock(&prepared_context_lock);
@@ -5805,6 +5808,9 @@ static void mvobj_draw_(VkExec *ex, const p_draw_idx *d, VkBuffer ib, VkDeviceSi
 int vk_mvobj_execute(VkExec *ex, uint64_t cam, VkImageView mv, VkImageView depth, VkFormat depth_fmt, uint32_t w,
                      uint32_t h) {
     static uint64_t frames;
+    if (!frames && RT_V111)
+        rt_log("vk_exec: first Ocarina scene using the legacy object-motion pass, collector %s",
+               vk_mvprev_on() ? "active" : "inactive");
     if (++frames % 60 == 0)
         rt_log("vk_exec: per-object motion: %.2f ms a frame checking, %.2f ms listing (%.1f us a draw), %.2f ms recording",
                MO.ns_check / 1e6 / (frames ? frames : 1), MO.ns_rec / 1e6 / (frames ? frames : 1),
@@ -6483,6 +6489,8 @@ static int restart_for(const VkExec *ex, int prim, int itype) {
     return 0;
 }
 
+#include "vk_shield_motion.inc"
+
 static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
     ex->dc->c0_binst = (uint32_t)d->base_instance;
     static const uint32_t isize[3] = {1, 2, 4};
@@ -6517,6 +6525,7 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
     vkCmdDrawIndexed(ex->cb, (uint32_t)d->count, d->instances > 0 ? (uint32_t)d->instances : 1, 0, d->base_vertex,
                      (uint32_t)d->base_instance);
     ex->recorded++;
+    if (RT_V111) shield_capture(ex,d);
     if (d->itype != NVN_INDEX_TYPE_UNSIGNED_BYTE) mvobj_draw(ex, d, sp.buffer, sp.offset);
 }
 

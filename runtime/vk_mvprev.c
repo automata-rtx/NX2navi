@@ -187,6 +187,7 @@ void vk_mvprev_frame(void) {
     if (!vk_dlaa_available()) return;
     if (P.knob < 0) {
         P.knob = rt_knob("DLAA_OBJMV", "1");
+        if (!P.knob) rt_log("mv_prev: legacy object history disabled by NX2NAVI_DLAA_OBJMV");
         if (P.knob) {
             P.t[0] = calloc(TABLE, sizeof(Seen)), P.t[1] = calloc(TABLE, sizeof(Seen));
             if (!P.t[0] || !P.t[1]) P.knob = 0;

@@ -29,6 +29,7 @@
 #include "platform/platform.h"
 #include "vk.h"
 #include "vk_dlaa.h"
+#include "vk_dlssg.h"
 #include "vk_exec.h"
 #include "vk_ffx.h"
 #include "vk_rec.h"
@@ -1003,10 +1004,25 @@ static void proj_planes(const double P[16], VkDlaaCamera *c) {
 static void fg_camera(const float *v, const double m[16]) {
     double P[16], Pi[16], mi[16];
     for (int i = 0; i < 16; i++) P[i] = v[28 + i];
-    if (!inv4(P, Pi) || !inv4(m, mi)) return;
+    // The tagged D32 image stores zero to one. Express the projection and both
+    // endpoints of the reprojection in that same basis before taking their inverses.
+    double projection[16], reprojection[16];
+    memcpy(projection, P, sizeof projection);
+    memcpy(reprojection, m, sizeof reprojection);
+    if (nvn_depth_minus_w()) {
+        for (int i = 0; i < 4; ++i) {
+            projection[8 + i] = (P[8 + i] + P[12 + i]) * 0.5;
+            reprojection[8 + i] = (m[8 + i] + m[12 + i]) * 0.5;
+        }
+        for (int i = 0; i < 4; ++i) {
+            reprojection[4 * i + 3] -= reprojection[4 * i + 2];
+            reprojection[4 * i + 2] *= 2.0;
+        }
+    }
+    if (!inv4(projection, Pi) || !inv4(reprojection, mi)) return;
     VkDlaaCamera *c = &D.fg_cam;
-    fg_store(c->view_to_clip, P), fg_store(c->clip_to_view, Pi);
-    fg_store(c->clip_to_prev_clip, m), fg_store(c->prev_clip_to_clip, mi);
+    fg_store(c->view_to_clip, projection), fg_store(c->clip_to_view, Pi);
+    fg_store(c->clip_to_prev_clip, reprojection), fg_store(c->prev_clip_to_clip, mi);
     for (int i = 0; i < 3; i++) {
         c->right[i] = v[i], c->up[i] = v[4 + i], c->fwd[i] = -v[8 + i];
         // the position: -R^T t, R the view's 3x3 and t its last column
@@ -1251,6 +1267,7 @@ static int mv_pass(VkExec *ex, struct Size *e, VkImageView zv, float jx, float j
     vk_mvcheck_camera(cb, e->mv, w, h, jx, jy);   // NX2NAVI_MV_CHECK (test)
     // the characters' own motion over the camera's (vk_exec_draw.c, per-object motion)
     uint64_t c0 = T.on > 0 ? kern_now_ns() : 0;
+    if (D.cam_size == OCAM_BLOCK && vk_shield_resolve(ex, D.cam_addr, D.depth.image, zv, e->mv_view, w, h, D.reset)) full_barrier(cb);
     if (D.cam_size == CAM_BLOCK && vk_mvobj_execute(ex, D.cam_addr, e->mv_view, zv, D.depth.format, w, h)) full_barrier(cb);
     if (T.on > 0) T.cpu_mv += kern_now_ns() - c0;
     times_mark(cb, T_OBJ);
@@ -2017,7 +2034,10 @@ evaluated:
     vkCmdBlitImage(cb, shown, VK_IMAGE_LAYOUT_GENERAL, dst->image, VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_NEAREST);
     full_barrier(cb);
     if (dst != t) vk_dlaa_swap_img = t->img, vk_dlaa_swap_view = e->out_view;   // the scaling draw reads DLSS's picture
-    if (vk_dlaa_hudless_wanted) hudless(cb, e, ow, oh);   // frame generation keeps the HUD out of its generated frames
+    // The forward scene has already been tonemapped here. In the deferred path later
+    // bloom and tonemapping would change the scene even in pixels without any UI.
+    if (vk_dlaa_hudless_wanted && (!vk_dlssg_active() || (D.cam_size == OCAM_BLOCK && !D.gbuf)))
+        hudless(cb, e, ow, oh);
     ex->recorded += 4;
     vk_exec_draw_new_cb();   // NGX bound pipelines and descriptor sets of its own: the next draw binds everything again
     D.jdepth = z->image, D.jw = z->width, D.jh = z->height;
@@ -2303,11 +2323,15 @@ int vk_dlaa_resized_take(void) {
     return 1;
 }
 
+uint64_t vk_dlaa_scene_frame(void) {
+    return __atomic_load_n(&D.presents, __ATOMIC_RELAXED);
+}
+
 void vk_dlaa_frame(void) {
     static unsigned cfg_seen;
     static int cfg_known;
     unsigned v = cfg_version();
-    D.presents++;
+    __atomic_add_fetch(&D.presents, 1, __ATOMIC_RELAXED);
     if (cfg_known && v != cfg_seen) setting_presents = SETTING_PRESENTS;
     else if (setting_presents) setting_presents--;
     cfg_seen = v, cfg_known = 1;

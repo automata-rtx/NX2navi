@@ -44,6 +44,7 @@ static struct {
     PFN_nx2sl_available available;
     PFN_nx2sl_log_unavailable log_unavailable;
     PFN_nx2sl_frame frame;
+    PFN_nx2sl_present_rect present_rect;
     PFN_nx2sl_present_marker marker;
     PFN_nx2sl_sleep sleep;
     PFN_nx2sl_submit_end submit_end;
@@ -106,6 +107,7 @@ int vk_dlssg_early(void) {
     S.available = (PFN_nx2sl_available)(void *)GetProcAddress(m, "nx2sl_available");
     S.log_unavailable = (PFN_nx2sl_log_unavailable)(void *)GetProcAddress(m, "nx2sl_log_unavailable");
     S.frame = (PFN_nx2sl_frame)(void *)GetProcAddress(m, "nx2sl_frame");
+    S.present_rect = (PFN_nx2sl_present_rect)(void *)GetProcAddress(m, "nx2sl_present_rect");
     S.marker = (PFN_nx2sl_present_marker)(void *)GetProcAddress(m, "nx2sl_present_marker");
     S.sleep = (PFN_nx2sl_sleep)(void *)GetProcAddress(m, "nx2sl_sleep");
     S.submit_end = (PFN_nx2sl_submit_end)(void *)GetProcAddress(m, "nx2sl_submit_end");
@@ -168,7 +170,10 @@ void vk_dlssg_device_ready(VkPhysicalDevice physical, VkDevice dev) {
     S.present = (PFN_vkQueuePresentKHR)g(dev, "vkQueuePresentKHR");
     S.active = S.create_sc && S.destroy_sc && S.images && S.acquire && S.present;
     rt_log("dlssg: %s", S.active ? "DLSS Frame Generation on the swapchain" : "the swapchain hooks are missing: off");
-    if (S.active) S.reflex(reflex_mode());
+    if (S.active) {
+        S.reflex(reflex_mode());
+        vk_dlaa_hudless_wanted = 1;
+    }
 }
 
 int vk_dlssg_active(void) { return S.active; }
@@ -282,10 +287,10 @@ void vk_dlssg_present_frame(uint64_t frame) { S.cur = (uint32_t)frame; }
 
 uint64_t vk_dlssg_shown(void) { return S.active ? S.shown() : 0; }
 
-void vk_dlssg_frame(VkCommandBuffer cb, VkExtent2D ext) {
+void vk_dlssg_frame(VkCommandBuffer cb, VkExtent2D ext, const int rect[4], VkImage hudless, VkImageView hudless_view, VkFormat hudless_format) {
     if (!S.active) return;
-    VkFfxImage d, m;
-    VkImageView dv, mvv;
+    VkFfxImage d = {0}, m = {0};
+    VkImageView dv = VK_NULL_HANDLE, mvv = VK_NULL_HANDLE;
     VkDlaaCamera c;
     float jx = 0, jy = 0;
     int reset = 0;
@@ -316,7 +321,12 @@ void vk_dlssg_frame(VkCommandBuffer cb, VkExtent2D ext) {
         k.reset = reset;
     }
     // the frames to generate between two rendered ones: the multiplier less the rendered one, 0 off
-    S.frame(cb, have ? &zd : NULL, have ? &zm : NULL, NULL, have ? &k : NULL, ext.width, ext.height, on ? mult - 1 : 0, S.cur);
+    Nx2SlImage hl = {hudless, hudless_view, hudless_format, ext.width, ext.height, VK_IMAGE_LAYOUT_GENERAL,
+                    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
+    if (S.present_rect) S.present_rect(rect);
+    S.frame(cb, have ? &zd : NULL, have ? &zm : NULL, have && hudless && hudless_view ? &hl : NULL,
+            have ? &k : NULL, ext.width, ext.height, on ? mult - 1 : 0, S.cur);
 }
 
 void vk_dlssg_release(void) {

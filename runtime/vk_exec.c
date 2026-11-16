@@ -1423,12 +1423,17 @@ static const void *gate_first_wait(const op_hdr *h) {
 }
 
 void vk_exec_gate_wait(const uint64_t *handles, int n) {
+    // Only the guest submitter has a queue here. The asynchronous replay thread
+    // receives the completed snapshot and must never wait a second time.
+    if (n < 1 || !handles[0] || !gfx_submit_queue) return;
+    int async = gfx_replay_async();
+    if (!async && !evo_enabled()) return;
     static int64_t cap_ns = -1;
     if (cap_ns < 0) {
         int ms = cfg_int("NX2NAVI_GATE_WAIT_MS");
         cap_ns = ms > 0 ? (int64_t)ms * 1000000 : 0;
     }
-    if (!cap_ns || n < 1 || !handles[0] || !gfx_submit_queue || !evo_enabled()) return;
+    if (!cap_ns) return;
     const void *w = gate_first_wait(nvn_op_first(handles[0]));
     if (!w || vk_exec_event_holds_now(w) || !vk_exec_event_cpu_known((const void *)((const p_wait_event *)w)->val)) return;
     uint64_t t0 = kern_now_ns(), now = t0;
@@ -1440,7 +1445,18 @@ void vk_exec_gate_wait(const uint64_t *handles, int n) {
         if (i < 20000) plat_pause();
         else plat_yield();
     }
-    GW.n++, GW.ns += kern_now_ns() - t0;
+    uint64_t elapsed = kern_now_ns() - t0;
+    if (async) {
+        // Distinguish a gate that opened from a bounded wait that expired.
+        static unsigned reports;
+        if (reports < 12) {
+            ++reports;
+            rt_log("vk: uniform snapshot after CPU gate: %s after %.3f ms, submit %llu",
+                   vk_exec_event_holds_now(w) ? "open" : "timed out", elapsed / 1e6,
+                   (unsigned long long)nvn_submit_count());
+        }
+    }
+    GW.n++, GW.ns += elapsed;
     if (GW.n >= 600) {
         if (rt_trace & RT_TRACE_PERF)
             rt_log("perf: gate: %llu submissions waited for the CPU's signal before their copies, %.2f ms on average; "

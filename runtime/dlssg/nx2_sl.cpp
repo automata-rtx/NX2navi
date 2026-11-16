@@ -6,8 +6,8 @@
 // Manual hooking (the SDK's ProgrammingGuideManualHooking): the game creates its instance and device through the
 // interposer's vkCreateInstance and vkCreateDevice, which add what DLSS-G needs, and calls the interposer's
 // swapchain functions; everything else goes to the Vulkan loader as before. Each frame of the game sleeps in Reflex
-// where it starts and gets the PCL latency markers, the camera constants and the depth and motion vector tags (valid
-// until the present), then the present goes through the interposer, which inserts the generated frames: one, two or
+// where it starts and gets the PCL latency markers, the camera constants and a snapshot of the depth and motion vectors (taken
+// when tagged), then the present goes through the interposer, which inserts the generated frames: one, two or
 // three between two rendered frames (2x, 3x or 4x), up to what the GPU and driver allow (numFramesToGenerateMax).
 #define NX2SL_BUILD
 #include <windows.h>
@@ -198,6 +198,12 @@ extern "C" NX2SL_API void nx2sl_submit_end(uint32_t frame) {
     if (t) p_marker(sl::PCLMarker::eRenderSubmitEnd, *t);
 }
 
+// Written and consumed on the present thread, once for each backbuffer.
+static sl::Extent backbufferRect{};
+extern "C" NX2SL_API void nx2sl_present_rect(const int rect[4]) {
+    backbufferRect = {(uint32_t)rect[1], (uint32_t)rect[0], (uint32_t)rect[2], (uint32_t)rect[3]};
+}
+
 extern "C" NX2SL_API int nx2sl_frame(VkCommandBuffer cb, const Nx2SlImage *depth, const Nx2SlImage *mv,
                                      const Nx2SlImage *hudless, const Nx2SlCamera *cam, uint32_t out_w, uint32_t out_h,
                                      int enable, uint32_t frame) {
@@ -230,14 +236,28 @@ extern "C" NX2SL_API int nx2sl_frame(VkCommandBuffer cb, const Nx2SlImage *depth
         c.cameraMotionIncluded = sl::Boolean::eTrue;
         c.motionVectors3D = sl::Boolean::eFalse;
         c.reset = cam->reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
-        p_constants(c, *t, vp);
+        sl::Result constantsResult = p_constants(c, *t, vp);
+        static unsigned constantErrors;
+        if (constantsResult != sl::Result::eOk && constantErrors++ < 8)
+            say("dlssg: camera constants rejected on frame %u (%d)", frame, (int)constantsResult);
         sl::Resource rd = resource(depth), rm = resource(mv), rh = hudless ? resource(hudless) : sl::Resource{};
         sl::Extent ed{0, 0, depth->width, depth->height}, em{0, 0, mv->width, mv->height};
-        sl::Extent eh{0, 0, hudless ? hudless->width : 0, hudless ? hudless->height : 0};
-        sl::ResourceTag tags[3] = {sl::ResourceTag(&rd, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &ed),
-                                   sl::ResourceTag(&rm, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, &em),
-                                   sl::ResourceTag(&rh, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent, &eh)};
-        if ((t = token(frame))) p_tag(*t, vp, tags, hudless ? 3 : 2, (sl::CommandBuffer *)cb);
+        sl::Extent eh = backbufferRect ? backbufferRect : sl::Extent{0, 0, out_w, out_h};
+        // Replay can write the next scene between the blit submission and the paced present.
+        // Preserve this frame's depth and motion on the blit command buffer while its color matches.
+        sl::ResourceTag tags[4] = {sl::ResourceTag(&rd, sl::kBufferTypeDepth, sl::ResourceLifecycle::eOnlyValidNow, &ed),
+                                   sl::ResourceTag(&rm, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eOnlyValidNow, &em),
+                                   sl::ResourceTag(hudless ? &rh : nullptr, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent, &eh)};
+        unsigned count = 3;   // a null HUD-less tag also clears the previous picture
+        if (backbufferRect)
+            tags[count++] = sl::ResourceTag(nullptr, sl::kBufferTypeBackbuffer,
+                                             sl::ResourceLifecycle::eValidUntilPresent, &backbufferRect);
+        if ((t = token(frame))) {
+            sl::Result result = p_tag(*t, vp, tags, count, (sl::CommandBuffer *)cb);
+            static unsigned tagErrors;
+            if (result != sl::Result::eOk && tagErrors++ < 8)
+                say("dlssg: frame %u resource tags rejected (%d)", frame, (int)result);
+        }
     }
     if (n != g_frames) {
         sl::DLSSGOptions o{};

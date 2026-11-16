@@ -1,4 +1,4 @@
-﻿// NVN front end, first slice: device, queue, memory pool, buffer, sync and
+// NVN front end, first slice: device, queue, memory pool, buffer, sync and
 // event objects. Back-end calls go to gfx_backend() (gfx.h). nvnQueuePresentTexture belongs to the window slice;
 // nvnDeviceGetProcAddress lives in nvn_procs.c.
 // Contains code Copyright (c) 2026 jhaizhou (MIT; see THIRD_PARTY_NOTICES.md).
@@ -11,6 +11,7 @@
 
 #include "cfg.h"
 #include "gfx.h"
+#include "motion_owner.h"
 #include "host.h"
 #include "nvn_api.h"
 #include "nvn_pool_index.h"
@@ -323,6 +324,7 @@ NVN_API(nvnMemoryPoolFinalize) {
     NVN_BLOCKING();   // as nvnMemoryPoolInitialize
     pool_t *o = arg_p(c, 0);
     if (o->magic != NVN_POOL_MAGIC) return;
+    motion_owner_forget_range((uint64_t)(uintptr_t)o->mem,o->size);
     if (pool_gpu_visible(o)) index_del(o);
     gfx_backend()->pool_fini(o);
     if (nvn_gpu_only((uintptr_t)o->mem)) gva_free((uintptr_t)o->mem);
@@ -421,6 +423,7 @@ NVN_API(nvnMemoryPoolMapVirtual) {
     if (n < 0 || (n && !r)) { rt_log("nvn: MapVirtual with %d requests at %p", n, (const void *)r); ret_x(c, 0); return; }
     for (int i = 0; i < n; i++)
         if (!check_request(v, &r[i], i)) { ret_x(c, 0); return; }
+    if (n) motion_owner_forget_range((uint64_t)(uintptr_t)v->mem, v->size);
     if (!gfx_backend()->pool_map_virtual(v, n, r))
         rt_fatal("nvn: MapVirtual of %d requests failed after validation; virtual pool %p is inconsistent", n, (void *)v);
     NVN_LOG("MapVirtual pool %p, %d requests", (void *)v->mem, n);
@@ -458,11 +461,12 @@ NVN_API(nvnBufferInitialize) {
         ret_x(c, 0);
         return;
     }
+    motion_owner_forget((uintptr_t)o);
     *o = (buf_t){BUF_MAGIC, s->pool, s->off, s->size};
     ret_x(c, 1);
 }
 // void nvnBufferFinalize(NVNbuffer *b)
-NVN_API(nvnBufferFinalize) { memset(arg_p(c, 0), 0, sizeof(buf_t)); }
+NVN_API(nvnBufferFinalize) { motion_owner_forget((uintptr_t)arg_p(c, 0)); memset(arg_p(c, 0), 0, sizeof(buf_t)); }
 static uint64_t buf_address(const buf_t *o) { return o->pool && o->pool->mem ? (uintptr_t)o->pool->mem + (uint64_t)o->off : 0; }
 // The mapping of a buffer with no pool behind it (no buffer, or one whose nvnBufferInitialize failed): memory of its
 // own, zero at first, instead of address 0, since the game's scene-loading thread has been seen filling such a mapping
