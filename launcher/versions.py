@@ -6,6 +6,9 @@ _NUM = re.compile(r'^\s*v?(\d+(?:\.\d+)*)(?:-([0-9A-Za-z.-]+))?(?:\+([0-9A-Za-z.
 
 def parse(text):
     """(numbers, pre-release) for comparing; a pre-release sorts before its release. ValueError when malformed."""
+    beta = re.fullmatch(r'Beta ([1-9][0-9]*)(?: - WIP ([1-9][0-9]*))?(?:\+[0-9A-Za-z.-]+)?', text or '')
+    if beta:
+        return (int(beta[1]), 0, int(beta[2] or 0), 0), (1,)
     m = _NUM.match(text or '')
     if not m:
         raise ValueError(f'not a version: {text!r}')

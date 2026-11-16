@@ -32,6 +32,10 @@ The repository's additions are all rights reserved (`LICENSE-ADDITIONS`). It nev
 - Graphics bugs: [docs/maxwell.md](docs/maxwell.md) lists the Maxwell behaviour the Vulkan path must match, what goes wrong when it does not, and what our runtime does.
 - Comments say what the code does and why, in words that stand on their own. Cite our code by file plus function (a line number may follow as a hint). Comments and docs do not name other projects or say where code came from: the license header of copied code and its `THIRD_PARTY_NOTICES.md` row carry that.
 
+## Fork releases
+
+The public name is `2NX2Navi`. Set `VERSION` to `Beta N` for a confirmed baseline. Label each unconfirmed candidate `Beta N - WIP M`, incrementing M for each candidate built against that baseline. Advance N only after confirmation.
+
 ## Writing
 
 Code, comments, docs and commit messages are in English. Commit messages are plain sentences without type prefixes.

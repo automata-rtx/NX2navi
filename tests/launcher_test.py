@@ -254,6 +254,10 @@ class Tmp(unittest.TestCase):
 
 class VersionTest(unittest.TestCase):
     def test_order(self):
+        self.assertTrue(versions.newer('Beta 1', '0.9.1-auto-fork'))
+        self.assertTrue(versions.newer('Beta 1 - WIP 1', 'Beta 1'))
+        self.assertTrue(versions.newer('Beta 1 - WIP 10', 'Beta 1 - WIP 9'))
+        self.assertTrue(versions.newer('Beta 2', 'Beta 1 - WIP 10'))
         self.assertTrue(versions.newer('0.3.11', '0.3.10'))
         self.assertTrue(versions.newer('0.4', '0.3.99'))
         self.assertFalse(versions.newer('0.3.10+abc', '0.3.10'))
@@ -457,7 +461,7 @@ class UninstallTest(Tmp):
     def test_plan_keeps_the_game_and_what_is_not_ours(self):
         from types import SimpleNamespace
         root = self.tmp / 'NX2navi'
-        self.tree(root, ('NX2navi.exe', 'app/current.txt', 'python.old-3/x', 'game/profile/save/1/a.sav', 'mine.txt'))
+        self.tree(root, ('2NX2Navi.exe', 'app/current.txt', 'python.old-3/x', 'game/profile/save/1/a.sav', 'mine.txt'))
         layout = SimpleNamespace(root=root, toolchain=root / 'toolchain')
         gone, empty = winsys.uninstall_plan(layout)
         self.assertNotIn(root / 'game', gone)
@@ -476,7 +480,7 @@ class UninstallTest(Tmp):
     @unittest.skipUnless(os.name == 'nt', 'runs the cmd.exe script')
     def test_script_on_windows(self):
         from types import SimpleNamespace
-        root = self.tmp / 'NX2navi ÿ x'   # spaces and a character outside ASCII
+        root = self.tmp / 'NX2navi Ã¿ x'   # spaces and a character outside ASCII
         self.tree(root, ('NX2navi.exe', 'app/1/VERSION', 'python/pythonw.exe', 'python.old-12/x', 'pydeps/z',
                          'data/launcher.json', 'toolchain/msys64/a', 'game/profile/save/1/a.sav', 'mine.txt'))
         layout = SimpleNamespace(root=root, toolchain=root / 'toolchain')
@@ -3551,7 +3555,7 @@ class JobTest(Tmp):
         # the check was done by an earlier build (the fake build has no scan step): the row has the count, home nothing
         j, _ = self.scan_job('ok', {'damaged': {p: 'x' for p in jobs.SCAN_EXPECTED}, 'repaired': {}})
         self.assertEqual(j.step('scan').state, jobs.SKIPPED)
-        self.assertEqual(j.step('scan').value, 'Unchanged · 4 Flagged, 0 Stand-Ins')
+        self.assertEqual(j.step('scan').value, 'Unchanged Â· 4 Flagged, 0 Stand-Ins')
         self.assertEqual(j.note, '')
         self.assertIsNone(build.scan_report(self.tmp / 'no game'))
         (self.tmp / 'game' / 'romfs-check.json').write_text('not json')
@@ -4576,7 +4580,7 @@ class WhilePlayingTest(Tmp):
         long = 'access violation (0xc0000005) at host 0x7ff6 (nx2navi+0x1234), reading address 0x10 ' + 'x' * 300
         a, log = self.ended(71, f'FATAL: {long}\n  a line of the report\n')
         self.assertIn('(code 71): access violation (0xc0000005)', a.message)
-        self.assertIn('…. Its log is', a.message)
+        self.assertIn('â€¦. Its log is', a.message)
         self.assertLess(len(a.message), app.FATAL_SHOWN + 120)
         self.assertIn(long, a.ctx.log.call_args[0][0])   # the launcher's log has the whole line
         # a log that still ends with an earlier run's end has no FATAL line of this run

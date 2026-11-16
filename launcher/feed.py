@@ -21,7 +21,7 @@ from pathlib import Path
 from . import net, versions
 
 MANIFEST = 'NX2navi-update.json'
-DEFAULT = {'type': 'github', 'repo': 'tangerineturtle1/NX2navi'}
+DEFAULT = {'type': 'github', 'repo': 'automata-rtx/NX2navi'}
 GITHUB_API = 'https://api.github.com'
 
 

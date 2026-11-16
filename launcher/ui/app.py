@@ -279,7 +279,7 @@ class App:
         self.navi_xy = None
         self.halo = []
 
-        root.title(NAME)
+        root.title(f"{NAME} {versions.display(self.layout.version)}")
         root.resizable(False, False)
         root.configure(background=P['window'])
         self.canvas = tk.Canvas(root, width=self.X(W), height=self.X(H), highlightthickness=0, bd=0,
@@ -784,7 +784,7 @@ class App:
 
     def after_update_notice(self):
         if self.args.rolled_back:
-            self.message = (f'Version {self.args.rolled_back} did not start, so NX2navi went back to '
+            self.message = (f'Version {self.args.rolled_back} did not start, so 2NX2Navi went back to '
                             f'{versions.display(self.layout.version)}.')
 
     def show(self, screen, focus=None):
@@ -860,9 +860,9 @@ class App:
             Row('value', 'Install Folder', gd, big=True, on=self.choose_folder, desc=folder_desc),
             Row('divider'),
             self.toggle('Desktop Shortcut', 'desktop_shortcut',
-                        'Put an NX2navi shortcut on the desktop. The Start menu always has one.'),
+                        'Put an 2NX2Navi shortcut on the desktop. The Start menu always has one.'),
             self.toggle('Check for Updates at Start', 'auto_check',
-                        'Look for a new version of NX2navi when the launcher opens, and every hour while it stays '
+                        'Look for a new version of 2NX2Navi when the launcher opens, and every hour while it stays '
                         'open. A new version downloads in the background and installs when you are not playing; '
                         'Settings can make it wait until you choose Updates.'),
             self.channel_row(),
@@ -905,7 +905,7 @@ class App:
             except OSError:   # nx2navi.ini there but unreadable: the game's default
                 return True
         return Row('toggle', 'Discord Status', on=on, get=get,
-                   desc=('Show "Playing NX2navi" with your play time in your Discord status while the game runs. '
+                   desc=('Show "Playing 2NX2Navi" with your play time in your Discord status while the game runs. '
                          'The game\'s menu switches it too (Game tab).',))
 
     def choose_dump(self):
@@ -931,7 +931,7 @@ class App:
             return
         p = Path(path)
         if p.exists() and any(p.iterdir()) and not (p / 'build-cache').is_dir() and p.name.lower() != 'nx2navi':
-            p = p / 'NX2navi'
+            p = p / '2NX2Navi'
         self.settings['game_dir'] = str(p)
         self.settings.save()
         self.show(self.screen, self.focus)
@@ -974,7 +974,7 @@ class App:
                       on=self.start_update, focus_value=True, desc=self.update_desc)
         elif self.check and self.check.result is None:
             upd = Row('value', 'Updates', 'Checking…', 'dim', big=True, icon='refresh', on=lambda: None,
-                      desc=('Looking for a new version of NX2navi.',))
+                      desc=('Looking for a new version of 2NX2Navi.',))
         elif self.check_error:
             upd = Row('value', 'Updates', 'Could not check', 'dim', big=True, icon='refresh',
                       on=lambda: self.check_now(force=True),
@@ -987,7 +987,7 @@ class App:
         else:
             upd = Row('value', 'Updates', f'Version {mine}', 'normal', big=True, icon='refresh',
                       on=lambda: self.check_now(force=True),
-                      desc=(f'You have NX2navi {mine}. Select this row to look for a new version.',))
+                      desc=(f'You have 2NX2Navi {mine}. Select this row to look for a new version.',))
         # an update that stopped in the compile left no finished build on record, but the exe of the build before it
         unfinished = not built and build.installed(gd)
         rebuild_value = (f'Built with {versions.display(built)}' if built else
@@ -1000,7 +1000,7 @@ class App:
             play_desc += (f'The last rebuild of the game did not finish, so Play starts the build from before it. '
                           f'Rebuild the Game finishes it and brings the game to {mine}; your dump is not needed.',)
         if staged and self.settings.get('auto_install'):
-            play_desc += (f'NX2navi {staged["version"]} is downloaded and installs after you quit the game.',)
+            play_desc += (f'2NX2Navi {staged["version"]} is downloaded and installs after you quit the game.',)
         if self.message:
             play_desc = (self.message,) + play_desc
         return [
@@ -1424,7 +1424,7 @@ class App:
         ready = self.save_waiting(gd)
         out = self.export_dir()
         export_desc = ('Write your save into one zip file, to attach to a bug report or give to another player: every '
-                       'save slot and a note of the NX2navi and game versions, never your keys or game files. The '
+                       'save slot and a note of the 2NX2Navi and game versions, never your keys or game files. The '
                        'folder opens with the zip selected.',)
         if self.export_message:
             export_desc = (self.export_message,) + export_desc
@@ -1434,7 +1434,7 @@ class App:
         if gd and saves.pending_import(gd):
             import_desc += ('A save imported in the game\'s menu waits for the game\'s next start; an import here '
                             'replaces it.',)
-        folder_desc = ('Bring in a save folder: a Switch save backup, an emulator\'s save, another NX2navi install, or '
+        folder_desc = ('Bring in a save folder: a Switch save backup, an emulator\'s save, another 2NX2Navi install, or '
                        'one save slot (a folder named slot_00 to slot_05: only that slot is replaced).',
                        'Your current save is copied to the saves folder first.')
         if self.save_message:
@@ -1514,7 +1514,7 @@ class App:
                 elif saves.waiting(gd)[0] is None:
                     src = filedialog.askopenfilename(parent=self.root, title='Choose the save to import',
                                                      initialdir=str(self.export_dir()),
-                                                     filetypes=[('NX2navi save', '*.zip'), ('All files', '*.*')])
+                                                     filetypes=[('2NX2Navi save', '*.zip'), ('All files', '*.*')])
                     if not src:
                         return
                 r = saves.import_save(gd, src, log=self.ctx.log)
@@ -1529,7 +1529,7 @@ class App:
         """What an import did, for the import rows' descriptions."""
         m = r.get('manifest')
         if m:
-            text = (f'Save imported from {r["source"].name} (exported {str(m.get("exported", ""))[:10]} with NX2navi '
+            text = (f'Save imported from {r["source"].name} (exported {str(m.get("exported", ""))[:10]} with 2NX2Navi '
                     f'{m.get("nx2navi") or "?"}).')
         elif r['slot']:
             text = f'Save imported into {r["slot"]}.'
@@ -1774,7 +1774,7 @@ class App:
         notes = feed.plain_notes(m.get('notes', ''), 4)
         if self.settings.get('auto_install'):
             text = (f'You have {mine}. Version {nv} is downloaded and installs when you are not playing: after you '
-                    'quit the game, or when NX2navi next opens. Select this row to install it now.')
+                    'quit the game, or when 2NX2Navi next opens. Select this row to install it now.')
         else:
             text = f'You have {mine}. Version {nv} is downloaded. Select this row to install it.'
         return {'title': f'Version {nv} Is Ready', 'text': [text],
@@ -1808,7 +1808,7 @@ class App:
         if not force and time.time() - self.settings.get('last_check', 0) < 600 and self.release:
             return
         if force and time.time() - self.check_started < FORCED_CHECK_PAUSE:
-            self.message = 'NX2navi looked for updates less than a minute ago.'
+            self.message = '2NX2Navi looked for updates less than a minute ago.'
             if self.screen == 'home':
                 self.show('home', self.focus)
             return
@@ -1941,10 +1941,10 @@ class App:
         if not ver:
             return False
         if self.bg.restarting:
-            self.message = f'Installing NX2navi {ver}…'
+            self.message = f'Installing 2NX2Navi {ver}…'
             self.root.after(200, self.root.destroy)
         else:
-            self.message = f'NX2navi {ver} is installed: start NX2navi again to finish it.'
+            self.message = f'2NX2Navi {ver} is installed: start 2NX2Navi again to finish it.'
         if self.screen == 'home':
             self.show('home', self.focus)
         return True
@@ -1977,11 +1977,11 @@ class App:
         dump = self.settings.get('dump')
         return [
             self.toggle('Check for Updates at Start', 'auto_check',
-                        'Look for a new version of NX2navi when the launcher opens, and every hour while it stays '
+                        'Look for a new version of 2NX2Navi when the launcher opens, and every hour while it stays '
                         'open (also while you play). A new version downloads in the background.'),
             self.toggle('Install Updates Automatically', 'auto_install',
                         'Install a downloaded update by itself when you are not playing: after you quit the game, '
-                        'or when NX2navi opens. Off: it waits until you select Updates. Updates download in the '
+                        'or when 2NX2Navi opens. Off: it waits until you select Updates. Updates download in the '
                         'background either way.'),
             self.toggle('Hide Launcher While Playing', 'hide_while_playing',
                         'Hide this window while the game runs; it comes back when you quit the game.'),
@@ -2001,7 +2001,7 @@ class App:
             Row('value', 'Open Logs Folder', '', 'arrow', on=lambda: self.open(self.layout.logs),
                 desc=('The launcher\'s logs. Attach launcher.log when you report a problem with installing or '
                       'updating; never send game files.',)),
-            Row('value', 'Uninstall NX2navi', 'Keeps your saves', 'salmon', on=lambda: self.show('uninstall'),
+            Row('value', 'Uninstall 2NX2Navi', 'Keeps your saves', 'salmon', on=lambda: self.show('uninstall'),
                 desc=('Remove the launcher and its build tools. You choose on the next screen whether the built '
                       'game goes too.',)),
             Row('action', 'Back', on=lambda: self.show('home'), height=40, desc=('Back to the main menu.',)),
@@ -2019,7 +2019,7 @@ class App:
                       'Off: the game folder and your saves stay where they are.')),
             Row('divider'),
             Row('pair', actions=[('Uninstall', self.do_uninstall), ('Cancel', lambda: self.show('settings'))],
-                desc=('Uninstall removes NX2navi, its build tools and its shortcuts. Your dump is never touched.',)),
+                desc=('Uninstall removes 2NX2Navi, its build tools and its shortcuts. Your dump is never touched.',)),
         ]
 
     def do_uninstall(self):
@@ -2134,7 +2134,7 @@ class App:
 
     def copy_report(self):
         j = self.job
-        report = [f'NX2navi {self.layout.version} ({"checkout" if self.layout.dev else "release"}), {sys.platform}',
+        report = [f'2NX2Navi {self.layout.version} ({"checkout" if self.layout.dev else "release"}), {sys.platform}',
                   f'Job: {j.kind}, step: {j.current().label}', f'Error: {j.error}', '', 'Last lines:']
         report += [ln for ln in list(j.lines)[-60:]]
         self.root.clipboard_clear()
@@ -2162,7 +2162,7 @@ class App:
                 if winsys.restart(self.layout, ['--continue-update', versions.display(self.layout.version)]):
                     self.root.after(200, self.root.destroy)
                     return
-                self.message = 'The update is ready: start NX2navi again to finish it.'
+                self.message = 'The update is ready: start 2NX2Navi again to finish it.'
             elif j.after == 'staged':
                 self.message = 'The update was downloaded; a checkout keeps running from the repository.'
             elif j.after == 'play':   # the mods' code is built in (play): the game starts
@@ -2179,7 +2179,7 @@ class App:
                 self.message = 'The game is built. Select Play.'
             elif j.kind in ('update', 'rebuild'):
                 self.message = 'The game is rebuilt and up to date.' if j.kind == 'rebuild' else \
-                    f'NX2navi is now {versions.display(self.layout.version)}.'
+                    f'2NX2Navi is now {versions.display(self.layout.version)}.'
                 self.release = None
             note = getattr(j, 'note', '')   # what the file check found (jobs.Job.note_scan)
             if note and j.after is None:
@@ -2658,7 +2658,7 @@ class App:
 
 
 def parse_args(argv):
-    ap = argparse.ArgumentParser(prog='NX2navi')
+    ap = argparse.ArgumentParser(prog='2NX2Navi')
     ap.add_argument('--from', dest='source', help='a folder to look in for the dump first (the setup\'s folder)')
     ap.add_argument('--continue-update', metavar='OLD', help='finish an update after the restart (from OLD)')
     ap.add_argument('--rolled-back', metavar='VERSION', help='the stub went back from VERSION')
@@ -2747,7 +2747,7 @@ def main(argv=None):
         if lock is None:
             ctx.log('another launcher is running')
             return 0
-    root = tk.Tk(className='NX2navi')
+    root = tk.Tk(className='2NX2Navi')
     app = App(root, ctx, a)
     if a.selftest:
         from .selftest import run

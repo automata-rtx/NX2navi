@@ -20,6 +20,7 @@
 
 #include "cfg.h"
 #include "gfx.h"
+#include "host.h"
 #include "gfx_wsys.h"
 #include "input.h"
 #include "input_sdl.h"
@@ -470,7 +471,9 @@ static void open_window(void *arg) {
     MonInfo mon;
     int on_mon = chosen_monitor(&mon, 1);
     SDL_PropertiesID props = SDL_CreateProperties();
-    SDL_SetStringProperty(props, SDL_PROP_WINDOW_CREATE_TITLE_STRING, "NX2navi");
+    char title[96];
+    snprintf(title, sizeof title, "2NX2Navi %s", rt_port_version);
+    SDL_SetStringProperty(props, SDL_PROP_WINDOW_CREATE_TITLE_STRING, title);
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, w);
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, h);
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_VULKAN_BOOLEAN, true);

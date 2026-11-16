@@ -234,6 +234,7 @@ def main():
     ap.add_argument('--romfs', type=Path, help='RomFS directory (default build/extracted/<version>/romfs)')
     ap.add_argument('--exefs', type=Path, help='ExeFS directory (default build/extracted/<version>/exefs)')
     ap.add_argument('--list', help='a shader_list.tsv instead of tools/data/shader_list.tsv or refs/MacNativeGames')
+    ap.add_argument('--full-inventory', action='store_true', help='scan all RomFS packages for shader programs')
     ap.add_argument('--no-run', action='store_true', help='write the seed files only')
     ap.add_argument('--no-list', action='store_true', help='default variants only, without a shared shader list')
     ap.add_argument('--pipeline-list', help='a pipeline list instead of tools/data/pipeline_list.bin (tools/pipeline_list.py)')
@@ -247,16 +248,28 @@ def main():
     variants, prio = parse_list('' if a.no_list else read_list(a.list))
     extracted = ROOT / 'build' / 'extracted' / a.version
     listed = len(variants)
-    shaders, _ = inventory(a.romfs or extracted / 'romfs', a.exefs or extracted / 'exefs', everything=False)
+    shaders, _ = inventory(a.romfs or extracted / 'romfs', a.exefs or extracted / 'exefs', everything=a.full_inventory)
     # A missing list row says nothing about the walk: the list covers several versions, and 1.1.0 holds 17,587 of its
     # 41,414 rows, so most rows are absent because the game does not have them, not because the walk missed them. A walk
     # that found next to nothing does say something: the shader directories have moved.
-    if len(shaders) < max(64, listed // 20):
+    if not a.full_inventory and len(shaders) < max(64, listed // 20):
         print(f'only {len(shaders)} shaders found of the {listed} listed variants: reading every RomFS file instead',
               flush=True)
         shaders, _ = inventory(a.romfs or extracted / 'romfs', a.exefs or extracted / 'exefs')
     t1 = time.monotonic()
     progs, recs, seen, skipped = {}, [], set(), {'not in this version': 0, 'stage': 0}
+    plist = None if a.no_pipeline_list else read_pipeline_list(a.pipeline_list)
+    recorded_hashes = {rec[4:36] for rec in plist[0]} if plist else set()
+    # A recorded bind state still needs its program even when we skip the expensive default variant.
+    for key, shader in shaders.items():
+        if not recorded_hashes or a.all_shaders or not slow_unused(shader):
+            continue
+        stage, control, code = STAGES[shader['stage']], shader['control'][:CONTROL], shader['code']
+        c1_off, length = bounds(control, code)
+        c1 = code[c1_off:length]
+        h = code_hash(stage, control, code, length, c1)
+        if h in recorded_hashes:
+            progs[key] = (h, struct.pack('<III', stage, length, len(c1)) + h + control + code[:length] + c1)
     left_out = 0 if a.all_shaders else sum(1 for s in shaders.values() if slow_unused(s))
     variants += [(key, DEFAULT) for key in sorted(shaders) if a.all_shaders or not slow_unused(shaders[key])]
     for key, deps in variants:
@@ -284,7 +297,6 @@ def main():
         assert len(rec) == ANS_REC
         recs.append((prio.get(key, 2), rec))
     out = a.build.resolve()
-    plist = None if a.no_pipeline_list else read_pipeline_list(a.pipeline_list)
     (out / SEED_KEYS).unlink(missing_ok=True)   # a list this build no longer has
     if plist:
         extra, absent = list_variants(plist[0], {h for h, _ in progs.values()}, seen)

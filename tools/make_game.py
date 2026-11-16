@@ -1534,8 +1534,8 @@ def resource_file(rt):
     takes a .res among its inputs and builds the exe's resource section from it.
 
     Python writes it, so no tool opens a path by the system's ANSI code page: windres does (binutils), and a build
-    folder or a user folder whose name holds a character outside that code page (C:\\Users\\Víctor on a Cyrillic or a
-    Japanese Windows, D:\\Games\\Zelda：Ocarina) failed with "Invalid argument" or "Cannot create temporary file"."""
+    folder or a user folder whose name holds a character outside that code page (C:\\Users\\VÃƒÂ­ctor on a Cyrillic or a
+    Japanese Windows, D:\\Games\\ZeldaÃ¯Â¼Å¡Ocarina) failed with "Invalid argument" or "Cannot create temporary file"."""
     def resource(typ, name, data, flags):
         head = struct.pack('<HHHHIHHII', 0xffff, typ, 0xffff, name, 0, flags, 0x0409, 0, 0)
         return struct.pack('<II', len(data), 8 + len(head)) + head + data + b'\0' * (-len(data) % 4)
@@ -2088,7 +2088,9 @@ def step_shaders(out, update=False):
                 copy_if_changed(d / name, out / name)
             break
     cmd = [sys.executable, '-u', str(KIT / 'tools' / 'prepare_shaders.py'), str(out), '--romfs', str(out / 'romfs'),
-           '--exefs', str(out / 'exefs'), '--no-list', '--exe', EXE_NAME]
+           '--exefs', str(out / 'exefs'), '--version', 'v111', '--full-inventory', '--exe', EXE_NAME]
+    if not (KIT / 'tools' / 'data' / 'shader_list.tsv').is_file():
+        cmd.append('--no-list')
     why = ''
     carry = update and shader_carry(out)
     if carry and prepared_from(out) is not None:

@@ -47,7 +47,7 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_AFTER_RESTART] = "after restart", [UI_MENU_SET_BY_ENV] = "set by environment variable",
     [UI_MENU_SAVE_FAILED] = "could not save settings",
     [UI_MENU_INI_UNKNOWN] = "nx2navi.ini: not settings of this version, ignored: %s",
-    [UI_MENU_VERSION] = "NX2navi %s, game %s",
+    [UI_MENU_VERSION] = "2NX2Navi %s, game %s",
 
     [UI_MENU_FULLSCREEN] = "Fullscreen", [UI_MENU_FULLSCREEN_DESC] = "Play in fullscreen. F11 switches it.",
     [UI_MENU_WINDOW_SIZE] = "Window size", [UI_MENU_WINDOW_SIZE_DESC] = "Window size outside fullscreen.",
@@ -517,7 +517,7 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_SAVE_IMPORT_CANCEL_DESC] = "Keeps your save as it is: the save waiting for the next start is dropped.",
     [UI_MENU_SAVE_BUSY] = "working…",
     [UI_MENU_SAVE_EXPORTED] = "Saved as %s",
-    [UI_MENU_SAVE_IMPORT_READY] = "The save (NX2navi %s) loads at the next start: select Restart below. Your current "
+    [UI_MENU_SAVE_IMPORT_READY] = "The save (2NX2Navi %s) loads at the next start: select Restart below. Your current "
                                   "save is copied to the saves folder first.",
     [UI_MENU_SAVE_IMPORT_CANCELLED] = "Import cancelled; your save stays as it is.",
     [UI_MENU_SAVE_IMPORTED] = "A shared save was imported at this start. Your old save is in %s",
@@ -738,7 +738,7 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_AFTER_RESTART] = "после перезапуска", [UI_MENU_SET_BY_ENV] = "задано переменной окружения",
     [UI_MENU_SAVE_FAILED] = "не удалось сохранить настройки",
     [UI_MENU_INI_UNKNOWN] = "nx2navi.ini: не настройки этой версии, пропущены: %s",
-    [UI_MENU_VERSION] = "NX2navi %s, игра %s",
+    [UI_MENU_VERSION] = "2NX2Navi %s, игра %s",
 
     [UI_MENU_FULLSCREEN] = "Полный экран", [UI_MENU_FULLSCREEN_DESC] = "Игра на весь экран. F11 переключает.",
     [UI_MENU_WINDOW_SIZE] = "Размер окна", [UI_MENU_WINDOW_SIZE_DESC] = "Размер окна вне полноэкранного режима.",
@@ -1209,7 +1209,7 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
                                         "удаляется.",
     [UI_MENU_SAVE_BUSY] = "выполняется…",
     [UI_MENU_SAVE_EXPORTED] = "Сохранено: %s",
-    [UI_MENU_SAVE_IMPORT_READY] = "Сохранение (NX2navi %s) загрузится при следующем запуске: выберите «Перезапустить» "
+    [UI_MENU_SAVE_IMPORT_READY] = "Сохранение (2NX2Navi %s) загрузится при следующем запуске: выберите «Перезапустить» "
                                   "внизу. Текущее сохранение сначала копируется в папку saves.",
     [UI_MENU_SAVE_IMPORT_CANCELLED] = "Импорт отменён, ваше сохранение не изменилось.",
     [UI_MENU_SAVE_IMPORTED] = "При этом запуске импортировано сохранение. Прежнее сохранение лежит в %s",
@@ -1425,7 +1425,7 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_AFTER_RESTART] = "após reiniciar", [UI_MENU_SET_BY_ENV] = "definido por variável de ambiente",
     [UI_MENU_SAVE_FAILED] = "não foi possível salvar as configurações",
     [UI_MENU_INI_UNKNOWN] = "nx2navi.ini: não são configurações desta versão, ignoradas: %s",
-    [UI_MENU_VERSION] = "NX2navi %s, jogo %s",
+    [UI_MENU_VERSION] = "2NX2Navi %s, jogo %s",
 
     [UI_MENU_FULLSCREEN] = "Tela cheia", [UI_MENU_FULLSCREEN_DESC] = "Jogar em tela cheia. F11 alterna.",
     [UI_MENU_WINDOW_SIZE] = "Tamanho da janela",
@@ -1888,7 +1888,7 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
                                         "descartado.",
     [UI_MENU_SAVE_BUSY] = "trabalhando…",
     [UI_MENU_SAVE_EXPORTED] = "Salvo como %s",
-    [UI_MENU_SAVE_IMPORT_READY] = "O save (NX2navi %s) é carregado na próxima inicialização: selecione Reiniciar abaixo. "
+    [UI_MENU_SAVE_IMPORT_READY] = "O save (2NX2Navi %s) é carregado na próxima inicialização: selecione Reiniciar abaixo. "
                                   "Seu save atual é copiado antes para a pasta saves.",
     [UI_MENU_SAVE_IMPORT_CANCELLED] = "Importação cancelada; seu save continua como estava.",
     [UI_MENU_SAVE_IMPORTED] = "Um save compartilhado foi importado nesta inicialização. Seu save anterior está em %s",
@@ -2111,7 +2111,7 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_SET_BY_ENV] = "由环境变量设定",
     [UI_MENU_SAVE_FAILED] = "无法保存设置",
     [UI_MENU_INI_UNKNOWN] = "nx2navi.ini：以下不是此版本的设置，已忽略：%s",
-    [UI_MENU_VERSION] = "NX2navi %s，游戏 %s",
+    [UI_MENU_VERSION] = "2NX2Navi %s，游戏 %s",
     [UI_MENU_FULLSCREEN] = "全屏",
     [UI_MENU_FULLSCREEN_DESC] = "全屏运行。按 F11 切换。",
     [UI_MENU_WINDOW_SIZE] = "窗口大小",
@@ -2661,7 +2661,7 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_SAVE_IMPORT_CANCEL_DESC] = "保留你的存档不变：丢弃等待下次启动的存档。",
     [UI_MENU_SAVE_BUSY] = "处理中…",
     [UI_MENU_SAVE_EXPORTED] = "已保存为 %s",
-    [UI_MENU_SAVE_IMPORT_READY] = "该存档（NX2navi %s）将在下次启动时载入：请选择下方的“重启”。你当前的存档会先复制到 saves "
+    [UI_MENU_SAVE_IMPORT_READY] = "该存档（2NX2Navi %s）将在下次启动时载入：请选择下方的“重启”。你当前的存档会先复制到 saves "
                                   "文件夹。",
     [UI_MENU_SAVE_IMPORT_CANCELLED] = "已取消导入，你的存档保持不变。",
     [UI_MENU_SAVE_IMPORTED] = "本次启动时已导入分享的存档。你原来的存档在 %s",
