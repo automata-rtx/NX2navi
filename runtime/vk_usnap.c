@@ -329,7 +329,7 @@ void vk_usnap_take(const uint64_t *handles, int n) {
     Taken *t = calloc(1, sizeof *t);
     if (!t) rt_fatal("vk_usnap: out of memory");
     t->n = n, t->first = handles[0];
-    t->owners = motion_owner_acquire();
+    if (vk_dlaa_available()) t->owners = motion_owner_acquire();
     int creg = 0;
     plat_mutex_lock(&gather_lock);
     U.ncol = 0;
@@ -417,7 +417,7 @@ void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
         RP_VALUE(RPK_OUTCOME, RPO_ADOPTED);
         return;
     }
-    if (!gfx_replay_async()) U.owners = motion_owner_acquire();
+    if (!gfx_replay_async() && vk_dlaa_available()) U.owners = motion_owner_acquire();
     uint64_t t0 = kern_now_ns();
     RP_CALL(RP_USNAP_GATHER_LOCK, plat_mutex_lock(&gather_lock));
     RP_SCOPE(rp_gather, RP_USNAP_GATHER);

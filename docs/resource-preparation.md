@@ -745,6 +745,14 @@ validation errors are not evidence that Vulkan validation layers were enabled.
 
 ## Windows benchmark baseline
 
+Young Link and his equipped gear contribute motion vectors to the temporal renderer
+by default on game version 1.1.1. One-frame-ahead replay remains opt-in because it
+can cause visible artifacts. Use `replay_async = 0` in the `[performance]` section
+of `nx2navi.ini` when comparing against this baseline.
+
+The Young Link playtest uses `resource_prep = 0` and `resource_deps = integrated`.
+Record these settings explicitly when comparing it with a standard Windows build.
+
 The Windows defaults enable prepared resources and integrated texture dependency tracking.
 The measured Ryzen 7 7800X3D build used the normal Windows build with
 `NX2NAVI_RENDERER_CPU=znver4` in the build environment. This selects ThinLTO for

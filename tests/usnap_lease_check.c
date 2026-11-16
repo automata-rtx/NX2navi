@@ -19,7 +19,22 @@ uint64_t vk_sync_fence_done(void) { return completed; }
 uint64_t kern_now_ns(void) { return ++ticks; }
 int rt_knob(const char *name, const char *def) { (void)name; (void)def; return 1; }
 int rt_ab(void) { return 0; }
-int vk_dlaa_available(void) { return 0; }
+static int temporal, async_replay, owner_acquires;
+static MotionOwnerSnapshot owner_snapshot;
+int vk_dlaa_available(void) { return temporal; }
+int gfx_replay_async(void) { return async_replay; }
+MotionOwnerSnapshot *motion_owner_acquire(void) {
+    owner_acquires++;
+    owner_snapshot.refs++;
+    return &owner_snapshot;
+}
+void motion_owner_release(MotionOwnerSnapshot *snapshot) {
+    if (snapshot) {
+        assert(snapshot == &owner_snapshot && snapshot->refs);
+        snapshot->refs--;
+    }
+}
+void motion_owner_shutdown(void) { assert(!owner_snapshot.refs); }
 uint64_t vk_mvprev_step(int stage, int index, uint64_t size) { (void)stage; (void)index; (void)size; return 0; }
 uint64_t vk_mem_gen(void) { return 1; }
 int vk_mem_lookup(uint64_t addr, uint64_t n, VkMemSpan *out) {
@@ -267,6 +282,16 @@ int main(void) {
     vk_usnap_proof_begin(&invalid_proof);
     assert(!vk_usnap_proof_inherit(&invalid_proof, &invalid_proof));
     vk_usnap_end(7);
+    assert(owner_acquires == 0);
+    temporal = 1;
+    vk_usnap_begin(&handle, 1, 8);
+    assert(U.owners == &owner_snapshot && owner_snapshot.refs == 1);
+    vk_usnap_end(8);
+    async_replay = 1;
+    vk_usnap_take(&handle, 1);
+    vk_usnap_begin(&handle, 1, 9);
+    assert(U.owners == &owner_snapshot && owner_snapshot.refs == 1 && owner_acquires == 2);
+    vk_usnap_end(9);
     vk_usnap_shutdown();
     free(allocation);
     puts("snapshot leases/proofs: intervals, ordered drops, publication, renewal, collisions, capture reuse and async adoption passed");

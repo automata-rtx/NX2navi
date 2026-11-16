@@ -32,7 +32,7 @@ static int owner_on, player_motion;
 static void owner_init(void *unused) {
     (void)unused;
     player_motion = rt_knob("PLAYER_MOTION", "1");
-    owner_on = RT_V111 && rt_knob("SHIELD_MOTION", "0");
+    owner_on = RT_V111 && rt_knob("SHIELD_MOTION", "1");
 }
 int motion_owner_enabled(void) {
     plat_once(&owner_once, owner_init, NULL);
