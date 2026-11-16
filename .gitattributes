@@ -3,6 +3,7 @@
 *.ps1 text eol=crlf
 *.bat text eol=crlf
 *.cmd text eol=crlf
+tools/input/benchmark/*-route.txt text eol=crlf
 
 *.png binary
 *.jpg binary

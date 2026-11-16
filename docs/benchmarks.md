@@ -15,3 +15,9 @@ For Castle Town, review each six-turn collage against the approved reference usi
 Each run directory holds `run.json`, `frames.bin` and a verified lossless `game.log.gz`. Compression starts after game exit. Each frame carries its application present number, interval in nanoseconds and game clock in microseconds. Whole-route scores include presents strictly after the start marker through the end marker. The Kokiri stress window is world seconds 1–8, Field is 24–32, and Castle Town is the first 750 ms of present intervals after each of six scored L2 taps. Average FPS is the reciprocal of mean interval. Median, 5%, 1% and 0.1% lows are reciprocals of linearly interpolated P50, P95, P99 and P99.9 frame times. Summarize scenes by the median of the per-run metrics and retain their ranges. Very short windows can have just one or two frames deciding the 0.1% low.
 
 The latest Beta 1 reference on the benchmark PC is `build/beta1-frame-recorder/runs.csv` with matching `stress-windows.csv`. Filter on `comparable_fully_warm=True` (four Kokiri, four Field and three Castle Town runs). These historical runs support a comparison with past performance. A small difference inside their run-to-run variation needs stronger evidence to attribute it to a branch.
+
+After verifying a Castle Town collage, write the verdict in that run's `camera-review.txt`. Use `excluded.txt` for a rejected attempt. The comparison tool checks the save hashes, route hashes and capture settings, then writes `comparison.csv` in the candidate directory. It includes both builds' sample counts, medians, ranges and percentage changes for all five FPS metrics in both windows.
+
+```powershell
+python tools/compare_benchmarks.py build/beta1-frame-recorder build/new-benchmark
+```
