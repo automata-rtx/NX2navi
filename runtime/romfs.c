@@ -800,11 +800,11 @@ static void action_prompt_overlay(void) {
     size_t n, dn, out_n = 0;
     void *in = read_served(ACTION_PROMPT_ARCHIVE, &base, &n, keeps), *out = NULL;
     void *dic = in ? read_served("Pack/ZsDic.pack.zs", &dic_base, &dn, keeps) : NULL;
-    int made = in && dic ? action_prompt_build(in, n, dic, dn, 1, &out, &out_n) : -1;
+    int made = in && dic ? action_prompt_build(in, n, dic, dn, layout, &out, &out_n) : -1;
     free(in);
     free(dic);
     if (made == 0 || (made > 0 && serve_generated(ACTION_PROMPT_ARCHIVE, base, out, out_n, "action-prompt",
-                                                   "face buttons by label", keeps)))
+                                                   "controller button positions", keeps)))
         action_prompt_for = layout;
 }
 
@@ -816,7 +816,7 @@ int romfs_action_prompt(void) { return action_prompt_for; }
 // romfs-patches-pc keeps that name, but at a game resolution of another shape than 16:9 its files come from pc_dir,
 // romfs-patches-pc-<w>x<h> (overlay_init).
 #define PROMPTS_PADS 3      // the pad styles: Xbox, PlayStation, Steam Deck
-#define PROMPTS_FOLDERS (PROMPTS_PADS * 2 + 1)   // each pad style by position and by label, then PC
+#define PROMPTS_FOLDERS (PROMPTS_PADS * PAD_LAYOUT_COUNT + 1)   // all four face layouts per controller style, then PC
 // A style's name in the log and its NX2NAVI_PROMPTS value.
 static const char *prompts_style(int pick) {
     return pick == PROMPTS_PC ? "keyboard and mouse" : pick == PROMPTS_PLAYSTATION ? "PlayStation"
@@ -871,11 +871,9 @@ static void overlay_init(void) {
     // With prompts = xbox, playstation or steamdeck, that pad's prompts folder for the pad layout in its place
     // (input_prompts_folder): the game's button font and interface textures with that pad's buttons drawn in
     // (tools/pad_prompts.py). The game reads the font and the archives once at boot, so
-    // the prompts stay until restart even though the layout itself changes live. Each folder replaces romfs-patches as
-    // a whole and the setup builds no folder of another shape with Xbox prompts, so a game resolution that is not 16:9
-    // keeps the Switch prompts. So does a RomFS mod (the NX2NAVI_ROMFS_MODS manifest or a player mod) that replaces one of
-    // the prompts' fonts: romfs-patches loads in their place, so the mod's file is not served beside prompts files made
-    // for the game's own. A mod's resource size table is no clash: restbl_overlay merges it with the prompts' one.
+    // the prompts stay until restart even though the layout itself changes live. Drawn controller font and texture
+    // overlays can accompany a widescreen layout. Older overlays that include other UI files keep their 16:9
+    // restriction. A RomFS mod that replaces a prompt resource takes precedence. Resource size tables are merged.
     // prompts = pc takes romfs-patches-pc whatever the pad layout, and at a game resolution of another shape
     // romfs-patches-pc-<w>x<h> (make_romfs_patches.py --prompts pc --aspect): it carries that shape's UI layout too, so
     // it replaces romfs-patches-<w>x<h> as romfs-patches-pc replaces romfs-patches.
@@ -894,11 +892,10 @@ static void overlay_init(void) {
                    "(tools/make_romfs_patches.py --aspect %ux%u)", out[0], out[1], out[0], out[1]);
         }
     }
-    static const char *const layouts[2] = {"nintendo", "xbox"};   // each pad's two folders, then the PC one
     static const int pads[PROMPTS_PADS] = {PROMPTS_XBOX, PROMPTS_PLAYSTATION, PROMPTS_STEAMDECK};
     for (int i = 0; i < PROMPTS_FOLDERS; i++) {
         int pc = i == PROMPTS_FOLDERS - 1;
-        const char *name = pc ? input_prompts_folder(PROMPTS_PC, 0) : input_prompts_folder(pads[i / 2], layouts[i % 2]);
+        const char *name = pc ? input_prompts_folder(PROMPTS_PC, 0) : input_pad_prompts_folder(pads[i / PAD_LAYOUT_COUNT], i % PAD_LAYOUT_COUNT);
         const char *dir = name;
         if (pc) {
             if (wide) snprintf(pc_dir, sizeof pc_dir, "%s-%ux%u", name, out[0], out[1]);
@@ -914,7 +911,6 @@ static void overlay_init(void) {
     const char *style = prompts_style(pick);
     prompts_wanted = input_prompts_folder(pick, layout);
     prompts_off = !prompts_wanted                         ? ROMFS_PROMPTS_OK
-                  : wide && !shaped                       ? ROMFS_PROMPTS_SHAPE
                   : patches && !wide                      ? ROMFS_PROMPTS_PATCHES
                   : !romfs_prompts_ready(prompts_wanted)  ? (shaped ? ROMFS_PROMPTS_SHAPE : ROMFS_PROMPTS_MISSING)
                                                           : ROMFS_PROMPTS_OK;
@@ -924,9 +920,26 @@ static void overlay_init(void) {
         // fits: its manifest path did
         snprintf(path, sizeof path, "%s/%s", index_dir, shaped ? pc_dir : prompts_wanted);
         if (overlay_load(path, 1, 0)) {
-            prompts_loaded = prompts_wanted;
-            rt_log("RomFS overlay: %s button prompts (%s)", style, path);
-            if (shaped) patches = NULL;   // in place of romfs-patches-<w>x<h>, whose UI layout it carries
+            // Modern pad art overlays only the font, textures and resource budget. Other (older) overlays
+            // can include 16:9 layouts, which must not override a widescreen layout.
+            int compatible = 1;
+            if (wide && !shaped) {
+                for (size_t i = first; i < noverlay; i++) {
+                    const char *file = overlays[i].name;
+                    if (strcmp(file, "Font2/Scalable/External.Nin_Ounce_NVN2.bfotf.zs") &&
+                        strcmp(file, "UI/Layout2Archive/Common.Product.100.Nin_Ounce_NVN2.bntx.zs") &&
+                        strcmp(file, restbl_rel)) compatible = 0;
+                }
+            }
+            if (compatible) {
+                prompts_loaded = prompts_wanted;
+                rt_log("RomFS overlay: %s button prompts (%s)", style, path);
+                if (shaped) patches = NULL;   // the PC overlay includes the widescreen UI layout
+            } else {
+                overlay_drop(first, noverlay);
+                prompts_off = ROMFS_PROMPTS_SHAPE;
+                rt_log("RomFS overlay: %s includes other UI files, keeping the widescreen layout", path);
+            }
         } else {
             prompts_off = ROMFS_PROMPTS_FAILED;
             rt_log("RomFS overlay: %s failed its check (run the setup again); romfs-patches loads instead", path);
@@ -958,7 +971,7 @@ static void overlay_init(void) {
         prompts_loaded = NULL;
         prompts_off = ROMFS_PROMPTS_MODS;
         if (shaped) overlay_load(def, 0, 0);
-        else if (plain_ok) overlay_load(plain, 0, 0);
+        else if (!wide && plain_ok) overlay_load(plain, 0, 0);
     }
     restbl_collect();
     overlay_contest();

@@ -123,9 +123,9 @@ SCAN_TOOL = '55ea0c150aaf9dac93a2e6fd3b4ca11e1c572b5eee8b6bd74960535964384634'
 # The same for the tools that draw the button prompts (tools/pad_prompts.py, prompt_art.py, button_icons.py) in the
 # prompts step's key, which held the digest of the three scripts' bytes: two of four releases changed a script, and
 # each time every install drew its prompts again, a minute. Changed by hand when a change to the scripts can change
-# what they write. Its value is their digest in 0.7.0 and 0.7.1, so the key of an install made by those stays what it
-# is. tests/launcher_test.py test_the_prompt_tools_logic_is_the_recorded_one asks the question when the logic changes.
-PROMPT_TOOLS = 'ad59f2c4533f6ea2630b916ef5f3695f72daffe9b2b7663eea4168a4f08e4249'
+# what they write. The independent X/Y layouts add six folders. tests/launcher_test.py
+# test_the_prompt_tools_logic_is_the_recorded_one checks this version against the generator.
+PROMPT_TOOLS = 'native-shoulder-labels-1'
 
 # Bring-up fixes in the lifted SDK, each anchored on exact generated text that must occur once.
 LIFT_FIXES = [

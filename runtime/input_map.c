@@ -41,10 +41,11 @@
 enum { DEFAULT_KEY_COUNT = 31, DEFAULT_PAD_COUNT = 16 };
 _Static_assert(sizeof (Binding[]){DEFAULT_KEYS} / sizeof (Binding) == DEFAULT_KEY_COUNT, "DEFAULT_KEY_COUNT");
 
-static const InputMap defaults = {{DEFAULT_KEYS}, DEFAULT_KEY_COUNT, {{NINTENDO_PADS}, {XBOX_PADS}},
-                                  {DEFAULT_PAD_COUNT, DEFAULT_PAD_COUNT}};
-InputMap input_map = {{DEFAULT_KEYS}, DEFAULT_KEY_COUNT, {{NINTENDO_PADS}, {XBOX_PADS}},
-                      {DEFAULT_PAD_COUNT, DEFAULT_PAD_COUNT}};
+#define DEFAULT_MAP {{DEFAULT_KEYS}, DEFAULT_KEY_COUNT, \
+    {{NINTENDO_PADS}, {XBOX_PADS}, {DEFAULT_PADS(B_B, B_A, B_X, B_Y)}, {DEFAULT_PADS(B_A, B_B, B_Y, B_X)}}, \
+    {DEFAULT_PAD_COUNT, DEFAULT_PAD_COUNT, DEFAULT_PAD_COUNT, DEFAULT_PAD_COUNT}}
+static const InputMap defaults = DEFAULT_MAP;
+InputMap input_map = DEFAULT_MAP;
 
 static const char *const action_names[ACTION_COUNT] = {
     "A", "B", "X", "Y", "LCLICK", "RCLICK", "L", "R", "ZL", "ZR", "PLUS", "MINUS", "LEFT", "UP", "RIGHT", "DOWN",
@@ -290,9 +291,11 @@ void input_map_line(const InputMap *m, int action, char *out, size_t n) {
 }
 
 int input_pad_layout_pick(const char *setting, int east_labelled_a) {
-    if (setting && (!strcasecmp(setting, "nintendo") || !strcasecmp(setting, "xbox_prompts"))) return PAD_LAYOUT_NINTENDO;
-    if (setting && (!strcasecmp(setting, "xbox") || !strcasecmp(setting, "playstation"))) return PAD_LAYOUT_XBOX;
-    return east_labelled_a ? PAD_LAYOUT_NINTENDO : PAD_LAYOUT_XBOX;
+    int xbox = !east_labelled_a;
+    if (setting && (!strcasecmp(setting, "nintendo") || !strcasecmp(setting, "xbox_prompts"))) xbox = 0;
+    if (setting && (!strcasecmp(setting, "xbox") || !strcasecmp(setting, "playstation"))) xbox = 1;
+    if (cfg_bool("NX2NAVI_SWAP_JUMP_ATTACK")) return xbox ? PAD_LAYOUT_XBOX_SWAP_XY : PAD_LAYOUT_NINTENDO_SWAP_XY;
+    return xbox ? PAD_LAYOUT_XBOX : PAD_LAYOUT_NINTENDO;
 }
 
 int input_prompts_pick(const char *prompts, const char *pad_layout) {
@@ -306,14 +309,19 @@ int input_prompts_pick(const char *prompts, const char *pad_layout) {
 }
 
 const char *input_prompts_folder(int prompts, const char *pad_layout) {
+    return input_pad_prompts_folder(prompts, input_pad_layout_pick(pad_layout, 0));
+}
+
+const char *input_pad_prompts_folder(int prompts, int layout) {
+#define FOLDERS(style) {"romfs-patches-" style, "romfs-patches-" style "-label", \
+                        "romfs-patches-" style "-swap-xy", "romfs-patches-" style "-label-swap-xy"}
+    static const char *const folders[][PAD_LAYOUT_COUNT] = {
+        [PROMPTS_XBOX] = FOLDERS("xbox"), [PROMPTS_PLAYSTATION] = FOLDERS("playstation"),
+        [PROMPTS_STEAMDECK] = FOLDERS("steamdeck")};
+#undef FOLDERS
     if (prompts == PROMPTS_PC) return "romfs-patches-pc";
-    if (prompts != PROMPTS_XBOX && prompts != PROMPTS_PLAYSTATION && prompts != PROMPTS_STEAMDECK) return NULL;
-    // The folders are read at start, before a pad is open: auto counts as Xbox, as for a pad without Nintendo labels.
-    // A Nintendo-labelled pad under auto plays by label too (its A is on the button labelled A), so it matches as well.
-    int by_position = input_pad_layout_pick(pad_layout, 0) == PAD_LAYOUT_NINTENDO;
-    if (prompts == PROMPTS_PLAYSTATION) return by_position ? "romfs-patches-playstation" : "romfs-patches-playstation-label";
-    if (prompts == PROMPTS_STEAMDECK) return by_position ? "romfs-patches-steamdeck" : "romfs-patches-steamdeck-label";
-    return by_position ? "romfs-patches-xbox" : "romfs-patches-xbox-label";
+    if (prompts < 0 || (size_t)prompts >= sizeof folders / sizeof *folders || (unsigned)layout >= PAD_LAYOUT_COUNT) return NULL;
+    return folders[prompts][layout];
 }
 
 uint64_t input_map_pad_buttons(const uint8_t down[PAD_COUNT], int layout) {

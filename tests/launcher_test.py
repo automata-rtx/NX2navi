@@ -1959,8 +1959,8 @@ class MakeGameTest(Tmp):
             self.assertEqual((others, runs), (['compile', 'lift', 'romfs', 'scan', 'shaders'], 1))
             self.assertEqual(states(ev), ['start', 'done'])
             fractions = [e['fraction'] for e in ev if e['ev'] == 'progress']
-            sets = len(self.mg.prompt_art.OVERLAYS)   # two folders per pad style and the keyboard and mouse one
-            self.assertEqual(sets, 7)
+            sets = len(self.mg.prompt_art.OVERLAYS)   # four layouts per pad style and one keyboard/mouse set
+            self.assertEqual(sets, 13)
             self.assertEqual(fractions, [round(i / sets, 4) for i in range(sets + 1)])
             details = [e['detail'] for e in ev if e['ev'] == 'progress']
             self.assertEqual(details[-1], f'Drew {sets} of {sets} sets of button prompts')
@@ -3327,10 +3327,10 @@ class FileCheckTest(Tmp):
 # PromptToolsTest.test_the_prompt_tools_logic_is_the_recorded_one. If the change can alter what the tools write, give
 # PROMPT_TOOLS a new value (every install then draws its prompts again) and record both here; if it cannot, record
 # only the new digests.
-PROMPT_LOGIC = ('ad59f2c4533f6ea2630b916ef5f3695f72daffe9b2b7663eea4168a4f08e4249',
-                {'pad_prompts.py': '780c246b5fde7a0e9dbf3f59ad16372e1737592add6f2f2d9825bee6df4e296f',
-                 'prompt_art.py': '87edacabcddb4952f5862373815d7d46a05c67f350e0734025ae4d2f83b12038',
-                 'button_icons.py': '3804e371a030965bc9eb4226f333b611651f25efaa67ee523b404edc3257818a'})
+PROMPT_LOGIC = ('native-shoulder-labels-1',
+                {'pad_prompts.py': '10fefe9c8dd1de422d7585d5d9db23dc9896622d14d39771fc1dfc07fe63eaa5',
+                 'prompt_art.py': '322d74443ba5fe62c9f4e5553ad450b246b198a17ef96753b0732916c0ec340a',
+                 'button_icons.py': '021730a02fb22225c942236386ef2594a746d1e065d75d01b4717563b8eb7502'})
 
 
 def load_pad_prompts():
@@ -3410,7 +3410,31 @@ class PromptToolsTest(Tmp):
         content, used = romfs.load('UI/dict.bntx.zs')
         self.assertEqual((content, used.dict_id()), (b''.join(samples[:50]), dic.dict_id()))
 
-    def test_the_prompts_key_is_the_one_installs_have(self):
+    def test_steam_dpad_fill(self):
+        try:
+            from fontTools.pens.pointInsidePen import PointInsidePen
+        except ImportError:
+            self.skipTest('needs fontTools')
+        # Sample at the center of each arm, ordered up, down, left, right.
+        masks = {0xe049: '1111', 0xe060: '1000', 0xe061: '0100', 0xe062: '0010',
+                 0xe063: '0001', 0xe064: '1100', 0xe065: '0011', 0xe06a: '0111'}
+        for cp, mask in masks.items():
+            for point, filled in zip([(50, 85), (50, 15), (15, 50), (85, 50), (50, 50), (50, 94), (50, 99)], mask + '001'):
+                pen = PointInsidePen(None, point)
+                self.pp.draw_cross_dpad(pen, (0, 0, 100, 100), self.pp.DPAD_DIRECTIONS[cp])
+                self.assertEqual(pen.getResult(), filled == '1', (hex(cp), point))
+
+    def test_controller_swap_changes_only_xy_art(self):
+        import prompt_art
+        for style in self.pp.STYLES:
+            for base, opposite in (('label', 'position'), ('position', 'label')):
+                mixed_layout = base + '-swap-xy'
+                self.assertIn(self.pp.overlay_folder(style, mixed_layout), prompt_art.OVERLAYS)
+                for mixed, normal, other in zip(self.pp.pad_pictures(style, mixed_layout),
+                                                self.pp.pad_pictures(style, base), self.pp.pad_pictures(style, opposite)):
+                    self.assertEqual(mixed, {k: other[k] if k in ('X', 'Y') else v for k, v in normal.items()})
+
+    def test_the_prompts_key_includes_the_new_layouts_version(self):
         import make_game
         kit = self.tmp / 'kit'
         art = kit / 'prompt-art' / 'XGamepad' / 'Default'
@@ -3419,7 +3443,7 @@ class PromptToolsTest(Tmp):
         out = self.tmp / 'game'
         out.mkdir()
         ident = 'nup C:\\dumps\\game.nup 28000000000 1760000000'
-        released = 'ad59f2c4533f6ea2630b916ef5f3695f72daffe9b2b7663eea4168a4f08e4249'   # the scripts of 0.7.1
+        released = PROMPT_LOGIC[0]
         with mock.patch.object(make_game, 'KIT', kit):
             pictures = make_game.tree_digest(kit / 'prompt-art', ('**/*.png',))
             binds = make_game.sha256_bytes(b'[]')

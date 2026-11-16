@@ -11,6 +11,7 @@
 
 // what input_map.c needs from the rest of the runtime; none of it is reached from input_mouse_stick
 const char *cfg_get(const char *key) { (void)key; return NULL; }
+int cfg_bool(const char *key) { (void)key; return 0; }
 double cfg_double(const char *key) { (void)key; return 0; }
 void rt_log(const char *fmt, ...) { (void)fmt; }
 

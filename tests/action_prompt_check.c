@@ -15,6 +15,7 @@
 #include <zstd.h>
 
 #include "action_prompt.h"
+#include "input_map.h"
 #include "sarc.h"
 
 static int fails;
@@ -301,6 +302,12 @@ static void game_archive(char **argv) {
     CHECK(copies == 4 && fields == 4 * 52, "game: %d copies of the layout, %d fields changed (%s)", copies, fields, why);
     memcpy(expect_back, expect, rn);
     action_prompt_archive(expect_back, rn, 0, why, sizeof why);
+    uint8_t *mixed = malloc(rn);
+    memcpy(mixed, raw, rn);
+    CHECK(action_prompt_archive(mixed, rn, PAD_LAYOUT_XBOX_SWAP_XY, why, sizeof why) > 0 &&
+          action_prompt_archive(mixed, rn, PAD_LAYOUT_XBOX_SWAP_XY, why, sizeof why) == 0,
+          "game: mixed Steam controller layout: %s", why);
+    free(mixed);
 
     void *out = NULL, *again = NULL;
     size_t out_n = 0, again_n = 0;
@@ -435,9 +442,14 @@ int main(int argc, char **argv) {
     CHECK(action_prompt_lay_out(p, 3, 1, why, sizeof why) == -1, "a 3-byte file");
     p[0] = 'X';
     CHECK(action_prompt_lay_out(p, n, 1, why, sizeof why) == -1 && strstr(why, "BFFH"), "wrong magic: %s", why);
-    // A label other than 1 counts as by label.
     memcpy(p, before, n);
-    CHECK(action_prompt_lay_out(p, n, 2, why, sizeof why) == 52 && px(p, "N_BtnA_00", 0x20) == -80, "label 2: %s", why);
+    CHECK(action_prompt_lay_out(p, n, PAD_LAYOUT_XBOX_SWAP_XY, why, sizeof why) > 0 &&
+          px(p, "N_BtnA_00", 0x20) == -80 && px(p, "N_BtnX_00", 0x20) == 80 &&
+          px(p, "N_BtnY_00", 0x1c) == -80, "Xbox swap: A bottom, jump top, attack left: %s", why);
+    CHECK(action_prompt_lay_out(p, n, PAD_LAYOUT_NINTENDO_SWAP_XY, why, sizeof why) > 0 &&
+          px(p, "N_BtnA_00", 0x1c) == 80 && px(p, "N_BtnX_00", 0x1c) == -80 &&
+          px(p, "N_BtnY_00", 0x20) == 80, "Nintendo swap: A right, jump left, attack top: %s", why);
+    CHECK(action_prompt_lay_out(p, n, PAD_LAYOUT_NINTENDO_SWAP_XY, why, sizeof why) == 0, "swap applied twice");
     // Both bubbles of X on one record, their values the same in both layouts: laid out, the record moved once.
     memcpy(p, before, n);
     uint64_t shared = pane_at[pane("W_BaseX_00")];

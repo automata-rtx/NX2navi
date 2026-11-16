@@ -8,9 +8,7 @@
 // The shared interface layouts of the game, which hold the action prompt (DoCommand_00).
 #define ACTION_PROMPT_ARCHIVE "UI/Layout2Archive/Common.Product.100.Nin_Ounce_NVN2.blarc.zs"
 
-// Lays the diamond of DoCommand_00.buil (p[0..n), in place) out for the face buttons by label (label nonzero: A
-// bottom, B right, X left, Y top) or by position (label = 0: the Switch's places, A right, B bottom, X top, Y left).
-// The runtime asks for label 1 only (romfs.c action_prompt_overlay); label 0 takes a layout by label back. Every field
+// Lays the diamond of DoCommand_00.buil (p[0..n), in place) out for a PAD_LAYOUT_* value in input_map.h. Every field
 // is found and checked before any is written, and read again after. Returns the number of fields changed; 0 when the
 // diamond is laid out that way already; -1 when the file is not the layout this expects (why says which field
 // differs; the file is left as it was).

@@ -49,7 +49,7 @@ enum {
 
 // Gamepad layouts (NX2NAVI_PAD_LAYOUT): which face button is Switch A. Nintendo: by position, east A, south B, west Y,
 // north X. Xbox: south A, east B, west X, north Y, as an Xbox pad labels them (cross A, circle B on a PlayStation pad).
-enum { PAD_LAYOUT_NINTENDO, PAD_LAYOUT_XBOX, PAD_LAYOUT_COUNT };
+enum { PAD_LAYOUT_NINTENDO, PAD_LAYOUT_XBOX, PAD_LAYOUT_NINTENDO_SWAP_XY, PAD_LAYOUT_XBOX_SWAP_XY, PAD_LAYOUT_COUNT };
 
 enum { INPUT_BINDING_MAX = 96, INPUT_PAD_BINDING_MAX = 48 };
 
@@ -86,6 +86,7 @@ void input_map_configure(void);
 // PlayStation name (cross A, circle B, square X, triangle Y); "xbox_prompts", 0.1.9's name for the Nintendo layout with
 // the Xbox prompts, maps the buttons as "nintendo". Anything else ("auto", NULL) picks Nintendo when the pad's east
 // button is labelled A (a Switch Pro Controller, a GuliKit) and Xbox otherwise.
+const char *input_pad_prompts_folder(int prompts, int layout);
 int input_pad_layout_pick(const char *setting, int east_labelled_a);
 
 // Button prompts (NX2NAVI_PROMPTS): the controller whose buttons the game's prompts show. Nintendo: the game's own. Xbox,

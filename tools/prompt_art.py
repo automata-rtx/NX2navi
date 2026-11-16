@@ -89,11 +89,12 @@ BLANKS = {'Dark': f'{KM}Blanks/T_Blank_Black_Normal.png', 'White': f'{KM}Blanks/
 def overlay_folder(style, layout=None):
     """The game folder's overlay folder of a style ('pc' for the keyboard and mouse) and pad layout ('position' or
     'label'), as runtime/input_map.c input_prompts_folder names it."""
-    return f'romfs-patches-{style}' + ('-label' if layout == 'label' else '')
+    suffix = (layout or 'position').removeprefix('position').lstrip('-')
+    return f'romfs-patches-{style}' + (f'-{suffix}' if suffix else '')
 
 
 # Every folder pad_prompts.py writes without --style and --layout.
-OVERLAYS = tuple(overlay_folder(s, layout) for s in sorted(STYLES) for layout in ('label', 'position')) + \
+OVERLAYS = tuple(overlay_folder(s, layout) for s in sorted(STYLES) for layout in ('label', 'position', 'label-swap-xy', 'position-swap-xy')) + \
     (overlay_folder('pc'),)
 
 

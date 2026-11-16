@@ -620,7 +620,7 @@ static int pad_layout_get(void) {
     const char *set = cfg_value("NX2NAVI_PAD_LAYOUT");
     pad_layout = input_pad_layout_pick(set, pad_east_a);
     if (pad_layout != was)
-        rt_log("input: gamepad layout %s (pad_layout = %s)", pad_layout == PAD_LAYOUT_XBOX ? "xbox" : "nintendo", set);
+        rt_log("input: gamepad layout %s (pad_layout = %s)", (pad_layout == PAD_LAYOUT_XBOX || pad_layout == PAD_LAYOUT_XBOX_SWAP_XY) ? "xbox" : "nintendo", set);
     plat_xchg32(&pad_layout_shown, pad_layout);
     return pad_layout;
 }

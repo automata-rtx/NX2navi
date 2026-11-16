@@ -37,11 +37,19 @@ The log says what happened in a line that starts with `action prompt:`. How the 
 `runtime/action_prompt.c` (`DoCommand_00` in `UI/Layout2Archive/Common.Product.100.Nin_Ounce_NVN2.blarc.zs`, served
 from `<profile>/action-prompt/`).
 
+**Swap jump and attack** (`swap_jump_attack = 1`, off by default) exchanges the controller's default X and Y bindings
+independently of the A/B layout. For a Steam controller with Xbox-style labels, choose **Xbox (A bottom)**,
+enable **Swap jump and attack**, and select **Steam Deck** prompts. Physical A confirms, X attacks, and Y jumps or
+performs the contextual action assigned to jump. Leave the game's *Swap Jump Controls* off for this arrangement.
+Explicit controller bindings take precedence. Keyboard bindings keep their configured actions.
+The controller changes immediately. Restart to load the matching prompt font, action diamond and ocarina notes.
+Older installations need the updated **Draw button prompts** step once for the new mixed-layout art.
+
 ## Button prompts
 
 `NX2NAVI_PROMPTS` (`prompts`, the *Button prompts* row on the Controls tab) picks the buttons the game's prompts show: `nintendo` (default, the game's own), `xbox`, `playstation`, `steamdeck` or `pc` (*Keyboard and mouse*). It changes three things the game draws:
 
-- the button font every prompt in text uses (dialogue, the button guides, the controls screen): A B X Y, L R ZL ZR, Plus and Minus, the d-pad and the sticks with their directions become that pad's buttons (LB RB LT RT, Menu and View; L1 R1 L2 R2, Options and Create; its d-pad and sticks), or the keys. Power, Home and the console stay;
+- the button font used in dialogue, guides and the controls screen. Shoulder prompts retain the Switch shapes and lettering height, with LB/RB/LT/RT on Xbox and L1/R1/L2/R2 on Steam Deck and PlayStation. Controller styles use the original Switch stick symbols for movement, clicks and rotation. Xbox and Steam Deck share an outlined D-pad with a filled marker for each active direction. PlayStation uses its own D-pad. Keyboard and mouse prompts show the bound keys and mouse inputs;
 - the letter in the action prompt (top right);
 - the ocarina's note buttons.
 
@@ -49,7 +57,7 @@ A, B, X and Y show the button the *Button layout* presses: with `nintendo` (by p
 
 `pc` shows the first key each Switch button has (the table above, or the `bind_` lines of `nx2navi.ini` when the tool runs): E, Ctrl, Space, the mouse with its left button for Y, Q, R, the mouse with its right button for ZL, F, Tab, M, V and C for the stick clicks, 1 to 4 for the d-pad, and W A S D for moving, the directions the prompt means set out as on the keyboard. The camera's prompts show the mouse moving. It follows no *Button layout*.
 
-The game reads the font and the interface textures once at start, so a change shows after a restart (the row says so; the menu's Restart button restarts). A button or key remapped on this tab keeps its old prompt until the folders are made again.
+The game reads the font and the interface textures once at start, so a change shows after a restart (the row says so; the menu's Restart button restarts). The jump/attack toggle selects matching controller art. Individual controller remaps keep their preset prompts. Keyboard prompts follow changed key bindings when their folder is drawn again.
 
 The prompts live in overlay folders next to the exe, `romfs-patches-xbox`, `romfs-patches-xbox-label`, `romfs-patches-playstation`, `romfs-patches-playstation-label`, `romfs-patches-steamdeck` and `romfs-patches-steamdeck-label` (by position and by label) and `romfs-patches-pc`, which `runtime/romfs.c` loads in place of the game's files. `tools/pad_prompts.py` draws them on the player's machine from the player's own RomFS and a folder of button art, which the repository does not hold. A launcher release or build kit made with `--prompt-art` carries that art (`prompt-art`, `tools/prompt_art.py`), and `tools/make_game.py` draws every folder in its last step, again whenever the art, the tools or the `bind_` lines change (so a rebuild after rebinding keys brings the keyboard prompts up to date). By hand:
 
@@ -57,7 +65,7 @@ The prompts live in overlay folders next to the exe, `romfs-patches-xbox`, `romf
 python tools\pad_prompts.py --art <art pack>\Source --game <install folder>
 ```
 
-`--style xbox|playstation|steamdeck|pc` makes one style; `steamdeck` shows the Deck's own labels (A B X Y where an Xbox pad has them, L1 R1 L2 R2 and L3 R3, Menu and View) and is drawn from the Xbox and PlayStation pictures, as the art has no Deck style; the keys come from `<install folder>\nx2navi.ini` (`--binds` names another). The art folder holds `XGamepad/Default`, `XGamepad/Light`, `P5Gamepad/Default`, `P5Gamepad/Light`, `Keyboard_Mouse/Dark` and `Keyboard_Mouse/White` with the file names of `STYLES` and `KEY_ART` in the tool; a key it has no picture of is written on `Keyboard_Mouse/Blanks`. Without the folders the row says *prompt files missing* and the Switch prompts stay; so they do when a RomFS mod replaces one of the same files (*off: a RomFS mod replaces their files*). The log has a `RomFS overlay: ... button prompts` line for the folder in use. The tool needs fontTools, Pillow and zstandard (`tools/requirements-py314.txt`).
+`--style xbox|playstation|steamdeck|pc` makes one style; `steamdeck` shows the Deck's own labels (A B X Y where an Xbox pad has them, L1 R1 L2 R2, Menu and View) and is drawn from the Xbox and PlayStation pictures, as the art has no Deck style; the keys come from `<install folder>\nx2navi.ini` (`--binds` names another). The art folder holds `XGamepad/Default`, `XGamepad/Light`, `P5Gamepad/Default`, `P5Gamepad/Light`, `Keyboard_Mouse/Dark` and `Keyboard_Mouse/White` with the file names of `STYLES` and `KEY_ART` in the tool; a key it has no picture of is written on `Keyboard_Mouse/Blanks`. Without the folders the row says *prompt files missing* and the Switch prompts stay; so they do when a RomFS mod replaces one of the same files (*off: a RomFS mod replaces their files*). The log has a `RomFS overlay: ... button prompts` line for the folder in use. The tool needs fontTools, Pillow and zstandard (`tools/requirements-py314.txt`).
 
 The actions are the game's own, as its *Basic Controls* screen (Plus menu, System) names them:
 

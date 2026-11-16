@@ -350,7 +350,7 @@ def pc_icons(g, adv, binds=PC_BINDS):
     }
 
 
-def redraw_font(otf, icons, swaps=()):
+def redraw_font(otf, icons, swaps=(), keep_metrics=()):
     """The OpenType font otf with the glyphs of each (code point, code point) pair of swaps trading places (outlines and
     horizontal metrics), then every code point of icons (code point -> (advance, draw)) drawn anew, written again by
     fontTools. The timestamps stay, so the same input gives the same bytes."""
@@ -371,6 +371,8 @@ def redraw_font(otf, icons, swaps=()):
         charstrings[cmap[cp]] = pen.getCharString(private=private, globalSubrs=cff.GlobalSubrs)
     glyphs = font.getGlyphSet()
     for cp, (advance, _) in icons.items():
+        if cp in keep_metrics:   # only the lettering inside the existing glyph changed
+            continue
         box = BoundsPen(glyphs); glyphs[cmap[cp]].draw(box)
         hmtx[cmap[cp]] = (advance, int(round(box.bounds[0])))
     out = io.BytesIO(); font.save(out)

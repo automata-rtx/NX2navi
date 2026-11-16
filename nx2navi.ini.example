@@ -694,6 +694,9 @@
 # pad with Nintendo labels, xbox for the others). The bind_ lines below apply
 # on top. Changes while the game runs take effect at once. 0.1.9's xbox_prompts is read as nintendo with prompts = xbox.
 # pad_layout = nintendo
+# Swap the controller's default X and Y bindings. With the Xbox layout, attack is left and jump is top.
+# Restart for the matching controller prompts. Explicit custom controller bindings take precedence.
+# swap_jump_attack = 0
 # The buttons the game's prompts show: nintendo (the game's own), xbox (LB RB LT RT, Menu, View), playstation (L1 R1
 # L2 R2, Options, Create) or steamdeck (the Deck's A B X Y, L1 R1 L2 R2, Menu, View), with A B X Y as the button
 # pad_layout presses is labelled: with nintendo, A shows as B or circle and X as Y or triangle. pc: the key each

@@ -2,7 +2,7 @@
 art on the player's machine.
 
     python tools/pad_prompts.py --art FOLDER --game FOLDER [--style xbox|playstation|steamdeck|pc]
-                                [--layout position|label]
+                                [--layout position|label|position-swap-xy|label-swap-xy]
                                 [--binds nx2navi.ini]
 
 --art is a folder of button art with the file names of STYLES (tools/prompt_art.py) and KEY_ART below: the Source
@@ -17,7 +17,7 @@ style and layout becomes the overlay folder <game>/romfs-patches-<style> (layout
 manifest.tsv: runtime/romfs.c overlay_init loads it in place of the game's files when nx2navi.ini has prompts = xbox,
 playstation, steamdeck or pc (runtime/input_map.c input_prompts_folder). Without --style or --layout, every style or
 layout. The Steam Deck style has no art of its own: its buttons are named as an Xbox pad's face buttons and a
-PlayStation pad's shoulders and stick clicks, so it is drawn from those two pads' pictures (prompt_art.py STYLES).
+PlayStation pad's shoulders. Controllers retain the game's analog stick glyphs, and Xbox and Steam share a drawn D-pad.
 --out writes a single style and layout elsewhere.
 
 The two pad layouts follow pad_layout (runtime/input_map.c). position, for pad_layout = nintendo: a pad is played by
@@ -33,7 +33,8 @@ What changes, the rest of each file staying as it is:
 - Font2/Scalable/External.Nin_Ounce_NVN2.bfotf.zs, the button font every prompt in text uses (dialogue, the button
   guides, the controls screen): the glyphs of the buttons (U+E040 A, B, X, Y, L, R, ZL, ZR, the d-pad, Plus, Minus,
   and the sticks and d-pad with their directions) become outlines traced from the art (trace), at the size of the
-  game's own face buttons; Power, Home, the console and the arrows stay. A .bfotf is a CFF OpenType font behind an
+  game's own face buttons. Controller shoulders retain the original outline and label height, and the sticks keep
+  their native glyphs. Power, Home, the console and the arrows stay. A .bfotf is a CFF OpenType font behind an
   8-byte header and an XOR (tools/button_icons.py bfotf_decode); fontTools writes it again.
 - UI/Layout2Archive/Common.Product.100.Nin_Ounce_NVN2.bntx.zs, the shared interface textures: KeyTexFontA/B/X/Y_00,
   the letter of the action prompt (DoCommand_00; 64x64 BC4 masks the layout tints), and OcarinaButtonA/B/X/Y/L/R_00,
@@ -57,6 +58,9 @@ from pathlib import Path
 import zstandard
 from PIL import Image, ImageDraw, ImageFont
 from fontTools.pens.boundsPen import BoundsPen
+from fontTools.pens.recordingPen import RecordingPen
+from fontTools.pens.reverseContourPen import ReverseContourPen
+from fontTools.pens.transformPen import TransformPen
 from fontTools.ttLib import TTFont
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -64,11 +68,12 @@ import button_icons  # noqa: E402  (bfotf_decode, bfotf_encode, redraw_font, gro
 from prompt_art import BLANKS, KM, OPTIONS, SHARE, STYLES, overlay_folder  # noqa: E402  (the art, the folders)
 
 FONT = 'Font2/Scalable/External.Nin_Ounce_NVN2.bfotf.zs'
+LABEL_FONT = 'Font2/Scalable/ClarimoUDPE-DemiBold.Nin_Ounce_NVN2.bfotf.zs'
 TEXTURES = 'UI/Layout2Archive/Common.Product.100.Nin_Ounce_NVN2.bntx.zs'
 DICTIONARIES = 'Pack/ZsDic.pack.zs'
 
 # The Switch button each code point of the button font shows (the stick and d-pad glyphs name their directions).
-# U+E06A is the d-pad with three directions lit; the art has no such picture, so it shows the whole d-pad.
+# U+E06A is left, right and down. Styles using stock art fall back to their whole d-pad picture.
 GLYPHS = {
     0xE040: 'A', 0xE041: 'B', 0xE042: 'X', 0xE043: 'Y', 0xE044: 'L', 0xE045: 'R', 0xE046: 'ZL', 0xE047: 'ZR',
     0xE049: 'DPAD', 0xE04B: 'PLUS', 0xE04C: 'MINUS',
@@ -82,6 +87,8 @@ GLYPHS = {
 # The face button that does each Switch face button, by its place on the pad.
 FACE = {'position': {'A': 'east', 'B': 'south', 'X': 'north', 'Y': 'west'},
         'label': {'A': 'south', 'B': 'east', 'X': 'west', 'Y': 'north'}}
+for layout, face in tuple(FACE.items()):
+    FACE[layout + '-swap-xy'] = {**face, 'X': face['Y'], 'Y': face['X']}
 
 
 # The textures drawn again: the action prompt's letter masks and the ocarina's note buttons, by Switch button.
@@ -512,13 +519,117 @@ def bounds(outlines):
     return min(xs), min(ys), max(xs), max(ys)
 
 
+# Xbox and Steam use the same cross. The three-way prompt selects left, right and down.
+DPAD_DIRECTIONS = {
+    0xE049: 'URDL', 0xE060: 'U', 0xE061: 'D', 0xE062: 'L', 0xE063: 'R',
+    0xE064: 'UD', 0xE065: 'LR', 0xE06A: 'LRD',
+}
+
+
+def draw_cross_dpad(pen, box, active):
+    """Fit the cross to the original glyph. Dimensions below are fractions of its half-width."""
+    x0, y0, x1, y1 = box
+    unit = min(x1 - x0, y1 - y0) / 2
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+
+    def rounded_contour(points, radius):
+        def toward(a, b):
+            dx, dy = b[0] - a[0], b[1] - a[1]
+            step = radius / (abs(dx) + abs(dy))   # edges are axis-aligned
+            return cx + unit * (a[0] + step * dx), cy + unit * (a[1] + step * dy)
+
+        for i, point in enumerate(points):
+            start = toward(point, points[i - 1])
+            (pen.moveTo if i == 0 else pen.lineTo)(start)
+            pen.qCurveTo((cx + unit * point[0], cy + unit * point[1]), toward(point, points[(i + 1) % len(points)]))
+        pen.closePath()
+
+    def cross(half, reach):
+        points = []
+        for nx, ny in ((0, 1), (1, 0), (0, -1), (-1, 0)):
+            tx, ty = ny, -nx
+            points.extend(((nx * reach - tx * half, ny * reach - ty * half),
+                           (nx * reach + tx * half, ny * reach + ty * half),
+                           (nx * half + tx * half, ny * half + ty * half)))
+        return points
+
+    arm, stroke, inner_radius = 0.34, 0.065, 0.04
+    rounded_contour(cross(arm, 1)[::-1], 0.085)
+    rounded_contour(cross(arm - stroke, 1 - stroke), inner_radius)
+
+    # The marker clears the rim equally on its three enclosed sides. Its fourth side faces the center.
+    gap, center_edge = 0.05821951, 0.39165189
+    half = arm - stroke - gap
+    tip = 1 - stroke - gap
+    points = [(-tip, -half), (-center_edge, -half), (-center_edge, half), (-tip, half)]
+    for side in 'LDRU':
+        if side in active:
+            rounded_contour(points, inner_radius)
+        points = [(-y, x) for x, y in points]
+
+
 # ---- the button font
-def draw_font(otf, glyph, traced, lit_dpad):
+def ink_bounds(contours):
+    box = BoundsPen(None)
+    for contour in contours:
+        contour.replay(box)
+    return box.bounds
+
+
+def button_parts(font, cp):
+    """Separate the enclosing button from its lettering, including counters such as the hole in R."""
+    rec = RecordingPen()
+    font.getGlyphSet()[font.getBestCmap()[cp]].draw(rec)
+    contours = []
+    for op, args in rec.value:
+        if op == 'moveTo':
+            contours.append(RecordingPen())
+        getattr(contours[-1], op)(*args)
+    full_box = ink_bounds(contours)
+    shell = next(c for c in contours if ink_bounds([c]) == full_box)
+    return shell, [c for c in contours if c is not shell]
+
+
+def shoulder_labels(otf, text_font, xbox):
+    """(original shell, new lettering) for each shoulder. All geometry stays in native font units."""
+    font = TTFont(io.BytesIO(otf))
+    # The slot in the game's ZL between its original Z and L sets the two-letter spacing.
+    _, zl = button_parts(font, 0xe046)
+    left, right = sorted(zl, key=lambda c: ink_bounds([c])[0])
+    gap = ink_bounds([right])[0] - ink_bounds([left])[2]
+    parts = {}
+    for cp, suffix in zip(range(0xe044, 0xe048), 'BBTT' if xbox else '1122'):
+        shell, letters = button_parts(font, cp)
+        old_left, _, old_right, _ = ink_bounds(letters)
+        if cp >= 0xe046:   # remove Z, keeping this trigger's own L or R
+            letters.remove(min(letters, key=lambda c: ink_bounds([c])[0]))
+        x0, y0, x1, y1 = ink_bounds(letters)
+        if suffix == 'B':
+            # The B on the native face button already winds as a cutout, including both counters.
+            _, extra = button_parts(font, 0xe041)
+        else:
+            extra = [RecordingPen()]
+            text_font.getGlyphSet()[text_font.getBestCmap()[ord(suffix)]].draw(ReverseContourPen(extra[0]))
+        sx0, sy0, sx1, sy1 = ink_bounds(extra)
+        scale = (y1 - y0) / (sy1 - sy0)
+        width = x1 - x0 + gap + (sx1 - sx0) * scale
+        start = (old_left + old_right - width) / 2
+        label = RecordingPen()
+        for c in letters:
+            c.replay(TransformPen(label, (1, 0, 0, 1, start - x0, 0)))
+        dest = TransformPen(label, (scale, 0, 0, scale, start + x1 - x0 + gap - sx0 * scale, y0 - sy0 * scale))
+        for c in extra:
+            c.replay(dest)
+        parts[cp] = shell, label
+    return parts
+
+
+def draw_font(otf, glyph, traced, style, shoulders):
     """The button font with the glyphs of GLYPHS drawn from glyph (Switch button -> picture). Every picture is scaled
     as A's picture is to the game's A (both fill their square the same way), centred in its advance and placed at the
     height of the art's own square, so the arrows of a stick reach out as they do in the art. A grid of keys is made
-    no taller than the game's A and centred on it. A wider picture widens its glyph. lit_dpad: the d-pad directions
-    are lit pad pictures (ink lit)."""
+    no taller than the game's A and centred on it. A wider picture widens its glyph. Xbox and Steam D-pad prompts use the
+    original ink bounds and advance. Controller styles retain the game's analog stick glyphs."""
     font = TTFont(io.BytesIO(otf))
     glyphs, cmap, hmtx = font.getGlyphSet(), font.getBestCmap(), font['hmtx']
     box = BoundsPen(glyphs)
@@ -530,8 +641,23 @@ def draw_font(otf, glyph, traced, lit_dpad):
     side = gx0   # the game's A has this much room on either side
     drawn = {}
     for cp, button in GLYPHS.items():
+        if cp in shoulders:
+            shape = RecordingPen()
+            for part in shoulders[cp]:
+                part.replay(shape)
+            drawn[cp] = (hmtx[cmap[cp]][0], shape.replay)
+            continue
+        if style != 'pc' and button.startswith(('LSTICK', 'RSTICK')):
+            continue   # preserve the game's complete analog glyph and its horizontal metrics
+        if style in ('steamdeck', 'xbox') and cp in DPAD_DIRECTIONS:
+            original = BoundsPen(glyphs)
+            glyphs[cmap[cp]].draw(original)
+            def draw(pen, box=original.bounds, active=DPAD_DIRECTIONS[cp]):
+                draw_cross_dpad(pen, box, active)
+            drawn[cp] = (hmtx[cmap[cp]][0], draw)
+            continue
         pic = glyph[button]
-        outlines = traced(pic, lit_dpad and button.startswith('DPAD_'))
+        outlines = traced(pic, style != 'pc' and button.startswith('DPAD_'))
         x0, y0, x1, y1 = bounds(outlines)
         s, cy = scale, mid_y_px
         if isinstance(pic, tuple) and pic[0] == 'grid':
@@ -546,7 +672,7 @@ def draw_font(otf, glyph, traced, lit_dpad):
                     pen.lineTo((ox + x * s, mid_y - (y - cy) * s))
                 pen.closePath()
         drawn[cp] = (advance, draw)
-    return button_icons.redraw_font(otf, drawn)
+    return button_icons.redraw_font(otf, drawn, keep_metrics=shoulders)
 
 
 # ---- BNTX textures: block-linear in the Switch 2 GOB layout (runtime/tex_deswizzle.c, nvn_bl_offset)
@@ -752,7 +878,26 @@ def note_texture(art, rel, box):
     return astc_encode(bleed(pic))
 
 
-def draw_textures(data, glyph, note, art, cache):
+def relabel_note(level, button, lettering):
+    """Replace only blocks inside the original 93px bumper's flat white face, preserving its entire rim."""
+    # Native game 1.1.1: both ink boxes span rows 27..62, centered at x=51 (L) and 44.5 (R).
+    left, center = (20, 51) if button == 'L' else (12, 44.5)
+    mask = Image.frombytes('L', (192, 192), button_icons.rasterize(lettering.replay, 192))
+    mask = mask.crop(mask.getbbox())
+    width = round(mask.width * 36 / mask.height)
+    patch = Image.new('RGBA', (60, 40), 'white')
+    x = round(center - width / 2) - left
+    assert 0 <= x and x + width <= patch.width, 'ocarina shoulder label exceeds its white face'
+    patch.paste('black', (x, 3, x + width, 39), mask.resize((width, 36), Image.Resampling.LANCZOS))
+    blocks = astc_encode(patch)
+    # A 93px texture has 24 four-pixel blocks per row. Both patch origins are block aligned.
+    for row in range(10):
+        start = ((6 + row) * 24 + left // 4) * 16
+        level[start:start + 15 * 16] = blocks[row * 15 * 16:(row + 1) * 15 * 16]
+    return level
+
+
+def draw_textures(data, glyph, note, art, cache, shoulders):
     """Paints the action prompt's letters (from glyph) and the ocarina's note buttons (from note; both Switch button ->
     picture) into the BNTX data (a bytearray) in place. A new letter takes the height and centre of the game's own
     letter in that mask (a wider one may use a little more width); a note button fills NOTE_BOXES."""
@@ -776,6 +921,11 @@ def draw_textures(data, glyph, note, art, cache):
         else:
             assert t['fmt'] == ASTC_4X4_SRGB and (t['w'], t['h']) == (93, 93), f'{name}: format {t["fmt"]:#x}, ' \
                 f'{t["w"]}x{t["h"]}'
+            if shoulders and button in ('L', 'R'):
+                label = shoulders[0xe044 if button == 'L' else 0xe045][1]
+                level = read_level(data, t, wb * 16, hb)
+                write_level(data, t, relabel_note(level, button, label), wb * 16, hb)
+                continue
             box = NOTE_BOXES['shoulder' if button in 'LR' else 'disc']
             rel = note[button]
             encoded = cache(('note', rel, box), lambda: note_texture(art, rel, box))
@@ -810,7 +960,7 @@ def main():
     ap.add_argument('--game', type=Path, help='the folder of the exe and romfs-index.bin; the overlays go there')
     ap.add_argument('--romfs', type=Path, help='default <game>/romfs')
     ap.add_argument('--style', choices=sorted(STYLES) + ['pc'], help='default: every one')
-    ap.add_argument('--layout', choices=sorted(FACE), help='default: both (pc has one)')
+    ap.add_argument('--layout', choices=sorted(FACE), help='default: all controller layouts (pc has one)')
     ap.add_argument('--binds', type=Path, help='pc: a nx2navi.ini whose bind_ lines the keys follow '
                                                '(default <game>/nx2navi.ini when there is one)')
     ap.add_argument('--out', type=Path, help='the overlay folder, for one --style and --layout')
@@ -841,16 +991,22 @@ def main():
     def traced(rel, lit=False):
         return cache(('outlines', rel, lit), lambda: outlines_of(load_art(args.art, rel), lit))
 
+    text_font = None
+    if args.style != 'pc':
+        text_blob, _ = romfs.load(LABEL_FONT)
+        text_font = TTFont(io.BytesIO(button_icons.bfotf_decode(text_blob)[0]))
     report = []
     for style in [args.style] if args.style else sorted(STYLES) + ['pc']:
+        shoulders = {} if style == 'pc' else cache(('shoulders', style == 'xbox'),
+                                                   lambda: shoulder_labels(otf, text_font, style == 'xbox'))
         # the keyboard follows no pad layout: one folder, romfs-patches-pc
         for layout in [None] if style == 'pc' else [args.layout] if args.layout else sorted(FACE):
             out = args.out or args.game / overlay_folder(style, layout)
             glyph, note = pc_pictures(args.art, keys) if style == 'pc' else pad_pictures(style, layout)
-            new_otf = draw_font(otf, glyph, traced, style != 'pc')
+            new_otf = draw_font(otf, glyph, traced, style, shoulders)
             blob = button_icons.bfotf_encode(new_otf, key, font_blob)
             data = bytearray(textures)
-            draw_textures(data, glyph, note, args.art, cache)
+            draw_textures(data, glyph, note, args.art, cache, shoulders)
             assert len(data) == len(textures)
             outputs = {FONT: compress(blob, font_dict, 19), TEXTURES: compress(bytes(data), textures_dict, args.level)}
             if len(blob) > len(font_blob):

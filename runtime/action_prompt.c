@@ -33,6 +33,7 @@
 #include <zstd.h>
 
 #include "action_prompt.h"
+#include "input_map.h"
 #include "host.h"
 #include "platform/platform.h"
 #include "sarc.h"
@@ -56,8 +57,11 @@ static const unsigned field_at[] = {
 static const char *const field_name[] = {"x", "y", "scale x", "scale y", "text origin", "cross picture"};
 
 static const char buttons[4] = {'A', 'B', 'X', 'Y'};
-static const int direction[2][4] = {{EAST, SOUTH, NORTH, WEST},    // by position: the Switch's places
-                                    {SOUTH, EAST, WEST, NORTH}};   // by label: an Xbox pad's
+static const int direction[PAD_LAYOUT_COUNT][4] = {
+    [PAD_LAYOUT_NINTENDO] = {EAST, SOUTH, NORTH, WEST},
+    [PAD_LAYOUT_XBOX] = {SOUTH, EAST, WEST, NORTH},
+    [PAD_LAYOUT_NINTENDO_SWAP_XY] = {EAST, SOUTH, WEST, NORTH},
+    [PAD_LAYOUT_XBOX_SWAP_XY] = {SOUTH, EAST, NORTH, WEST}};
 static const float place[4][2] = {[EAST] = {80, 0}, [SOUTH] = {0, -80}, [NORTH] = {0, 80}, [WEST] = {-80, 0}};
 // The cross lit toward each direction: its picture and the flips that turn it.
 static const struct { int picture; float sx, sy; } cross[4] = {
@@ -215,7 +219,10 @@ static int field_get(const uint8_t *p, size_t n, const Field *f, const Where *w,
 static int same(float a, float b) { return fabsf(a - b) < 1e-3f; }
 
 int action_prompt_lay_out(uint8_t *p, size_t n, int label, char *why, size_t why_n) {
-    label = !!label;
+    if ((unsigned)label >= PAD_LAYOUT_COUNT) {
+        snprintf(why, why_n, "unknown controller layout %d", label);
+        return -1;
+    }
     Field from[MAX_FIELDS], to[MAX_FIELDS];
     int count = diamond(!label, from);
     if (count != MAX_FIELDS || diamond(label, to) != MAX_FIELDS) {
@@ -238,12 +245,18 @@ int action_prompt_lay_out(uint8_t *p, size_t n, int label, char *why, size_t why
         done &= same(now[k], to[k].value);
     }
     if (done) return 0;
-    for (int k = 0; k < count; k++)
-        if (!same(now[k], from[k].value)) {
+    // Accept any one complete supported source layout. A partially edited mod still keeps its own layout.
+    int source = 0;
+    for (; source < PAD_LAYOUT_COUNT; source++) {
+        diamond(source, from);
+        int k = 0;
+        while (k < count && same(now[k], from[k].value)) k++;
+        if (k == count) break;
+        if (source == !label)
             snprintf(why, why_n, "%s %s %s is %g, not %g", MEMBER, from[k].pane, field_name[from[k].field],
                      (double)now[k], (double)from[k].value);
-            return -1;
-        }
+    }
+    if (source == PAD_LAYOUT_COUNT) return -1;
     // The name offsets of both pictures, from the crosses that show them now (the diamond by either layout shows both).
     uint64_t names[2][2];
     for (int k = 0; k < count; k++)
@@ -339,7 +352,6 @@ int action_prompt_archive(uint8_t *sarc, size_t n, int label, char *why, size_t 
 int action_prompt_build(const void *in, size_t n, const void *zsdic, size_t zsdic_n, int label, void **out,
                         size_t *out_n) {
     uint64_t t0 = plat_now_ns();
-    label = !!label;
     *out = NULL;
     int result = -1;
     uint8_t *dics = NULL, *raw = NULL;
@@ -393,11 +405,10 @@ int action_prompt_build(const void *in, size_t n, const void *zsdic, size_t zsdi
     }
     *out = z, *out_n = zn, z = NULL;
     result = 1;
-    rt_log("action prompt: face buttons laid out %s, %d fields (%.0f ms)", label ? "by label (A bottom)" : "by position",
-           changed, (double)(plat_now_ns() - t0) / 1e6);
+    rt_log("action prompt: controller layout %d, %d fields changed (%.0f ms)", label, changed, (double)(plat_now_ns() - t0) / 1e6);
 done:
     if (result == 0)
-        rt_log("action prompt: the layout archive has the face buttons %s already", label ? "by label" : "by position");
+        rt_log("action prompt: the layout archive already uses controller layout %d", label);
     if (result < 0) rt_log("action prompt: %s; the diamond keeps the Switch places", why);
     free(z);
     free(raw);

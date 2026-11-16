@@ -235,6 +235,9 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_RUMBLE_CURVE_DESC] = "Lower values make light vibration stronger.",
     [UI_MENU_RUMBLE_TRIGGERS] = "Trigger vibration (Xbox)",
     [UI_MENU_RUMBLE_TRIGGERS_DESC] = "Also vibrates the triggers on Xbox controllers.",
+    [UI_MENU_SWAP_JUMP_ATTACK] = "Swap jump and attack",
+    [UI_MENU_SWAP_JUMP_ATTACK_DESC] = "Swaps the default controller buttons for jump and sword attack. With Xbox layout, "
+                                     "attack is on the left and jump is on top. Restart to update the prompts.",
     [UI_MENU_PAD_LAYOUT] = "Button layout",
     [UI_MENU_PAD_LAYOUT_DESC] = "Sets which button acts as A. Nintendo: by position, A right, B bottom, X top, Y "
                                 "left. Xbox and PlayStation: by label, A bottom, B right, X left, Y top (on a "
@@ -729,6 +732,8 @@ static const char *const text_en[UI_TEXT_COUNT] = {
 };
 
 static const char *const text_ru[UI_TEXT_COUNT] = {
+    [UI_MENU_SWAP_JUMP_ATTACK] = "Поменять прыжок и атаку",
+    [UI_MENU_SWAP_JUMP_ATTACK_DESC] = "Меняет местами стандартные кнопки прыжка и атаки на геймпаде. С раскладкой Xbox атака слева, прыжок сверху. Перезапустите игру, чтобы обновить подсказки.",
     SWKBD("Ввод текста", "Введите имя", "Лошадь", "ОК", "Отмена", "Контроллер: A — ОК, B — отмена"),
 
     [UI_MENU_TITLE] = "Настройки",
@@ -1387,6 +1392,8 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
 };
 
 static const char *const text_pt_br[UI_TEXT_COUNT] = {
+    [UI_MENU_SWAP_JUMP_ATTACK] = "Trocar salto e ataque",
+    [UI_MENU_SWAP_JUMP_ATTACK_DESC] = "Troca os botões padrão de salto e ataque no controle. No layout Xbox, o ataque fica à esquerda e o salto em cima. Reinicie o jogo para atualizar os ícones.",
     SWKBD("Inserir texto", "Insira um nome", "Cavalo", "OK", "Cancelar", "Controle: A = OK, B = Cancelar"),
 
     [UI_MENU_TITLE] = "Configurações",
@@ -2073,6 +2080,8 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
 // when the menu language is zh-Hans (ui_text.h menu_text). The rows are fixed width, so the strings stay close to the
 // English length; an id without a Chinese entry falls back to English.
 static const char *const text_zh_hans[UI_TEXT_COUNT] = {
+    [UI_MENU_SWAP_JUMP_ATTACK] = "互换跳跃和攻击键",
+    [UI_MENU_SWAP_JUMP_ATTACK_DESC] = "互换手柄默认的跳跃键和攻击键。使用 Xbox 布局时，左键攻击，上键跳跃。重启游戏后，按键提示会随之更新。",
     SWKBD("文字输入", "请输入名字", "马儿", "确定", "取消", "手柄：A 确定，B 取消"),
 
     [UI_MENU_TITLE] = "设置",

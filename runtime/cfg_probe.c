@@ -530,6 +530,15 @@ int probe_cfg(void) {
     CHECK(input_map_pad_buttons(pd, PAD_LAYOUT_NINTENDO) == (1ull << B_B | 1ull << B_X) &&
           input_map_pad_buttons(pd, PAD_LAYOUT_XBOX) == (1ull << B_A | 1ull << B_Y),
           "pad layout: south and north are B and X by position, A and Y on Xbox");
+    cfg_setenv("NX2NAVI_SWAP_JUMP_ATTACK", "1");
+    int mixed = input_pad_layout_pick("xbox", 0);
+    CHECK(mixed == PAD_LAYOUT_XBOX_SWAP_XY && input_map_pad_buttons(pd, mixed) == (1ull << B_A | 1ull << B_X) &&
+          input_map_pad_buttons((uint8_t[PAD_COUNT]){[PAD_WEST] = 1}, mixed) == (1ull << B_Y) &&
+          EQ(input_prompts_folder(PROMPTS_STEAMDECK, "xbox"), "romfs-patches-steamdeck-label-swap-xy"),
+          "swapping jump and attack keeps south confirm and moves attack left and jump up with Steam art");
+    CHECK(input_pad_layout_pick("auto", 1) == PAD_LAYOUT_NINTENDO_SWAP_XY &&
+          EQ(input_prompts_folder(PROMPTS_PC, "xbox"), "romfs-patches-pc"), "swapped Nintendo controls and keyboard art");
+    cfg_setenv("NX2NAVI_SWAP_JUMP_ATTACK", NULL);
     pd[PAD_SOUTH] = pd[PAD_NORTH] = 0;
     pd[PAD_START] = pd[PAD_ZR] = 1;
     CHECK(input_map_pad_buttons(pd, PAD_LAYOUT_XBOX) == (1ull << B_PLUS | 1ull << B_ZR), "pad layout: Xbox keeps the other buttons");

@@ -1441,7 +1441,7 @@ static const char *pad_layout_note(void) {
     int got = input_pad_layout();
     if (got < 0 || strcmp(cfg_value("NX2NAVI_PAD_LAYOUT"), "auto")) return nullptr;
     static char note[96];
-    UiTextId name = got != PAD_LAYOUT_XBOX                     ? UI_MENU_PAD_LAYOUT_NINTENDO
+    UiTextId name = got == PAD_LAYOUT_NINTENDO || got == PAD_LAYOUT_NINTENDO_SWAP_XY ? UI_MENU_PAD_LAYOUT_NINTENDO
                     : input_pad_label(PAD_SOUTH) == PAD_LABEL_CROSS ? UI_MENU_PAD_LAYOUT_PLAYSTATION
                                                                   : UI_MENU_PAD_LAYOUT_XBOX;
     snprintf(note, sizeof note, menu_text(UI_MENU_PAD_LAYOUT_IN_USE), menu_text(name));
@@ -1587,6 +1587,7 @@ static void tab_controls(float scale) {
     static const UiTextId layout[] = {UI_MENU_PAD_LAYOUT_AUTO, UI_MENU_PAD_LAYOUT_NINTENDO, UI_MENU_PAD_LAYOUT_XBOX,
                                       UI_MENU_PAD_LAYOUT_PLAYSTATION};
     opt_choice("NX2NAVI_PAD_LAYOUT", UI_MENU_PAD_LAYOUT, layout, 4, UI_MENU_PAD_LAYOUT_DESC, pad_layout_note());
+    opt_toggle("NX2NAVI_SWAP_JUMP_ATTACK", UI_MENU_SWAP_JUMP_ATTACK, UI_MENU_SWAP_JUMP_ATTACK_DESC);
     // The setting's values in their cfg.c order (nintendo, xbox, playstation, steamdeck, pc). The game reads its prompts
     // at start: the row's note says when a restart would bring others, and the bar's Restart button does it.
     static const UiTextId prompts[] = {UI_MENU_PROMPTS_NINTENDO, UI_MENU_PROMPTS_XBOX, UI_MENU_PROMPTS_PLAYSTATION,
