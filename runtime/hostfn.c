@@ -10,6 +10,9 @@
 #include <string.h>
 
 #include "host.h"
+#ifdef _WIN32
+#include "vk_dlssg.h"
+#endif
 
 #define MAX_HOSTFN 4096   // dispatch.c holds HOST_CAP / 2 host functions
 #define MAX_ADDED 64
@@ -180,7 +183,11 @@ void hostfn_seal(void) {
     rt_register_host(RT_RET_HOST, return_sentinel);
     sealed = 1;
     int n = rt_linked_modules(mods, 16);
-    rt_dispatch_init(mods, n);
+    RtDispatchHook *hook = NULL;
+#ifdef _WIN32
+    hook = vk_dlssg_update_hook();
+#endif
+    rt_dispatch_init(mods, n, hook);
 }
 
 uint64_t hostfn_calls(void) {

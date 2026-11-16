@@ -14,8 +14,8 @@
 // limit and the game renders a half, a third or a quarter of it.
 //
 // DLSS-G needs Reflex, whose low-latency mode paces the game (NX2NAVI_REFLEX, default 1; 0 off, 2 on with boost): the
-// game's frame sleeps in Reflex where it starts (its acquire of a window image), and each frame carries the latency
-// markers from that start to the host present, all with the frame's number, the count of the game's presents up to it.
+// 1.1.1 sleeps before the engine dispatches the update that samples the pad. Image acquisition supplies a fallback.
+// Simulation, host submission, and presentation use the frame number of the image acquired for that update.
 // The mode is the swapchain's, so it is set again after each one (vk_dlssg_create_swapchain).
 #ifdef _WIN32
 #include <windows.h>
@@ -25,6 +25,7 @@
 #include <string.h>
 
 #include "cfg.h"
+#include "dispatch.h"
 #include "host.h"
 #include "vk.h"
 #include "vk_dlaa.h"
@@ -47,12 +48,15 @@ static struct {
     PFN_nx2sl_present_rect present_rect;
     PFN_nx2sl_present_marker marker;
     PFN_nx2sl_sleep sleep;
+    PFN_nx2sl_wait wait;
+    PFN_nx2sl_phase phase;
     PFN_nx2sl_submit_end submit_end;
     PFN_nx2sl_shown shown;
     PFN_nx2sl_reflex reflex;
     uint32_t game;   // the game's presents (vk_dlssg_game_present)
     uint32_t cur;    // the frame the present thread blits and presents next (vk_dlssg_present_frame)
-    uint32_t started;      // the last frame vk_dlssg_frame_start started
+    uint32_t started;      // last distinct guest image acquisition, on the frame-loop thread
+    uint32_t waited;       // frame already paced by the update or its acquisition fallback
     uint64_t hosted_ns;    // kern_now_ns after the last host present
     PFN_nx2sl_shutdown shutdown;
     PFN_vkCreateSwapchainKHR create_sc;
@@ -110,6 +114,8 @@ int vk_dlssg_early(void) {
     S.present_rect = (PFN_nx2sl_present_rect)(void *)GetProcAddress(m, "nx2sl_present_rect");
     S.marker = (PFN_nx2sl_present_marker)(void *)GetProcAddress(m, "nx2sl_present_marker");
     S.sleep = (PFN_nx2sl_sleep)(void *)GetProcAddress(m, "nx2sl_sleep");
+    S.wait = (PFN_nx2sl_wait)(void *)GetProcAddress(m, "nx2sl_wait");
+    S.phase = (PFN_nx2sl_phase)(void *)GetProcAddress(m, "nx2sl_phase");
     S.submit_end = (PFN_nx2sl_submit_end)(void *)GetProcAddress(m, "nx2sl_submit_end");
     S.shown = (PFN_nx2sl_shown)(void *)GetProcAddress(m, "nx2sl_shown");
     S.shutdown = (PFN_nx2sl_shutdown)(void *)GetProcAddress(m, "nx2sl_shutdown");
@@ -268,16 +274,63 @@ VkResult vk_dlssg_present(VkQueue q, const VkPresentInfoKHR *pi) {
 // apart), so a change waits until the new state has held for FG_SETTLE_FRAMES frames.
 #define FG_SETTLE_FRAMES 12
 
+static int recently_presenting(void) {
+    uint64_t hosted = __atomic_load_n(&S.hosted_ns, __ATOMIC_RELAXED);
+    return hosted && kern_now_ns() - hosted < HOLD_IDLE_NS;
+}
+
+static RtDispatchHook update_hook;
+
+// In 1.1.1 the frame loop calls this virtual method, waits for its update jobs (including the pad reads),
+// then acquires the image for their result. The previous image can still be presented during the update.
+static void game_update(Cpu *c) {
+    uint32_t frame = S.started + 1;
+    if (c->x[30] != 0x700346c73cull || !S.active || !S.phase || !S.wait || frame == S.waited) {
+        update_hook.original(c);
+        return;
+    }
+    static int announced;
+    if (!announced) {
+        announced = 1;
+        rt_log("dlssg: pacing before the game update; simulation and render submission use separate Reflex markers");
+    }
+    S.waited = frame;
+    int hold = recently_presenting();
+    int away = hold ? kern_core_away() : 0;
+    S.wait(frame, hold);
+    if (hold) kern_core_back(&away);
+    S.phase(frame, NX2SL_SIM_START);
+    update_hook.original(c);
+    S.phase(frame, NX2SL_SIM_END);
+}
+
+RtDispatchHook *vk_dlssg_update_hook(void) {
+    if (!RT_V111 || strcmp(cfg_value("NX2NAVI_FRAMEGEN"), "dlss")) return NULL;
+    update_hook = (RtDispatchHook){.pc = 0x7003b4eb40ull, .wrapper = game_update};
+    return &update_hook;
+}
+
 void vk_dlssg_frame_start(void) {
     if (!S.active) return;
     uint32_t f = __atomic_load_n(&S.game, __ATOMIC_RELAXED) + 1;
     if (f == S.started) return;
     S.started = f;
-    uint64_t hosted = __atomic_load_n(&S.hosted_ns, __ATOMIC_RELAXED);
-    S.sleep(f, hosted && kern_now_ns() - hosted < HOLD_IDLE_NS);
+    if (S.waited == f) return;
+    S.waited = f;
+    if (S.wait && S.phase && update_hook.original) S.wait(f, recently_presenting());
+    else S.sleep(f, recently_presenting());
 }
 
 void vk_dlssg_game_present(void) { __atomic_add_fetch(&S.game, 1, __ATOMIC_RELAXED); }
+
+void vk_dlssg_render_start(uint64_t frame) {
+    if (!S.active || !S.phase || !S.wait || !update_hook.original) return;
+    // The replay worker (or the synchronous submit path) visits frames in guest submission order.
+    static uint64_t last;
+    if (last == frame) return;
+    last = frame;
+    S.phase((uint32_t)frame, NX2SL_RENDER_START);
+}
 
 void vk_dlssg_submitted(uint64_t frame) {
     if (S.active) S.submit_end((uint32_t)frame);

@@ -16,6 +16,8 @@
 #include <string.h>
 
 #include <atomic>
+#include <chrono>
+#include <mutex>
 
 #include <sl.h>
 #include <sl_consts.h>
@@ -41,13 +43,18 @@ PFun_slDLSSGSetOptions *p_dlssg_options;
 PFun_slDLSSGGetState *p_dlssg_state;
 PFun_slPCLSetMarker *p_marker;
 PFun_slReflexSetOptions *p_reflex;
+PFun_slReflexGetState *p_reflex_state;
 PFun_slReflexSleep *p_sleep;
+std::mutex g_reflex_options;  // GetState and SetOptions are not thread safe
+using Clock = std::chrono::steady_clock;
+constexpr unsigned pacingWindow = 300;
 PFN_vkGetInstanceProcAddr p_gipa;
 PFN_vkGetDeviceProcAddr p_gdpa;
 int g_available = -1;
 int g_frames = -1;                   // the frames to generate as last set (0 off), -1 before the first nx2sl_frame
 std::atomic<uint32_t> g_max{0};      // numFramesToGenerateMax as Streamline last reported it, 0 before it did
-uint64_t g_presented, g_shown;
+uint64_t g_presented;
+std::atomic<uint64_t> g_shown{0};
 
 void say(const char *fmt, ...) {
     if (!g_log) return;
@@ -71,6 +78,15 @@ template <class T> T *proc(const char *name) { return reinterpret_cast<T *>(GetP
 sl::FrameToken *token(uint32_t frame) {
     sl::FrameToken *t = nullptr;
     return frame && p_token(t, &frame) == sl::Result::eOk ? t : nullptr;
+}
+
+void mark(sl::PCLMarker marker, sl::FrameToken &t, uint32_t frame) {
+    sl::Result r = p_marker(marker, t);
+    if (r != sl::Result::eOk) {
+        static std::atomic<unsigned> errors{0};
+        if (errors.fetch_add(1, std::memory_order_relaxed) < 8)
+            say("dlssg: PCL marker %u rejected on frame %u: %s", (unsigned)marker, frame, sl::getResultAsStr(r));
+    }
 }
 
 void matrix(sl::float4x4 &m, const float *v) {
@@ -145,15 +161,16 @@ extern "C" NX2SL_API int nx2sl_available(void) {
     if (g_available && p_feature(sl::kFeatureDLSS_G, "slDLSSGGetState", f) == sl::Result::eOk) p_dlssg_state = (PFun_slDLSSGGetState *)f;
     if (p_feature(sl::kFeaturePCL, "slPCLSetMarker", f) == sl::Result::eOk) p_marker = (PFun_slPCLSetMarker *)f;
     if (p_feature(sl::kFeatureReflex, "slReflexSetOptions", f) == sl::Result::eOk) p_reflex = (PFun_slReflexSetOptions *)f;
+    if (p_feature(sl::kFeatureReflex, "slReflexGetState", f) == sl::Result::eOk) p_reflex_state = (PFun_slReflexGetState *)f;
     if (p_feature(sl::kFeatureReflex, "slReflexSleep", f) == sl::Result::eOk) p_sleep = (PFun_slReflexSleep *)f;
-    if (!p_dlssg_options || !p_marker) g_available = 0;
+    if (!p_dlssg_options || !p_dlssg_state || !p_marker || !p_reflex || !p_sleep || !p_reflex_state) g_available = 0;
     // How many frames this GPU and driver generate per rendered frame: known once the device exists (else after the
     // first presents, nx2sl_present_marker)
     sl::DLSSGState s{};
     if (g_available && p_dlssg_state && p_dlssg_state(sl::ViewportHandle(0), s, nullptr) == sl::Result::eOk)
         g_max.store(s.numFramesToGenerateMax);
-    if (!g_available) say("dlssg: frame generation unavailable (DLSS-G plugin loaded: %d, DLSS-G options: %d, PCL marker: %d)",
-                          loaded, p_dlssg_options != nullptr, p_marker != nullptr);
+    if (!g_available) say("dlssg: frame generation unavailable (loaded %d, FG options/state %d/%d, PCL marker %d, Reflex options/sleep/state %d/%d/%d)",
+                          loaded, !!p_dlssg_options, !!p_dlssg_state, !!p_marker, !!p_reflex, !!p_sleep, !!p_reflex_state);
     else if (g_max.load()) say("dlssg: DLSS Frame Generation available, up to %ux", g_max.load() + 1);
     else say("dlssg: DLSS Frame Generation available (its most frames per rendered frame not reported yet)");
     return g_available;
@@ -174,19 +191,48 @@ extern "C" NX2SL_API void nx2sl_reflex(int mode) {
     if (g_available != 1 || !p_reflex) return;
     sl::ReflexOptions o{};
     o.mode = mode == 2 ? sl::ReflexMode::eLowLatencyWithBoost : mode ? sl::ReflexMode::eLowLatency : sl::ReflexMode::eOff;
+    std::lock_guard<std::mutex> lock(g_reflex_options);
     sl::Result r = p_reflex(o);
-    static int n;
-    if (n++ < 8) say("dlssg: Reflex low-latency mode %s (%d)", mode == 2 ? "on with boost" : mode ? "on" : "off", (int)r);
+    say("dlssg: Reflex mode request %s, frameLimitUs %u: %s", mode == 2 ? "on with boost" : mode ? "on" : "off",
+        o.frameLimitUs, sl::getResultAsStr(r));
 }
 
-// The game's simulation and its recording of the frame's commands are one span here: the guest's threads cannot be
-// told apart, so the simulation markers sit at the frame's start and the render submission runs until the frame's
-// submissions went out (nx2sl_submit_end).
-extern "C" NX2SL_API void nx2sl_sleep(uint32_t frame, int hold) {
+extern "C" NX2SL_API void nx2sl_wait(uint32_t frame, int hold) {
     if (g_available != 1) return;
     sl::FrameToken *t = token(frame);
-    if (hold && t && p_sleep) p_sleep(*t);
-    if ((t = token(frame))) {
+    // This window belongs to the game thread. Time inside the SDK call can include CPU scheduling.
+    static unsigned starts, calls, errors, idle, missing;
+    static Clock::duration sleepTime{};
+    if (!hold) ++idle;
+    else if (!t) ++missing;
+    else {
+        auto start = Clock::now();
+        sl::Result result = p_sleep(*t);
+        sleepTime += Clock::now() - start;
+        ++calls;
+        if (result != sl::Result::eOk && ++errors == 1)
+            say("dlssg: Reflex sleep failed on frame %u: %s", frame, sl::getResultAsStr(result));
+    }
+    if (++starts == pacingWindow) {
+        double ms = std::chrono::duration<double, std::milli>(sleepTime).count();
+        say("dlssg: Reflex through game frame %u: sleep calls %u, failures %u, skipped idle %u, missing token %u, mean time in call %.3f ms",
+            frame, calls, errors, idle, missing, calls ? ms / calls : 0.0);
+        starts = calls = errors = idle = missing = 0;
+        sleepTime = {};
+    }
+}
+
+extern "C" NX2SL_API void nx2sl_phase(uint32_t frame, Nx2SlPhase phase) {
+    static const sl::PCLMarker markers[] = {sl::PCLMarker::eSimulationStart, sl::PCLMarker::eSimulationEnd,
+                                            sl::PCLMarker::eRenderSubmitStart};
+    if (g_available != 1 || (unsigned)phase >= sizeof markers / sizeof *markers) return;
+    if (auto *t = token(frame)) mark(markers[phase], *t, frame);
+}
+
+// Original bridge ABI for executables that only report image acquisition.
+extern "C" NX2SL_API void nx2sl_sleep(uint32_t frame, int hold) {
+    nx2sl_wait(frame, hold);
+    if (auto *t = g_available == 1 ? token(frame) : nullptr) {
         p_marker(sl::PCLMarker::eSimulationStart, *t);
         p_marker(sl::PCLMarker::eSimulationEnd, *t);
         p_marker(sl::PCLMarker::eRenderSubmitStart, *t);
@@ -195,7 +241,7 @@ extern "C" NX2SL_API void nx2sl_sleep(uint32_t frame, int hold) {
 
 extern "C" NX2SL_API void nx2sl_submit_end(uint32_t frame) {
     sl::FrameToken *t = g_available == 1 ? token(frame) : nullptr;
-    if (t) p_marker(sl::PCLMarker::eRenderSubmitEnd, *t);
+    if (t) mark(sl::PCLMarker::eRenderSubmitEnd, *t, frame);
 }
 
 // Written and consumed on the present thread, once for each backbuffer.
@@ -280,26 +326,55 @@ extern "C" NX2SL_API int nx2sl_frame(VkCommandBuffer cb, const Nx2SlImage *depth
 extern "C" NX2SL_API void nx2sl_present_marker(int after, uint32_t frame) {
     sl::FrameToken *t = g_available == 1 ? token(frame) : nullptr;
     if (!t) return;
-    p_marker(after ? sl::PCLMarker::ePresentEnd : sl::PCLMarker::ePresentStart, *t);
+    mark(after ? sl::PCLMarker::ePresentEnd : sl::PCLMarker::ePresentStart, *t, frame);
     if (!after) return;
     g_presented++;
     // Asked after each present, numFramesActuallyPresented is what that present showed: 2 with one generated frame, 4
     // with three.
     sl::DLSSGState s{};
-    if (!p_dlssg_state || p_dlssg_state(sl::ViewportHandle(0), s, nullptr) != sl::Result::eOk) return;
-    g_shown += s.numFramesActuallyPresented;
+    static unsigned stateErrors;
+    sl::Result result = p_dlssg_state(sl::ViewportHandle(0), s, nullptr);
+    if (result != sl::Result::eOk) {
+        if (stateErrors++ % pacingWindow == 0)
+            say("dlssg: FG state query after present failed: %s", sl::getResultAsStr(result));
+        return;
+    }
+    uint64_t shown = g_shown.fetch_add(s.numFramesActuallyPresented, std::memory_order_relaxed) + s.numFramesActuallyPresented;
     if (s.numFramesToGenerateMax && s.numFramesToGenerateMax != g_max.load()) {   // a 0 now and then is no news
         say("dlssg: up to %ux on this GPU and driver", s.numFramesToGenerateMax + 1);
         g_max.store(s.numFramesToGenerateMax);
     }
-    if (g_presented == 600 || g_presented % 3600 == 0)
-        say("dlssg: %llu frames, %u presented per frame, status %u", (unsigned long long)g_presented,
-            s.numFramesActuallyPresented, (unsigned)s.status);
+    // Count presentations over elapsed time. A single multiplier sample cannot distinguish 167 from 170 FPS.
+    static uint64_t startPresent, startShown;
+    static Clock::time_point startTime;
+    if (!startPresent || stateErrors || g_presented - startPresent >= pacingWindow) {
+        auto now = Clock::now();
+        if (startPresent && !stateErrors) {
+            double seconds = std::chrono::duration<double>(now - startTime).count();
+            say("dlssg: through game frame %u: %.2f app presents/s, %.2f Streamline frames presented/s, latest %u frames/present, status %u, FG VSync support %d",
+                frame, (g_presented - startPresent) / seconds, (shown - startShown) / seconds,
+                s.numFramesActuallyPresented, (unsigned)s.status, (int)s.bIsVsyncSupportAvailable);
+        }
+        // Query on a live swapchain. The Vulkan backend asks the driver about its sleep and latency reports here.
+        sl::ReflexState state{};
+        {
+            std::lock_guard<std::mutex> lock(g_reflex_options);
+            result = p_reflex_state(state);
+        }
+        if (result == sl::Result::eOk)
+            say("dlssg: Reflex driver low latency available %d, latency reports available %d",
+                state.lowLatencyAvailable, state.latencyReportAvailable);
+        else say("dlssg: Reflex state query failed: %s", sl::getResultAsStr(result));
+        startTime = now;
+        startPresent = g_presented;
+        startShown = shown;
+        stateErrors = 0;
+    }
 }
 
 extern "C" NX2SL_API uint32_t nx2sl_frames_max(void) { return g_available == 1 ? g_max.load() : 0; }
 
-extern "C" NX2SL_API uint64_t nx2sl_shown(void) { return g_shown; }
+extern "C" NX2SL_API uint64_t nx2sl_shown(void) { return g_shown.load(std::memory_order_relaxed); }
 
 extern "C" NX2SL_API void nx2sl_shutdown(void) {
     if (p_shutdown && g_available >= 0) p_shutdown();

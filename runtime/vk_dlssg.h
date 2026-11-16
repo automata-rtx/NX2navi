@@ -2,6 +2,9 @@
 #pragma once
 #include <stdint.h>
 #include <vulkan/vulkan.h>
+struct RtDispatchHook;
+struct RtDispatchHook *vk_dlssg_update_hook(void);
+void vk_dlssg_render_start(uint64_t frame);
 
 int vk_dlssg_wanted(void);   // NX2NAVI_FRAMEGEN = dlss with DLSS or FSR 3.1 upscaling on (read once)
 int vk_dlssg_early(void);    // before the instance exists: loads the DLL and Streamline; 1 when its proxies are there
@@ -21,10 +24,9 @@ VkResult vk_dlssg_acquire(VkDevice d, VkSwapchainKHR sc, uint64_t timeout, VkSem
 VkResult vk_dlssg_present(VkQueue q, const VkPresentInfoKHR *pi);
 void vk_dlssg_frame(VkCommandBuffer cb, VkExtent2D ext, const int rect[4], VkImage hudless, VkImageView hudless_view, VkFormat hudless_format);   // each present, before its command buffer is submitted
 // Frames are numbered by the game's presents (frame n ends with the n-th). Reflex's frame timing while active:
-void vk_dlssg_frame_start(void);    // the game starts a frame (nvn_api_obj.c nvnWindowAcquireTexture): Reflex's sleep
+void vk_dlssg_frame_start(void);    // record image acquisition and pace a frame that did not pass through the update hook
 void vk_dlssg_game_present(void);   // the game presents it (vk_backend.c vk_be_present): counts it
-// its submissions went out (vk_backend.c: vk_be_present, or replay_main with asynchronous replay): the render-submit-end
-// marker; frame is gfx_counters.frames of its present, the same count
+// Its last submission went out, including the present blit (or the final signal for a skipped picture).
 void vk_dlssg_submitted(uint64_t frame);
 void vk_dlssg_present_frame(uint64_t frame);   // the present thread's next blit and present are of this frame
 uint64_t vk_dlssg_shown(void);   // the frames the display got, generated ones included (present thread); 0 when off

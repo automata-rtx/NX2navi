@@ -89,6 +89,7 @@ static void present_main(void *arg) {
         vk_dlssg_present_frame(j.frame);
         vk_present_blit(j.image, VK_IMAGE_LAYOUT_GENERAL, j.format, j.w, j.h, j.has_crop ? j.crop : NULL);
         uint64_t f = vk_sync_submit(NULL, 0);   // a timeline value after the blit: deferred destruction waits for the blit too
+        vk_dlssg_submitted(j.frame);
         if (j.value && f != j.value)
             rt_fatal("vk: the present of frame %llu signalled %llu, queued as %llu", (unsigned long long)j.frame,
                      (unsigned long long)f, (unsigned long long)j.value);
@@ -240,6 +241,7 @@ static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uin
             uint64_t f = vk_sync_submit(NULL, 0);
             if (f != value) rt_fatal("vk: skipped present signalled %llu, queued as %llu", (unsigned long long)f, (unsigned long long)value);
         }
+        vk_dlssg_submitted(frame);
         return;
     }
     PresentJob j = {.image = img->image, .format = img->format, .w = (int)img->width, .h = (int)img->height, .frame = frame,
@@ -422,6 +424,7 @@ static void replay_main(void *arg) {
         plat_mutex_unlock(&rl);
         if (it.kind == RI_SUBMIT) {
             vk_sub_in_frame = sub_idx++;
+            if (!vk_sub_in_frame) vk_dlssg_render_start(__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1);
             uint64_t f = submit_sync(it.h, it.n);
             if (f != it.value)
                 rt_fatal("vk: replayed submission signalled %llu, queued as %llu", (unsigned long long)f,
@@ -433,7 +436,7 @@ static void replay_main(void *arg) {
             free((void *)it.tex);
         } else {
             uint64_t frame = __atomic_add_fetch(&gfx_counters.frames, 1, __ATOMIC_RELAXED);
-            vk_dlssg_submitted(frame);   // the frame's submissions were replayed before its present
+            vk_dlssg_render_start(frame);   // the blit can be the first submission of an otherwise empty frame
             present_image(it.tex, it.has_crop ? it.crop : NULL, it.at, it.queued, frame, it.value);
             sub_idx = 0;
         }
@@ -545,7 +548,7 @@ static void vk_be_present(const tex_t *t, const int crop[4], uint64_t at_ns) {
     vk_dlssg_game_present();
     if (!gfx_replay_async()) {
         uint64_t frame = __atomic_add_fetch(&gfx_counters.frames, 1, __ATOMIC_RELAXED);
-        vk_dlssg_submitted(frame);
+        vk_dlssg_render_start(frame);
         vk_exec_evt_frame(frame);
         perf_present(frame);   // before vk_exec_frame_log, which resets the frame's exec counts the flight recorder reads
         uint64_t queued = kern_now_ns();
@@ -623,6 +626,7 @@ static void vk_be_program_release(const prog_t *p) { replay_drain(DR_PROG_RELEAS
 static uint64_t vk_be_submit(const uint64_t *handles, int n) {
     if (!gfx_replay_async()) {
         vk_sub_in_frame = __atomic_load_n(&nvn_submits_in_frame, __ATOMIC_RELAXED);   // the front end counts it up after the submit returns
+        if (!vk_sub_in_frame) vk_dlssg_render_start(__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1);
         return submit_sync(handles, n);
     }
     vk_sync_start();

@@ -855,7 +855,7 @@ NVN_API(nvnWindowAcquireTexture) {
             perf_end(PERF_PACE, p0);
         }
     }
-    if (gfx_backend()->frame_start) gfx_backend()->frame_start();   // the frame's work starts here
+    if (gfx_backend()->frame_start) gfx_backend()->frame_start();
     // The sync means "the display no longer reads this image". Presents are copies queued in submit order, so it is
     // already satisfied: fenced = 3 with fence 0.
     if (s) {

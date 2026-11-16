@@ -138,7 +138,7 @@ static void table_seal(void *p, uint64_t bytes) {
     if (!plat_mem_protect((uint64_t)(uintptr_t)p, bytes, PLAT_PROT_READ)) rt_fatal("dispatch: sealing the table failed");
 }
 
-void rt_dispatch_init(const RtModule *mods, int count) {
+void rt_dispatch_init(const RtModule *mods, int count, RtDispatchHook *hook) {
     if (g_ready) rt_fatal("rt_dispatch_init called twice");
     if (count <= 0 || count > MAX_MODULES) rt_fatal("rt_dispatch_init: %d modules", count);
 
@@ -154,7 +154,7 @@ void rt_dispatch_init(const RtModule *mods, int count) {
 
     // Function tables: sorted, aligned, inside their module. Range of guest starts and of host functions.
     uint64_t lo = UINT64_MAX, hi = 0;
-    uintptr_t host_lo = UINTPTR_MAX, host_hi = 0;
+    uintptr_t host_lo = hook ? (uintptr_t)hook->wrapper : UINTPTR_MAX, host_hi = hook ? host_lo : 0;
     for (int i = 0; i < g_nmods; i++) {
         const RtModule *m = g_mods[i];
         for (uint64_t k = 0; k < m->count; k++) {
@@ -197,6 +197,13 @@ void rt_dispatch_init(const RtModule *mods, int count) {
         for (uint64_t k = 0; k < m->count; k++)
             slot[(m->addrs[k] - lo) >> 2] = (uint32_t)((uintptr_t)m->fns[k] - anchor);
         g_functions += m->count;
+    }
+    if (hook && hook->pc >= lo && hook->pc < hi && !(hook->pc & 3)) {
+        uint32_t *entry = &slot[(hook->pc - lo) >> 2];
+        if (*entry) {
+            hook->original = (GuestFn)(anchor + *entry);
+            *entry = (uint32_t)((uintptr_t)hook->wrapper - anchor);
+        }
     }
     table_seal(slot, bytes);
 
