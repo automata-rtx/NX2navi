@@ -6869,9 +6869,9 @@ static void untranslated_dispatch_fallback(VkExec *ex) {
         si = twin ? twin->image : VK_NULL_HANDLE, sf = twin ? twin->format : VK_FORMAT_B10G11R11_UFLOAT_PACK32;
     }
     int native = raw_native_9e5(si, sf);   // RGB9E5 texels in an RGB9E5 image: decoded as they are, no copy
+    int packed_scene = dst && dst->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && (native || raw_9e5(si, sf));
     VkImageView dst_view = VK_NULL_HANDLE;   // for the tonemap pass, while the lock keeps the image
-    if (src && dst && (dst->usage & VK_IMAGE_USAGE_STORAGE_BIT) && (raw_9e5(si, sf) || native) &&
-        dst->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && knob_tm_dispatch() != 2) {
+    if (src && dst && (dst->usage & VK_IMAGE_USAGE_STORAGE_BIT) && packed_scene && knob_tm_dispatch() != 2) {
         view_t nv;
         memset(&nv, 0, sizeof nv);
         dst_view = get_view(ex, dst, &nv, 0, 3, 1);   // 3: the translator's Texture2D
@@ -6880,6 +6880,7 @@ static void untranslated_dispatch_fallback(VkExec *ex) {
     VkFormat df = dst ? dst->format : VK_FORMAT_UNDEFINED;
     vk_texture_unlock();
     if (!si || !di) return;
+    if (packed_scene && vk_dlaa_scene_upscale(ex, sw, sh, dst)) return;
     static int logged;
     if (!logged++) rt_log("vk_exec: untranslated compute dispatch: its output image (%ux%u) gets a linear blit of its "
                           "largest input (%ux%u) instead (NX2NAVI_CS_FALLBACK=0 turns this off)", dw, dh, sw, sh);

@@ -636,9 +636,10 @@ static int dl_active(void) { return N.available && !D.failed && D.on; }
 // with NGX's functions not loaded, a call to address 0 (issue #325).
 static int use_fsr(void) { return !N.ngx_up && fsr_frame; }
 
-static void dl_fail(const char *what, NgxResult r) {
+static int dl_fail(const char *what, NgxResult r) {
     rt_log("dlaa: %s failed (%08x): DLAA off for this run", what, (unsigned)r);
     D.failed = 1;
+    return 0;
 }
 
 static int image2d(uint32_t w, uint32_t h, VkFormat f, VkImageUsageFlags usage, VkImage *img, VmaAllocation *mem,
@@ -1870,7 +1871,7 @@ static void edge_fill(VkCommandBuffer cb, const VkExecTarget *t, const VkExecTar
 // Set when the scene the upscaler runs on has another size than the last one; vk_dlaa_resized_take reads it.
 static volatile int32_t size_changed;
 
-static void evaluate(VkExec *ex, const VkExecTarget *dst) {
+static int evaluate(VkExec *ex, const VkExecTarget *dst) {
     const VkExecTarget *t = &D.color, *z = &D.depth;
     if (!dst) dst = t;
     uint32_t w = t->width, h = t->height, ow = dst->width, oh = dst->height;
@@ -1891,7 +1892,7 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
     // Read once: vk_dlaa_frame runs on the present's thread and can clear fsr_frame while this replay is between the
     // checks below, which would send the rest of this function to DLSS's path without NGX after all.
     const int fsr = use_fsr();
-    if (!fsr && !N.ngx_up) return;   // neither runs this frame: vk_dlaa_frame turns DLAA off at the next present
+    if (!fsr && !N.ngx_up) return 0;   // neither runs this frame: vk_dlaa_frame turns DLAA off at the next present
     if (!fsr && !D.params && !NGX_OK(N.alloc_params(&D.params))) return dl_fail("parameter allocation", 0);
     NgxParam *p = D.params;
     VkImageView zv = vk_exec_target_view(z->img, z->format, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_DEPTH_BIT, z->level,
@@ -2062,6 +2063,7 @@ evaluated:
                (unsigned long long)D.cam_none_draw, (unsigned long long)D.cam_none_snap, (unsigned long long)D.cam_kept,
                (unsigned long long)D.cam_kept_max, KEEP_MAX, (unsigned long long)D.cam_at_draw);
     window_line();
+    return 1;
 }
 
 // The HUD-less picture (vk_dlaa_fg_hudless): DLSS's output, which the HUD is then drawn over, through the encode the
@@ -2128,6 +2130,22 @@ static int scene_color(VkFormat f) {
     return f == VK_FORMAT_B10G11R11_UFLOAT_PACK32 || f == VK_FORMAT_R16G16B16A16_SFLOAT;
 }
 
+// The final encode samples the compute upscaler's output even on frames that skip the HUD pass.
+int vk_dlaa_scene_upscale(VkExec *ex, uint32_t sw, uint32_t sh, const VkTexImage *dst) {
+    if (!dl_active()) return 0;
+    vk_exec_hooks_wait();
+    if (!D.armed || D.gbuf || D.done || sw != D.color.width || sh != D.color.height ||
+        dst->image == D.color.image || dst->width < sw || dst->height < sh)
+        return 0;
+    vk_exec_hook_turn();
+    VkExecTarget out = {.image = dst->image, .format = dst->format, .width = dst->width, .height = dst->height, .img = dst};
+    if (!evaluate(ex, &out)) return 0;
+    D.ended = D.done = D.up = 1;
+    static int told;
+    if (!told++) rt_log("dlaa: resolved the scene at its compute upscale (%ux%u -> %ux%u)", sw, sh, dst->width, dst->height);
+    return 1;
+}
+
 // Two frame shapes. A deferred frame (the G-buffer, several colour targets at the scene size) arms on the light target
 // drawn after it and ends the scene at the first pass a quarter as wide (the bloom), as described above. Ocarina's
 // frame has no G-buffer: its light target (B10G11R11 at the scene size, with the D32F scene depth) is drawn into from the
@@ -2136,11 +2154,9 @@ static int scene_color(VkFormat f) {
 // target (each such pass at the scene's size takes over the arming, with its depth); the game's upscaler (its stand-in
 // here, vk_tonemap.c) then fills a light-format target without depth, at the picture's size, which the HUD is drawn
 // into; a last draw copies that target into the 8-bit sRGB output target, encoding only, since the game tonemaps before
-// its post pass (vk_tonemap.c, vk_hdr.c). The scene ends at the start of the pass the HUD is drawn into: DLSS reads the
-// armed pair and its picture goes into that target, which the HUD is drawn over and the last draw reads. With an
-// upscaling share that target is larger than the scene; in DLAA it has the scene's size. A frame without it (the
-// menus) ends at the last draw, at the 8-bit output target of the scene's size, and DLSS's picture goes back into the
-// light target, which that draw reads.
+// its post pass (vk_tonemap.c, vk_hdr.c). vk_dlaa_scene_upscale resolves the armed pair directly into the compute
+// upscaler's destination. For frames that reach the graphics hooks without that dispatch, the light-format output
+// pass or the final encode still provides the resolve point.
 static int srgb8(VkFormat f) { return f == VK_FORMAT_R8G8B8A8_SRGB || f == VK_FORMAT_B8G8R8A8_SRGB; }
 
 // The output target DLAA runs at. With the game's own HDR (vk_hdr.c vk_hdr_native) the same pass, at the same point of

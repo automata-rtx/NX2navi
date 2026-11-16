@@ -65,6 +65,8 @@ int64_t vk_dlaa_vram(void);
 // frame (vk_dlaa_frame).
 typedef struct VkExec VkExec;
 void vk_dlaa_pass(VkExec *ex);
+// The forward scene's compute upscaler. Returns 1 when temporal reconstruction filled its output.
+int vk_dlaa_scene_upscale(VkExec *ex, uint32_t sw, uint32_t sh, const VkTexImage *dst);
 void vk_dlaa_frame(void);
 // 1 once, at the present of the first frame whose scene has a new size after a setting changed (vk_dlaa.c).
 int vk_dlaa_resized_take(void);
