@@ -188,7 +188,7 @@
 # 1: the log says how many pipelines came from pipeline-cache.bin; 2 also logs every compute pipeline built. 0: off.
 # pipe_feedback = 1
 # pipeline-cache.bin larger than this (MB) starts empty and is rewritten (0: no limit).
-# pipeline_cache_max_mb = 512
+# pipeline_cache_max_mb = 1024
 # 1: the pipelines a run compiles go into pipeline-cache-play.bin, a small file of its own, so pipeline-cache.bin
 # (hundreds of MB) is not written again while you play; the small file is folded into the large one at a start once
 # it has grown. 0: one file, written whole whenever a run made a new pipeline.

@@ -741,7 +741,7 @@ static VkResult pipe_create(int kind, void *ci, VkPipeline *pipe) {
 // The data of the pipeline cache file at path for vkCreatePipelineCache (malloc'd, its size in *size), NULL when the
 // run starts without it, which the log says with the file's size. Cache data whose header names another device or
 // driver is dropped before Vulkan sees it.
-// NX2NAVI_PIPELINE_CACHE_MAX_MB (default 512; 0 no limit): a larger file starts the run empty, and the run's
+// NX2NAVI_PIPELINE_CACHE_MAX_MB (default 1024; 0 no limit): a larger file starts the run empty, and the run's
 // saves replace it. The file only grows: entries of earlier translators and builds stay, and on NVIDIA
 // (621.01) an entry another executable wrote is neither used nor written again, so a renamed or updated exe
 // compiles while the file keeps its size (2026-11-09: 650 MB, 15-18 % of the pipelines read from it). The
