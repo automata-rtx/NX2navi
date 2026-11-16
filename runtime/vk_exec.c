@@ -913,6 +913,8 @@ void vk_exec_pass_begin(VkExec *ex) {
                           .pDepthAttachment = ex->pass_depth ? &da : NULL,
                           .pStencilAttachment = ex->pass_stencil ? &sa : NULL};
     if (tonemap) vk_dlaa_tonemap_begin(ex, ca, &da, &ri);
+    ex->hud_alpha_attachment = !tonemap && vk_dlaa_hud_attachment(ex, &ca[1]);
+    if (ex->hud_alpha_attachment) ri.colorAttachmentCount = 2;
     vkCmdBeginRendering(ex->cb, &ri);
     vk_exec_frame.passes++;
     ex->recorded++;
@@ -1075,6 +1077,7 @@ static void clear_color(VkExec *ex, const p_clear_color *c) {
         return;
     }
     const VkExecTarget *t = &ex->color[i];
+    vk_dlaa_hud_write(t->image);
     VkClearColorValue cv;
     memcpy(cv.float32, c->rgba, sizeof cv.float32);   // integer targets: the payload's bits as the front end stored them
     if (whole_target(ex, t)) {

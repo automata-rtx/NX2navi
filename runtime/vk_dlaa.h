@@ -17,7 +17,7 @@ int vk_ngxfg_on(void);       // ... and NX2NAVI_FRAMEGEN = dlss now (the menu sw
 void vk_ngxfg_reset(void);   // the next generation starts without history (a resize, the menu)
 // Records count generated frames into out[] and a copy of bb into real; returns how many were made (0: none, and real
 // is not written).
-int vk_ngxfg_evaluate(VkCommandBuffer cb, const VkNgxImage *bb, const VkNgxImage *hudless, const VkNgxImage *out, int count,
+int vk_ngxfg_evaluate(VkCommandBuffer cb, const VkNgxImage *bb, const VkNgxImage *hudless, const VkNgxImage *alpha, const VkNgxImage *out, int count,
                       const VkNgxImage *real);
 int vk_dlaa_fsr3(void);   // the setting is on and its upscaler is AMD FSR 3.1, which loads
 int vk_dlaa_needs_restart(void);   // the menu's upscaler cannot start in this run
@@ -65,6 +65,11 @@ int64_t vk_dlaa_vram(void);
 // frame (vk_dlaa_frame).
 typedef struct VkExec VkExec;
 void vk_dlaa_pass(VkExec *ex);
+int vk_dlaa_hud_attachment(const VkExec *ex, VkRenderingAttachmentInfo *attachment);
+int vk_hud_alpha_pipeline(VkPipeState *s);
+void vk_dlaa_hud_incomplete(void);
+void vk_dlaa_hud_write(VkImage image);
+VkNgxImage vk_dlaa_present_alpha(VkCommandBuffer cb, VkExtent2D ext, const int rect[4], const int to[4], uint64_t frame);
 int vk_dlaa_swap_active(const VkExec *ex);
 int vk_dlaa_tonemap_target(const VkExec *ex);
 void vk_dlaa_tonemap_begin(VkExec *ex, VkRenderingAttachmentInfo *color, VkRenderingAttachmentInfo *depth,

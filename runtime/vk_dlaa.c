@@ -567,6 +567,10 @@ static struct {
     uint32_t hl_w, hl_h;
     VkFormat hl_fmt;
     int hl_fresh;
+    VkImage hud_target;
+    VkNgxImage alpha, present_alpha;
+    VmaAllocation alpha_mem, present_alpha_mem;
+    int alpha_incomplete;
 } D = {.mv_ok = -1, .cfg_seen = ~0u};
 
 // What this frame drew into a D32F depth at least DLAA_SCENE_MIN_W wide before DLSS ran (vk_dlaa_draw), for the line a
@@ -1514,7 +1518,17 @@ static struct Snap *mask_pass(VkCommandBuffer cb, VkImageView cv, uint32_t w, ui
 
 // ---------------------------------------------------------------- teardown
 // The HUD-less picture's images, a half-made pair too. The device must be idle, or the images not yet used.
+static void free_alpha(VkNgxImage *a, VmaAllocation *allocation) {
+    VkCtx *c = vk_ctx();
+    if (a->view) vkDestroyImageView(c->device, a->view, NULL);
+    if (a->img) vmaDestroyImage(c->vma, a->img, *allocation);
+    *a = (VkNgxImage){0};
+    *allocation = NULL;
+}
+
 static void hl_destroy(void) {
+    free_alpha(&D.alpha, &D.alpha_mem);
+    D.hud_target = VK_NULL_HANDLE;
     const VkCtx *c = vk_ctx();
     if (D.hl_view) vkDestroyImageView(c->device, D.hl_view, NULL);
     if (D.hl) vmaDestroyImage(c->vma, D.hl, D.hl_mem);
@@ -1588,6 +1602,7 @@ void vk_dlaa_release(void) {
     for (int i = 0; i < 5; i++) destroy_size(&D.sizes[i]);
     for (int i = 0; i < SNAPS; i++) destroy_snap(&R.s[i]);
     hl_destroy();
+    free_alpha(&D.present_alpha, &D.present_alpha_mem);
     release_post();
     if (D.mv_pipe) vkDestroyPipeline(c->device, D.mv_pipe, NULL);
     if (D.mv_layout) vkDestroyPipelineLayout(c->device, D.mv_layout, NULL);
@@ -1821,7 +1836,7 @@ static void window_line(void) {
 }
 
 // dst: the target DLSS's picture goes to, NULL for the light target itself (DLAA in place).
-static void hudless(VkCommandBuffer cb, VkImage source, uint32_t w, uint32_t h);
+static void hudless(VkCommandBuffer cb, VkImage source, VkImage target, uint32_t w, uint32_t h);
 
 // Another light target than last frame's. The game draws its scene into one of a few pooled targets of the same size
 // and moves to another whenever its pass list changes, in the middle of play with the camera and the scene carrying
@@ -2099,8 +2114,12 @@ evaluated:
     if (dst != t) vk_dlaa_swap_img = t->img, vk_dlaa_swap_view = e->out_view;   // the scaling draw reads DLSS's picture
     // Frame generation needs the tonemapped scene. The early forward resolve takes
     // that copy in vk_dlaa_scene_upscale after the game composites bloom.
-    if (!D.early && vk_dlaa_hudless_wanted && (!vk_dlssg_active() || (D.cam_size == OCAM_BLOCK && !D.gbuf)))
-        hudless(cb, e->out, ow, oh);
+    if (!D.early && vk_dlaa_hudless_wanted && (!vk_dlssg_active() || (D.cam_size == OCAM_BLOCK && !D.gbuf))) {
+        if (!dst->level && !dst->base_layer)
+            hudless(cb, dst->image, dst->image, dst->width, dst->height);
+        else
+            hudless(cb, e->out, VK_NULL_HANDLE, ow, oh);
+    }
     ex->recorded += 4;
     vk_exec_draw_new_cb();   // NGX bound pipelines and descriptor sets of its own: the next draw binds everything again
     D.jdepth = z->image, D.jw = z->width, D.jh = z->height;
@@ -2133,10 +2152,84 @@ evaluated:
 // HDR (NX2NAVI_HDR = 1) the game's picture stays float and linear up to the present, which encodes it to PQ
 // (vk_hdr_encode): DLSS's output is kept as RGBA16F for the same encode. The game's own HDR (native) encodes inside the
 // game, which this cannot follow: no HUD-less picture there.
+static int alpha_image(VkCommandBuffer cb, VkNgxImage *a, VmaAllocation *allocation, uint32_t w, uint32_t h,
+                       VkImageUsageFlags usage, VkFormat format) {
+    if (a->img && (a->w != w || a->h != h)) {
+        vk_queue_lock(), vkDeviceWaitIdle(vk_ctx()->device), vk_queue_unlock();
+        free_alpha(a, allocation);
+    }
+    if (a->img) return 1;
+    a->w = w, a->h = h, a->fmt = format;
+    usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    if (!image2d(w, h, a->fmt, usage, &a->img, allocation, &a->view)) {
+        free_alpha(a, allocation);
+        return 0;
+    }
+    VkImageMemoryBarrier2 b = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+        .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .dstAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = a->img, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &b};
+    vkCmdPipelineBarrier2(cb, &di);
+    return 1;
+}
+
+static void clear_alpha(VkCommandBuffer cb, VkImage image) {
+    VkImageSubresourceRange all = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkClearColorValue zero = {0};
+    vkCmdClearColorImage(cb, image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &all);
+    full_barrier(cb);
+}
+
+void vk_dlaa_hud_incomplete(void) { __atomic_store_n(&D.alpha_incomplete, 1, __ATOMIC_RELAXED); }
+
+void vk_dlaa_hud_write(VkImage image) {
+    if (image && image == D.hud_target && D.hl_at == D.presents) vk_dlaa_hud_incomplete();
+}
+
+int vk_dlaa_hud_attachment(const VkExec *ex, VkRenderingAttachmentInfo *a) {
+    if (!D.hud_target || D.hl_at != D.presents) return 0;
+    for (uint32_t i = 0; i < ex->pass_ncolor; i++) {
+        const VkExecTarget *t = &ex->color[i];
+        if (t->image != D.hud_target || t->level || t->base_layer) continue;
+        if (ex->pass_ncolor != 1 || ex->pass_layers != 1 || t->samples > 1 ||
+            t->width != D.alpha.w || t->height != D.alpha.h) {
+            vk_dlaa_hud_incomplete();
+            return 0;
+        }
+        *a = (VkRenderingAttachmentInfo){.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .imageView = D.alpha.view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+        return 1;
+    }
+    return 0;
+}
+
+VkNgxImage vk_dlaa_present_alpha(VkCommandBuffer cb, VkExtent2D ext, const int rect[4], const int to[4], uint64_t frame) {
+    // The SDK Vulkan format table recognizes R16F for a single-channel UI tag.
+    if (!D.hud_target || D.hl_at + 1 != frame || D.fg_at != D.hl_at ||
+        __atomic_load_n(&D.alpha_incomplete, __ATOMIC_RELAXED) ||
+        !alpha_image(cb, &D.present_alpha, &D.present_alpha_mem, ext.width, ext.height,
+                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT, VK_FORMAT_R16_SFLOAT))
+        return (VkNgxImage){0};
+    full_barrier(cb);
+    if (to[2] != (int)ext.width || to[3] != (int)ext.height) clear_alpha(cb, D.present_alpha.img);
+    VkImageBlit region = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+        .srcOffsets = {{rect[0], rect[1], 0}, {rect[0] + rect[2], rect[1] + rect[3], 1}},
+        .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+        .dstOffsets = {{to[0], to[1], 0}, {to[0] + to[2], to[1] + to[3], 1}}};
+    vkCmdBlitImage(cb, D.alpha.img, VK_IMAGE_LAYOUT_GENERAL, D.present_alpha.img, VK_IMAGE_LAYOUT_GENERAL,
+                   1, &region, VK_FILTER_LINEAR);
+    full_barrier(cb);
+    return D.present_alpha;
+}
+
 int vk_dlaa_hudless_wanted;
-static void hudless(VkCommandBuffer cb, VkImage source, uint32_t w, uint32_t h) {
+static void hudless(VkCommandBuffer cb, VkImage source, VkImage target, uint32_t w, uint32_t h) {
     const VkCtx *c = vk_ctx();
     int hdr = vk_hdr_wanted() && !vk_hdr_native();
+    D.hud_target = VK_NULL_HANDLE;
     if (vk_hdr_native()) return;
     VkFormat fmt = hdr ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
     if (D.hl && (D.hl_w != w || D.hl_h != h || D.hl_fmt != fmt)) {
@@ -2174,6 +2267,13 @@ static void hudless(VkCommandBuffer cb, VkImage source, uint32_t w, uint32_t h) 
     }
     VkImageBlit b = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .srcOffsets = {{0, 0, 0}, {(int32_t)w, (int32_t)h, 1}},
                      .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstOffsets = {{0, 0, 0}, {(int32_t)w, (int32_t)h, 1}}};
+    if (target && D.cam_size == OCAM_BLOCK && !D.gbuf && (vk_dlssg_ui_alpha() || vk_ngxfg_on()) &&
+        alpha_image(cb, &D.alpha, &D.alpha_mem, w, h, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_FORMAT_R8_UNORM)) {
+        D.hud_target = target;
+        __atomic_store_n(&D.alpha_incomplete, 0, __ATOMIC_RELAXED);
+        full_barrier(cb);
+        clear_alpha(cb, D.alpha.img);
+    }
     vkCmdBlitImage(cb, source, VK_IMAGE_LAYOUT_GENERAL, hdr ? D.hl : D.hl_srgb, VK_IMAGE_LAYOUT_GENERAL, 1, &b,
                    VK_FILTER_NEAREST);
     full_barrier(cb);
@@ -2275,7 +2375,7 @@ int vk_dlaa_scene_upscale(VkExec *ex, uint32_t sw, uint32_t sh, const VkTexImage
         blit_scene(ex->cb, src, D.promoted ? post.size.width : sw, D.promoted ? post.size.height : sh,
                    dst->image, dst->width, dst->height);
         full_barrier(ex->cb);
-        if (vk_dlaa_hudless_wanted) hudless(ex->cb, dst->image, dst->width, dst->height);
+        if (vk_dlaa_hudless_wanted) hudless(ex->cb, dst->image, dst->image, dst->width, dst->height);
         D.up = 1;
         ex->recorded += 2;
         D.early_outputs++;
@@ -2661,7 +2761,7 @@ int vk_ngxfg_max(void) { return vk_ngxfg_wanted() && N.available && !FG.failed ?
 int vk_ngxfg_on(void) { return vk_ngxfg_max() && !strcmp(cfg_value("NX2NAVI_FRAMEGEN"), "dlss"); }
 void vk_ngxfg_reset(void) { FG.reset = 1; }
 
-int vk_ngxfg_evaluate(VkCommandBuffer cb, const VkNgxImage *bb, const VkNgxImage *hudless, const VkNgxImage *out, int count,
+int vk_ngxfg_evaluate(VkCommandBuffer cb, const VkNgxImage *bb, const VkNgxImage *hudless, const VkNgxImage *alpha, const VkNgxImage *out, int count,
                       const VkNgxImage *real) {
     if (!vk_ngxfg_max() || count < 1) return 0;
     if (count > FG.max) count = FG.max;
@@ -2713,7 +2813,10 @@ int vk_ngxfg_evaluate(VkCommandBuffer cb, const VkNgxImage *bb, const VkNgxImage
     p_setp(p, "DLSSG.MVecs", &rm);
     p_setp(p, "DLSSG.HUDLess", hudless ? &rh : NULL);
     p_setp(p, "DLSSG.UI", NULL);
-    p_setp(p, "DLSSG.UIAlpha", NULL);
+    NgxResourceVK ra = alpha ? res_image(alpha->view, alpha->img, alpha->fmt, alpha->w, alpha->h,
+                                          VK_IMAGE_ASPECT_COLOR_BIT, 0) : rb;
+    p_setp(p, "DLSSG.UIAlpha", alpha ? &ra : NULL);
+    p_setu(p, "DLSSG.UserInterfaceRecompositionEnabled", hudless && alpha);
     p_setp(p, "DLSSG.BidirectionalDistortionField", NULL);
     p_setp(p, "DLSSG.OutputReal", &rr);
     p_setp(p, "DLSSG.OutputDisableInterpolation", NULL);
@@ -2749,7 +2852,7 @@ int vk_ngxfg_evaluate(VkCommandBuffer cb, const VkNgxImage *bb, const VkNgxImage
     p_setu(p, "DLSSG.MenuDetectionEnabled", 0);
     struct { const char *base; uint32_t w, h; } rects[] = {
         {"DLSSG.MVecsSubrect", m.width, m.height}, {"DLSSG.DepthSubrect", d.width, d.height},
-        {"DLSSG.HUDLessSubrect", bb->w, bb->h}, {"DLSSG.InputBackbufferSubrect", bb->w, bb->h},
+        {"DLSSG.UIAlphaSubrect", bb->w, bb->h}, {"DLSSG.HUDLessSubrect", bb->w, bb->h}, {"DLSSG.InputBackbufferSubrect", bb->w, bb->h},
         {"DLSSG.OutputInterpolatedSubrect", bb->w, bb->h}, {"DLSSG.OutputRealSubrect", bb->w, bb->h}};
     for (size_t i = 0; i < sizeof rects / sizeof *rects; i++) {
         char k[64];

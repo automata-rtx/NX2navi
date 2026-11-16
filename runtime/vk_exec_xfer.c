@@ -42,6 +42,7 @@
 #include "tex.h"
 #include "vk.h"
 #include "vk_exec.h"
+#include "vk_dlaa.h"
 
 enum { W_FORMAT, W_REGION, W_BUFFER, W_OVERLAP, W_COPY, W_CLEAR, W_QUERY, W_COUNT };
 
@@ -964,6 +965,7 @@ static void copy_buffer_image(VkExec *ex, const p_copy_b2t *p, int to_image) {
     vk_mem_count(m.cls, to_image ? VK_MUSE_COPY_SRC : VK_MUSE_GPU_WRITE, size);
     vk_exec_pass_end(ex);
     vk_exec_barrier(ex);
+    if (to_image) vk_dlaa_hud_write(s.img->image);
     if (to_image) vkCmdCopyBufferToImage(ex->cb, m.buffer, s.img->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
     else vkCmdCopyImageToBuffer(ex->cb, s.img->image, VK_IMAGE_LAYOUT_GENERAL, m.buffer, 1, &c);
     ex->recorded++;
@@ -987,6 +989,7 @@ static void copy_t2t(VkExec *ex, const p_copy_t2t *p) {
         warn_once(W_COPY, "texture copy between formats %#x and %#x: skipped", p->src->d.format, p->dst->d.format);
         return;
     }
+    vk_dlaa_hud_write(d.img->image);
     VkImageSubresourceLayers sl = sub_layers(&s), dl = sub_layers(&d);
     vk_exec_pass_end(ex);
     vk_exec_barrier(ex);
@@ -1136,6 +1139,7 @@ static void clear_tex(VkExec *ex, const p_clear_tex *p) {
         }
         vk_exec_pass_end(ex);
         vk_exec_barrier(ex);
+        vk_dlaa_hud_write(img->image);
         vkCmdClearColorImage(ex->cb, img->image, VK_IMAGE_LAYOUT_GENERAL, &cv, 1, &rng);
     } else {
         int both = (img->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) && (img->aspect & VK_IMAGE_ASPECT_STENCIL_BIT);

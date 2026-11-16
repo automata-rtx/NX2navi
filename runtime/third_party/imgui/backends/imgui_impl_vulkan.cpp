@@ -86,6 +86,7 @@
 
 #include "imgui.h"
 #ifndef IMGUI_DISABLE
+#include <stdlib.h>
 #include "imgui_impl_vulkan.h"
 #include <stdio.h>
 #ifndef IM_MAX
@@ -240,6 +241,7 @@ struct ImGui_ImplVulkan_Data
     VkDescriptorSetLayout       DescriptorSetLayout;
     VkPipelineLayout            PipelineLayout;
     VkPipeline                  Pipeline;
+    VkPipeline                  HudPipeline;
     VkShaderModule              ShaderModuleVert;
     VkShaderModule              ShaderModuleFrag;
     VkDescriptorPool            DescriptorPool;
@@ -872,7 +874,7 @@ static void ImGui_ImplVulkan_CreateShaderModules(VkDevice device, const VkAlloca
     }
 }
 
-static void ImGui_ImplVulkan_CreatePipeline(VkDevice device, const VkAllocationCallbacks* allocator, VkPipelineCache pipelineCache, VkRenderPass renderPass, VkSampleCountFlagBits MSAASamples, VkPipeline* pipeline, uint32_t subpass)
+static void ImGui_ImplVulkan_CreatePipeline(VkDevice device, const VkAllocationCallbacks* allocator, VkPipelineCache pipelineCache, VkRenderPass renderPass, VkSampleCountFlagBits MSAASamples, VkPipeline* pipeline, uint32_t subpass, VkShaderModule hudFragment = VK_NULL_HANDLE)
 {
     ImGui_ImplVulkan_Data* bd = ImGui_ImplVulkan_GetBackendData();
     ImGui_ImplVulkan_CreateShaderModules(device, allocator);
@@ -884,7 +886,7 @@ static void ImGui_ImplVulkan_CreatePipeline(VkDevice device, const VkAllocationC
     stage[0].pName = "main";
     stage[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stage[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    stage[1].module = bd->ShaderModuleFrag;
+    stage[1].module = hudFragment ? hudFragment : bd->ShaderModuleFrag;
     stage[1].pName = "main";
 
     VkVertexInputBindingDescription binding_desc[1] = {};
@@ -932,7 +934,7 @@ static void ImGui_ImplVulkan_CreatePipeline(VkDevice device, const VkAllocationC
     ms_info.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
     ms_info.rasterizationSamples = (MSAASamples != 0) ? MSAASamples : VK_SAMPLE_COUNT_1_BIT;
 
-    VkPipelineColorBlendAttachmentState color_attachment[1] = {};
+    VkPipelineColorBlendAttachmentState color_attachment[2] = {};
     color_attachment[0].blendEnable = VK_TRUE;
     color_attachment[0].srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
     color_attachment[0].dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
@@ -947,7 +949,10 @@ static void ImGui_ImplVulkan_CreatePipeline(VkDevice device, const VkAllocationC
 
     VkPipelineColorBlendStateCreateInfo blend_info = {};
     blend_info.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    blend_info.attachmentCount = 1;
+    blend_info.attachmentCount = hudFragment ? 2 : 1;
+    color_attachment[1] = color_attachment[0];
+    color_attachment[1].srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+    color_attachment[1].colorWriteMask = VK_COLOR_COMPONENT_R_BIT;
     blend_info.pAttachments = color_attachment;
 
     VkDynamicState dynamic_states[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
@@ -974,17 +979,50 @@ static void ImGui_ImplVulkan_CreatePipeline(VkDevice device, const VkAllocationC
     info.subpass = subpass;
 
 #ifdef IMGUI_IMPL_VULKAN_HAS_DYNAMIC_RENDERING
+    VkPipelineRenderingCreateInfoKHR rendering = bd->VulkanInitInfo.PipelineRenderingCreateInfo;
+    VkFormat formats[2] = {};
     if (bd->VulkanInitInfo.UseDynamicRendering)
     {
         IM_ASSERT(bd->VulkanInitInfo.PipelineRenderingCreateInfo.sType == VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR && "PipelineRenderingCreateInfo sType must be VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR");
         IM_ASSERT(bd->VulkanInitInfo.PipelineRenderingCreateInfo.pNext == nullptr && "PipelineRenderingCreateInfo pNext must be nullptr");
-        info.pNext = &bd->VulkanInitInfo.PipelineRenderingCreateInfo;
+        if (hudFragment) {
+            formats[0] = rendering.pColorAttachmentFormats[0];
+            formats[1] = VK_FORMAT_R16_SFLOAT;
+            rendering.pColorAttachmentFormats = formats;
+            rendering.colorAttachmentCount = 2;
+        }
+        info.pNext = &rendering;
         info.renderPass = VK_NULL_HANDLE; // Just make sure it's actually nullptr.
     }
 #endif
 
     VkResult err = vkCreateGraphicsPipelines(device, pipelineCache, 1, &info, allocator, pipeline);
     check_vk_result(err);
+}
+
+// A second attachment accumulates the host overlay's opacity with the guest HUD in the same draw.
+extern "C" uint32_t *vk_hud_overlay_code(const uint32_t *, size_t, size_t *);
+VkPipeline ImGui_ImplVulkan_HudPipeline()
+{
+    ImGui_ImplVulkan_Data* bd = ImGui_ImplVulkan_GetBackendData();
+    if (bd->HudPipeline) return bd->HudPipeline;
+    ImGui_ImplVulkan_InitInfo* v = &bd->VulkanInitInfo;
+    size_t words = 0;
+    uint32_t* code = vk_hud_overlay_code(__glsl_shader_frag_spv, IM_ARRAYSIZE(__glsl_shader_frag_spv), &words);
+    if (!code) return VK_NULL_HANDLE;
+    VkShaderModuleCreateInfo module = {};
+    module.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    module.codeSize = words * sizeof(*code);
+    module.pCode = code;
+    VkShaderModule shader = VK_NULL_HANDLE;
+    VkResult result = vkCreateShaderModule(v->Device, &module, v->Allocator, &shader);
+    free(code);
+    if (result == VK_SUCCESS) {
+        ImGui_ImplVulkan_CreatePipeline(v->Device, v->Allocator, v->PipelineCache, v->RenderPass,
+                                        v->MSAASamples, &bd->HudPipeline, v->Subpass, shader);
+        vkDestroyShaderModule(v->Device, shader, v->Allocator);
+    }
+    return bd->HudPipeline;
 }
 
 bool ImGui_ImplVulkan_CreateDeviceObjects()
@@ -1077,6 +1115,7 @@ void    ImGui_ImplVulkan_DestroyDeviceObjects()
     if (bd->ShaderModuleFrag)     { vkDestroyShaderModule(v->Device, bd->ShaderModuleFrag, v->Allocator); bd->ShaderModuleFrag = VK_NULL_HANDLE; }
     if (bd->DescriptorSetLayout)  { vkDestroyDescriptorSetLayout(v->Device, bd->DescriptorSetLayout, v->Allocator); bd->DescriptorSetLayout = VK_NULL_HANDLE; }
     if (bd->PipelineLayout)       { vkDestroyPipelineLayout(v->Device, bd->PipelineLayout, v->Allocator); bd->PipelineLayout = VK_NULL_HANDLE; }
+    if (bd->HudPipeline) { vkDestroyPipeline(v->Device, bd->HudPipeline, v->Allocator); bd->HudPipeline = VK_NULL_HANDLE; }
     if (bd->Pipeline)             { vkDestroyPipeline(v->Device, bd->Pipeline, v->Allocator); bd->Pipeline = VK_NULL_HANDLE; }
     if (bd->DescriptorPool)       { vkDestroyDescriptorPool(v->Device, bd->DescriptorPool, v->Allocator); bd->DescriptorPool = VK_NULL_HANDLE; }
 }

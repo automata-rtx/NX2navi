@@ -692,7 +692,7 @@ static void shader_free(GfxShader *s) {
     free(s->spirv), free(s->reflection), free(s);
 }
 
-static void reflect(GfxShader *s);
+static void reflect(GfxShader *s, int patch_txd);
 
 // A shader of a previous translator entered the memory cache: counted, and the first one logged.
 static void carry_served(const GfxShader *s) {
@@ -802,12 +802,12 @@ static GfxShader *disk_load_from(const uint8_t key[32], const uint8_t *iid, int 
         reflect_stage(s), reflect_spirv(s);
         return s;
     }
-    reflect(s);
+    reflect(s, 1);
     if (s->stage == GFX_STAGE_FS) vk_hdr_shader_swap(&s->spirv, &s->words);   // the in-memory copy; the cache keeps its own
     return s;
 }
 
-const GfxShader *gfx_shader_own(const uint32_t *spirv, uint64_t words, const char *res_json) {
+static const GfxShader *own_shader(const uint32_t *spirv, uint64_t words, const char *res_json, int patch_txd) {
     if (words < 5 || spirv[0] != 0x07230203 || !spirv_complete(spirv, words) ||
         !reflection_valid(res_json, strlen(res_json)))
         return NULL;
@@ -822,8 +822,17 @@ const GfxShader *gfx_shader_own(const uint32_t *spirv, uint64_t words, const cha
     free(buf);
     memcpy(s->spirv, spirv, words * 4), memcpy(s->reflection, res_json, rn + 1);
     s->words = words, s->reflection_size = rn;
-    reflect(s);
+    reflect(s, patch_txd);
     return s;
+}
+
+const GfxShader *gfx_shader_own(const uint32_t *spirv, uint64_t words, const char *res_json) {
+    return own_shader(spirv, words, res_json, 1);
+}
+
+const GfxShader *gfx_shader_variant(const GfxShader *original, const uint32_t *spirv, uint64_t words) {
+    // The input is the already patched in-memory module. Transposing its gradients again changes texture samples.
+    return own_shader(spirv, words, original->reflection, 0);
 }
 
 // The pack, then the loose files (a newer translation of a key the pack holds a bad copy of); NULL when neither has a
@@ -1183,7 +1192,7 @@ static void reflect_stage(GfxShader *s) {
              : !strcmp(stage, "ms") ? GFX_STAGE_MS : GFX_STAGE_VS;
 }
 
-static void reflect(GfxShader *s) {
+static void reflect(GfxShader *s, int patch_txd) {
     static const char *const kinds[GFX_RES_KINDS] = {"cbufs", "sbufs", "textures", "images"};
     const char *js = s->reflection;
     reflect_stage(s);
@@ -1196,7 +1205,7 @@ static void reflect(GfxShader *s) {
     }
     reflect_spirv(s);
     reflect_exact(s);
-    patch_txd_transpose(s);
+    if (patch_txd) patch_txd_transpose(s);
 }
 
 // ---- use masks (see the cache key at the top)

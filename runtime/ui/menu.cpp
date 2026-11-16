@@ -2163,9 +2163,11 @@ extern "C" int menu_boot_frame(const MenuTarget *t) {
     return ImGui::GetDrawData()->TotalVtxCount > 0;
 }
 
-extern "C" void menu_overlay_draw(VkCommandBuffer cb) {
+extern "C" VkPipeline menu_overlay_hud_pipeline(void) { return ImGui_ImplVulkan_HudPipeline(); }
+
+extern "C" void menu_overlay_draw_with_pipeline(VkCommandBuffer cb, VkPipeline pipeline) {
     uint64_t t0 = plat_now_ns();
-    ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cb);
+    ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cb, pipeline);
     g_cost_ns += plat_now_ns() - t0;
     if (++g_cost_frames == 600) {
         rt_log("menu: %.3f ms CPU per open frame (layout and recording, mean of 600)", g_cost_ns / 600 / 1e6);

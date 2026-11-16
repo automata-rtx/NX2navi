@@ -250,9 +250,15 @@ extern "C" NX2SL_API void nx2sl_present_rect(const int rect[4]) {
     backbufferRect = {(uint32_t)rect[1], (uint32_t)rect[0], (uint32_t)rect[2], (uint32_t)rect[3]};
 }
 
+// Set immediately before nx2sl_frame on the present thread. The optional export keeps older hosts compatible.
+static Nx2SlImage pendingAlpha{};
+extern "C" NX2SL_API void nx2sl_ui_alpha(const Nx2SlImage *alpha) { pendingAlpha = alpha ? *alpha : Nx2SlImage{}; }
+
 extern "C" NX2SL_API int nx2sl_frame(VkCommandBuffer cb, const Nx2SlImage *depth, const Nx2SlImage *mv,
                                      const Nx2SlImage *hudless, const Nx2SlCamera *cam, uint32_t out_w, uint32_t out_h,
                                      int enable, uint32_t frame) {
+    Nx2SlImage alpha = pendingAlpha;
+    pendingAlpha = {};
     if (g_available != 1) return 0;
     sl::FrameToken *t = token(frame);
     if (!t) return 0;
@@ -261,6 +267,7 @@ extern "C" NX2SL_API int nx2sl_frame(VkCommandBuffer cb, const Nx2SlImage *depth
     uint32_t max = g_max.load();
     int n = enable > 0 ? enable : 0;
     if (n > (int)(max ? max : 1)) n = (int)(max ? max : 1);
+    bool recompose = n && depth && mv && cam && hudless && alpha.view;
     if (n && depth && mv && cam) {
         sl::Constants c{};
         matrix(c.cameraViewToClip, cam->view_to_clip);
@@ -283,6 +290,7 @@ extern "C" NX2SL_API int nx2sl_frame(VkCommandBuffer cb, const Nx2SlImage *depth
         c.motionVectors3D = sl::Boolean::eFalse;
         c.reset = cam->reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
         sl::Result constantsResult = p_constants(c, *t, vp);
+        if (constantsResult != sl::Result::eOk) recompose = false;
         static unsigned constantErrors;
         if (constantsResult != sl::Result::eOk && constantErrors++ < 8)
             say("dlssg: camera constants rejected on frame %u (%d)", frame, (int)constantsResult);
@@ -291,23 +299,34 @@ extern "C" NX2SL_API int nx2sl_frame(VkCommandBuffer cb, const Nx2SlImage *depth
         sl::Extent eh = backbufferRect ? backbufferRect : sl::Extent{0, 0, out_w, out_h};
         // Replay can write the next scene between the blit submission and the paced present.
         // Preserve this frame's depth and motion on the blit command buffer while its color matches.
-        sl::ResourceTag tags[4] = {sl::ResourceTag(&rd, sl::kBufferTypeDepth, sl::ResourceLifecycle::eOnlyValidNow, &ed),
+        sl::Resource ra = recompose ? resource(&alpha) : sl::Resource{};
+        sl::ResourceTag tags[5] = {sl::ResourceTag(&rd, sl::kBufferTypeDepth, sl::ResourceLifecycle::eOnlyValidNow, &ed),
                                    sl::ResourceTag(&rm, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eOnlyValidNow, &em),
                                    sl::ResourceTag(hudless ? &rh : nullptr, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent, &eh)};
         unsigned count = 3;   // a null HUD-less tag also clears the previous picture
+        tags[count++] = sl::ResourceTag(recompose ? &ra : nullptr, sl::kBufferTypeUIAlpha,
+                                        sl::ResourceLifecycle::eValidUntilPresent, &eh);
         if (backbufferRect)
             tags[count++] = sl::ResourceTag(nullptr, sl::kBufferTypeBackbuffer,
                                              sl::ResourceLifecycle::eValidUntilPresent, &backbufferRect);
-        if ((t = token(frame))) {
-            sl::Result result = p_tag(*t, vp, tags, count, (sl::CommandBuffer *)cb);
-            static unsigned tagErrors;
-            if (result != sl::Result::eOk && tagErrors++ < 8)
-                say("dlssg: frame %u resource tags rejected (%d)", frame, (int)result);
-        }
+        t = token(frame);
+        sl::Result result = t ? p_tag(*t, vp, tags, count, (sl::CommandBuffer *)cb) : sl::Result::eErrorMissingInputParameter;
+        if (result != sl::Result::eOk) recompose = false;
+        static unsigned tagErrors;
+        if (result != sl::Result::eOk && tagErrors++ < 8)
+            say("dlssg: frame %u resource tags rejected (%d)", frame, (int)result);
+    } else if (n) {
+        // The generation mode can remain on for a few presents while scene inputs are missing.
+        sl::ResourceTag absent[] = {
+            {nullptr, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent},
+            {nullptr, sl::kBufferTypeUIAlpha, sl::ResourceLifecycle::eValidUntilPresent}};
+        p_tag(*t, vp, absent, 2, (sl::CommandBuffer *)cb);
     }
-    if (n != g_frames) {
+    static bool recomposing = false;
+    if (n != g_frames || recompose != recomposing) {
         sl::DLSSGOptions o{};
         o.mode = n ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
+        o.enableUserInterfaceRecomposition = recompose ? sl::Boolean::eTrue : sl::Boolean::eFalse;
         o.numFramesToGenerate = n ? (uint32_t)n : 1;
         // Generation goes off for every menu, cutscene and frame without depth and motion, and on again after it. Off
         // frees the generator's resources unless this flag is set, and on allocates them again inside the present, with
@@ -318,7 +337,11 @@ extern "C" NX2SL_API int nx2sl_frame(VkCommandBuffer cb, const Nx2SlImage *depth
         sl::Result r = p_dlssg_options(vp, o);
         if (n) say("dlssg: frame generation on, %dx (%d generated per rendered frame) (%d), output %ux%u", n + 1, n, (int)r, out_w, out_h);
         else say("dlssg: frame generation off (%d), output %ux%u", (int)r, out_w, out_h);
-        g_frames = n;
+        if (r == sl::Result::eOk) {
+            if (recompose != recomposing) say("dlssg: UI alpha recomposition %s", recompose ? "on" : "off");
+            recomposing = recompose;
+            g_frames = n;
+        }
     }
     return 1;
 }

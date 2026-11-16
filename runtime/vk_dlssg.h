@@ -16,13 +16,17 @@ VkResult vk_dlssg_create_device(VkInstance inst, VkPhysicalDevice pd, const VkDe
 void vk_dlssg_device_ready(VkPhysicalDevice physical, VkDevice dev);   // after the device: checks DLSS-G and takes the swapchain hooks
 PFN_vkGetDeviceProcAddr vk_dlssg_dpa(void);   // Streamline's device entry points, or NULL when it is not in use
 int vk_dlssg_active(void);
+int vk_dlssg_ui_alpha(void);
+uint64_t vk_dlssg_current_frame(void);
 // gfx_present.c's swapchain calls while active
 VkResult vk_dlssg_create_swapchain(VkDevice d, const VkSwapchainCreateInfoKHR *ci, VkSwapchainKHR *sc);
 void vk_dlssg_destroy_swapchain(VkDevice d, VkSwapchainKHR sc);
 VkResult vk_dlssg_get_images(VkDevice d, VkSwapchainKHR sc, uint32_t *n, VkImage *img);
 VkResult vk_dlssg_acquire(VkDevice d, VkSwapchainKHR sc, uint64_t timeout, VkSemaphore sem, uint32_t *idx);
 VkResult vk_dlssg_present(VkQueue q, const VkPresentInfoKHR *pi);
-void vk_dlssg_frame(VkCommandBuffer cb, VkExtent2D ext, const int rect[4], VkImage hudless, VkImageView hudless_view, VkFormat hudless_format);   // each present, before its command buffer is submitted
+// Each present, before its command buffer is submitted.
+void vk_dlssg_frame(VkCommandBuffer cb, VkExtent2D ext, const int rect[4], VkImage hudless, VkImageView hudless_view,
+                    VkFormat hudless_format, VkImage alpha, VkImageView alpha_view);
 // Frames are numbered by the game's presents (frame n ends with the n-th). Reflex's frame timing while active:
 void vk_dlssg_frame_start(void);    // record image acquisition and pace a frame that did not pass through the update hook
 void vk_dlssg_game_present(void);   // the game presents it (vk_backend.c vk_be_present): counts it

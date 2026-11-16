@@ -4850,6 +4850,7 @@ static int prepare_draw_ex(VkExec *ex, int prim, int32_t count, int restart, int
     uint32_t fbl = RWT_CALL(RWT_STAGE_TARGET, feedback_prepare(ex, fs));
     VkPipeState s = ex->pipe;
     s.vs = vs, s.fs = fs, s.ts = ts;
+    if (ex->hud_alpha_attachment && !vk_hud_alpha_pipeline(&s)) vk_dlaa_hud_incomplete();
     if (mesh) foliage_shadow_cull(ex, &s);
     if (fb) memset(s.vattr, 0, sizeof s.vattr), memset(s.vstream, 0, sizeof s.vstream);   // whatever the last vertex draw left
     s.feedback = (uint8_t)((fbl & 0xff ? 1 : 0) | (fbl & 0x100 ? 2 : 0));

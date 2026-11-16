@@ -65,6 +65,7 @@ typedef void (*PFN_nx2sl_submit_end)(uint32_t frame);
 // the number of frames to generate between two rendered ones (0 off; 1, 2 or 3 for 2x, 3x or 4x), at most what
 // nx2sl_frames_max reports; a DLL without nx2sl_frames_max (an older build) generates one for any nonzero value. Then
 // nx2sl_present_marker(0) before and (1) after the present.
+typedef void (*PFN_nx2sl_ui_alpha)(const Nx2SlImage *alpha);
 typedef int (*PFN_nx2sl_frame)(VkCommandBuffer cb, const Nx2SlImage *depth, const Nx2SlImage *mv, const Nx2SlImage *hudless,
                                const Nx2SlCamera *cam, uint32_t out_w, uint32_t out_h, int enable, uint32_t frame);
 // The most frames DLSS-G can generate between two rendered ones on this GPU and driver (Streamline's

@@ -59,7 +59,9 @@ typedef struct {
 // back end and uploads the font. With the menu closed it costs two loads and a compare.
 int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot);
 // Records the frame menu_overlay_frame laid out into cb, which is inside dynamic rendering on the image.
-void menu_overlay_draw(VkCommandBuffer cb);
+VkPipeline menu_overlay_hud_pipeline(void);
+void menu_overlay_draw_with_pipeline(VkCommandBuffer cb, VkPipeline pipeline);
+static inline void menu_overlay_draw(VkCommandBuffer cb) { menu_overlay_draw_with_pipeline(cb, VK_NULL_HANDLE); }
 // The boot screen while boot.c waits for the prewarm: phase as VkPrewarmProgress.phase (0 starting, 1 shaders,
 // 2 pipelines) with its count. menu_boot_frame lays out the screen for t like menu_overlay_frame (1: draw it with
 // menu_overlay_draw); only before the guest runs, from the thread that presents then.

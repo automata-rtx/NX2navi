@@ -111,6 +111,7 @@ struct ImGui_ImplVulkan_InitInfo
 IMGUI_IMPL_API bool             ImGui_ImplVulkan_Init(ImGui_ImplVulkan_InitInfo* info);
 IMGUI_IMPL_API void             ImGui_ImplVulkan_Shutdown();
 IMGUI_IMPL_API void             ImGui_ImplVulkan_NewFrame();
+IMGUI_IMPL_API VkPipeline       ImGui_ImplVulkan_HudPipeline();
 IMGUI_IMPL_API void             ImGui_ImplVulkan_RenderDrawData(ImDrawData* draw_data, VkCommandBuffer command_buffer, VkPipeline pipeline = VK_NULL_HANDLE);
 IMGUI_IMPL_API bool             ImGui_ImplVulkan_CreateFontsTexture();
 IMGUI_IMPL_API void             ImGui_ImplVulkan_DestroyFontsTexture();

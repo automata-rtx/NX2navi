@@ -198,6 +198,14 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   `taa` is DLSS or FSR at the scene's size with the game's SMAA. While DLSS or FSR runs (`dlaa`, any mode), the other
   values still choose the pass: in the native modes it smooths the upscaler's picture after the bloom, in the scaling
   modes it runs on the scene before the upscaler scales it.
+- DLSS Frame Generation takes the postprocessed scene before the HUD and a separate single-channel opacity image.
+  `vk_dlaa.c` clears opacity when it captures that scene. Later draws to the same target accumulate opacity in a
+  second attachment using their original fragment coverage. Source-over draws accumulate `a + (1 - a) * previous`.
+  `vk_hud_alpha.c` estimates coverage for colored multipliers and additive glows from their RGB blend equations.
+  The present applies the game's crop and letterboxing to the mask and adds the host overlay at display resolution.
+  The Streamline bridge enables UI recomposition when both images belong to the current frame. Untracked writes,
+  unsupported blends and movie replacement frames use the existing fallback. Native HDR uses the game's own PQ
+  encode and currently lacks a matching HUD-less capture. `NX2NAVI_FG_UI_ALPHA_SHOW=1` previews opacity in red.
 - HDR (`vk_hdr.c`): the game tonemaps its scene into a float target, upscales it, draws the HUD into a second float
   target and copies that into the 8-bit sRGB window texture it presents. With `NX2NAVI_HDR=1` the tonemap shader gets
   the function of `shaders/hdr_tonemap.frag` spliced in where its SDR curve clamps each channel, so the float picture

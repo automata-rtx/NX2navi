@@ -1269,7 +1269,7 @@ static int ng_multiplier(int max) {
 // Records the copy of the frame's picture and DLSS-G's frames (the end of present_image's command buffer, dst in
 // layout *last). Returns the number of generated frames, -1 when the frame goes out the plain way.
 static int ng_record(VkCommandBuffer cb, VkImage dst, VkImageLayout *last, VkPipelineStageFlags2 *stage, VkAccessFlags2 *write,
-                     VkImage hudless, int *set, int gen) {
+                     VkImage hudless, const VkNgxImage *alpha, int *set, int gen) {
     if (!ng.on) return -1;
     if (ng.fresh) {   // every image to GENERAL, once
         NgImg *all[1 + 2 + 2 * NG_MAX];
@@ -1299,7 +1299,7 @@ static int ng_record(VkCommandBuffer cb, VkImage dst, VkImageLayout *last, VkPip
         VkNgxImage out[NG_MAX], real = {ng.real[*set].img, ng.real[*set].view, ng.fmt, ng.w, ng.h};
         for (int i = 0; i < NG_MAX; i++) out[i] = (VkNgxImage){ng.out[*set][i].img, ng.out[*set][i].view, ng.fmt, ng.w, ng.h};
         int hl_ok = hudless && g_hl_w == ng.w && g_hl_h == ng.h && g_hl_fmt == ng.fmt;
-        made = vk_ngxfg_evaluate(cb, &bb, hl_ok ? &hl : NULL, out, want, &real);
+        made = vk_ngxfg_evaluate(cb, &bb, hl_ok ? &hl : NULL, hl_ok ? alpha : NULL, out, want, &real);
     }
     // the rendered frame for the presenter (ng.bb is drawn again by the next frame)
     sync_barrier(cb, ng.real[*set].img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
@@ -1493,7 +1493,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
                      VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
                      VK_ACCESS_2_TRANSFER_WRITE_BIT);
     }
-    if (!g_sc_hdr && src) movie_overlay(cb, slot, dst);   // a movie frame over the game image (SDR swapchains)
+    int movie = !g_sc_hdr && src && movie_overlay(cb, slot, dst);   // a movie frame over the game image (SDR swapchains)
     // last: the image's layout, and the stage and access of its last write, as each step leaves it
     VkImageLayout last = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     VkPipelineStageFlags2 last_stage = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
@@ -1501,6 +1501,11 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     // HDR10: the menu goes into vk_hdr.c's RGBA8 image, which is then blended onto the swapchain image at the HUD's white
     VkImageView menu_view = overlay && g_sc_hdr ? vk_hdr_ui_target(cb, g_sc_ext.width, g_sc_ext.height) : VK_NULL_HANDLE;
     if (overlay && g_sc_hdr && !menu_view) overlay = 0;
+    VkNgxImage alpha = {0};
+    if (hudless && (vk_dlssg_ui_alpha() || ng_running()) && !movie && !show_hl)
+        alpha = vk_dlaa_present_alpha(cb, g_sc_ext, rect, to, vk_dlssg_current_frame());
+    VkPipeline overlay_pipeline = overlay && alpha.img ? menu_overlay_hud_pipeline() : VK_NULL_HANDLE;
+    if (overlay && !overlay_pipeline) alpha = (VkNgxImage){0};
     if (overlay) {
         sync_barrier(cb, dst, last, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, last_stage, last_write,
                      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
@@ -1512,13 +1517,43 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
                                         .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
         VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, g_sc_ext}, .layerCount = 1,
                               .colorAttachmentCount = 1, .pColorAttachments = &ca};
+        VkRenderingAttachmentInfo attachments[2] = {ca, ca};
+        if (overlay_pipeline) {
+            attachments[1].imageView = alpha.view;
+            attachments[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            attachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+            ri.pColorAttachments = attachments;
+            ri.colorAttachmentCount = 2;
+        }
         vkCmdBeginRendering(cb, &ri);
-        menu_overlay_draw(cb);
+        menu_overlay_draw_with_pipeline(cb, overlay_pipeline);
         vkCmdEndRendering(cb);
+        if (alpha.img)
+            sync_barrier(cb, alpha.img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                         VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                         VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT);
         if (menu_view) vk_hdr_ui_compose(cb, dst_view, g_sc_fmt, g_sc_ext.width, g_sc_ext.height);
         last = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         last_stage = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
         last_write = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    }
+    static int show_alpha = -1;
+    if (show_alpha < 0) {
+        const char *value = cfg_get("NX2NAVI_FG_UI_ALPHA_SHOW");
+        show_alpha = value && !strcmp(value, "1");
+    }
+    if (alpha.img && show_alpha) {
+        VkImageBlit blit = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+            .srcOffsets = {{0, 0, 0}, {(int)g_sc_ext.width, (int)g_sc_ext.height, 1}},
+            .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+            .dstOffsets = {{0, 0, 0}, {(int)g_sc_ext.width, (int)g_sc_ext.height, 1}}};
+        sync_barrier(cb, dst, last, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, last_stage, last_write,
+                     VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        vkCmdBlitImage(cb, alpha.img, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+        last = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        last_stage = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        last_write = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        alpha = (VkNgxImage){0};
     }
     if (cap) {
         sync_barrier(cb, dst, last, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, last_stage, last_write,
@@ -1541,11 +1576,12 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     }
     if (src) vk_fg_frame(cb, g_sc, g_sc_fmt, g_sc_ext, hudless, g_hl_view, to);   // frame generation: this frame's preparation
     if (src) output_rate();
-    if (src) vk_dlssg_frame(cb, g_sc_ext, to, hudless, g_hl_view, g_sc_fmt);
+    if (src) vk_dlssg_frame(cb, g_sc_ext, to, movie ? VK_NULL_HANDLE : hudless, g_hl_view, g_sc_fmt,
+                            alpha.img, alpha.view);
     // through the presenter: the picture stays in ng.bb, and DLSS Frame Generation's frames and the copy for the
     // presenter are recorded; otherwise the swapchain image is ready to present
     int ng_set = 0;
-    const int ng_count = ngp ? ng_record(cb, dst, &last, &last_stage, &last_write, hudless, &ng_set, src != VK_NULL_HANDLE) : -1;
+    const int ng_count = ngp ? ng_record(cb, dst, &last, &last_stage, &last_write, movie ? VK_NULL_HANDLE : hudless, alpha.img ? &alpha : NULL, &ng_set, src != VK_NULL_HANDLE) : -1;
     const int via_ng = ng_count >= 0;
     if (!via_ng) sync_barrier(cb, dst, last, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, last_stage, last_write, VK_PIPELINE_STAGE_2_NONE, 0);
     vk_crumb(cb, VK_CRUMB_PRESENT_END, crumb);

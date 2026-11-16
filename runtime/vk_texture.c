@@ -5191,6 +5191,7 @@ const VkTexImage *vk_texture_at_locked(const VkTexImage *img, VkFormat format) {
 // A storage image may be written by the shaders of the submission being recorded (texture lock held, vk_exec_draw.c
 // tex_info). Its storage is not marked GPU-owned: only the write fence for ReadTexels.
 void vk_texture_storage_bound_locked(const VkTexImage *img) {
+    vk_dlaa_hud_write(img->image);
     Tex *e = (Tex *)img;   // pub is the first member
     uint64_t f = vk_exec_recording_fence();
     if (f > e->wr_fence) e->wr_fence = f;

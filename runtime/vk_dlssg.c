@@ -44,6 +44,7 @@ static struct {
     PFN_nx2sl_device_proc gdpa;
     PFN_nx2sl_available available;
     PFN_nx2sl_log_unavailable log_unavailable;
+    PFN_nx2sl_ui_alpha ui_alpha;
     PFN_nx2sl_frame frame;
     PFN_nx2sl_present_rect present_rect;
     PFN_nx2sl_present_marker marker;
@@ -54,7 +55,7 @@ static struct {
     PFN_nx2sl_shown shown;
     PFN_nx2sl_reflex reflex;
     uint32_t game;   // the game's presents (vk_dlssg_game_present)
-    uint32_t cur;    // the frame the present thread blits and presents next (vk_dlssg_present_frame)
+    uint64_t cur;    // the frame the present thread blits and presents next (vk_dlssg_present_frame)
     uint32_t started;      // last distinct guest image acquisition, on the frame-loop thread
     uint32_t waited;       // frame already paced by the update or its acquisition fallback
     uint64_t hosted_ns;    // kern_now_ns after the last host present
@@ -110,6 +111,7 @@ int vk_dlssg_early(void) {
     S.gdpa = (PFN_nx2sl_device_proc)(void *)GetProcAddress(m, "nx2sl_device_proc");
     S.available = (PFN_nx2sl_available)(void *)GetProcAddress(m, "nx2sl_available");
     S.log_unavailable = (PFN_nx2sl_log_unavailable)(void *)GetProcAddress(m, "nx2sl_log_unavailable");
+    S.ui_alpha = (PFN_nx2sl_ui_alpha)(void *)GetProcAddress(m, "nx2sl_ui_alpha");
     S.frame = (PFN_nx2sl_frame)(void *)GetProcAddress(m, "nx2sl_frame");
     S.present_rect = (PFN_nx2sl_present_rect)(void *)GetProcAddress(m, "nx2sl_present_rect");
     S.marker = (PFN_nx2sl_present_marker)(void *)GetProcAddress(m, "nx2sl_present_marker");
@@ -122,6 +124,7 @@ int vk_dlssg_early(void) {
     S.reflex = (PFN_nx2sl_reflex)(void *)GetProcAddress(m, "nx2sl_reflex");
     S.frames_max = (PFN_nx2sl_frames_max)(void *)GetProcAddress(m, "nx2sl_frames_max");   // optional: 2x only without
     if (!S.frames_max) rt_log("dlssg: nx2navi_dlssg.dll is older than multi frame generation: 2x at most");
+    if (!S.ui_alpha) rt_log("dlssg: this nx2navi_dlssg.dll predates UI alpha tagging; using HUD-less color alone");
     if (!ver || ver() != NX2SL_VERSION || !S.init || !S.gipa || !S.gdpa || !S.available || !S.frame || !S.marker ||
         !S.sleep || !S.submit_end || !S.shown || !S.reflex) {
         rt_log("dlssg: nx2navi_dlssg.dll is from another build: DLSS Frame Generation off");
@@ -336,11 +339,15 @@ void vk_dlssg_submitted(uint64_t frame) {
     if (S.active) S.submit_end((uint32_t)frame);
 }
 
-void vk_dlssg_present_frame(uint64_t frame) { S.cur = (uint32_t)frame; }
+void vk_dlssg_present_frame(uint64_t frame) { S.cur = frame; }
 
 uint64_t vk_dlssg_shown(void) { return S.active ? S.shown() : 0; }
 
-void vk_dlssg_frame(VkCommandBuffer cb, VkExtent2D ext, const int rect[4], VkImage hudless, VkImageView hudless_view, VkFormat hudless_format) {
+int vk_dlssg_ui_alpha(void) { return S.active && S.ui_alpha; }
+uint64_t vk_dlssg_current_frame(void) { return S.cur; }
+
+void vk_dlssg_frame(VkCommandBuffer cb, VkExtent2D ext, const int rect[4], VkImage hudless, VkImageView hudless_view,
+                    VkFormat hudless_format, VkImage alpha, VkImageView alpha_view) {
     if (!S.active) return;
     VkFfxImage d = {0}, m = {0};
     VkImageView dv = VK_NULL_HANDLE, mvv = VK_NULL_HANDLE;
@@ -377,6 +384,9 @@ void vk_dlssg_frame(VkCommandBuffer cb, VkExtent2D ext, const int rect[4], VkIma
     Nx2SlImage hl = {hudless, hudless_view, hudless_format, ext.width, ext.height, VK_IMAGE_LAYOUT_GENERAL,
                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
+    Nx2SlImage ui = {alpha, alpha_view, VK_FORMAT_R16_SFLOAT, ext.width, ext.height, VK_IMAGE_LAYOUT_GENERAL,
+                     hl.usage | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT};
+    if (S.ui_alpha) S.ui_alpha(have && hudless && hudless_view && alpha && alpha_view ? &ui : NULL);
     if (S.present_rect) S.present_rect(rect);
     S.frame(cb, have ? &zd : NULL, have ? &zm : NULL, have && hudless && hudless_view ? &hl : NULL,
             have ? &k : NULL, ext.width, ext.height, on ? mult - 1 : 0, S.cur);
