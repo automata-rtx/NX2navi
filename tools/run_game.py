@@ -37,6 +37,7 @@ else:
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from launcher import saves   # noqa: E402  (Import Saves' search, for a save from elsewhere)
+from tools.benchmark_log import archive_log
 PROFILE = ROOT / 'build' / 'profile'
 SAVES = ROOT / 'build' / 'save-backup'
 SLOTS = ROOT / 'build' / 'run-slots'
@@ -215,7 +216,8 @@ def main():
                                                '(a script that never reaches the world clock)')
     ap.add_argument('--tag', default='run', help='names the profile copy and the log')
     ap.add_argument('--shot', type=Path, help='PNG of the last frame; turns async pipeline builds off (boot.c)')
-    ap.add_argument('--log', type=Path, help='default: <exe dir>/logs/<tag>.log')
+    ap.add_argument('--frame-capture', type=Path, help='write the compact gameplay frame timings on exit')
+    ap.add_argument('--log', type=Path, help='explicit text log path; default: logs/<tag>.log, archived to .log.gz for compact captures')
     ap.add_argument('--env', action='append', default=[], metavar='KEY=VALUE', help='extra environment, repeatable')
     ap.add_argument('--quiet', action='store_true', help='wait until no other copy of the game or Ninja runs (benchmarks)')
     ap.add_argument('--show', action='store_true',
@@ -244,6 +246,10 @@ def main():
         for kv in a.env:
             k, _, v = kv.partition('=')
             env[k] = v
+        if a.frame_capture:
+            capture = a.frame_capture.resolve()
+            capture.parent.mkdir(parents=True, exist_ok=True)
+            env['NX2NAVI_FRAME_CAPTURE'] = str(capture)
         args = [str(exe), '--profile', str(prof), '--seconds', str(a.seconds)]
         if a.shot:
             args += ['--shot', str(a.shot.resolve())]
@@ -266,6 +272,13 @@ def main():
                         f'{exe.name} {count(exe.name)}, {NINJA} {count(NINJA)}\n')
         finally:
             shutil.rmtree(prof, ignore_errors=True)
+        if a.frame_capture and rc == 0:
+            with log.open(encoding='utf-8', errors='replace') as lines:
+                saved = any('frame capture: saved ' in line for line in lines)
+            if not saved or not capture.is_file():
+                sys.exit(f'run_game: the game did not write the requested frame capture; see {log}')
+        if a.frame_capture and not a.log:
+            log = archive_log(log)
     finally:
         release_gpu_lock(gpu)
     print(f'{log}: rc={rc}')

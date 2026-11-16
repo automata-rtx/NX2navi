@@ -34,6 +34,8 @@ The repository's additions are all rights reserved (`LICENSE-ADDITIONS`). It nev
 
 ## Fork releases
 
+For independent performance comparisons follow [docs/benchmarks.md](docs/benchmarks.md). It specifies the compact recorder, warm-cache acceptance, route windows and camera checks.
+
 The public name is `2NX2Navi`. Set `VERSION` to `Beta N` for a confirmed baseline. Label each unconfirmed candidate `Beta N - WIP M`, incrementing M for each candidate built against that baseline. Advance N only after confirmation.
 
 ## Writing

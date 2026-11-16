@@ -231,6 +231,18 @@ Scripted runs from saves (`tools/run_game.py`) add to the same file. Then:
 writes `build\pgo\pgo-v143.profdata` and its record (`.json`: the `recomp/` tree it fits). `make_release.py` ships every
 profile of `build\pgo` in `data\` and warns when a record names another `recomp/` tree than the one released.
 
+## Recording benchmark frame intervals
+
+Pass `--frame-capture build/frames.bin` to `tools/run_game.py` to record a scripted benchmark. This creates the parent directory and checks that the game reported saving the capture. For a direct launch, set `NX2NAVI_FRAME_CAPTURE` to a fresh output file path in an existing directory. The runtime buffers application present intervals while the loaded world's clock is active and writes them atomically on orderly exit. Each record contains the present number, interval in nanoseconds, and the game clock in microseconds at that present. Input script `MARK` lines name present boundaries in the ordinary game log. For the interval between two markers, include frames strictly after the first marker through the second marker's frame.
+
+Use the compact recorder with performance tracing off for routine FPS benchmarks. Keep the binary timing file and losslessly compress the text log after the game exits. With `--frame-capture`, the runner archives the default log as `.log.gz` and verifies that it decompresses byte for byte before removing the text file. Passing an explicit `--log` path keeps the text file for tools that consume it directly.
+
+Use a unique file for each attempt and check for successful exit and the matching `frame capture: saved` log line. An interrupted run can end before the buffer is written. To export the records as a tab-separated table:
+
+```powershell
+python tools/frame_capture.py frames.bin > frames.tsv
+```
+
 ## Linux (in progress)
 
 The runtime builds and runs on x86-64 Linux with a window, input and menu on SDL3 (`*_sdl.c`) in place of the Win32

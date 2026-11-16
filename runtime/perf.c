@@ -47,11 +47,29 @@ int perf_gpu_timing(void) {
 
 static volatile int64_t gpu_busy_total;
 
+// NX2NAVI_FRAME_CAPTURE is a benchmark output path. Only the present thread appends.
+// Flush can run on another thread at shutdown, including a window close.
+typedef struct { uint64_t frame, interval_ns; int64_t world_us; } FrameSample;
+typedef struct { char magic[8]; FrameSample samples[]; } FrameCapture;
+_Static_assert(sizeof(FrameSample) == 24 && sizeof(FrameCapture) == 8, "frame capture file layout");
+static const char *capture_path;
+static FrameCapture *capture;
+static size_t capture_count, capture_capacity;
+static int capture_failed, capture_closed;
+
 void perf_gpu_busy(uint64_t ns) { plat_add64(&gpu_busy_total, (int64_t)ns); }
 
 uint64_t perf_gpu_busy_total(void) { return (uint64_t)__atomic_load_n(&gpu_busy_total, __ATOMIC_RELAXED); }
 
 void prof_start(void) {
+    capture_path = getenv("NX2NAVI_FRAME_CAPTURE");
+    if (capture_path && !*capture_path) capture_path = NULL;
+    if (capture_path) {
+        capture_capacity = 32768;
+        capture = malloc(sizeof *capture + capture_capacity * sizeof(FrameSample));
+        if (capture) memcpy(capture->magic, "NX2FRM01", 8);
+        else capture_failed = 1;
+    }
     flight_init();
     atexit(perf_summary_flush);   // boot.c's _exit path goes through prof_write instead
     perf_base = (rt_trace & RT_TRACE_PERF) || flight_on;
@@ -251,10 +269,51 @@ static const char *wtxt(int64_t w, char *b) {
 }
 
 void perf_segment(const char *name) {
-    if (!(rt_trace & RT_TRACE_PERF)) return;
+    if (!(rt_trace & RT_TRACE_PERF) && !capture_path) return;
     plat_mutex_lock(&seg_lock);
     snprintf(seg_next, sizeof seg_next, "%s", name && *name ? name : "(unnamed)");
     seg_asked = 1;
+    plat_mutex_unlock(&seg_lock);
+}
+
+// Reuse the input script's segment handoff. With perf tracing enabled seg_frame
+// consumes it instead, so both recording modes use the same present boundary.
+static void capture_frame(uint64_t frame, uint64_t interval) {
+    int64_t world = frame_step_world_us();
+    char marker[sizeof seg_next] = "";
+    plat_mutex_lock(&seg_lock);
+    if (!(rt_trace & RT_TRACE_PERF) && seg_asked) {
+        memcpy(marker, seg_next, sizeof marker);
+        seg_asked = 0;
+    }
+    if (world >= 0 && interval && !capture_closed && !capture_failed) {
+        if (capture_count == capture_capacity) {
+            size_t limit = (SIZE_MAX - sizeof *capture) / sizeof(FrameSample);
+            size_t n = capture_capacity <= limit / 2 ? capture_capacity * 2 : 0;
+            FrameCapture *larger = n ? realloc(capture, sizeof *capture + n * sizeof(FrameSample)) : NULL;
+            if (larger) { capture = larger; capture_capacity = n; }
+            else capture_failed = 1;
+        }
+        if (!capture_failed)
+            capture->samples[capture_count++] = (FrameSample){frame, interval, world};
+    }
+    plat_mutex_unlock(&seg_lock);
+    if (*marker) {
+        char wb[24];
+        rt_log("segment: '%s' starts at frame %llu, world %s s", marker, (unsigned long long)frame, wtxt(world, wb));
+    }
+}
+
+static void capture_flush(void) {
+    plat_mutex_lock(&seg_lock);
+    if (!capture_closed) {
+        capture_closed = 1;
+        if (!capture_failed && plat_file_write_atomic(capture_path, capture, sizeof *capture + capture_count * sizeof(FrameSample)))
+            rt_log("frame capture: saved %zu frames to %s", capture_count, capture_path);
+        else rt_log("frame capture: could not save the complete recording to %s", capture_path);
+        free(capture);
+        capture = NULL;
+    }
     plat_mutex_unlock(&seg_lock);
 }
 
@@ -578,6 +637,7 @@ __attribute__((weak)) void gfx_exit_log(void) {}
 __attribute__((weak)) void vk_texstat_frame(uint64_t frame, uint64_t d) { (void)frame, (void)d; }
 
 void perf_summary_flush(void) {   // at exit (prof_write)
+    if (capture_path) capture_flush();
     if (rt_trace & RT_TRACE_PERF) seg_close(__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED), kern_now_ns(), 1);
     if (summary_t0) {
         ft_report(kern_now_ns(), "exit");
@@ -812,6 +872,7 @@ void perf_present(uint64_t frame) {
     prof_render_tid = plat_thread_id();
     if (rt_trace & RT_TRACE_SCHED) kern_sched_report(frame);
     uint64_t now = kern_now_ns(), d = last ? now - last : 0;
+    if (capture_path) capture_frame(frame, d);
     prof_sampler_frame(frame, now, last ? d : 0);
     uint64_t rep = ft_frame(frame, now, d);   // d is 0 on the first present: it only starts the period
     ab_b += rt_ab();
