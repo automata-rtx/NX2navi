@@ -112,10 +112,16 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   when warm; after a GPU or driver change, or a translator change with nothing to carry (below), a "Preparing
   shaders" screen shows the progress (`ui/menu.cpp`
   `menu_boot_frame`). With the graphics pipeline library the boot builds recorded pipelines in record order for at
-  most 20 s after the shaders are ready and leaves the rest to the pipeline workers below normal priority; a draw
-  that meets one before it is built gets a fast-linked pipeline (`vk_pipeline.c` `PREWARM_PIPE_MS`).
+  most 120 s by default after the shaders are ready, then leaves queued jobs to background workers. An explicit
+  `NX2NAVI_PREWARM_FULL=0` gives this phase 20 s. Jobs already inside the graphics driver can finish later.
   `NX2NAVI_PREWARM_FULL=1`, and drivers without the library, wait for every pipeline. `NX2NAVI_PREWARM_WAIT_MS` caps
   the whole wait, after which the rest finishes in the background.
+  The runtime gives its built-in equipment motion fragment a persistent ID per input location. A learned pipeline
+  can therefore reconstruct that shader at the next startup.
+  - Planned installer coverage: share the renderer's feature rules with installer preparation. Generate a fork
+    recipe list at release from known game draws and QA observations. Filter both shipped and locally learned
+    recipes against active feature revisions, keeping valid rare recipes. Verify that fresh preparation covers the
+    applicable QA recipes and queues zero retired recipes.
 - Translator updates: every cache key names the translator, so a new one has no translations. The cache carries the
   previous translator's (`NX2NAVI_SHADER_CARRY`, `runtime/gfx_shader.c` "Carry"): `shader-cache/identities.txt`
   lists the translators it holds translations of, and a shader the new translator has not translated yet uses the

@@ -207,9 +207,9 @@
 # Count the shared pipeline list that comes with the release (seed-pipeline-keys.bin) as known pipelines, so a new
 # install builds them at the start instead of at their first draw. 0: only the pipelines this install drew.
 # pipe_seed = 1
-# 1: the start waits until every known pipeline is built. Default 0: with the graphics pipeline library the start
-# builds them for at most 20 seconds and the rest in the background while you play.
-# prewarm_full = 0
+# With graphics pipeline libraries, startup normally gives the known graphics queue up to 120 seconds.
+# Set 0 for a quick start (20 seconds), or 1 to wait for the whole queue. Jobs in progress can finish later.
+# prewarm_full = 1
 # Threads that translate known shaders at start (1 to 64; default: half the CPU threads, at most 16).
 # prewarm_xlate = 8
 # After an update that brings a new shader translator, 1 keeps using the shader cache's translations from the earlier

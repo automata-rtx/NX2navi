@@ -110,6 +110,7 @@ const char *gfx_shader_res_json(const GfxShader *s);        // the translator's 
 int gfx_shader_write_code(const GfxShader *s, const char *path);   // the guest program, from the stored inputs
 // A shader of the runtime's own (SPIR-V and a .res.json text as the translator writes them), outside the cache and
 // never freed; its key is the sha256 of both. NULL when the SPIR-V is malformed.
+const GfxShader *gfx_shader_motion_fragment(int loc);
 const GfxShader *gfx_shader_own(const uint32_t *spirv, uint64_t words, const char *res_json);
 // A variant of an already translated module with the original bindings and new SPIR-V outputs.
 const GfxShader *gfx_shader_variant(const GfxShader *original, const uint32_t *spirv, uint64_t words);

@@ -830,6 +830,36 @@ const GfxShader *gfx_shader_own(const uint32_t *spirv, uint64_t words, const cha
     return own_shader(spirv, words, res_json, 1);
 }
 
+#include "mvobj_fs_spv.h"
+static const char MO_FS_RES[] = "{\"key\":\"mvobj\",\"stage\":\"ps\",\"notes\":[],\"cbufs\":[{\"binding\":1,\"slot\":3}],"
+                                "\"sbufs\":[],\"textures\":[],\"images\":[]}";
+
+// A built-in has no guest shader binary to translate. Its input identity names the
+// runtime recipe and the varying it reads. Both boot and replay use the same instance.
+static const uint8_t motion_fragment_id[31] = "NX2Navi motion fragment v1";
+const GfxShader *gfx_shader_motion_fragment(int loc) {
+    static GfxShader *shaders[16];
+    static PlatMutex lock = PLAT_MUTEX_INIT;
+    if (loc < 0 || loc >= 16) return NULL;
+    GfxShader *s = __atomic_load_n(&shaders[loc], __ATOMIC_ACQUIRE);
+    if (s) return s;
+    plat_mutex_lock(&lock);
+    s = shaders[loc];
+    if (!s) {
+        uint32_t w[sizeof mvobj_fs_spv / sizeof(uint32_t)];
+        memcpy(w, mvobj_fs_spv, sizeof w);
+        w[MVOBJ_FS_LOCATION_WORD] = (uint32_t)loc;
+        s = own_shader(w, sizeof w / sizeof *w, MO_FS_RES, 1);
+        if (s) {
+            memcpy(s->iid, motion_fragment_id, sizeof motion_fragment_id);
+            s->iid[31] = (uint8_t)loc;
+            __atomic_store_n(&shaders[loc], s, __ATOMIC_RELEASE);
+        }
+    }
+    plat_mutex_unlock(&lock);
+    return s;
+}
+
 const GfxShader *gfx_shader_variant(const GfxShader *original, const uint32_t *spirv, uint64_t words) {
     // The input is the already patched in-memory module. Transposing its gradients again changes texture samples.
     return own_shader(spirv, words, original->reflection, 0);
@@ -2270,6 +2300,7 @@ const uint8_t *gfx_shader_input_id(const GfxShader *s) { return s->iid; }
 // inputs; a previous translator's entry in between as get_one takes them. NULL when none has it; a failed translation
 // is counted as a failure.
 const GfxShader *gfx_shader_load_input(const uint8_t iid[32], int xlate) {
+    if (!memcmp(iid, motion_fragment_id, sizeof motion_fragment_id)) return gfx_shader_motion_fragment(iid[31]);
     paths();
     if (!cache_dir[0]) return NULL;
     uint8_t key[32];
@@ -2290,6 +2321,7 @@ const GfxShader *gfx_shader_load_input(const uint8_t iid[32], int xlate) {
 // cache has it, that entry is returned with *owned 0 and must not be released. NULL when not cached.
 const GfxShader *gfx_shader_load_private(const uint8_t iid[32], int *owned) {
     *owned = 0;
+    if (!memcmp(iid, motion_fragment_id, sizeof motion_fragment_id)) return gfx_shader_motion_fragment(iid[31]);
     paths();
     if (!cache_dir[0]) return NULL;
     uint8_t key[32];

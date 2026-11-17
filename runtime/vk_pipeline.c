@@ -4867,13 +4867,20 @@ static void warm_builder(void *arg) {
         j->p->building = 0;
         j->p->job = NULL;
         if (pipe) {
-            P.stats.graphics++, P.stats.async_built++, K.built++;
+            P.stats.graphics++, P.stats.async_built++;
+            if (!j->prebuild) keys_note(&j->s);
         } else {
-            P.stats.failures++, K.failed++;
+            P.stats.failures++;
             rt_log("vk_pipeline: graphics pipeline not built: pipeline creation failed");
         }
-        K.promoted += j->demanded;
-        K.left--;
+        // An explicit boot timeout can start replay while these builders still drain
+        // the low queue. A fast-linked draw's optimized job shares that queue.
+        if (j->prebuild) {
+            if (pipe) K.built++;
+            else K.failed++;
+            K.promoted += j->demanded;
+            K.left--;
+        }
         if (!--A.inflight) plat_cond_broadcast(&A.idle);
         plat_cond_broadcast(&done_cv);
         free(j);
@@ -4902,15 +4909,9 @@ void vk_pipeline_prewarm_progress(VkPrewarmProgress *p) {
 
 static void prewarm_run(void);
 
-// The boot's share of the pipeline prebuild with the graphics pipeline library. The boot builds the recorded
-// pipelines in record order, so those met first in play (the title screen, the first places) come first, for at most
-// this long after the shaders are ready; the rest stay queued for the pool workers, which build them below normal
-// priority while the game runs. A draw that meets one of them before it is built gets a pipeline linked from stage
-// libraries at once (gpl_link), as for any new pipeline in play. After a driver update, when every pipeline is built
-// from nothing, the boot thus waits this long instead of for all of them (15 minutes and more with a long play
-// history). Without the library a draw would have to wait for a whole build, so the boot waits for all; so it does
-// with NX2NAVI_PREWARM_FULL=1.
-#define PREWARM_PIPE_MS 20000.0
+// Limit how long startup workers take new graphics jobs on drivers with fast linking.
+#define PREWARM_PIPE_MS 120000.0
+#define PREWARM_QUICK_MS 20000.0
 
 void vk_pipeline_prewarm(void) {
     prewarm_run();
@@ -5030,7 +5031,11 @@ static void prewarm_run(void) {
     __atomic_store_n(&pw_pipe_total, (int64_t)queued, __ATOMIC_RELAXED);
     __atomic_store_n(&pw_phase, 2, __ATOMIC_RELEASE);
     const char *full = cfg_get("NX2NAVI_PREWARM_FULL");
-    K.until = P.gpl && !(full && !strcmp(full, "1")) ? now_ms() + PREWARM_PIPE_MS : 0;   // before the builders start
+    double budget = PREWARM_PIPE_MS;
+    if (!P.gpl || (full && !strcmp(full, "1"))) budget = 0;
+    else if (full && !strcmp(full, "0")) budget = PREWARM_QUICK_MS;
+    K.until = budget ? now_ms() + budget : 0;
+    rt_log("vk_pipeline: prewarm: graphics queue budget %.0f s (0 waits for all)", budget / 1000.0);
     PlatThread *t[64];
     int nt = 0;
     if (queued) warm_builder((void *)1);   // the first alone (warm_builder)

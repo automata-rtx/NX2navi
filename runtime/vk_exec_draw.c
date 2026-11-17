@@ -5120,11 +5120,7 @@ void vk_exec_ahead_op(VkExec *sx, uint32_t op, const void *payload) {
 // vk_mvprev_find and mo_prev_block; the camera: vk_dlaa_prev_camera. A draw whose variant or pipeline is still
 // building, or whose last-frame blocks are not in the snapshot, keeps the camera's motion. NX2NAVI_DLAA_OBJMV=0 turns it
 // off (vk_mvprev.c).
-#include "mvobj_fs_spv.h"
-static const char MO_FS_RES[] = "{\"key\":\"mvobj\",\"stage\":\"ps\",\"notes\":[],\"cbufs\":[{\"binding\":1,\"slot\":3}],"
-                                "\"sbufs\":[],\"textures\":[],\"images\":[]}";
 static struct {
-    const GfxShader *fs[16];     // per input Location
     int failed;
     uint64_t cand, still, draws, nodata, building, ran, dropped;
     uint64_t ns_check, ns_rec, n_rec, ns_emit, ns_still;
@@ -5224,14 +5220,12 @@ static void mo_begin(VkExec *ex, uint64_t frame) {
 
 static const GfxShader *mo_fs(int loc) {
     if (loc < 0 || loc >= 16) return NULL;
-    if (!MO.fs[loc]) {
-        uint32_t w[sizeof mvobj_fs_spv / 4];
-        memcpy(w, mvobj_fs_spv, sizeof w);
-        w[MVOBJ_FS_LOCATION_WORD] = (uint32_t)loc;
-        MO.fs[loc] = gfx_shader_own(w, sizeof w / 4, MO_FS_RES);
-        if (!MO.fs[loc]) MO.failed = 1, rt_log("vk_exec: the per-object motion fragment shader is malformed: off");
+    const GfxShader *s = gfx_shader_motion_fragment(loc);
+    if (!s) {
+        MO.failed = 1;
+        rt_log("vk_exec: the per-object motion fragment shader is malformed: off");
     }
-    return MO.fs[loc];
+    return s;
 }
 
 // The write of binding b from its packed descriptors.
