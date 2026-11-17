@@ -571,8 +571,8 @@ static struct {
     VkFormat hl_fmt;
     int hl_fresh;
     VkImage hud_target;
-    VkNgxImage alpha, present_alpha;
-    VmaAllocation alpha_mem, present_alpha_mem;
+    VkNgxImage alpha, present_alpha[2];
+    VmaAllocation alpha_mem, present_alpha_mem[2];
     int alpha_incomplete;
 } D = {.mv_ok = -1, .cfg_seen = ~0u};
 
@@ -695,7 +695,7 @@ static void release_post(void) {
 static int post_images(VkCommandBuffer cb, VkExtent2D size) {
     if (size.width == post.size.width && size.height == post.size.height) return post.ready;
     if (post.color || post.depth) {
-        vk_queue_lock(), vkDeviceWaitIdle(vk_ctx()->device), vk_queue_unlock();
+        vk_queue_lock(), vk_device_wait_idle(), vk_queue_unlock();
         release_post();
     }
     post.size = size;
@@ -768,7 +768,7 @@ static void destroy_size(struct Size *e) {
 }
 
 static void free_size(struct Size *e) {
-    vk_queue_lock(), vkDeviceWaitIdle(vk_ctx()->device), vk_queue_unlock();   // a third scene size: the evicted images may still be in flight
+    vk_queue_lock(), vk_device_wait_idle(), vk_queue_unlock();   // a third scene size: the evicted images may still be in flight
     destroy_size(e);
 }
 
@@ -1444,7 +1444,7 @@ static void destroy_snap(struct Snap *s) {
 }
 
 static void free_snap(struct Snap *s) {
-    vk_queue_lock(), vkDeviceWaitIdle(vk_ctx()->device), vk_queue_unlock();   // a fourth size: the evicted images may still be in flight
+    vk_queue_lock(), vk_device_wait_idle(), vk_queue_unlock();   // a fourth size: the evicted images may still be in flight
     destroy_snap(s);
 }
 
@@ -1610,7 +1610,7 @@ void vk_dlaa_release(void) {
     for (int i = 0; i < 5; i++) destroy_size(&D.sizes[i]);
     for (int i = 0; i < SNAPS; i++) destroy_snap(&R.s[i]);
     hl_destroy();
-    free_alpha(&D.present_alpha, &D.present_alpha_mem);
+    for (unsigned i = 0; i < 2; ++i) free_alpha(&D.present_alpha[i], &D.present_alpha_mem[i]);
     release_post();
     if (D.mv_pipe) vkDestroyPipeline(c->device, D.mv_pipe, NULL);
     if (D.mv_layout) vkDestroyPipelineLayout(c->device, D.mv_layout, NULL);
@@ -1906,7 +1906,7 @@ static void release_kept(const struct Size *making, int all) {
         struct Size *s = &D.sizes[i];
         if (s == making || !s->feat) continue;
         if (!all && (uint64_t)s->w * s->h <= (uint64_t)making->w * making->h) continue;
-        if (!n++) vk_queue_lock(), vkDeviceWaitIdle(vk_ctx()->device), vk_queue_unlock();
+        if (!n++) vk_queue_lock(), vk_device_wait_idle(), vk_queue_unlock();
         N.release(s->feat), s->feat = NULL;
         if (D.last == s) D.last = NULL;
     }
@@ -2163,7 +2163,7 @@ evaluated:
 static int alpha_image(VkCommandBuffer cb, VkNgxImage *a, VmaAllocation *allocation, uint32_t w, uint32_t h,
                        VkImageUsageFlags usage, VkFormat format) {
     if (a->img && (a->w != w || a->h != h)) {
-        vk_queue_lock(), vkDeviceWaitIdle(vk_ctx()->device), vk_queue_unlock();
+        vk_queue_lock(), vk_device_wait_idle(), vk_queue_unlock();
         free_alpha(a, allocation);
     }
     if (a->img) return 1;
@@ -2214,23 +2214,23 @@ int vk_dlaa_hud_attachment(const VkExec *ex, VkRenderingAttachmentInfo *a) {
     return 0;
 }
 
-VkNgxImage vk_dlaa_present_alpha(VkCommandBuffer cb, VkExtent2D ext, const int rect[4], const int to[4], uint64_t frame) {
+VkNgxImage vk_dlaa_present_alpha(VkCommandBuffer cb, VkExtent2D ext, const int rect[4], const int to[4], uint64_t frame, unsigned slot) {
     // The SDK Vulkan format table recognizes R16F for a single-channel UI tag.
     if (!D.hud_target || D.hl_at + 1 != frame || D.fg_at != D.hl_at ||
         __atomic_load_n(&D.alpha_incomplete, __ATOMIC_RELAXED) ||
-        !alpha_image(cb, &D.present_alpha, &D.present_alpha_mem, ext.width, ext.height,
+        !alpha_image(cb, &D.present_alpha[slot], &D.present_alpha_mem[slot], ext.width, ext.height,
                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT, VK_FORMAT_R16_SFLOAT))
         return (VkNgxImage){0};
     full_barrier(cb);
-    if (to[2] != (int)ext.width || to[3] != (int)ext.height) clear_alpha(cb, D.present_alpha.img);
+    if (to[2] != (int)ext.width || to[3] != (int)ext.height) clear_alpha(cb, D.present_alpha[slot].img);
     VkImageBlit region = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
         .srcOffsets = {{rect[0], rect[1], 0}, {rect[0] + rect[2], rect[1] + rect[3], 1}},
         .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
         .dstOffsets = {{to[0], to[1], 0}, {to[0] + to[2], to[1] + to[3], 1}}};
-    vkCmdBlitImage(cb, D.alpha.img, VK_IMAGE_LAYOUT_GENERAL, D.present_alpha.img, VK_IMAGE_LAYOUT_GENERAL,
+    vkCmdBlitImage(cb, D.alpha.img, VK_IMAGE_LAYOUT_GENERAL, D.present_alpha[slot].img, VK_IMAGE_LAYOUT_GENERAL,
                    1, &region, VK_FILTER_LINEAR);
     full_barrier(cb);
-    return D.present_alpha;
+    return D.present_alpha[slot];
 }
 
 int vk_dlaa_hudless_wanted;
@@ -2241,7 +2241,7 @@ static void hudless(VkCommandBuffer cb, VkImage source, VkImage target, uint32_t
     if (vk_hdr_native()) return;
     VkFormat fmt = hdr ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
     if (D.hl && (D.hl_w != w || D.hl_h != h || D.hl_fmt != fmt)) {
-        vk_queue_lock(), vkDeviceWaitIdle(c->device), vk_queue_unlock();
+        vk_queue_lock(), vk_device_wait_idle(), vk_queue_unlock();
         hl_destroy();
     }
     if (!D.hl) {

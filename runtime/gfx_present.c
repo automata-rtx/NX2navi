@@ -24,6 +24,7 @@
 #include "gfx_wsys.h"
 #include "nvn_api.h"
 #include "ov.h"
+#include "perfmon.h"
 #include "platform/platform.h"
 #include "ui/menu.h"
 #include "vk.h"
@@ -48,6 +49,27 @@ void vk_queue_lock(void) {
 void vk_queue_lock_raw(void) { plat_rmutex_lock(&g_ql); }
 int vk_queue_trylock_raw(void) { return plat_rmutex_trylock(&g_ql); }
 void vk_queue_unlock(void) { plat_rmutex_unlock(&g_ql); }
+
+// The display queue has no game submissions. Shared-queue devices retain the original lock.
+static PlatRMutex g_pql;
+void vk_present_queue_lock(void) {
+    if (vk_ctx()->present_queue != vk_ctx()->gfx_queue) plat_rmutex_lock(&g_pql);
+    else vk_queue_lock();
+}
+void vk_present_queue_unlock(void) {
+    if (vk_ctx()->present_queue != vk_ctx()->gfx_queue) plat_rmutex_unlock(&g_pql);
+    else vk_queue_unlock();
+}
+VkResult vk_device_wait_idle(void) {
+    vk_queue_lock();
+    vk_present_queue_lock();
+    PFN_vkGetDeviceProcAddr get = vk_dlssg_dpa();
+    PFN_vkDeviceWaitIdle wait = get ? (PFN_vkDeviceWaitIdle)get(vk_ctx()->device, "vkDeviceWaitIdle") : NULL;
+    VkResult r = wait ? wait(vk_ctx()->device) : vkDeviceWaitIdle(vk_ctx()->device);
+    vk_present_queue_unlock();
+    vk_queue_unlock();
+    return r;
+}
 
 // ---- window state shared with the back end
 static VkSurfaceKHR g_surface;
@@ -151,6 +173,152 @@ static VkDeviceSize g_cap_size;
 static int g_cap_w, g_cap_h, g_cap_valid;
 static int g_flip_on;            // vk_present_blit submitted the blit of swapchain image g_flip_idx; vk_present_flip presents it
 static uint32_t g_flip_idx;
+// Each slot owns the composed picture until the display copy and FG input consumers finish.
+// The game timeline covers composition only; it never waits for the display queue to present.
+static struct PresentSlot {
+    VkImage image;
+    VkImageView view;
+    VmaAllocation memory;
+    VkExtent2D extent;
+    VkFormat format;
+    VkCommandBuffer copy;
+    VkFence copied;
+    VkFence acquired;
+    VkSemaphore retired;
+    uint64_t retire_value, ready_value;
+} g_present_slots[FRAMES];
+static VkSemaphore g_snapshot_ready;
+static uint64_t g_snapshot_value;
+static int g_flip_snapshot;
+static int g_flip_separate;
+static unsigned g_flip_slot;
+static uint64_t g_present_acquire_ns, g_present_flip_ns, g_present_reuse_ns;
+static unsigned g_present_samples;
+static void present_require(VkResult result, const char *operation) {
+    if (result == VK_SUCCESS) return;
+    vk_device_lost_check(result, operation);
+    rt_fatal("gfx: %s failed (%d)", operation, (int)result);
+}
+static void sync_barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImageLayout to,
+                         VkPipelineStageFlags2 s0, VkAccessFlags2 a0, VkPipelineStageFlags2 s1, VkAccessFlags2 a1);
+
+static int present_split(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *v = cfg_get("NX2NAVI_PRESENT_SPLIT");
+        enabled = !v || strcmp(v, "0");
+        rt_log("gfx: presentation handoff %s", enabled ? "enabled" : "legacy diagnostic");
+    }
+    // FSR and NGX already own their display scheduling. A device without a spare queue
+    // keeps the direct path: an extra copy there would not remove queue serialization.
+    return enabled && vk_ctx()->present_queue != vk_ctx()->gfx_queue && !vk_fg_active() && !vk_ngxfg_wanted();
+}
+
+static int present_slot_ready(unsigned slot) {
+    struct PresentSlot *p = &g_present_slots[slot];
+    VkDevice d = vk_ctx()->device;
+    uint64_t start = kern_now_ns();
+    VkResult r = vkWaitForFences(d, 1, &p->copied, VK_TRUE, 5000000000ull);
+    if (kern_now_ns() - start > 25000000ull) {
+        static unsigned late;
+        if (++late <= 12) rt_log("presentation: delayed copy %.3f ms",
+            (kern_now_ns() - start) / 1e6);
+    }
+    if (r == VK_SUCCESS && p->retired && p->retire_value) {
+        VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+            .semaphoreCount = 1, .pSemaphores = &p->retired, .pValues = &p->retire_value};
+        r = vkWaitSemaphores(d, &wi, 5000000000ull);
+    }
+    g_present_reuse_ns += kern_now_ns() - start;
+    if (r != VK_SUCCESS) {
+        vk_device_lost_check(r, "presentation slot retirement");
+        rt_fatal("gfx: presentation slot retirement failed (%d)", (int)r);
+    }
+    p->retired = VK_NULL_HANDLE;
+    p->retire_value = 0;
+    return 1;
+}
+
+static void present_slot_drop(struct PresentSlot *p) {
+    VkCtx *c = vk_ctx();
+    if (p->view) vkDestroyImageView(c->device, p->view, NULL);
+    if (p->image) vmaDestroyImage(c->vma, p->image, p->memory);
+    p->view = VK_NULL_HANDLE;
+    p->image = VK_NULL_HANDLE;
+}
+
+static int present_slot_image(unsigned slot) {
+    struct PresentSlot *p = &g_present_slots[slot];
+    if (p->image && p->extent.width == g_sc_ext.width && p->extent.height == g_sc_ext.height && p->format == g_sc_fmt) return 1;
+    present_slot_drop(p); // both consumers of this slot have retired
+    VkCtx *c = vk_ctx();
+    VkImageCreateInfo ii = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
+        .format = g_sc_fmt, .extent = {g_sc_ext.width, g_sc_ext.height, 1}, .mipLevels = 1, .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT};
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    if (vmaCreateImage(c->vma, &ii, &ai, &p->image, &p->memory, NULL) != VK_SUCCESS) return 0;
+    VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = p->image,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = g_sc_fmt,
+        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    if (vkCreateImageView(c->device, &vi, NULL, &p->view) != VK_SUCCESS) { present_slot_drop(p); return 0; }
+    p->extent = g_sc_ext;
+    p->format = g_sc_fmt;
+    return 1;
+}
+
+// Called after the renderer has released its source images. Acquisition and display copies
+// wait only on the presentation queue, never on the game's completion timeline.
+static int present_snapshot_copy(void) {
+    VkCtx *c = vk_ctx();
+    struct PresentSlot *p = &g_present_slots[g_flip_slot];
+    uint64_t start = kern_now_ns();
+    if (!vk_dlssg_active()) present_require(vkResetFences(c->device, 1, &p->acquired), "reset display acquisition fence");
+    VkResult r = vk_dlssg_active()
+        ? vk_dlssg_acquire(c->device, g_sc, 1000000000ull, g_acquire[g_flip_slot], &g_flip_idx)
+        : vkAcquireNextImageKHR(c->device, g_sc, 1000000000ull, g_acquire[g_flip_slot], p->acquired, &g_flip_idx);
+    g_present_acquire_ns += kern_now_ns() - start;
+    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
+        vk_device_lost_check(r, "snapshot acquisition");
+        plat_xchg32(&g_dirty, 1);
+        return 0; // no acquired image and no binary semaphore to consume
+    }
+    if (r == VK_SUBOPTIMAL_KHR) plat_xchg32(&g_dirty, 1);
+    VkCommandBuffer cb = p->copy;
+    present_require(vkResetCommandBuffer(cb, 0), "reset display copy commands");
+    VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    present_require(vkBeginCommandBuffer(cb, &bi), "begin display copy commands");
+    VkImage dst = g_sc_img[g_flip_idx];
+    sync_barrier(cb, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    VkImageCopy cp = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+        .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .extent = {p->extent.width, p->extent.height, 1}};
+    vkCmdCopyImage(cb, p->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
+    sync_barrier(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+        VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_NONE, 0);
+    present_require(vkEndCommandBuffer(cb), "end display copy commands");
+    VkSemaphoreSubmitInfo waits[2] = {
+        {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_snapshot_ready,
+         .value = p->ready_value, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT},
+        {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_acquire[g_flip_slot],
+         .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT}};
+    VkSemaphoreSubmitInfo sig = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+        .semaphore = g_render_done[g_flip_idx], .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+    VkCommandBufferSubmitInfo cbi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cb};
+    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+        .waitSemaphoreInfoCount = 2, .pWaitSemaphoreInfos = waits, .commandBufferInfoCount = 1,
+        .pCommandBufferInfos = &cbi, .signalSemaphoreInfoCount = 1, .pSignalSemaphoreInfos = &sig};
+    present_require(vkResetFences(c->device, 1, &p->copied), "reset display copy fence");
+    vk_present_queue_lock();
+    r = vkQueueSubmit2(c->present_queue, 1, &si, p->copied);
+    vk_present_queue_unlock();
+    if (r != VK_SUCCESS) {
+        vk_device_lost_check(r, "snapshot display copy");
+        rt_fatal("gfx: snapshot display copy failed (%d)", (int)r);
+    }
+    return 1;
+}
 
 // ---- NX2NAVI_FLIGHT thumbnails (flight.c; g_pl): each present also blits the swapchain image down into slot frame % g_th_n
 // of a host-visible ring. A slot's tag names the frame it holds complete; recording a new frame clears the tag first,
@@ -308,19 +476,44 @@ const char *gfx_window_present_mode(void) { return __atomic_load_n(&g_present_go
 
 // Queues the present of a blit vk_present_blit left waiting (g_pl held). A swapchain rebuild and the next blit flush it
 // first; the device release drops it.
-static void flip_locked(void) {
-    if (!g_flip_on) return;
+static int flip_locked(void) {
+    if (!g_flip_on) return 0;
     g_flip_on = 0;
-    if (!g_sc) return;
+    if (!g_sc) return 0;
+    if (g_flip_snapshot && !present_snapshot_copy()) return 0;
     VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1,
                            .pWaitSemaphores = &g_render_done[g_flip_idx], .swapchainCount = 1, .pSwapchains = &g_sc,
                            .pImageIndices = &g_flip_idx};
-    vk_queue_lock();
-    VkResult r = vk_dlssg_active() ? vk_dlssg_present(vk_ctx()->gfx_queue, &pi)
-               : vk_fg_active()    ? vk_fg_present(&pi) : vkQueuePresentKHR(vk_ctx()->gfx_queue, &pi);
-    vk_queue_unlock();
+    uint64_t start = kern_now_ns();
+    VkQueue queue = g_flip_separate ? vk_ctx()->present_queue : vk_ctx()->gfx_queue;
+    if (g_flip_separate) vk_present_queue_lock(); else vk_queue_lock();
+    VkResult r = vk_dlssg_active() ? vk_dlssg_present(queue, &pi)
+               : vk_fg_active() ? vk_fg_present(&pi) : vkQueuePresentKHR(queue, &pi);
+    if (g_flip_snapshot && vk_dlssg_active()) {
+        struct PresentSlot *p = &g_present_slots[g_flip_slot];
+        if (!vk_dlssg_input_retirement(&p->retired, &p->retire_value)) {
+            // Default SDK queue mode blocks this queue until FG is through. Missing state must
+            // never turn into an unsafe reuse of the input images on the graphics queue.
+            uint64_t idle_start = kern_now_ns();
+            VkResult idle = vkQueueWaitIdle(queue);
+            static unsigned fallbacks;
+            if (++fallbacks <= 3 || fallbacks % 300 == 0)
+                rt_log("presentation: FG retirement fallback %u, queue idle %.3f ms", fallbacks,
+                       (kern_now_ns() - idle_start) / 1e6);
+            if (idle != VK_SUCCESS) rt_fatal("gfx: missing FG retirement and queue wait failed (%d)", (int)idle);
+        }
+    }
+    if (g_flip_separate) vk_present_queue_unlock(); else vk_queue_unlock();
+    g_present_flip_ns += kern_now_ns() - start;
+    if (++g_present_samples == 300) {
+        rt_log("presentation: %u frames, acquire %.3f ms, present %.3f ms, reuse %.3f ms per frame, split %d",
+            g_present_samples, g_present_acquire_ns / 3e8, g_present_flip_ns / 3e8, g_present_reuse_ns / 3e8, g_flip_snapshot);
+        g_present_samples = 0;
+        g_present_acquire_ns = g_present_flip_ns = g_present_reuse_ns = 0;
+    }
     vk_device_lost_check(r, "the present");
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) plat_xchg32(&g_dirty, 1);
+    return r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR;
 }
 
 static void free_capture(void) {
@@ -390,7 +583,11 @@ static int create_swapchain(void) {
     if (count > most) count = most;
 
     vk_queue_lock();
-    vkDeviceWaitIdle(c->device);
+    vk_device_wait_idle();
+    for (unsigned i = 0; i < FRAMES; ++i) {
+        g_present_slots[i].retired = VK_NULL_HANDLE;
+        g_present_slots[i].retire_value = 0;
+    }
     VkSwapchainKHR old = g_sc;
     VkSwapchainCreateInfoKHR ci = {
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, .surface = g_surface, .minImageCount = count,
@@ -809,7 +1006,7 @@ static int movie_overlay(VkCommandBuffer cb, int slot, VkImage dst) {
     plat_mutex_unlock(&g_mv_lock);
     if (g_mvi_w != w || g_mvi_h != h) {
         if (g_mvi) {
-            vk_queue_lock(), vkDeviceWaitIdle(c->device), vk_queue_unlock();
+            vk_queue_lock(), vk_device_wait_idle(), vk_queue_unlock();
             vmaDestroyImage(c->vma, g_mvi, g_mvia);
             g_mvi = VK_NULL_HANDLE;
         }
@@ -903,11 +1100,20 @@ static void output_rate(void) {
 }
 double gfx_output_fps(void) { return g_out_fps; }
 
-static VkImage g_hl;                 // frame generation's HUD-less picture at the swapchain's size (hudless_record)
-static VmaAllocation g_hl_mem;
-static VkImageView g_hl_view;
-static uint32_t g_hl_w, g_hl_h;
-static VkFormat g_hl_fmt;
+static struct {
+    VkImage image;
+    VmaAllocation memory;
+    VkImageView view;
+    uint32_t width, height;
+    VkFormat format;
+} g_hudless[FRAMES];
+static unsigned g_hudless_slot;
+#define g_hl g_hudless[g_hudless_slot].image
+#define g_hl_mem g_hudless[g_hudless_slot].memory
+#define g_hl_view g_hudless[g_hudless_slot].view
+#define g_hl_w g_hudless[g_hudless_slot].width
+#define g_hl_h g_hudless[g_hudless_slot].height
+#define g_hl_fmt g_hudless[g_hudless_slot].format
 
 static VkImage hudless_record(VkCommandBuffer cb, unsigned slot, int w, int h, const int rect[4], const int to[4], int general) {
     VkImage pic;
@@ -918,7 +1124,7 @@ static VkImage hudless_record(VkCommandBuffer cb, unsigned slot, int w, int h, c
         return VK_NULL_HANDLE;
     VkCtx *c = vk_ctx();
     if (g_hl && (g_hl_w != g_sc_ext.width || g_hl_h != g_sc_ext.height || g_hl_fmt != g_sc_fmt)) {
-        vk_queue_lock(), vkDeviceWaitIdle(c->device), vk_queue_unlock();
+        vk_queue_lock(), vk_device_wait_idle(), vk_queue_unlock();
         vkDestroyImageView(c->device, g_hl_view, NULL);
         vmaDestroyImage(c->vma, g_hl, g_hl_mem);
         g_hl = VK_NULL_HANDLE;
@@ -975,6 +1181,7 @@ static VkImage hudless_record(VkCommandBuffer cb, unsigned slot, int w, int h, c
 // - a timeline wait is never submitted ahead of its signal on the same queue (ng_wait_signaled);
 // - an acquire never blocks while it holds the queue lock the presenter presents with (ng_acquire).
 typedef struct { VkImage img; VmaAllocation mem; VkImageView view; } NgImg;
+typedef struct { uint32_t idx; int count, set; uint64_t n, t; VkSwapchainKHR sc; } NgJob;
 static struct {
     int tried, on, fresh;         // tried: 0 nothing made, 1 the objects below exist, 2 it cannot run here
     int thread_up;                // the presenter thread runs (started once, kept over a release)
@@ -989,7 +1196,7 @@ static struct {
     PlatMutex m;
     PlatCond cv;
     int busy, pending;
-    struct { uint32_t idx; int count, set, shown; uint64_t n, t; VkSwapchainKHR sc; } job;
+    NgJob job;
     uint64_t signaled;              // the last value of ng.copied the presenter submitted a signal for (ng.m)
     uint64_t last_t, interval;      // average time between rendered frames (ns)
     volatile uint64_t presents;     // frames presented while it runs, generated ones included
@@ -1023,25 +1230,31 @@ static void ng_sleep_until(uint64_t t) {
     if (t > now && t - now < 100000000ull) plat_sleep_ns(t - now);
 }
 
-static void ng_present(VkSwapchainKHR sc, uint32_t idx) {
+static int ng_present(VkSwapchainKHR sc, uint32_t idx) {
     VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1,
                            .pWaitSemaphores = &g_render_done[idx], .swapchainCount = 1, .pSwapchains = &sc,
                            .pImageIndices = &idx};
-    vk_queue_lock();
-    VkResult r = vkQueuePresentKHR(vk_ctx()->gfx_queue, &pi);
-    vk_queue_unlock();
+    vk_present_queue_lock();
+    VkResult r = vkQueuePresentKHR(vk_ctx()->present_queue, &pi);
+    vk_present_queue_unlock();
     vk_device_lost_check(r, "the present of a generated frame");
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) plat_xchg32(&g_dirty, 1);
+    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) return 0;
     __atomic_add_fetch(&ng.presents, 1, __ATOMIC_RELAXED);
+    return 1;
 }
 
 static void ng_signal_copied(uint64_t v) {   // after everything submitted before it (frame v's copies included)
     VkSemaphoreSubmitInfo sig = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = ng.copied, .value = v,
                                  .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
     VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .signalSemaphoreInfoCount = 1, .pSignalSemaphoreInfos = &sig};
-    vk_queue_lock();
-    vkQueueSubmit2(vk_ctx()->gfx_queue, 1, &si, VK_NULL_HANDLE);
-    vk_queue_unlock();
+    vk_present_queue_lock();
+    VkResult r = vkQueueSubmit2(vk_ctx()->present_queue, 1, &si, VK_NULL_HANDLE);
+    vk_present_queue_unlock();
+    if (r != VK_SUCCESS) {
+        vk_device_lost_check(r, "the generated-frame copied signal");
+        rt_fatal("ngxfg: copied signal submit failed (%d)", (int)r);
+    }
     plat_mutex_lock(&ng.m);
     ng.signaled = v;
     plat_cond_broadcast(&ng.cv);
@@ -1059,10 +1272,10 @@ static void ng_wait_signaled(uint64_t v) {
 // Acquires a swapchain image, copies img (GENERAL, the swapchain's size and format) into it once frame n's command
 // buffer is done (ng.rendered), and presents it. Only the presenter acquires while it runs: the frame's own command
 // buffer never waits for an acquire, whose image the compositor may give back only after a later present.
-static int ng_show(VkImage img, int set, int slot, uint64_t n) {
+static int ng_show(VkImage img, int set, int slot, uint64_t n, VkSwapchainKHR sc) {
     VkCtx *c = vk_ctx();
     uint32_t j = 0;
-    VkResult r = ng_acquire(ng.job.sc, 1000000000ull, ng.acq[set][slot], &j);
+    VkResult r = ng_acquire(sc, 1000000000ull, ng.acq[set][slot], &j);
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
         static int told;
         if (told++ < 5) rt_log("ngxfg: presenter acquire failed (%d)", (int)r);
@@ -1070,10 +1283,12 @@ static int ng_show(VkImage img, int set, int slot, uint64_t n) {
         return 0;
     }
     VkCommandBuffer cb = ng.cb[set][slot];
-    vkResetCommandBuffer(cb, 0);
+    r = vkResetCommandBuffer(cb, 0);
+    if (r != VK_SUCCESS) rt_fatal("ngxfg: presenter command buffer reset failed (%d)", (int)r);
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
-    vkBeginCommandBuffer(cb, &bi);
+    r = vkBeginCommandBuffer(cb, &bi);
+    if (r != VK_SUCCESS) rt_fatal("ngxfg: presenter command buffer begin failed (%d)", (int)r);
     sync_barrier(cb, g_sc_img[j], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
                  0, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
     VkImageCopy cp = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
@@ -1081,7 +1296,8 @@ static int ng_show(VkImage img, int set, int slot, uint64_t n) {
     vkCmdCopyImage(cb, img, VK_IMAGE_LAYOUT_GENERAL, g_sc_img[j], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
     sync_barrier(cb, g_sc_img[j], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                  VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_NONE, 0);
-    vkEndCommandBuffer(cb);
+    r = vkEndCommandBuffer(cb);
+    if (r != VK_SUCCESS) rt_fatal("ngxfg: presenter command buffer end failed (%d)", (int)r);
     VkSemaphoreSubmitInfo wait[2] = {
         {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = ng.acq[set][slot], .stageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT},
         {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = ng.rendered, .value = n,
@@ -1092,19 +1308,21 @@ static int ng_show(VkImage img, int set, int slot, uint64_t n) {
     VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .waitSemaphoreInfoCount = 2, .pWaitSemaphoreInfos = wait,
                         .commandBufferInfoCount = 1, .pCommandBufferInfos = &cbi, .signalSemaphoreInfoCount = 1,
                         .pSignalSemaphoreInfos = &sig};
-    vk_queue_lock();
-    r = vkQueueSubmit2(c->gfx_queue, 1, &si, VK_NULL_HANDLE);
-    vk_queue_unlock();
-    if (r != VK_SUCCESS) { vk_device_lost_check(r, "the submit of a generated frame"); return 0; }
-    ng_present(ng.job.sc, j);
-    return 1;
+    vk_present_queue_lock();
+    r = vkQueueSubmit2(c->present_queue, 1, &si, VK_NULL_HANDLE);
+    vk_present_queue_unlock();
+    if (r != VK_SUCCESS) {
+        vk_device_lost_check(r, "the submit of a generated frame");
+        // The acquired semaphore must not be reused after a failed consuming submission.
+        rt_fatal("ngxfg: presenter copy submit failed (%d)", (int)r);
+    }
+    return ng_present(sc, j);
 }
 
-static void ng_run(void) {
+static void ng_run(const NgJob *job) {
     VkCtx *c = vk_ctx();
-    uint64_t t = ng.job.t, n = ng.job.n;
-    int set = ng.job.set, count = ng.job.count;
-    ng.job.shown = 0;
+    uint64_t t = job->t, n = job->n;
+    int set = job->set, count = job->count, shown = 0;
     if (ng.last_t && t > ng.last_t) {
         uint64_t d = t - ng.last_t;
         if (d > 2000000ull && d < 100000000ull) ng.interval = ng.interval ? (ng.interval * 7 + d) / 8 : d;
@@ -1115,19 +1333,24 @@ static void ng_run(void) {
         uint64_t v = n - 2;
         VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &ng.copied,
                                   .pValues = &v};
-        vkWaitSemaphores(c->device, &wi, 2000000000ull);
+        VkResult r = vkWaitSemaphores(c->device, &wi, 2000000000ull);
+        if (r != VK_SUCCESS) {
+            vk_device_lost_check(r, "generated-frame image reuse");
+            rt_fatal("ngxfg: presenter reuse wait failed (%d), frame %llu", (int)r, (unsigned long long)n);
+        }
     }
     for (int i = 0; i < count; i++) {
         if (i) ng_sleep_until(t + (uint64_t)i * step);   // the first one at once: the least latency
-        if (!ng_show(ng.out[set][i].img, set, i, n)) break;
-        ng.job.shown = i + 1;
+        if (!ng_show(ng.out[set][i].img, set, i, n, job->sc)) break;
+        shown = i + 1;
     }
     static uint64_t jobs, gen_ok, gen_want;
     jobs++, gen_want += (uint64_t)count;
     if (count) ng_sleep_until(t + (uint64_t)count * step);
-    ng_show(ng.real[set].img, set, NG_MAX, n);   // the rendered frame, last
+    if (ng_show(ng.real[set].img, set, NG_MAX, n, job->sc)) // the rendered frame, last
+        perfmon_shown(kern_now_ns());
     ng_signal_copied(n);   // after the copies out of this set
-    gen_ok += (uint64_t)ng.job.shown;
+    gen_ok += (uint64_t)shown;
     if (jobs == 60 || jobs % 1200 == 0)
         rt_log("ngxfg: presenter: %llu rendered frames, %llu of %llu generated frames shown, %llu presents; %.2f ms between rendered frames",
                (unsigned long long)jobs, (unsigned long long)gen_ok, (unsigned long long)gen_want,
@@ -1149,10 +1372,12 @@ static void ng_thread(void *arg) {
                            (unsigned long long)ng.n, (unsigned long long)ng.signaled, (unsigned long long)rv, (unsigned long long)cv);
             }
         }
+        // Own the complete job before the producer can fill the next pending slot.
+        const NgJob job = ng.job;
         ng.pending = 0, ng.busy = 1;
         plat_cond_broadcast(&ng.cv);
         plat_mutex_unlock(&ng.m);
-        ng_run();
+        ng_run(&job);
         plat_mutex_lock(&ng.m);
         ng.busy = 0;
         plat_cond_broadcast(&ng.cv);
@@ -1225,7 +1450,7 @@ static int ng_ready(void) {
     if (ng.tried == 2) return 0;
     ng_drain();
     vk_queue_lock();
-    vkDeviceWaitIdle(c->device);
+    vk_device_wait_idle();
     vk_queue_unlock();
     ng_free_image(&ng.bb);
     for (int s = 0; s < 2; s++) {
@@ -1327,7 +1552,7 @@ static void ng_release(void) {
     if (!ng.tried) return;
     ng_drain();
     VkCtx *c = vk_ctx();
-    vk_queue_lock(), vkDeviceWaitIdle(c->device), vk_queue_unlock();   // what the presenter submitted while it drained
+    vk_queue_lock(), vk_device_wait_idle(), vk_queue_unlock();   // what the presenter submitted while it drained
     ng_free_image(&ng.bb);
     for (int s = 0; s < 2; s++) {
         ng_free_image(&ng.real[s]);
@@ -1376,14 +1601,22 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     if (wsys_minimized() || !g_sc) goto out;
 
     unsigned slot = g_frame % FRAMES;
+    g_hudless_slot = slot;
     if (vkWaitForFences(c->device, 1, &g_fence[slot], VK_TRUE, 5000000000ull) != VK_SUCCESS) {
         rt_log("gfx: present fence wait timed out");
         goto out;
     }
+    const int separate = present_split();
+    // A native swapchain already owns immutable display images until acquisition. Compose
+    // directly into one and present on the separate queue, avoiding an extra output copy.
+    // The SDK swapchain keeps staging even while FG is temporarily off: its scheduling
+    // must never extend the game's completion timeline through its acquisition waits.
+    const int split = separate && vk_dlssg_active();
+    if (split && (!present_slot_ready(slot) || !present_slot_image(slot))) goto out;
     uint32_t idx = 0;
     // NGX frame generation: the frame is composed into ng.bb and the presenter shows it (ng_show); no acquire here
     const int ngp = ng_ready();
-    VkResult r = ngp               ? VK_SUCCESS
+    VkResult r = (ngp || split)    ? VK_SUCCESS
                : vk_dlssg_active() ? vk_dlssg_acquire(c->device, g_sc, 1000000000ull, g_acquire[slot], &idx)
                : vk_fg_active()    ? vk_fg_acquire(g_sc, 1000000000ull, g_acquire[slot], &idx)
                                    : vkAcquireNextImageKHR(c->device, g_sc, 1000000000ull, g_acquire[slot], VK_NULL_HANDLE, &idx);
@@ -1434,7 +1667,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
                      g_sc_hdr ? VK_FORMAT_R8G8B8A8_UNORM : g_sc_fmt, g_sc_ext.width,
                      g_sc_ext.height, cw, ch, g_scaler};
     // without a source image (gfx_present_boot): a black frame with the boot screen
-    VkImageView dst_view = ngp ? ng.bb.view : g_sc_view[idx];
+    VkImageView dst_view = split ? g_present_slots[slot].view : ngp ? ng.bb.view : g_sc_view[idx];
     int overlay = dst_view &&
                   (src ? menu_overlay_frame(__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED), &mt, &menu_shot)
                        : menu_boot_frame(&mt));
@@ -1468,7 +1701,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     vkBeginCommandBuffer(cb, &bi);
     uint64_t crumb = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
     vk_crumb(cb, VK_CRUMB_PRESENT, crumb);
-    VkImage dst = ngp ? ng.bb.img : g_sc_img[idx];
+    VkImage dst = split ? g_present_slots[slot].image : ngp ? ng.bb.img : g_sc_img[idx];
     sync_barrier(cb, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT, 0,
                  VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
     const int rect[4] = {cx, cy, cw, ch};
@@ -1512,7 +1745,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     if (overlay && g_sc_hdr && !menu_view) overlay = 0;
     VkNgxImage alpha = {0};
     if (hudless && (vk_dlssg_ui_alpha() || ng_running()) && !movie && !show_hl)
-        alpha = vk_dlaa_present_alpha(cb, g_sc_ext, rect, to, vk_dlssg_current_frame());
+        alpha = vk_dlaa_present_alpha(cb, g_sc_ext, rect, to, vk_dlssg_current_frame(), slot);
     VkPipeline overlay_pipeline = overlay && alpha.img ? menu_overlay_hud_pipeline() : VK_NULL_HANDLE;
     if (overlay && !overlay_pipeline) alpha = (VkNgxImage){0};
     if (overlay) {
@@ -1592,7 +1825,9 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     int ng_set = 0;
     const int ng_count = ngp ? ng_record(cb, dst, &last, &last_stage, &last_write, movie ? VK_NULL_HANDLE : hudless, alpha.img ? &alpha : NULL, &ng_set, src != VK_NULL_HANDLE) : -1;
     const int via_ng = ng_count >= 0;
-    if (!via_ng) sync_barrier(cb, dst, last, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, last_stage, last_write, VK_PIPELINE_STAGE_2_NONE, 0);
+    if (!via_ng) sync_barrier(cb, dst, last,
+        split ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+        last_stage, last_write, VK_PIPELINE_STAGE_2_NONE, 0);
     vk_crumb(cb, VK_CRUMB_PRESENT_END, crumb);
     vkEndCommandBuffer(cb);
 
@@ -1604,6 +1839,12 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .waitSemaphoreInfoCount = 1, .pWaitSemaphoreInfos = &wait,
                         .commandBufferInfoCount = 1, .pCommandBufferInfos = &cbi, .signalSemaphoreInfoCount = 1,
                         .pSignalSemaphoreInfos = &sig};
+    if (split) {
+        g_present_slots[slot].ready_value = ++g_snapshot_value;
+        si.waitSemaphoreInfoCount = 0;
+        sig.semaphore = g_snapshot_ready;
+        sig.value = g_snapshot_value;
+    }
     const uint64_t ng_n = ng.n + 1;   // through the presenter: this frame's number on its timelines
     if (via_ng) {
         // No acquire to wait for. The frame writes one of the presenter's two image sets: it waits on the GPU until
@@ -1624,6 +1865,9 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
         ng_hand(idx, ng_count, ng_set, ng_n);
     } else if (r == VK_SUCCESS) {
         g_flip_on = 1;
+        g_flip_snapshot = split;
+        g_flip_separate = separate;
+        g_flip_slot = slot;
         g_flip_idx = idx;
         if (!defer) flip_locked();
     } else {
@@ -1633,7 +1877,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
         // wait would time out (5 s) at every later present and the picture stop for good. An empty batch takes the
         // semaphore and signals the fence; the acquired image goes back with the swapchain, made again next frame.
         // (through the presenter nothing was acquired: the batch only signals the fence)
-        VkSubmitInfo2 settle = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .waitSemaphoreInfoCount = via_ng ? 0u : 1u,
+        VkSubmitInfo2 settle = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .waitSemaphoreInfoCount = via_ng || split ? 0u : 1u,
                                 .pWaitSemaphoreInfos = &wait};
         vk_queue_lock();
         VkResult r2 = vkQueueSubmit2(c->gfx_queue, 1, &settle, g_fence[slot]);
@@ -1666,11 +1910,12 @@ void vk_present_blit(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int
 // are skipped. The size only places the picture rectangle, which a frame without a picture leaves as it was.
 void gfx_present_boot(void) { present_image(VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED, VK_FORMAT_UNDEFINED, 1920, 1080, NULL, 0); }
 
-void vk_present_flip(void) {
-    if (vk_device_is_lost()) return;
+int vk_present_flip(void) {
+    if (vk_device_is_lost()) return 0;
     plat_rmutex_lock(&g_pl);
-    flip_locked();
+    int shown = flip_locked();
     plat_rmutex_unlock(&g_pl);
+    return shown;
 }
 
 void gfx_window_resize(int cw, int chh) {
@@ -1687,7 +1932,7 @@ void gfx_window_release_vk(void) {
     plat_rmutex_lock(&g_pl);
     if (c && g_started) {
         vk_queue_lock();
-        vk_queue_lock(), vkDeviceWaitIdle(c->device), vk_queue_unlock();
+        vk_queue_lock(), vk_device_wait_idle(), vk_queue_unlock();
         vk_queue_unlock();
         g_flip_on = 0;   // its blit is done (device idle); the swapchain goes away unpresented
         ng_release();    // NGX frame generation's presenter shows nothing more; its images go before the device
@@ -1701,7 +1946,18 @@ void gfx_window_release_vk(void) {
         for (int i = 0; i < FRAMES; i++) {
             vkDestroySemaphore(c->device, g_acquire[i], NULL);
             vkDestroyFence(c->device, g_fence[i], NULL);
+            vkDestroyFence(c->device, g_present_slots[i].copied, NULL);
+            vkDestroyFence(c->device, g_present_slots[i].acquired, NULL);
+            present_slot_drop(&g_present_slots[i]);
+            g_hudless_slot = i;
+            if (g_hl_view) vkDestroyImageView(c->device, g_hl_view, NULL);
+            if (g_hl) vmaDestroyImage(c->vma, g_hl, g_hl_mem);
+            memset(&g_hudless[i], 0, sizeof g_hudless[i]);
         }
+        vkDestroySemaphore(c->device, g_snapshot_ready, NULL);
+        memset(g_present_slots, 0, sizeof g_present_slots);
+        g_snapshot_ready = VK_NULL_HANDLE;
+        g_snapshot_value = 0;
         for (uint32_t i = 0; i < g_sc_n; i++) {
             vkDestroySemaphore(c->device, g_render_done[i], NULL);
             if (g_sc_view[i]) vkDestroyImageView(c->device, g_sc_view[i], NULL);
@@ -1739,7 +1995,17 @@ void gfx_window_start(void) {
         for (int i = 0; i < FRAMES; i++) {
             vkCreateFence(c->device, &fi, NULL, &g_fence[i]);
             vkCreateSemaphore(c->device, &semi, NULL, &g_acquire[i]);
+            present_require(vkCreateFence(c->device, &fi, NULL, &g_present_slots[i].copied), "create display copy fence");
+            present_require(vkCreateFence(c->device, &fi, NULL, &g_present_slots[i].acquired), "create acquisition diagnostic fence");
+            VkCommandBufferAllocateInfo copy_ai = ai;
+            copy_ai.commandBufferCount = 1;
+            present_require(vkAllocateCommandBuffers(c->device, &copy_ai, &g_present_slots[i].copy), "allocate display copy commands");
         }
+        VkSemaphoreTypeCreateInfo ti = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+            .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE};
+        VkSemaphoreCreateInfo ready_ci = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &ti};
+        if (vkCreateSemaphore(c->device, &ready_ci, NULL, &g_snapshot_ready) != VK_SUCCESS)
+            rt_fatal("gfx: cannot create the presentation handoff timeline");
         g_frame = 0;
         g_started = 1;
         plat_rmutex_lock(&g_pl);

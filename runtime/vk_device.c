@@ -309,6 +309,7 @@ typedef struct {
     VkPhysicalDeviceShaderMaximalReconvergenceFeaturesKHR mrc;
     VkPhysicalDeviceMaintenance5FeaturesKHR m5;
     VkPhysicalDevicePipelineBinaryFeaturesKHR pbin;
+    VkPhysicalDevicePresentIdFeaturesKHR present_id;
 } FeatureChain;
 
 // One line for a fatal error's report (dispatch.h rt_fatal_note_add): the card, its driver, and the settings in effect
@@ -414,6 +415,13 @@ static int create_device(void) {
         g_vk.has_nv_checkpoints = 1;
         ext[n_ext++] = VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME;
     }
+    // The frame-generation interposer enables low_latency2 for Reflex. Its present-ID
+    // dependency must be enabled with the device, even when the application does not attach IDs itself.
+    if (vk_dlssg_dpa() && has_ext(ep, ne, "VK_NV_low_latency2") &&
+        has_ext(ep, ne, VK_KHR_PRESENT_ID_EXTENSION_NAME)) {
+        ext[n_ext++] = VK_KHR_PRESENT_ID_EXTENSION_NAME;
+        CHAIN(present_id, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR);
+    }
     // Graphics pipeline library: chained last so it can be dropped again when vk_caps_gpl declines it.
     void **gpl_link = NULL;
     if (has_ext(ep, ne, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) && has_ext(ep, ne, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME)) {
@@ -491,8 +499,8 @@ static int create_device(void) {
     }
 
     // Frame generation (vk_fg.cpp) presents on a second queue of the graphics family and acquires on a third
-    static const float prio[3] = {1.0f, 1.0f, 1.0f};
-    uint32_t nq_gfx = vk_fg_queue_count() < g_gfx_queues ? vk_fg_queue_count() : g_gfx_queues;
+    static const float prio[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    uint32_t nq_gfx = g_gfx_queues < 4 ? g_gfx_queues : 4;
     VkDeviceQueueCreateInfo qi[2] = {
         {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g_vk.gfx_family, .queueCount = nq_gfx,
          .pQueuePriorities = prio}};
@@ -513,10 +521,14 @@ static int create_device(void) {
         rt_log("vk: device entry points come through Streamline's interposer (DLSS Frame Generation)");
     }
     vkGetDeviceQueue(g_vk.device, g_vk.gfx_family, 0, &g_vk.gfx_queue);
+    g_vk.present_queue = g_vk.gfx_queue;
+    if (nq_gfx >= 4) vkGetDeviceQueue(g_vk.device, g_vk.gfx_family, 3, &g_vk.present_queue);
+    rt_log("vk: presentation queue %s (graphics family offers %u queues)",
+           g_vk.present_queue != g_vk.gfx_queue ? "separate" : "shared fallback", g_gfx_queues);
     if (nq_gfx >= 2) {
         VkQueue present, acquire;
         vkGetDeviceQueue(g_vk.device, g_vk.gfx_family, 1, &present);
-        vkGetDeviceQueue(g_vk.device, g_vk.gfx_family, nq_gfx - 1, &acquire);
+        vkGetDeviceQueue(g_vk.device, g_vk.gfx_family, (nq_gfx >= 3 ? 2 : 1), &acquire);
         vk_fg_queues(present, acquire);
     }
     if (g_vk.xfer_family != g_vk.gfx_family) vkGetDeviceQueue(g_vk.device, g_vk.xfer_family, 0, &g_vk.xfer_queue);
@@ -554,7 +566,7 @@ static long g_errors_total;     // outlives the device so the probe can print it
 
 static void destroy_all(void) {
     gfx_window_release_vk();
-    if (g_vk.device) vkDeviceWaitIdle(g_vk.device);
+    if (g_vk.device) { if (vk_ctx()) vk_device_wait_idle(); else vkDeviceWaitIdle(g_vk.device); }
     if (g_vk.device) vk_dlaa_release();   // the DLSS features and NGX: the allocator and the device still live
     if (g_vk.device) vk_astc_release();
     if (g_vk.device) vk_crumbs_release();

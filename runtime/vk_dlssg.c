@@ -53,6 +53,7 @@ static struct {
     PFN_nx2sl_phase phase;
     PFN_nx2sl_submit_end submit_end;
     PFN_nx2sl_shown shown;
+    PFN_nx2sl_input_retirement input_retirement;
     PFN_nx2sl_reflex reflex;
     uint32_t game;   // the game's presents (vk_dlssg_game_present)
     uint64_t cur;    // the frame the present thread blits and presents next (vk_dlssg_present_frame)
@@ -106,6 +107,7 @@ int vk_dlssg_early(void) {
         return 0;
     }
     PFN_nx2sl_version ver = (PFN_nx2sl_version)(void *)GetProcAddress(m, "nx2sl_version");
+    S.input_retirement = (PFN_nx2sl_input_retirement)(void *)GetProcAddress(m, "nx2sl_input_retirement");
     S.init = (PFN_nx2sl_init)(void *)GetProcAddress(m, "nx2sl_init");
     S.gipa = (PFN_nx2sl_instance_proc)(void *)GetProcAddress(m, "nx2sl_instance_proc");
     S.gdpa = (PFN_nx2sl_device_proc)(void *)GetProcAddress(m, "nx2sl_device_proc");
@@ -126,7 +128,7 @@ int vk_dlssg_early(void) {
     if (!S.frames_max) rt_log("dlssg: nx2navi_dlssg.dll is older than multi frame generation: 2x at most");
     if (!S.ui_alpha) rt_log("dlssg: this nx2navi_dlssg.dll predates UI alpha tagging; using HUD-less color alone");
     if (!ver || ver() != NX2SL_VERSION || !S.init || !S.gipa || !S.gdpa || !S.available || !S.frame || !S.marker ||
-        !S.sleep || !S.submit_end || !S.shown || !S.reflex) {
+        !S.input_retirement || !S.sleep || !S.submit_end || !S.shown || !S.reflex) {
         rt_log("dlssg: nx2navi_dlssg.dll is from another build: DLSS Frame Generation off");
         return 0;
     }
@@ -186,6 +188,11 @@ void vk_dlssg_device_ready(VkPhysicalDevice physical, VkDevice dev) {
 }
 
 int vk_dlssg_active(void) { return S.active; }
+int vk_dlssg_input_retirement(VkSemaphore *semaphore, uint64_t *value) {
+    *semaphore = VK_NULL_HANDLE;
+    *value = 0;
+    return S.active && S.input_retirement && S.input_retirement(semaphore, value);
+}
 
 int vk_dlssg_status(void) {
     if (S.active) return DLSSG_RUNS;
@@ -258,8 +265,19 @@ VkResult vk_dlssg_acquire(VkDevice d, VkSwapchainKHR sc, uint64_t t, VkSemaphore
 
 VkResult vk_dlssg_present(VkQueue q, const VkPresentInfoKHR *pi) {
     S.marker(0, S.cur);
+    uint64_t begin = kern_now_ns();
     VkResult r = S.present(q, pi);
+    uint64_t presented = kern_now_ns();
     S.marker(1, S.cur);
+    static uint64_t present_ns, state_ns;
+    static unsigned samples;
+    present_ns += presented - begin;
+    state_ns += kern_now_ns() - presented;
+    if (++samples == 120) {
+        rt_log("presentation: SDK present %.3f ms, state %.3f ms per frame", present_ns / 1.2e8, state_ns / 1.2e8);
+        samples = 0;
+        present_ns = state_ns = 0;
+    }
     __atomic_store_n(&S.hosted_ns, kern_now_ns(), __ATOMIC_RELAXED);
     return r;
 }

@@ -293,7 +293,7 @@ Up *context_for(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh) {
     if (small && up_tick - small->used >= UP_RECENT) slot = nullptr, lru = small;   // a larger one takes its place
     const VkCtx *c = vk_ctx();
     if (!slot && lru) {
-        vk_queue_lock(), vkDeviceWaitIdle(c->device), vk_queue_unlock();   // its work may still be in flight
+        vk_queue_lock(), vk_device_wait_idle(), vk_queue_unlock();   // its work may still be in flight
         destroy_up(lru, lru == small ? "a larger render size came" : "its slot went to another output size");
         slot = lru;
     }
@@ -303,7 +303,7 @@ Up *context_for(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh) {
     Up *u = create(slot, mw, mh, ow, oh);
     if (!u) {
         int freed = 0;
-        vk_queue_lock(), vkDeviceWaitIdle(c->device), vk_queue_unlock();
+        vk_queue_lock(), vk_device_wait_idle(), vk_queue_unlock();
         for (Up &o : U)
             if (o.ctx && up_tick - o.used >= UP_RECENT) destroy_up(&o, "room for a context whose creation failed"), freed++;
         freed += vk_ffx_trim_idle(UP_RECENT);

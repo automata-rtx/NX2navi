@@ -5138,7 +5138,7 @@ void vk_mem_shutdown(void) {
     if (!c) return;
     vk_upload_flush(1);
     vk_queue_lock();
-    vkDeviceWaitIdle(c->device);
+    vk_device_wait_idle();
     vk_queue_unlock();
     vk_gpa_report();
     vk_gpa_shutdown();

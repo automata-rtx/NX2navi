@@ -51,6 +51,7 @@ typedef struct VkCtx {
     // VK_FEEDBACK_RESTART (the pass ends and restarts behind the full barrier).
     int feedback;                           // VK_FEEDBACK_*
     uint32_t min_imported_host_alignment;   // VK_EXT_external_memory_host
+    VkQueue present_queue;                 // presentation only; gfx_queue on single-queue devices
     int device_index;                       // index in vkEnumeratePhysicalDevices
 } VkCtx;
 enum { VK_FEEDBACK_OFF, VK_FEEDBACK_RESTART, VK_FEEDBACK_LAYOUT };
@@ -220,12 +221,15 @@ void vk_hdr_support(float out[4]);
 // vk_contact.c: screen-space contact shadows on the game's composed scene colour (NX2NAVI_CONTACT_SHADOWS)
 int vk_contact_strength(void);   // percent, 0 = off
 void vk_contact_release(void);   // before the device goes away
-void vk_present_flip(void);
+int vk_present_flip(void); // true when a host present succeeded; asynchronous presenters report separately
 // Every submission to ctx->gfx_queue (and xfer_queue when shared) takes this lock; vk_present_image and the swapchain
 // rebuild do. Recursive. Taking it first hands the replay's held submissions to the queue (vk_sync_flush_held); the
 // raw forms leave them held, for vk_sync.c itself.
 void vk_queue_lock(void);
 void vk_queue_unlock(void);
+void vk_present_queue_lock(void);
+void vk_present_queue_unlock(void);
+VkResult vk_device_wait_idle(void);
 void vk_queue_lock_raw(void);
 int vk_queue_trylock_raw(void);   // 1 when acquired
 void vk_sync_flush_held(void);    // queue lock held: the held submissions go to the queue in one call (vk_sync.c)

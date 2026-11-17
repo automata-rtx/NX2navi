@@ -177,7 +177,7 @@ Up *context_for(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh) {
     if (small && up_tick - small->used >= UP_RECENT) slot = nullptr, lru = small;   // a larger one takes its place
     const VkCtx *c = vk_ctx();
     if (!slot && lru) {
-        vk_queue_lock(), vkDeviceWaitIdle(c->device), vk_queue_unlock();   // its work may still be in flight
+        vk_queue_lock(), vk_device_wait_idle(), vk_queue_unlock();   // its work may still be in flight
         destroy_up(lru, lru == small ? "a larger render size came" : "its slot went to another output size");
         slot = lru;
     }
@@ -373,7 +373,7 @@ extern "C" int vk_ffx_probe_cache(void) {
     if (!u) fails++, printf("probe-ffx-cache: FAIL: no context\n");
     if (u && on && !made) fails++, printf("probe-ffx-cache: FAIL: the library created its pipelines past the runtime\n");
     if (u && !on && made) fails++, printf("probe-ffx-cache: FAIL: pipelines came through the runtime with the setting 0\n");
-    vk_queue_lock(), vkDeviceWaitIdle(vk_ctx()->device), vk_queue_unlock();
+    vk_queue_lock(), vk_device_wait_idle(), vk_queue_unlock();
     vk_ffx_release();
     vk_pipeline_save();
     printf("probe-ffx-cache: %s\n", fails ? "FAILED" : "passed");

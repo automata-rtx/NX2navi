@@ -76,7 +76,7 @@ static void pace_shown(uint64_t interval_ns) {
 
 static void present_main(void *arg) {
     (void)arg;
-    uint64_t last = 0, last_queued = 0;
+    uint64_t last = 0, last_delivered = 0, last_queued = 0;
     plat_mutex_lock(&pl);
     for (;;) {
         while (!pending) plat_cond_wait(&pcv, &pl);
@@ -100,17 +100,42 @@ static void present_main(void *arg) {
         uint64_t t0 = kern_now_ns();
         wait_until(pace_smooth(j.at, last, t0));
         uint64_t t1 = kern_now_ns();
+        // Pace present-call starts as before. Including time inside the driver here
+        // adds it to the next spacing target and can slow otherwise uncapped rendering.
+        // Delivery accounting below independently measures successful call returns.
         if (last) pace_shown(t1 - last);
-        vk_present_flip();
-        perfmon_shown(t1);   // the overlay's frame times: the pictures as shown
+        int shown = vk_present_flip();
+        uint64_t delivered = kern_now_ns();
+        if (shown) {
+            perfmon_shown(delivered); // successful host presents, including time inside the presentation call
+        }
+        // Optional compact diagnostic. This measures host delivery, not physical scan-out.
+        // Together with the frame number it detects a faster producer building a display backlog.
+        static FILE *delivery;
+        static int delivery_opened;
+        static unsigned delivery_rows;
+        if (!delivery_opened) {
+            delivery_opened = 1;
+            const char *path = cfg_get("NX2NAVI_PRESENT_TIMING");
+            if (path && *path) {
+                delivery = fopen(path, "wb");
+                if (delivery) fprintf(delivery, "frame\tqueued_ns\tflip_start_ns\tflip_end_ns\tshown\n");
+            }
+        }
+        if (delivery) {
+            fprintf(delivery, "%llu\t%llu\t%llu\t%llu\t%d\n", (unsigned long long)j.frame,
+                (unsigned long long)j.queued, (unsigned long long)t1, (unsigned long long)delivered, shown);
+            if (++delivery_rows % 60 == 0) fflush(delivery);
+        }
         // NX2NAVI_TRACE=present: one line per present: the host present's interval, the interval of the game's present
         // calls (when the host present went out before back-edge pacing), the wait and how far past its target it went
         if (rt_trace & RT_TRACE_PRESENT)
             rt_log("present: frame %llu interval %.3f ms, game %.3f ms, waited %.3f ms, %.3f ms past target",
-                   (unsigned long long)j.frame, last ? (t1 - last) / 1e6 : 0.0,
+                   (unsigned long long)j.frame, last_delivered ? (delivered - last_delivered) / 1e6 : 0.0,
                    last_queued ? (j.queued - last_queued) / 1e6 : 0.0, (t1 - t0) / 1e6,
                    j.at && t1 > j.at ? (t1 - j.at) / 1e6 : 0.0);
         last = t1;
+        if (shown) last_delivered = delivered;
         last_queued = j.queued;
         vk_pipeline_autosave();   // starts the autosave thread once
         plat_mutex_lock(&pl);

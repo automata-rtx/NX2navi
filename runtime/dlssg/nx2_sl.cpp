@@ -54,6 +54,8 @@ int g_available = -1;
 int g_frames = -1;                   // the frames to generate as last set (0 off), -1 before the first nx2sl_frame
 std::atomic<uint32_t> g_max{0};      // numFramesToGenerateMax as Streamline last reported it, 0 before it did
 uint64_t g_presented;
+VkSemaphore g_input_fence;
+uint64_t g_input_value;
 std::atomic<uint64_t> g_shown{0};
 
 void say(const char *fmt, ...) {
@@ -347,6 +349,10 @@ extern "C" NX2SL_API int nx2sl_frame(VkCommandBuffer cb, const Nx2SlImage *depth
 }
 
 extern "C" NX2SL_API void nx2sl_present_marker(int after, uint32_t frame) {
+    if (after) {
+        g_input_fence = VK_NULL_HANDLE;
+        g_input_value = 0;
+    }
     sl::FrameToken *t = g_available == 1 ? token(frame) : nullptr;
     if (!t) return;
     mark(after ? sl::PCLMarker::ePresentEnd : sl::PCLMarker::ePresentStart, *t, frame);
@@ -356,12 +362,16 @@ extern "C" NX2SL_API void nx2sl_present_marker(int after, uint32_t frame) {
     // with three.
     sl::DLSSGState s{};
     static unsigned stateErrors;
+    g_input_fence = VK_NULL_HANDLE;
+    g_input_value = 0;
     sl::Result result = p_dlssg_state(sl::ViewportHandle(0), s, nullptr);
     if (result != sl::Result::eOk) {
         if (stateErrors++ % pacingWindow == 0)
             say("dlssg: FG state query after present failed: %s", sl::getResultAsStr(result));
         return;
     }
+    g_input_fence = (VkSemaphore)(uintptr_t)s.inputsProcessingCompletionFence;
+    g_input_value = s.lastPresentInputsProcessingCompletionFenceValue;
     uint64_t shown = g_shown.fetch_add(s.numFramesActuallyPresented, std::memory_order_relaxed) + s.numFramesActuallyPresented;
     if (s.numFramesToGenerateMax && s.numFramesToGenerateMax != g_max.load()) {   // a 0 now and then is no news
         say("dlssg: up to %ux on this GPU and driver", s.numFramesToGenerateMax + 1);
@@ -396,6 +406,17 @@ extern "C" NX2SL_API void nx2sl_present_marker(int after, uint32_t frame) {
 }
 
 extern "C" NX2SL_API uint32_t nx2sl_frames_max(void) { return g_available == 1 ? g_max.load() : 0; }
+
+extern "C" NX2SL_API int nx2sl_input_retirement(VkSemaphore *semaphore, uint64_t *value) {
+    if (g_frames == 0) { // no persistent inputs consumed by this present
+        *semaphore = VK_NULL_HANDLE;
+        *value = 0;
+        return 1;
+    }
+    *semaphore = g_input_fence;
+    *value = g_input_value;
+    return g_input_fence && g_input_value;
+}
 
 extern "C" NX2SL_API uint64_t nx2sl_shown(void) { return g_shown.load(std::memory_order_relaxed); }
 

@@ -90,7 +90,7 @@ static int ensure_image(VkCtx *c, uint32_t w, uint32_t h) {
     if (C.img && C.w == w && C.h == h) return 1;
     // another crop size (a resolution change): earlier presents may still read the old image
     vk_queue_lock();
-    vkDeviceWaitIdle(c->device);
+    vk_device_wait_idle();
     vk_queue_unlock();
     free_image(c);
     VkImageCreateInfo ii = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,

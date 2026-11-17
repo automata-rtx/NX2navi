@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <vulkan/vulkan.h>
 
-#define NX2SL_VERSION 3
+#define NX2SL_VERSION 4
 
 typedef struct {
     VkImage image;
@@ -75,6 +75,8 @@ typedef uint32_t (*PFN_nx2sl_frames_max)(void);
 typedef void (*PFN_nx2sl_present_marker)(int after, uint32_t frame);
 // The frames the display got, generated ones included, counted after each present (on the present thread)
 typedef uint64_t (*PFN_nx2sl_shown)(void);
+// Queried on the present thread after the present; the SDK owns this timeline semaphore.
+typedef int (*PFN_nx2sl_input_retirement)(VkSemaphore *semaphore, uint64_t *value);
 typedef void (*PFN_nx2sl_shutdown)(void);
 #ifdef __cplusplus
 }

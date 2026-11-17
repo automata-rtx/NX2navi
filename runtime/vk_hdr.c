@@ -897,7 +897,7 @@ static int img_ensure(VkCtx *c, Img *m, uint32_t w, uint32_t h, VkFormat fmt, Vk
     if (m->img && m->w == w && m->h == h) return 1;
     if (m->img) {
         vk_queue_lock();
-        vkDeviceWaitIdle(c->device);
+        vk_device_wait_idle();
         vk_queue_unlock();
         img_free(c, m);
     }
@@ -1063,7 +1063,7 @@ static int ui_pipeline(VkCtx *c, VkFormat fmt) {
     if (H.ui && H.ui_fmt == fmt) return 1;
     if (H.ui) {   // another swapchain format: earlier presents may still use the old pipeline
         vk_queue_lock();
-        vkDeviceWaitIdle(c->device);
+        vk_device_wait_idle();
         vk_queue_unlock();
         vkDestroyPipeline(c->device, H.ui, NULL);
         H.ui = VK_NULL_HANDLE;

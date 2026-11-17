@@ -69,7 +69,7 @@ int vk_dlaa_hud_attachment(const VkExec *ex, VkRenderingAttachmentInfo *attachme
 int vk_hud_alpha_pipeline(VkPipeState *s);
 void vk_dlaa_hud_incomplete(void);
 void vk_dlaa_hud_write(VkImage image);
-VkNgxImage vk_dlaa_present_alpha(VkCommandBuffer cb, VkExtent2D ext, const int rect[4], const int to[4], uint64_t frame);
+VkNgxImage vk_dlaa_present_alpha(VkCommandBuffer cb, VkExtent2D ext, const int rect[4], const int to[4], uint64_t frame, unsigned slot);
 int vk_dlaa_swap_active(const VkExec *ex);
 int vk_dlaa_tonemap_target(const VkExec *ex);
 void vk_dlaa_tonemap_begin(VkExec *ex, VkRenderingAttachmentInfo *color, VkRenderingAttachmentInfo *depth,
