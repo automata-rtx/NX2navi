@@ -2048,27 +2048,22 @@ def refresh_pipeline_seed(out):
 
 
 def warm_driver_cache(out):
-    """After an update that carries the shaders over: every prepared stage library is built into the graphics driver's
-    cache again (`nx2navi.exe --warm-shaders`). It takes seconds while the driver still has them. It takes minutes when
-    the update changed what a library is built with, which gives each one another entry in the driver's cache: without
-    this run every pipeline a draw first needed then compiled in play, which skipped that draw for some frames or made
-    it wait (on an RX 7900 XT 100 to 340 ms a library against 3 ms from the cache, after dynamic vertex input was
-    turned off for that driver). A run that fails is not an error of the build: the game checks the cache at every
-    start and warms it in the background itself (runtime/vk_pipeline.c lw_start)."""
+    """Refresh the seed pipelines and reuse completed stage-library work after validating
+    the saved preparation against the current Vulkan device and effective library recipe."""
     exe = out / EXE_NAME
     if not exe.is_file() or not (out / 'shader-prepared.bin').is_file():
         return
     refresh_pipeline_seed(out)
-    say("  the prepared shaders are built into the graphics driver's cache again")
+    say('  checking prepared pipelines and repairing missing libraries')
     t0 = time.monotonic()
     try:
-        rc = shader_run([str(exe), '--warm-shaders'], cwd=str(out), build_only=True)
+        rc = shader_run([str(exe), '--refresh-shaders'], cwd=str(out), build_only=True)
     except OSError as e:
         rc = str(e)
     if rc:
-        say(f'  that did not finish ({rc}); the game does it in the background while it runs')
+        say(f'  that did not finish ({rc}); the game can repair missing libraries during play')
     else:
-        say(f"  driver's cache warm in {time.monotonic() - t0:.0f} s")
+        say(f"  pipeline refresh finished in {time.monotonic() - t0:.0f} s")
 
 
 def step_shaders(out, update=False):

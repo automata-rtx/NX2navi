@@ -462,7 +462,7 @@ int probe_zstd(void);                                      // ov_zstd.c
 int probe_gamepad(void);                                   // input.c
 int probe_movie(void);                                     // movie_probe.c: the host movie decoders on one RomFS movie
 int vk_pipeline_prepare_shaders(void);                     // vk_pipeline.c: --prepare-shaders (tools/prepare_shaders.py)
-int vk_pipeline_warm_shaders(void);                        // vk_pipeline.c: --warm-shaders (tools/build_game.py)
+int vk_pipeline_warm_shaders(int update);                        // vk_pipeline.c: --warm-shaders (tools/build_game.py)
 int vk_pipeline_prepare_pipelines(void);                   // vk_pipeline.c: --prepare-pipelines (the shared pipeline list)
 int vk_pipeline_probe_prewarm(void);                       // vk_pipeline.c: --probe-prewarm
 int vk_pipeline_probe_buildgate(void);                     // vk_pipeline.c: --probe-buildgate

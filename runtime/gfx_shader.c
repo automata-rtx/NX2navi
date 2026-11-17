@@ -2263,6 +2263,7 @@ const uint8_t *gfx_shader_key(const GfxShader *s) { return s->key; }
 
 int gfx_shader_origin(const GfxShader *s) { return s->fresh ? 2 : s->carried ? 1 : 0; }
 
+const uint8_t *gfx_shader_translation_id(void) { paths(); return xlate_id; }
 const uint8_t *gfx_shader_input_id(const GfxShader *s) { return s->iid; }
 
 // By input id: memory, then the disk cache under the current translator, then (xlate 1) a translation from the stored

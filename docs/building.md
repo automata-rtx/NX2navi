@@ -139,12 +139,20 @@ of them.
    The AMD driver keeps its pipeline cache per exe path and holds a limited amount: preparing another build folder can
    evict this one's. `nx2navi.exe --warm-shaders` rebuilds it from the shader cache. A driver update empties the
    driver's cache too, and a change to what a stage library is built with gives every library another entry in it.
-   So an update that carries the prepared shaders over runs `--warm-shaders` (`tools/make_game.py`
+   So an update that carries the prepared shaders over runs `--refresh-shaders` (`tools/make_game.py`
    `warm_driver_cache`: seconds while the libraries are there, minutes when they are not), and the game itself checks
-   at every start: it builds a sample of the prepared fragment libraries and, when their median time says the cache
-   is cold, builds the whole prepared list into the driver's cache again on idle-priority threads while it runs
-   (`runtime/vk_pipeline.c` `lw_start`, `NX2NAVI_LIB_WARM`; `shader-warm.txt` next to the caches says where that
-   stands). With the cache cold every pipeline a draw first needs compiles in play: on an RX 7900 XT a library took
+   at startup. On a device with cache-control support, an idle worker asks Vulkan for recently encountered
+   and prepared stage libraries with compilation forbidden. It tries the driver and then the application's
+   pipeline caches. A confirmed miss can be repaired. Misses in both groups trigger incremental checks of the
+   prepared list. The automatic tail gets up to 128 requests or 1.5 seconds per launch, plus the last in-flight
+   call. Setup and the runtime checkpoint successful work in a versioned `shader-warm-*.bin` under the cache
+   root. Updates sample prior successes before reusing completed graphics work. Full manual
+   preparation still checks the whole list. Automatic tail repairs can add up to about 32 MiB per recipe to
+   the application's existing pipeline cache when its configured limit has headroom. Additional repairs
+   target the driver cache. A rotating set of six compile-forbidden requests checks beyond the repaired
+   sample. `lib_warm = force` requests a full repair and `lib_warm = 0` disables the startup worker.
+   Devices without cache control and configurations using explicit pipeline binaries retain normal preparation
+   and first-use pipeline creation, with a small recorded-library warm-up. With the cache cold every pipeline a draw first needs compiles in play: on an RX 7900 XT a library took
    93 ms (vertex) and 242 ms (fragment) on average against 0.3 and 0.6 ms from the cache, and a first walk through a
    village skipped 11,180 draws and made 94 draws wait 5.5 s in all, against 1,605 skipped (1,473 of them in the
    scene's first frames) and 60 ms of waits with the cache warm.
@@ -397,9 +405,11 @@ header comment describes, and checks that:
 No game files. `--romfs <folder with romfs.bin and index.json>` also runs it on the game's own archive: four copies laid
 out, 208 fields, the same dictionary and unpacked size, and no byte changed outside the layout's copies.
 
-A change to what the library warm logs when the driver's cache of stage libraries is cold (`runtime/vk_warm_hint.h`,
-`runtime/vk_pipeline.c` `lw_main`) passes `python tests\warm_hint_check.py`, which builds the header alone and checks
-the added text by GPU vendor and by why the cache was cold. No game files.
+To verify stage-library reuse across independent processes, run
+`python tests/library_reuse_check.py --exe <candidate> --xlate <translator> --fixture <fixture> --out <new-directory>`.
+Use a small graphics-only local fixture with matching translations, recorded answers, and a prepared list
+of at least 257 entries. The check runs Vulkan preparation without starting gameplay, including five
+warm launches, interrupted repair, an update, a corrupted checkpoint and memory-pressure deferral.
 
 A change to how a run ends when the GPU device is lost (`runtime/vk_device.c` `vk_device_lost_check`, the checks of
 `vk_lost` in the replay, upload and present paths, `runtime/vk_sync.c` `completion_main`) passes

@@ -65,6 +65,7 @@ void gfx_shader_disk_counts(uint64_t *sync, uint64_t *sync_ns, uint64_t *bg);   
 void gfx_shader_set_host(int float64, uint32_t sbuf_align, const uint32_t subgroup[3], uint32_t gather_bits, int zero_locals,
                          int bda);
 const uint8_t *gfx_shader_key(const GfxShader *s);          // the 32-byte cache key (stable while the translator is)
+const uint8_t *gfx_shader_translation_id(void);            // active 32-byte identity including host options
 const uint8_t *gfx_shader_input_id(const GfxShader *s);     // the 32-byte input id (stable across translators)
 // Where the translation in use came from: 0 the shader cache, under the current translator; 1 the shader cache, a
 // previous translator's (gfx_shader.c "Carry"); 2 translated in this process, so nothing was prepared from it.

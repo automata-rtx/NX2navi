@@ -53,7 +53,7 @@
 #include "vk_build_gate.h"
 #include "vk_cache_file.h"
 #include "vk_save_retry.h"
-#include "vk_warm_hint.h"
+#include "vk_warm_progress.h"
 
 #define LOG_ONCE(...) do { static volatile int32_t once_; if (!plat_xchg32(&once_, 1)) rt_log(__VA_ARGS__); } while (0)
 
@@ -549,11 +549,6 @@ static void cache_build_enter(void) {
 // but the background builder of large compute shaders) for P.cache itself. A create into it does not hold cache_rw, so
 // a build of minutes does not keep pipeline-cache.bin from being saved; bg_merge moves its content into P.cache.
 static __thread VkPipelineCache own_cache;
-// 1 on a thread whose creates take no pipeline cache of ours at all (the library warm in play, lw_worker and lw_probe):
-// what it builds is wanted in the driver's own disk cache only. Built into P.cache, the 37,572 stage libraries of a
-// warm grew it by 1.6 GB (2026-11-11: a save of 2026.7 MB in play, +1612 MB since the boot); the file was then over
-// NX2NAVI_PIPELINE_CACHE_MAX_MB, so the next start dropped it whole and compiled the pipelines it had held.
-static __thread int no_cache;
 // New content in P.cache that P.stats does not count, for autosave_once to save: bg_merge's merges, and the compiles
 // of pipelines built for the cache only (lb_compute keep 0).
 static volatile uint32_t cache_merges;
@@ -584,7 +579,6 @@ static VkResult pipe_create_one(int kind, void *ci, VkPipeline *pipe, VkPipeline
 }
 
 static VkResult pipe_create_in(int kind, void *ci, VkPipeline *pipe, VkPipelineCache cache) {
-    if (no_cache) cache = VK_NULL_HANDLE;
     int shared = cache && !own_cache;
     if (cache && own_cache) cache = own_cache;
     uint64_t t0 = perf_mark_begin();   // NX2NAVI_TRACE=perf: the create on any thread, its wait for cache_rw included
@@ -3350,7 +3344,35 @@ static VkPipelineLayout half_layout(Layout *l, int h) {
 }
 
 // Builds one library from the pipeline's state; key is the library's key (PrKey: fin holds the added outputs).
-static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPipelineLayout lay, const void *key) {
+// A warm probe uses the same library recipe as a real create. A miss may be repaired
+// only after both noncompiling lookups returned VK_PIPELINE_COMPILE_REQUIRED.
+typedef struct {
+    int repair, store_in_app, driver_only_build, driver_hit, app_hit, compile_required, compiled;
+    VkResult result;
+} LibraryProbe;
+
+static VkResult library_lookup(VkGraphicsPipelineCreateInfo *ci, VkPipeline *pipe, LibraryProbe *probe) {
+    if (probe->driver_only_build) return pipe_create_one(1, ci, pipe, VK_NULL_HANDLE);
+    VkPipelineCreateFlags saved = ci->flags;
+    ci->flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+    VkResult r = pipe_create_one(1, ci, pipe, VK_NULL_HANDLE);
+    probe->driver_hit = r == VK_SUCCESS && *pipe;
+    if (r == VK_PIPELINE_COMPILE_REQUIRED && P.cache) {
+        r = pipe_create_in(1, ci, pipe, P.cache);
+        probe->app_hit = r == VK_SUCCESS && *pipe;
+    }
+    ci->flags = saved;
+    probe->compile_required = r == VK_PIPELINE_COMPILE_REQUIRED;
+    if (probe->compile_required && probe->repair) {
+        r = pipe_create_in(1, ci, pipe, probe->store_in_app ? P.cache : VK_NULL_HANDLE);
+        probe->compiled = r == VK_SUCCESS && *pipe;
+        if (probe->compiled && probe->store_in_app && P.cache)
+            __atomic_fetch_add(&cache_merges, 1, __ATOMIC_RELAXED);
+    }
+    return r == VK_SUCCESS && !*pipe ? VK_ERROR_INITIALIZATION_FAILED : r;
+}
+
+static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPipelineLayout lay, const void *key, LibraryProbe *probe) {
     static const VkGraphicsPipelineLibraryFlagsEXT part[4] = {
         VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT, VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT,
         VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT, VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT};
@@ -3459,9 +3481,11 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
     VkPipelineCreationFeedback fb;
     pi.pNext = fb_chain(&fci, &fb, pi.pNext);
     crash_note("a pipeline library", s->vs, s->fs, NULL);
-    if (pipe_create(1, &pi, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
+    VkResult result = probe ? library_lookup(&pi, &pipe, probe) : pipe_create(1, &pi, &pipe);
+    if (probe) probe->result = result;
+    if (result != VK_SUCCESS) pipe = VK_NULL_HANDLE;
     plat_crash_context(NULL);
-    if (pipe && (kind == LIB_PR || kind == LIB_FS)) fb_note(FB_LIBRARY, &fb);   // the shader libraries: the others compile nothing
+    if (pipe && !probe && (kind == LIB_PR || kind == LIB_FS)) fb_note(FB_LIBRARY, &fb);   // the shader libraries: the others compile nothing
 out:
     if (m) vkDestroyShaderModule(P.device, m, NULL);
     free(patched);
@@ -3531,7 +3555,7 @@ static VkPipeline lib_build(Lib *b, int kind, const VkPipeState *s, const GKey *
     if (lay || kind == LIB_VI || kind == LIB_FO) {
         plat_mutex_unlock(&P.lock);
         uint64_t t0 = qpc();
-        pipe = lib_create(kind, s, k, lay, b->key);
+        pipe = lib_create(kind, s, k, lay, b->key, NULL);
         double ms = ms_since(t0);
         plat_mutex_lock(&P.lock);
         P.g.lib_n[kind]++, P.g.lib_ms[kind] += ms;
@@ -3594,7 +3618,7 @@ static VkPipeline lib_get(int kind, const VkPipeState *s, const GKey *k, Layout 
     if (b) return lib_build(b, kind, s, k, l);
     plat_mutex_unlock(&P.lock);
     uint64_t t0 = qpc();
-    VkPipeline pipe = lib_create(kind, s, k, lay, key);
+    VkPipeline pipe = lib_create(kind, s, k, lay, key, NULL);
     double ms = ms_since(t0);
     plat_mutex_lock(&P.lock);
     if ((have = lib_find(h, key, size)) && !have->building) {   // another thread built it meanwhile
@@ -4896,9 +4920,13 @@ void vk_pipeline_prewarm(void) {
 static void prewarm_run(void) {
     const char *gpu = rt_config()->gpu;
     uint32_t pr_hist[16] = {0}, fs_hist[4] = {0};   // library state of the recorded pipelines (lb_start)
-    if (!A.on || (gpu && !strcmp(gpu, "null"))) return;
+    if (!A.on || (gpu && !strcmp(gpu, "null"))) {
+        rt_log("vk_pipeline: library reuse: terminal disabled");
+        return;
+    }
     if (!cfg_bool("NX2NAVI_PIPE_PREBUILD")) {   // prebuild_start logs the off case
         if (ensure_init()) lb_start(pr_hist, fs_hist);
+        else rt_log("vk_pipeline: library reuse: terminal no-device");
         return;
     }
     double t0 = now_ms();
@@ -4906,6 +4934,7 @@ static void prewarm_run(void) {
     if (!ensure_init() || !K.file_n) {
         rt_log("vk_pipeline: prewarm: no pipeline keys (%s)", K.path[0] ? K.path : "<none>");
         if (P.ready) lb_start(pr_hist, fs_hist);
+        else rt_log("vk_pipeline: library reuse: terminal no-device");
         return;
     }
     const KeyRec *r = (const KeyRec *)K.file;
@@ -4914,6 +4943,7 @@ static void prewarm_run(void) {
     const GfxShader **sh = calloc(3 * n, sizeof *sh);
     if (!ids || !sh) {
         free(ids), free(sh);
+        rt_log("vk_pipeline: library reuse: terminal no-memory");
         return;
     }
     for (size_t i = 0; i < n; i++) {
@@ -6175,7 +6205,8 @@ static void lb_compute(const GfxShader *cs, const uint8_t iid[32], int keep) {
 
 // The pre-rasterization (vertex) or fragment-shader library of one shader with the LB state.
 // keep 0: build into the driver's pipeline cache only (sh is a private copy; the library is destroyed).
-static void lb_library(const GfxShader *sh, int vertex, int keep) {
+static int lb_library(const GfxShader *sh, int vertex, int keep, LibraryProbe *probe) {
+    if (probe) probe->result = VK_ERROR_INITIALIZATION_FAILED;
     int kind = vertex ? LIB_PR : LIB_FS, stat = vertex ? 0 : 1;
     VkPipeState s;
     vk_pipe_state_defaults(&s);
@@ -6211,16 +6242,16 @@ static void lb_library(const GfxShader *sh, int vertex, int keep) {
     }
     lb_unlock();
     if (have || !lay) {
-        lb_count(stat, have ? 1 : 2, 0);
-        return;
+        if (!probe) lb_count(stat, have ? 1 : 2, 0);
+        return have;
     }
     double t0 = now_ms();
-    VkPipeline pipe = lib_create(kind, &s, &k, lay, key);
+    VkPipeline pipe = lib_create(kind, &s, &k, lay, key, probe);
     double ms = now_ms() - t0;
     if (!keep) {
         if (pipe) vkDestroyPipeline(P.device, pipe, NULL);
-        lb_count(stat, pipe ? 3 : 2, ms);
-        return;
+        if (!probe) lb_count(stat, pipe ? 3 : 2, ms);
+        return pipe != VK_NULL_HANDLE;
     }
     lb_lock();
     have = lib_find(h, key, size) != NULL;
@@ -6231,6 +6262,7 @@ static void lb_library(const GfxShader *sh, int vertex, int keep) {
     }
     lb_unlock();
     lb_count(stat, !pipe ? 2 : have || got != pipe ? 1 : 0, ms);
+    return got != VK_NULL_HANDLE;
 }
 
 // A vertex or fragment variant with the graphics pipeline library off: no stage library to build ahead.
@@ -6307,7 +6339,7 @@ static void lb_worker(void *arg) {
         } else if (gfx_shader_stage(sh) == GFX_STAGE_CS) {
             lb_compute(sh, LB.e[i].iid, keep);
         } else if (!owned && (gfx_shader_stage(sh) == GFX_STAGE_VS || gfx_shader_stage(sh) == GFX_STAGE_FS)) {
-            if (P.gpl) lb_library(sh, gfx_shader_stage(sh) == GFX_STAGE_VS, 1);   // a kept library points at sh: never a copy
+            if (P.gpl) lb_library(sh, gfx_shader_stage(sh) == GFX_STAGE_VS, 1, NULL);   // a kept library points at sh: never a copy
             else lb_skip_lib();
         }
         if (owned) gfx_shader_release_private(sh);
@@ -6336,201 +6368,432 @@ static void lb_state(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
     LB.samples = (uint8_t)(1u << bf);
 }
 
-// ---- the driver's cache of stage libraries, warmed again during play
-//
-// The preparation (lb_warm_prepared) builds every prepared variant's stage library once, so the driver's disk cache
-// holds it and the library a draw needs later takes a few milliseconds instead of a compile: 3 ms against 100 ms for
-// a vertex and 340 ms for a fragment library on an RX 7900 XT (driver 26.10.1). The driver's cache does not outlive
-// everything, though: a driver update empties it, the AMD driver keeps a limited amount and drops old entries, and a
-// change to what a library is built with (the dynamic states it lists, as when dynamic vertex input was turned off for
-// this driver) gives every library another entry. After any of them each pipeline a draw first needs compiles cold:
-// the draw is skipped for the frames that takes, or waits for it. Measured on that card with the cache cold, a walk
-// through a village not seen before skipped 11,180 draws while their pipelines built and 94 draws waited 5.5 s in
-// all, one of them 1.9 s.
-//
-// So every start checks: a sample of the prepared fragment libraries is built (lw_probe), and when their median time
-// says the cache is cold, the whole prepared list is built again into the driver's cache on a few idle-priority
-// threads while the game runs (lw_worker), as the preparation does but without stopping play. shader-warm.txt beside
-// the caches says where that stands: "warming" while it runs, so a start after a run that ended meanwhile goes on,
-// and "done" with the driver and a count of the times the cache was cold again right after a finished warm. At two in
-// a row the driver does not keep stage libraries at all and warming stops being tried (NX2NAVI_LIB_WARM=0 turns it off;
-// =force warms at every start).
+// ---- check stage-library reuse and repair confirmed misses
+// The checkpoint records successful work, never proof of present residency. Each launch
+// checks recorded-play recipes and a separate sample of the prepared list in Vulkan.
 #define LW_SAMPLE 12
-#define LW_COLD_MS 15.0
-#define LW_MAX_THREADS 6
+#define LW_TAIL_LIMIT 128
+#define LW_TAIL_MS 1500
 static struct {
-    GfxWarmEnt *e;
-    size_t n;
-    volatile int64_t next, done;
-    volatile int32_t running, stop, started;
-    volatile int32_t short_mem;   // the memory gate refused a build for GATE_WAIT_MS: the warm ended for this run
-    PlatThread *th[LW_MAX_THREADS + 1];
-    int threads, strikes;
-    uint32_t vendor;   // the GPU's vendor id, for what a cold cache's log line adds (vk_warm_hint.h)
-    double t0;
-    char stamp[PLAT_PATH_MAX * 2 + 32], id[64];
-} LW;
+    GfxWarmEnt *e, *recorded, hot[LW_SAMPLE];
+    size_t n, nrecorded, nhot, bytes;
+    WarmProgress *progress;
+    int dirty, locked, persist_tail;
+    PlatMutex io;
+    char file[PLAT_PATH_MAX * 2 + 96], lock[PLAT_PATH_MAX * 2 + 32];
+    volatile int32_t stop, started;
+    PlatThread *th;
+} LW = {.io = PLAT_MUTEX_INIT};
 
-static void lw_stamp(const char *state, int strikes) {
-    char line[128];
-    int n = snprintf(line, sizeof line, "%s %s %d\n", state, LW.id, strikes);
-    if (!plat_file_write_atomic(LW.stamp, line, (size_t)n)) rt_log("vk_pipeline: cannot write %s", LW.stamp);
+static int lw_stage(const GfxWarmEnt *e) {
+    return e->stage == GFX_STAGE_VS || e->stage == GFX_STAGE_FS;
 }
 
-// One prepared vertex or fragment variant's library into the driver's cache; its time in ms, negative when the
-// variant is on the skip list, not in the shader cache or of another stage.
-static double lw_build(const GfxWarmEnt *e) {
-    if (e->stage != GFX_STAGE_VS && e->stage != GFX_STAGE_FS) return -1;
-    if (skip_listed(e->iid)) return -1;
+// Output padding changes the actual vertex module. Hash the input IDs and their
+// required outputs in stable order, independent of process-local shader addresses.
+static int lw_vertex_recipe(uint8_t digest[32]) {
+    typedef struct { uint8_t id[32]; uint32_t mask; GfxShaderIo io[32]; } Outputs;
+    plat_mutex_lock_shared(&VO.lock);
+    Outputs *rows = calloc(VO.n + 1, sizeof *rows);
+    size_t n = 0;
+    if (rows) for (size_t i = 0; i < VS_OUTS_CAP; i++) {
+        if (!VO.vs[i] || !VO.mask[i]) continue;
+        Outputs *row = &rows[n++];
+        memcpy(row->id, gfx_shader_input_id(VO.vs[i]), 32);
+        row->mask = VO.mask[i];
+        memcpy(row->io, VO.io[i], sizeof row->io);
+    }
+    plat_mutex_unlock_shared(&VO.lock);
+    if (!rows) return 0;
+    qsort(rows, n, sizeof *rows, id_cmp);
+    rt_sha256(rows, n * sizeof *rows, digest);
+    free(rows);
+    return 1;
+}
+
+// The format revision includes the stage module/layout recipes. Bump when the emitted
+// Vulkan state changes in a way not represented by the fields below.
+static int lw_open(const char *dir, const GfxWarmEnt *entries, size_t n) {
+    struct {
+        uint8_t list[32], translator[32], uuid[VK_UUID_SIZE], exe[32], dyn[32], outputs[32];
+        uint32_t state[20];
+    } recipe = {0};
+    char exe[PLAT_PATH_MAX * 2] = {0};
+    if (!n || !plat_exe_path(exe, sizeof exe) || !lw_vertex_recipe(recipe.outputs)) return 0;
+    VkPhysicalDeviceProperties props;
+    vkGetPhysicalDeviceProperties(vk_ctx()->phys, &props);
+    rt_sha256(exe, strlen(exe), recipe.exe);
+    rt_sha256(entries, n * sizeof *entries, recipe.list);
+    rt_sha256(P.dyn, P.n_dyn * sizeof *P.dyn, recipe.dyn);
+    memcpy(recipe.translator, gfx_shader_translation_id(), 32);
+    memcpy(recipe.uuid, props.pipelineCacheUUID, sizeof recipe.uuid);
+    const uint32_t fields[] = {1, props.vendorID, props.deviceID, props.driverVersion, LB.clamp, LB.poly, LB.minus_w,
+        LB.samples, P.vs_outs_all, P.push_stage, P.max_push, P.indep, P.pv_last, P.sg32_stages,
+        P.reconverge, P.nan_preserve, P.nan_bits, noopt_flag(), vk_hdr_armed(), vk_hdr_native()};
+    _Static_assert(sizeof fields == sizeof recipe.state, "library recipe fields");
+    memcpy(recipe.state, fields, sizeof fields);
+    uint8_t key[32];
+    rt_sha256(&recipe, sizeof recipe, key);
+    snprintf(LW.file, sizeof LW.file, "%s/shader-warm-%02x%02x%02x%02x%02x%02x%02x%02x.bin", dir,
+             key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7]);
+    snprintf(LW.lock, sizeof LW.lock, "%s/shader-warm.lock", dir);
+    if (plat_lock_file(LW.lock) != 1) return 0;
+    LW.locked = 1;
+    LW.bytes = warm_progress_size(n);
+    rt_log("vk_pipeline: library repair checkpoint %s, cache UUID %02x%02x%02x%02x, state %u/%u/%u samples %u",
+           LW.file, props.pipelineCacheUUID[0], props.pipelineCacheUUID[1], props.pipelineCacheUUID[2],
+           props.pipelineCacheUUID[3], LB.clamp, LB.poly, LB.minus_w, LB.samples);
+    uint64_t size = 0;
+    WarmProgress *p = NULL;
+    if (plat_file_size(LW.file) == (int64_t)LW.bytes) p = (WarmProgress *)plat_file_read(LW.file, &size);
+    if (!warm_progress_valid(p, size, n, key)) {
+        free(p);
+        p = calloc(1, LW.bytes);
+        if (!p) {
+            plat_unlock_file(LW.lock);
+            LW.locked = 0;
+            return 0;
+        }
+        memcpy(p->key, key, 32);
+        p->version = 3;
+    }
+    LW.progress = p;
+    return 1;
+}
+
+static void lw_flush(void) {
+    if (!LW.dirty) return;
+    rt_sha256(LW.progress->key, LW.bytes - offsetof(WarmProgress, key), LW.progress->digest);
+    if (plat_file_write_atomic(LW.file, LW.progress, LW.bytes)) LW.dirty = 0;
+    else LOG_ONCE("vk_pipeline: could not save library repair progress at %s", LW.file);
+}
+
+static void lw_close(void) {
+    if (!LW.locked) return;
+    lw_flush();
+    free(LW.progress);
+    LW.progress = NULL;
+    plat_unlock_file(LW.lock);
+    LW.locked = LW.dirty = 0;
+}
+
+// A limited amount of speculative repair can use the existing on-disk application
+// cache. Leave room for actual draws and avoid copying any cache data to measure size.
+// If another thread owns the cache, skip speculative admission for this slice.
+#define LW_APP_BYTES (32ull << 20)
+static int lw_cache_size(size_t *active, uint64_t *combined) {
+    if (!P.cache || !plat_mutex_trylock(&cache_rw)) return 0;
+    size_t base = 0, play = 0;
+    int ok = vkGetPipelineCacheData(P.device, P.cache, &base, NULL) == VK_SUCCESS &&
+             (!P.play || vkGetPipelineCacheData(P.device, P.play, &play, NULL) == VK_SUCCESS);
+    plat_mutex_unlock(&cache_rw);
+    *active = P.play ? play : base;
+    *combined = (uint64_t)base + play;
+    return ok;
+}
+
+typedef struct { int eligible, hits, misses, built, stored, failed, missing, wrong_stage, skipped, deferred; } WarmCounts;
+
+// Keep the recorded and prepared startup samples across processes. Admission of additional
+// prepared libraries is limited by the measured cache size and the repair allowance.
+typedef enum { LW_RECORDED, LW_PREPARED, LW_TAIL, LW_VALIDATE } WarmRequest;
+
+static void lw_request(const GfxWarmEnt *e, WarmCounts *c, WarmRequest request, int force) {
+    if (!lw_stage(e) || skip_listed(e->iid)) { c->skipped++; return; }
+    c->eligible++;
+    double held;
+    if (!(force ? gate_wait("library repair", &LW.stop, &held) : gate_enter(0, &held))) {
+        c->deferred++;
+        return;
+    }
     int owned = 0;
     const GfxShader *sh = gfx_shader_load_private(e->iid, &owned);
-    if (!sh) return -1;
-    double t0 = now_ms();
-    int st = gfx_shader_stage(sh);
-    if (st == GFX_STAGE_VS || st == GFX_STAGE_FS) lb_library(sh, st == GFX_STAGE_VS, 0);
-    double ms = now_ms() - t0;
-    if (owned) gfx_shader_release_private(sh);
-    return ms;
-}
-
-static void lw_worker(void *arg) {
-    (void)arg;
-    plat_thread_priority(PLAT_PRIO_IDLE);
-    no_cache = 1;   // into the driver's own cache only (see no_cache)
-    for (;;) {
-        size_t i = (size_t)plat_inc64(&LW.next) - 1;
-        if (i >= LW.n || LW.stop) break;
-        // The memory gate (gate_wait): without room the warm waits, and after GATE_WAIT_MS it ends for this run.
-        // shader-warm.txt keeps saying "warming", so the next start goes on with it.
-        double held;
-        if (LW.short_mem || !gate_wait("library warm", &LW.stop, &held)) {
-            if (!LW.stop && !plat_xchg32(&LW.short_mem, 1)) {
-                char g[256];
-                rt_log("vk_pipeline: library warm: ends for this run at %lld of %zu prepared variants: no commit headroom "
-                       "for another build (%s). The next start goes on with it", (long long)LW.done, LW.n,
-                       gate_text(g, sizeof g));
-            }
-            break;
-        }
-        lw_build(&LW.e[i]);
+    if (sh && (gfx_shader_stage(sh) == GFX_STAGE_TS || gfx_shader_stage(sh) == GFX_STAGE_MS)) {
+        // These translations participate in whole mesh pipelines. Vulkan has no
+        // vertex/fragment stage library matching the legacy prepared-list label.
+        c->eligible--;
+        c->skipped++;
+        c->wrong_stage++;
+        if (owned) gfx_shader_release_private(sh);
         gate_leave(held);
-        int64_t d = plat_inc64(&LW.done);
-        if (d % 8000 == 0)
-            rt_log("vk_pipeline: library warm: %lld of %zu prepared variants in %.0f s", (long long)d, LW.n,
-                   (now_ms() - LW.t0) / 1000);
+        return;
     }
-    if (!plat_dec32(&LW.running) && !LW.stop && !LW.short_mem) {
-        lw_stamp("done", LW.strikes);
-        rt_log("vk_pipeline: library warm: done, %zu prepared variants in %.0f s on %d idle threads; new pipelines "
-               "link from the driver's cache from here on", LW.n, (now_ms() - LW.t0) / 1000, LW.threads);
+    int validate = request == LW_VALIDATE;
+    LibraryProbe probe = {.repair = !validate, .store_in_app = request == LW_RECORDED || request == LW_PREPARED || (request == LW_TAIL && LW.persist_tail),
+                          .result = VK_ERROR_INITIALIZATION_FAILED};
+    int exact = P.cache_control && !PB.on;
+    int ok = 0;
+    double t0 = now_ms();
+    if (sh && gfx_shader_stage(sh) == e->stage) {
+        probe.driver_only_build = !exact && !PB.on && request == LW_TAIL;
+        ok = lb_library(sh, e->stage == GFX_STAGE_VS, 0, exact || probe.driver_only_build ? &probe : NULL);
+        if (!exact && ok) c->built++;   // completed create; the driver does not report cache residency here
     }
+    if (probe.driver_hit || probe.app_hit) c->hits++;
+    if (probe.compile_required) c->misses++;
+    if (probe.compiled) { c->built++; c->stored += probe.store_in_app && P.cache; }
+    if (!ok && !(validate && probe.compile_required)) {
+        c->failed++;
+        c->missing += !sh;
+        if (c->failed <= 3)
+            rt_log("vk_pipeline: library request failed: id %02x%02x%02x%02x%02x%02x%02x%02x expected stage %u, "
+                   "loaded stage %d, Vulkan result %d", e->iid[0], e->iid[1], e->iid[2], e->iid[3],
+                   e->iid[4], e->iid[5], e->iid[6], e->iid[7], e->stage, sh ? gfx_shader_stage(sh) : -1,
+                   (int)probe.result);
+    }
+    if (request != LW_TAIL)
+        rt_log("vk_pipeline: library sample: %s stage %u id %02x%02x%02x%02x%02x%02x%02x%02x, %s, VkResult %d, %.2f ms",
+               request == LW_RECORDED ? "recorded" : validate ? "validation" : "prepared", e->stage, e->iid[0], e->iid[1], e->iid[2], e->iid[3],
+               e->iid[4], e->iid[5], e->iid[6], e->iid[7], probe.driver_hit ? "driver hit" :
+               probe.app_hit ? "application lookup hit" : probe.compiled ? "repaired" : probe.compile_required ? "compile required" : "unavailable",
+               (int)probe.result, now_ms() - t0);
+    if (owned) gfx_shader_release_private(sh);
+    gate_leave(held);
 }
 
-// The median time of LW_SAMPLE prepared fragment libraries spread over the list; negative without that many.
-static double lw_probe(void) {
-    double ms[LW_SAMPLE];
-    int got = 0;
-    size_t step = LW.n / LW_SAMPLE ? LW.n / LW_SAMPLE : 1, at = (size_t)(plat_now_ns() / 1000) % step;
-    for (size_t i = at; i < LW.n && got < LW_SAMPLE && !LW.stop; i += step)
-        for (size_t j = i; j < i + step && j < LW.n; j++) {   // the next fragment variant from here
-            if (LW.e[j].stage != GFX_STAGE_FS) continue;
-            double t = lw_build(&LW.e[j]);
-            if (t >= 0) ms[got++] = t;
-            break;
+// Pick one graphics stage in each disjoint interval. The decision is reproducible,
+// and sparse or compute-only lists cannot fabricate a successful probe.
+static size_t lw_sample(const GfxWarmEnt *e, size_t n, size_t pass, size_t count) {
+    size_t start = n * pass / count, end = n * (pass + 1) / count;
+    for (size_t i = start; i < end; i++) if (lw_stage(&e[i]) && !skip_listed(e[i].iid)) return i;
+    return n;
+}
+
+// Speculative tail work yields to a queued draw or a busy renderer lock.
+static int lw_draw_waiting(void) {
+    if (!plat_mutex_trylock(&P.lock)) return 1;
+    int waiting = A.head != NULL;
+    plat_mutex_unlock(&P.lock);
+    return waiting;
+}
+
+// Prefer prepared entries that past draws used, in first-encounter order. The
+// completion bitmap always uses the original list index, even when history grows.
+static size_t *lw_repair_order(void) {
+    if (!LW.nrecorded) return NULL;
+    typedef struct { uint8_t iid[32]; size_t index; } Indexed;
+    Indexed *keys = malloc(LW.n * sizeof *keys);
+    uint8_t *queued = calloc(LW.n, 1);
+    size_t *order = malloc(LW.n * sizeof *order);
+    if (!keys || !queued || !order) {
+        free(keys); free(queued); free(order);
+        return NULL;
+    }
+    for (size_t i = 0; i < LW.n; i++) {
+        memcpy(keys[i].iid, LW.e[i].iid, 32);
+        keys[i].index = i;
+    }
+    qsort(keys, LW.n, sizeof *keys, id_cmp);
+    size_t count = 0;
+    for (size_t i = 0; i < LW.nrecorded; i++) {
+        const Indexed *found = bsearch(LW.recorded[i].iid, keys, LW.n, sizeof *keys, id_cmp);
+        if (found && !queued[found->index]) {
+            order[count++] = found->index;
+            queued[found->index] = 1;
         }
-    if (got < LW_SAMPLE / 2) return -1;
-    for (int i = 1; i < got; i++)
-        for (int j = i; j > 0 && ms[j] < ms[j - 1]; j--) {
-            double t = ms[j];
-            ms[j] = ms[j - 1], ms[j - 1] = t;
+    }
+    for (size_t i = 0; i < LW.n; i++) if (!queued[i]) order[count++] = i;
+    free(keys); free(queued);
+    return order;
+}
+
+static size_t lw_repair_tail(int force, WarmCounts *tail) {
+    size_t scanned = 0;
+    // An explicit repair verifies everything again, including entries evicted
+    // since a previous completion. Automatic work resumes at the recorded cursor.
+    if (force && !LW.progress->full_pass) {
+        LW.progress->cursor = 0;
+        LW.progress->full_pass = LW.progress->pending = 1;
+        LW.dirty++;
+        lw_flush();
+    }
+    size_t *order = LW.progress->full_pass ? NULL : lw_repair_order();
+    size_t position = LW.progress->cursor;
+    double deadline = now_ms() + LW_TAIL_MS;
+    int visited = 0;
+    size_t size_before = 0;
+    uint64_t combined = 0;
+    uint64_t cap = strtoull(cfg_value("NX2NAVI_PIPELINE_CACHE_MAX_MB"), NULL, 10) << 20;
+    LW.persist_tail = !force && LW.progress->repair_bytes < LW_APP_BYTES &&
+        lw_cache_size(&size_before, &combined) && (!cap || combined + LW_APP_BYTES < cap);
+    while (scanned < LW.n && !LW.stop) {
+        if (!force && (now_ms() >= deadline || visited >= LW_TAIL_LIMIT || lw_draw_waiting())) break;
+        size_t i = order ? order[position] : position;
+        if (lw_stage(&LW.e[i]) && !warm_other_stage(LW.progress, LW.n, i) &&
+            (LW.progress->full_pass || !warm_completed(LW.progress, i))) {
+            int successes = tail->hits + tail->built, stored = tail->stored, other = tail->wrong_stage;
+            lw_request(&LW.e[i], tail, LW_TAIL, force);
+            if (tail->stored > stored) {
+                size_t after = 0;
+                if (!lw_cache_size(&after, &combined)) LW.progress->repair_bytes = LW_APP_BYTES;
+                else if (after > size_before) LW.progress->repair_bytes += after - size_before;
+                size_before = after;
+                LW.persist_tail = LW.progress->repair_bytes < LW_APP_BYTES && (!cap || combined + LW_APP_BYTES < cap);
+            }
+            if (tail->wrong_stage > other) warm_note_other_stage(LW.progress, LW.n, i);
+            if (tail->deferred) break;
+            if (tail->hits + tail->built > successes) warm_complete(LW.progress, i);
+            else LW.progress->bits[i / 8] &= (uint8_t)~(1u << (i % 8));
+            visited++;
         }
-    return ms[got / 2];
+        position = (position + 1) % LW.n;
+        LW.progress->cursor = position;
+        LW.dirty++;
+        scanned++;
+        if (visited && visited % 128 == 0 && LW.dirty >= 128) lw_flush();
+        if (!position) break;
+    }
+    LW.persist_tail = 0;
+    if (!LW.progress->cursor && scanned && !LW.stop && !tail->deferred) {
+        LW.progress->pending = LW.progress->full_pass = 0;
+        for (size_t k = 0; k < LW.n && !LW.progress->pending; k++)
+            if (!warm_completed(LW.progress, k) && !warm_other_stage(LW.progress, LW.n, k) && lw_stage(&LW.e[k]) && !skip_listed(LW.e[k].iid))
+                LW.progress->pending = 1;
+        LW.dirty++;
+    }
+    free(order);
+    return scanned;
 }
 
 static void lw_main(void *arg) {
     (void)arg;
-    plat_thread_priority(PLAT_PRIO_BELOW_NORMAL);
-    char was[16] = "", id[64] = "";
-    int strikes = 0;
-    uint64_t size = 0;
-    char *f = (char *)plat_file_read(LW.stamp, &size);
-    if (f && size < 200) {
-        char line[200];
-        memcpy(line, f, size), line[size] = 0;
-        if (sscanf(line, "%15s %63s %d", was, id, &strikes) < 2) was[0] = 0;
+    plat_thread_priority(PLAT_PRIO_IDLE);
+    int force = !strcmp(cfg_value("NX2NAVI_LIB_WARM"), "force");
+    char dir[PLAT_PATH_MAX * 2];
+    const char *status = "unavailable";
+    WarmCounts hot = {0}, sample = {0}, verify = {0}, tail = {0};
+    size_t scanned = 0;
+    if (!cache_dir(dir, sizeof dir) || !lw_open(dir, LW.e, LW.n)) goto done;
+    if (!force && (!P.cache_control || PB.on)) {
+        // Without a noncompiling lookup, warm only the small recorded working set
+        // through the normal production cache. Never infer residency from elapsed time.
+        for (size_t i = 0; i < LW.nhot && !LW.stop; i++)
+            lw_request(&LW.hot[i], &hot, LW_RECORDED, 0);
+        status = "unsupported";
+        goto done;
     }
-    free(f);
-    int same = !strcmp(id, LW.id), resume = same && !strcmp(was, "warming");
-    const char *mode = cfg_value("NX2NAVI_LIB_WARM");
-    double median = resume ? 0 : lw_probe();
-    if (LW.stop) return;
-    int cold = median > LW_COLD_MS || !strcmp(mode, "force");
-    if (!resume && !cold) {
-        if (same && strikes) lw_stamp("done", 0);   // the driver kept them this time
-        rt_log("vk_pipeline: library warm: the driver's cache has the prepared libraries (a sample's median %.1f ms)",
-               median);
-        return;
+    if (!force) {
+        for (size_t i = 0; i < LW.nhot && !LW.stop; i++)
+            lw_request(&LW.hot[i], &hot, LW_RECORDED, 0);
+        size_t fixed[LW_SAMPLE];
+        for (size_t j = 0; j < LW_SAMPLE; j++) fixed[j] = LW.n;
+        for (size_t j = 0; j < LW_SAMPLE && !LW.stop; j++) {
+            size_t i = fixed[j] = lw_sample(LW.e, LW.n, j, LW_SAMPLE);
+            if (i == LW.n) continue;
+            int hits = sample.hits + sample.built, other = sample.wrong_stage;
+            lw_request(&LW.e[i], &sample, LW_PREPARED, 0);
+            if (sample.wrong_stage > other) warm_note_other_stage(LW.progress, LW.n, i);
+            if (sample.hits + sample.built > hits && !warm_completed(LW.progress, i)) {
+                warm_complete(LW.progress, i);
+                LW.dirty++;
+            }
+        }
+        // Rotate six independent requests. Never compile these as part of the sample.
+        // Reusing only the entries we repaired for the fixed panel is weaker evidence.
+        for (size_t j = 0; j < LW_SAMPLE / 2 && !LW.stop; j++) {
+            size_t start = LW.n * j / (LW_SAMPLE / 2), end = LW.n * (j + 1) / (LW_SAMPLE / 2);
+            for (size_t k = 0; k < end - start; k++) {
+                size_t i = start + ((uint64_t)LW.progress->sample_round + k + 1) % (end - start);
+                if (!lw_stage(&LW.e[i]) || warm_other_stage(LW.progress, LW.n, i) || skip_listed(LW.e[i].iid)) continue;
+                int seen = 0;
+                for (size_t h = 0; h < LW.nhot; h++) seen |= !memcmp(LW.hot[h].iid, LW.e[i].iid, 32);
+                for (size_t h = 0; h < LW_SAMPLE && !seen; h++)
+                    seen = fixed[h] == i;
+                if (seen) continue;
+                int other = verify.wrong_stage;
+                lw_request(&LW.e[i], &verify, LW_VALIDATE, 0);
+                if (verify.wrong_stage > other) { warm_note_other_stage(LW.progress, LW.n, i); continue; }
+                break;
+            }
+        }
+        LW.progress->sample_round++;
+        LW.dirty++;
+        // Independent misses in both groups justify checking more entries. Without
+        // recorded draws, require multiple misses spread across the prepared list.
+        int broad_loss = ((hot.misses || verify.misses) && sample.misses) ||
+                         (verify.misses >= 2 && LW.progress->missed_last_time);
+        LW.progress->missed_last_time = verify.misses >= 2;
+        if (broad_loss && !LW.progress->pending && !LW.progress->loss_checked) {
+            // A previous installation or repair can be evicted. Revalidate every entry
+            // once on evidence of broad loss; repeated loss alone never restarts the scan.
+            memset(LW.progress->bits, 0, (LW.n + 7) / 8);
+            LW.progress->cursor = 0;
+            LW.progress->pending = LW.progress->loss_checked = 1;
+            LW.dirty++;
+        } else if (!LW.progress->pending && !hot.misses && sample.hits >= LW_SAMPLE / 2 &&
+                   !hot.failed && !sample.failed && verify.hits >= 3 && !verify.misses && LW.progress->loss_checked) {
+            LW.progress->loss_checked = 0;
+            LW.dirty++;
+        }
     }
-    if (!resume && same && strikes >= 2 && strcmp(mode, "force")) {
-        rt_log("vk_pipeline: library warm: the prepared libraries are cold again (a sample's median %.0f ms) after two "
-               "finished warms on this driver: it does not keep them, so pipelines compile when a draw first needs "
-               "them (NX2NAVI_LIB_WARM=force warms anyway).%s", median,
-               lw_cold_hint(LW.vendor, LW_COLD_GAVE_UP, LW_ON_WINDOWS));
-        return;
-    }
-    LW.strikes = resume ? strikes : same && !strcmp(was, "done") ? strikes + 1 : 0;
-    lw_stamp("warming", LW.strikes);
-    int cpus = (int)plat_cpu_usable(), t = cpus / 4;
-    t = t < 2 ? 2 : t > LW_MAX_THREADS ? LW_MAX_THREADS : t;
-    if (resume)
-        rt_log("vk_pipeline: library warm: going on with the warm an earlier run began: %zu prepared variants on %d "
-               "idle threads", LW.n, t);
-    else   // cold right after a finished warm on this driver says more than a first cold (vk_warm_hint.h)
-        rt_log("vk_pipeline: library warm: the driver's cache does not have the prepared libraries (a sample's median "
-               "%.0f ms; a driver update or a change of what they are built with): building %zu prepared variants "
-               "into it on %d idle threads while the game runs. Until it is done, a pipeline a draw first needs may "
-               "compile, which skips that draw for some frames or makes it wait.%s", median, LW.n, t,
-               lw_cold_hint(LW.vendor,
-                            median <= LW_COLD_MS ? LW_WARM_FORCED   // warm, but lib_warm = force
-                            : same && !strcmp(was, "done") ? LW_COLD_AFTER_WARM : LW_COLD_FIRST,
-                            LW_ON_WINDOWS));
-    LW.t0 = now_ms();
-    LW.running = t;
-    int started = 0;
-    for (int i = 0; i < t; i++)
-        if ((LW.th[1 + started] = plat_thread_new(lw_worker, NULL, "lib warm"))) started++;
-    LW.threads = started;
-    if (plat_add32(&LW.running, started - t) == 0 && !started) rt_log("vk_pipeline: library warm: no thread started");
+    if (force || LW.progress->pending) scanned = lw_repair_tail(force, &tail);
+    if (LW.stop) status = "interrupted";
+    else if (hot.failed || sample.failed || tail.failed || verify.failed || hot.deferred || sample.deferred || tail.deferred || verify.deferred ||
+             LW.progress->pending) status = "partial";
+    else if (force) status = "repair-complete";
+    else if (hot.misses || sample.misses || tail.misses) status = "repaired";
+    else if (verify.misses) status = "partial-residency";
+    else if (verify.hits >= 3 && sample.hits >= LW_SAMPLE / 2 && (!LW.nhot || (hot.hits > 0 && hot.hits == hot.eligible))) status = "sample-reused";
+    else status = "insufficient";
+done:
+    lw_close();
+    rt_log("vk_pipeline: library reuse: terminal %s (recorded hits %d/%d, prepared hits %d/%d, independent hits %d/%d, tail hits %d; "
+           "compile-required %d, built %d, %d tail builds into the application cache, skipped %d, failed %d (missing %d), mesh/task entries %d, deferred %d, tail entries visited %zu)",
+           status, hot.hits, hot.eligible, sample.hits, sample.eligible, verify.hits, verify.eligible, tail.hits,
+           hot.misses + sample.misses + verify.misses + tail.misses, hot.built + sample.built + tail.built, tail.stored,
+           hot.skipped + sample.skipped + verify.skipped + tail.skipped, hot.failed + sample.failed + verify.failed + tail.failed,
+           hot.missing + sample.missing + verify.missing + tail.missing,
+           hot.wrong_stage + sample.wrong_stage + verify.wrong_stage + tail.wrong_stage,
+           hot.deferred + sample.deferred + verify.deferred + tail.deferred, scanned);
 }
 
-// Boot, once the library state is known (lb_state): the prepared list is read and the check starts on its own thread.
-static void lw_start(void) {
-    const char *mode = cfg_value("NX2NAVI_LIB_WARM");
-    if (!P.gpl || !strcmp(mode, "0") || plat_xchg32(&LW.started, 1)) return;
+static void lw_start(const GfxWarmEnt *all, size_t total) {
+    if (plat_xchg32(&LW.started, 1)) return;
+    if (!P.gpl || !strcmp(cfg_value("NX2NAVI_LIB_WARM"), "0")) {
+        rt_log("vk_pipeline: library reuse: terminal disabled");
+        return;
+    }
     char dir[PLAT_PATH_MAX * 2], path[PLAT_PATH_MAX * 2 + 32];
-    if (!cache_dir(dir, sizeof dir)) return;
-    snprintf(path, sizeof path, "%s/shader-prepared.bin", dir);
-    snprintf(LW.stamp, sizeof LW.stamp, "%s/shader-warm.txt", dir);
     size_t n = 0;
-    uint8_t *f = gfx_shader_prepared_read(path, &n, NULL, NULL);   // the records alone, whichever version the file is
-    LW.e = n ? calloc(n, sizeof *LW.e) : NULL;
-    for (size_t i = 0; LW.e && i < n; i++)
-        memcpy(LW.e[i].iid, f + PRP_REC * i + 4, 32), LW.e[i].stage = f[PRP_REC * i], LW.e[i].prio = f[PRP_REC * i + 1];
+    uint8_t *f = NULL;
+    if (cache_dir(dir, sizeof dir)) {
+        snprintf(path, sizeof path, "%s/shader-prepared.bin", dir);
+        f = gfx_shader_prepared_read(path, &n, NULL, NULL);
+    }
+    LW.e = f && n ? calloc(n, sizeof *LW.e) : NULL;
+    for (size_t i = 0; LW.e && i < n; i++) {
+        memcpy(LW.e[i].iid, f + PRP_REC * i + 4, 32);
+        LW.e[i].stage = f[PRP_REC * i];
+        LW.e[i].prio = f[PRP_REC * i + 1];
+    }
     free(f);
-    if (!LW.e) return;   // nothing prepared (a build without the preparation step)
+    if (!LW.e) { rt_log("vk_pipeline: library reuse: terminal missing-list"); return; }
     LW.n = n;
-    VkPhysicalDeviceProperties pp;
-    vkGetPhysicalDeviceProperties(vk_ctx()->phys, &pp);
-    snprintf(LW.id, sizeof LW.id, "%04x:%04x:%08x", pp.vendorID, pp.deviceID, pp.driverVersion);
-    LW.vendor = pp.vendorID;
-    LW.th[0] = plat_thread_new(lw_main, NULL, "lib warm check");
+    size_t recorded = 0;
+    while (recorded < total && all[recorded].prio == 0) recorded++;
+    for (size_t j = 0; j < LW_SAMPLE; j++) {
+        size_t i = lw_sample(all, recorded, j, LW_SAMPLE);
+        if (i < recorded) LW.hot[LW.nhot++] = all[i];
+    }
+    if (recorded) {
+        LW.recorded = malloc(recorded * sizeof *LW.recorded);
+        if (LW.recorded) {
+            memcpy(LW.recorded, all, recorded * sizeof *all);
+            LW.nrecorded = recorded;
+        }
+    }
+    LW.th = plat_thread_new(lw_main, NULL, "library repair");
+    if (!LW.th) rt_log("vk_pipeline: library reuse: terminal no-worker");
 }
 
 static void lw_stop(void) {
     plat_xchg32(&LW.stop, 1);
-    for (int i = 0; i <= LW_MAX_THREADS; i++)
-        if (LW.th[i]) plat_thread_join(LW.th[i]), LW.th[i] = NULL;
+    if (LW.th) plat_thread_join(LW.th), LW.th = NULL;
+    free(LW.e);
+    free(LW.recorded);
+    LW.e = LW.recorded = NULL;
 }
+
 
 // Boot: compute shaders of the warm list (recorded and prepared), those whose pipeline stays first, then the first
 // KEEP recorded graphics variants.
@@ -6538,14 +6801,18 @@ static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
     const char *e = cfg_value("NX2NAVI_LIB_PREBUILD"), *ke = cfg_get("NX2NAVI_LIB_PREBUILD_KEEP");
     const char *te = cfg_get("NX2NAVI_LIB_PREBUILD_THREADS");   // no fixed default: 2 when unset (1 under 4 CPUs)
     const char *be = cfg_get("NX2NAVI_LIB_PREBUILD_BIG");       // SPIR-V words; LB_BIG_WORDS when unset, 0 no limit
-    if (!A.on || !cfg_bool("NX2NAVI_LIB_PREBUILD")) return;
+    if (!A.on || !cfg_bool("NX2NAVI_LIB_PREBUILD")) {
+        rt_log("vk_pipeline: library reuse: terminal disabled");
+        return;
+    }
     lb_state(pr_hist, fs_hist);   // the libraries' state, also for lw_start
-    lw_start();
     LB.big_words = be && *be ? strtoull(be, NULL, 10) : LB_BIG_WORDS;
     char dir[PLAT_PATH_MAX * 2];
     if (cache_dir(dir, sizeof dir)) skip_init(dir);
     GfxWarmEnt *all = NULL;
     size_t total = gfx_shader_warm_list(&all), n = 0, n_cs = 0;
+    LB.idle = 1;
+    lw_start(all, total);
     LB.keep_n = ke && *ke ? atoi(ke) : 0;
     LB.e = malloc((total + 1) * sizeof *LB.e);
     // the compute shaders whose pipeline stays come first: they are the ones the game is about to dispatch
@@ -6567,7 +6834,6 @@ static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
         return;
     }
     LB.n = n;
-    LB.idle = 1;
     int cpus = (int)plat_cpu_usable();
     // Two threads by default, not half the CPUs. On a 32-thread CPU with NVIDIA's driver, 16 builders kept the driver's
     // lock busy: 77% of the process's running time was a spin loop in nvoglv64.dll (about 8 cores), the prebuild had not
@@ -6614,6 +6880,32 @@ static void lb_stop(void) {
     if (BG.th) plat_thread_join(BG.th), BG.th = NULL;   // after its current build, if one runs
 }
 
+// An update can reuse the installer journal only after checking entries that the
+// journal actually covers. Manual full repair always visits every eligible entry.
+static uint8_t *update_completed;
+static size_t update_reused;
+
+static void lw_update_check(const GfxWarmEnt *entries, size_t n) {
+    if (!LW.progress || !P.cache_control || PB.on) return;
+    WarmCounts sample = {0};
+    for (size_t j = 0; j < LW_SAMPLE; j++) {
+        size_t start = n * j / LW_SAMPLE, end = n * (j + 1) / LW_SAMPLE;
+        size_t fixed = lw_sample(entries, n, j, LW_SAMPLE);
+        for (size_t k = 0; k < end - start; k++) {
+            size_t i = start + (LW.progress->sample_round + (end - start) / 2 + k) % (end - start);
+            if (i == fixed || !warm_completed(LW.progress, i) || !lw_stage(&entries[i]) || skip_listed(entries[i].iid)) continue;
+            lw_request(&entries[i], &sample, LW_VALIDATE, 0);
+            break;
+        }
+    }
+    LW.progress->sample_round++;
+    LW.dirty++;
+    if (sample.hits < LW_SAMPLE / 2 || sample.hits != sample.eligible) return;
+    size_t bytes = (n + 7) / 8;
+    update_completed = malloc(bytes);
+    if (update_completed) memcpy(update_completed, LW.progress->bits, bytes);
+}
+
 // Preparation: one prepared variant at a time into the driver's disk cache (private shader copy, nothing kept). arg is
 // the worker's journal slot.
 static void lb_warm_worker(void *arg) {
@@ -6621,6 +6913,14 @@ static void lb_warm_worker(void *arg) {
     for (;;) {
         size_t i = (size_t)plat_inc64(&LB.next) - 1;
         if (i >= LB.n) return;
+        if (update_completed && lw_stage(&LB.e[i]) && (update_completed[i / 8] & (1u << (i % 8))) &&
+            !skip_listed(LB.e[i].iid)) {
+            plat_mutex_lock(&LB.stat);
+            update_reused++;
+            LB.done++;
+            plat_mutex_unlock(&LB.stat);
+            continue;
+        }
         int owned = 0, skip = skip_listed(LB.e[i].iid);
         const GfxShader *sh = skip ? NULL : gfx_shader_load_private(LB.e[i].iid, &owned);
         int st = sh ? gfx_shader_stage(sh) : -1;
@@ -6642,8 +6942,20 @@ static void lb_warm_worker(void *arg) {
             if (pipe) vkDestroyPipeline(P.device, pipe, NULL);
             lb_count(2, pipe ? 3 : 2, now_ms() - t0);
         } else if (st == GFX_STAGE_VS || st == GFX_STAGE_FS) {
-            if (P.gpl) lb_library(sh, st == GFX_STAGE_VS, 0);
-            else lb_skip_lib();
+            if (P.gpl) {
+                LibraryProbe probe = {.repair = 1};
+                int exact = P.cache_control && !PB.on;
+                double t0 = now_ms();
+                int ok = lb_library(sh, st == GFX_STAGE_VS, 0, exact ? &probe : NULL);
+                if (exact) lb_count(st == GFX_STAGE_VS ? 0 : 1, !ok ? 2 : probe.compiled ? 3 : 1, now_ms() - t0);
+                if (LW.progress) {
+                    plat_mutex_lock(&LW.io);
+                    if (ok) warm_complete(LW.progress, i);
+                    else LW.progress->bits[i / 8] &= (uint8_t)~(1u << (i % 8));
+                    if (++LW.dirty >= 256) lw_flush();
+                    plat_mutex_unlock(&LW.io);
+                }
+            } else lb_skip_lib();
         }
         if (sh) journal_mark(slot, NULL);
         if (owned) gfx_shader_release_private(sh);
@@ -6655,7 +6967,7 @@ static void lb_warm_worker(void *arg) {
 }
 
 // Preparation: every variant of <dir>/shader-prepared.bin on every core at normal priority.
-static void lb_warm_prepared(const char *dir) {
+static void lb_warm_prepared(const char *dir, int update) {
     char path[PLAT_PATH_MAX * 2 + 32];
     snprintf(path, sizeof path, "%s/shader-prepared.bin", dir);
     size_t n = 0;
@@ -6673,6 +6985,7 @@ static void lb_warm_prepared(const char *dir) {
     LB.n = n, LB.idle = 0, LB.t0 = now_ms();
     static const uint32_t no_pr[16], no_fs[4];
     lb_state(no_pr, no_fs);
+    if (P.gpl && lw_open(dir, LB.e, n) && update) lw_update_check(LB.e, n);
     int cpus = (int)plat_cpu_usable(), k = 0;
     PlatThread *t[JR_SLOTS];
     for (int i = 0; i < cpus && i < JR_SLOTS; i++)
@@ -6691,17 +7004,19 @@ static void lb_warm_prepared(const char *dir) {
     printf("prepare-shaders: progress build %zu %zu\n", n, n);
     fflush(stdout);
     if (SK.journal) plat_file_close(SK.journal), SK.journal = NULL, plat_file_delete(jp);   // every build returned
+    free(update_completed);
+    update_completed = NULL;
+    lw_close();
     lb_report("preparation done");
     // with gpl off only compute variants are built: say so, rather than count the skipped ones as built
     unsigned long long skipped = LB.skipped;
-    size_t tried = n - (size_t)skipped;
-    if (LB.nolib)
-        printf("prepare-shaders: %zu variants on %d threads in %.0f ms, %llu vertex/fragment variants skipped (graphics "
-               "pipeline library off, they build at their first draw)\n", tried, k, now_ms() - LB.t0,
-               (unsigned long long)LB.nolib);
-    else
-        printf("prepare-shaders: %zu variants built into the driver cache on %d threads in %.0f ms\n", tried, k,
-               now_ms() - LB.t0);
+    printf("prepare-shaders: %zu entries visited, %zu reused from checked preparation, %llu cache hits, "
+           "%llu built, %llu failed, %llu missing shaders, %llu graphics libraries disabled, on %d threads in %.0f ms\n",
+           n, update_reused, (unsigned long long)(LB.have[0] + LB.have[1] + LB.have[2]),
+           (unsigned long long)(LB.warmed[0] + LB.warmed[1] + LB.warmed[2]),
+           (unsigned long long)(LB.fail[0] + LB.fail[1] + LB.fail[2]), (unsigned long long)LB.noshader,
+           (unsigned long long)LB.nolib, k ? k : 1, now_ms() - LB.t0);
+    update_reused = 0;
     if (skipped)   // installer/steps.py Prepare reads this line
         printf("prepare-shaders: %llu variants skipped: the graphics driver crashed while building them in an earlier "
                "run (shader-prepare-skip.txt); they build at their first draw\n", skipped);
@@ -6894,7 +7209,7 @@ int vk_pipeline_prepare_shaders(void) {
     // The listed pipelines before the stage libraries: the pipeline cache is saved with them in it and without the
     // tens of thousands of libraries the next step builds, which would take the file past its size limit.
     if (!rc) seed_pipelines(dir);
-    if (!rc) lb_warm_prepared(dir);
+    if (!rc) lb_warm_prepared(dir, 0);
     return rc;
 }
 
@@ -6902,7 +7217,7 @@ int vk_pipeline_prepare_shaders(void) {
 // cache, without translating the seed. The AMD cache is keyed to the exe path (a relink keeps it: 29,587 variants in
 // 1.8 s) and holds a limited amount: preparing another build dir evicted this one's libraries, and a library a draw
 // needed then took 40-220 ms in play instead of 0.2 ms. Seconds when the libraries are still there.
-int vk_pipeline_warm_shaders(void) {
+int vk_pipeline_warm_shaders(int update) {
     prep_mode = 1;   // builds into pipeline-cache.bin alone (cache_load)
     if (!ensure_init()) {
         fprintf(stderr, "warm-shaders: no Vulkan device\n");
@@ -6917,7 +7232,7 @@ int vk_pipeline_warm_shaders(void) {
         return 1;
     }
     seed_pipelines(dir);   // before the libraries, as in vk_pipeline_prepare_shaders
-    lb_warm_prepared(dir);
+    lb_warm_prepared(dir, update);
     return 0;
 }
 
@@ -6942,8 +7257,11 @@ int vk_pipeline_probe_prewarm(void) {
                "or NX2NAVI_PIPE_SYNC=1)\n");
         return 0;
     }
+    if (LW.th) plat_thread_join(LW.th), LW.th = NULL;   // include the fresh-process library reuse outcome
     while (__atomic_load_n(&LB.running, __ATOMIC_ACQUIRE) > 0) plat_sleep_ms(50);
     if (!LB.n) {
+        lb_stop();
+        vk_pipeline_save();
         printf("probe-prewarm: SKIP (no recorded compute shaders next to the executable: %s)\n", P.cache_path);
         return 0;
     }

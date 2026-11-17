@@ -144,11 +144,8 @@
 # The threads that build shader libraries also link the pipelines of draws that were left out of a frame, several at
 # once, instead of one thread linking them one after another while the others build optimised pipelines. 0: as before.
 # pipe_fast_workers = 1
-# The graphics driver's cache of shader libraries is checked at every start and, when it lost them (a driver update,
-# a cache the driver emptied), filled again in the background while the game runs. 0: no check; force: at every start.
-# After two cold starts in a row warming stops being tried on that driver; once its cache can hold the libraries (on
-# NVIDIA under Windows, Shader Cache Size Unlimited in the NVIDIA app), start once with force, or delete
-# shader-warm.txt, to warm again.
+# Check recorded and prepared stage libraries for reuse. Repair missing entries on an idle worker.
+# 0 disables the check. force requests a full repair of the prepared graphics libraries.
 # lib_warm = 1
 # Draws into a picture drawn for the first time (a lookup table, a new area's target) wait for a pipeline built for
 # the first time from pipe_frame_wait_ms; one left over is drawn the next frame its picture is drawn. 0: as up to

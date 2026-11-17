@@ -1700,7 +1700,7 @@ class MakeGameTest(Tmp):
         real = self.mg.subprocess.Popen
 
         def popen(cmd, **kw):
-            self.assertEqual(cmd, [str(exe), '--warm-shaders'])
+            self.assertEqual(cmd, [str(exe), '--refresh-shaders'])
             return real([sys.executable, str(script)], **kw)
         buf = io.StringIO()
         with mock.patch.object(self.mg, 'EVENTS', True), mock.patch.object(self.mg.subprocess, 'Popen', popen), \
@@ -1757,7 +1757,7 @@ class MakeGameTest(Tmp):
         self.assertIn('shader cache packed', buf.getvalue())
 
     def test_carried_update_warms_the_drivers_cache(self):
-        """An update that carries the shaders over runs the game's --warm-shaders, in the game folder; a run that
+        """An update that carries the shaders over runs the game's --refresh-shaders, in the game folder; a run that
         fails is said and does not stop the build, and without a built game or a preparation nothing runs."""
         calls = []
         for name, value in (('shader_carry', lambda out: True),
@@ -1779,8 +1779,8 @@ class MakeGameTest(Tmp):
         with contextlib.redirect_stdout(buf):
             self.mg.step_shaders(self.out, update=True)
         self.assertEqual(calls[0][0][-1], '--no-run')         # the seed is written first, to compare the list with
-        self.assertEqual(calls[1:], [([str(self.out / self.mg.EXE_NAME), '--warm-shaders'], str(self.out))])
-        self.assertIn("driver's cache warm", buf.getvalue())
+        self.assertEqual(calls[1:], [([str(self.out / self.mg.EXE_NAME), '--refresh-shaders'], str(self.out))])
+        self.assertIn("pipeline refresh finished", buf.getvalue())
         self.rc = 3
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -1810,7 +1810,10 @@ class MakeGameTest(Tmp):
         calls = []
 
         def run(cmd, cwd=None, build_only=False):
-            calls.append(cmd[-1])
+            if '--exe' in cmd and '--no-run' not in cmd:
+                calls.append(cmd[cmd.index('--exe') + 1])
+            else:
+                calls.append(cmd[-1])
             if cmd[-1] == '--no-run':                          # the kit's seed, as tools/prepare_shaders.py writes it
                 (self.out / 'seed-programs.bin').write_bytes(self.programs)
                 (self.out / 'seed-answers.bin').write_bytes(self.answers)
@@ -1835,7 +1838,7 @@ class MakeGameTest(Tmp):
         # prepared from this seed: kept, and the driver's cache is warmed
         lst.write_bytes(prepared_list(digest(self.programs), digest(self.answers), b't' * 32))
         self.assertIn('stay in use', update())
-        self.assertEqual(calls, ['--no-run', '--warm-shaders'])
+        self.assertEqual(calls, ['--no-run', '--refresh-shaders'])
         # the same seed, another translator: still kept, the game carries the translations over
         lst.write_bytes(prepared_list(digest(self.programs), digest(self.answers), b'u' * 32))
         self.assertIn('stay in use', update())
@@ -1844,7 +1847,7 @@ class MakeGameTest(Tmp):
         text = update()
         self.assertIn('the shader seed changed since the shaders were prepared: preparing them again', text)
         self.assertNotIn('stay in use', text)
-        self.assertEqual(calls, ['--no-run', self.mg.EXE_NAME])   # the seed, then the preparation (its last argument)
+        self.assertEqual(calls, ['--no-run', self.mg.EXE_NAME])   # the seed, then the preparation with the game executable
         # so does a change to the answers alone
         lst.write_bytes(prepared_list(digest(self.programs), digest(b'other answers'), b't' * 32))
         self.assertIn('preparing them again', update())
