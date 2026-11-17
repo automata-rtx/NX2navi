@@ -44,6 +44,9 @@ __attribute__((constructor)) static void camera_history_register(void) {
 __attribute__((constructor)) static void day_register(void) {
     if (RT_V111) rt_register_host(RT_PATCH_PAGE + 0xf60, frame_rate_day_host);
 }
+__attribute__((constructor)) static void thumbnail_register(void) {
+    if (RT_V111) rt_register_host(RT_PATCH_PAGE + 0xf20, wide_save_thumbnail);
+}
 #endif
 
 #if RT_PATCH_COUNT

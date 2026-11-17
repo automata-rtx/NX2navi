@@ -114,6 +114,31 @@ static double scene_share(void) {
 // Under a 1080-line picture the game measures against that picture instead (a share of 1.0 times 1080/1440 gave an
 // 810-line scene, three quarters of the picture), so there the share goes in as it is: wide_init sets the factor.
 static double scale_k = 1.0;
+static float thumbnail_zoom = 1.0f;
+
+// main+0x338b7b0 draws the source texture into the save caption. Its rectangle takes a scale
+// and a top-left offset in destination pixels. Zoom about the center of the bound viewport
+// so the render target clips the extra width before the game encodes the JPEG.
+void wide_save_thumbnail(Cpu *c) {
+    uint64_t args = c->x[29] - 56;
+    c->x[2] = args;
+    // The capture settings map target 0 to autosave and target 1 to manual save.
+    if (thumbnail_zoom == 1.0f || LD32(c->x[19] + 1088) > 1) return;
+
+    const float *bounds = (const float *)(uintptr_t)(LD64(args + 8) + 8);
+    float *scale = (float *)(uintptr_t)LD64(args + 16);
+    const float *offset = (const float *)(uintptr_t)LD64(args + 24);
+    float width = bounds[2] - bounds[0];
+    float center = width * 0.5f;
+    scale[0] *= thumbnail_zoom;
+
+    // The original offset can point at a shared constant. The render state at sp+16
+    // has already been bound, so its stack storage can hold a private offset for this draw.
+    float *local_offset = (float *)(uintptr_t)(c->sp + 16);
+    local_offset[0] = center + (offset[0] - center) * thumbnail_zoom;
+    local_offset[1] = offset[1];
+    ST64(args + 24, (uintptr_t)local_offset);
+}
 
 void wide_present(void) {
     static int set = -2;
@@ -186,6 +211,7 @@ void wide_init(void) {
     float match = 16.0f / 9.0f, ratio = (float)ow / oh, tolerance = 0.01f, squeeze = match / ratio;
     float ui[2] = {2.0f / 3840.0f, 2.0f / 2160.0f}, squeeze4[4] = {squeeze, squeeze, squeeze, squeeze};
     float margin = (1.0f - squeeze) / 2;
+    thumbnail_zoom = ratio > match * 1.01f ? 1.0f / squeeze : 1.0f;
     // the screens whose UI keeps the whole picture (recomp/patches-v111.txt, set wide_hud): the item-wheel, pause and
     // system menu backgrounds, the event and loading fades
     uint64_t keep[2] = {MOD_MAIN_BASE + 0x4bed098, MOD_MAIN_BASE + 0x4be4fb0},
