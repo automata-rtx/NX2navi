@@ -152,10 +152,6 @@ site wide_hud main 774368 ad401041 ad401041 @page:x16 fd404a10 6e040431 6e0c2491
 # at x29 - 40: min x +8, max x +16); it moves in by the page's margin on each side, the middle 16:9 of the picture.
 site wide_movie main 3b5c758 a941a269 d100a3b0 bd400a10 bd401211 1e303a32 @page:x17 bd40c233 1e330a52 1e322a10 1e323a31 bd000a10 bd001211 a941a269   # movie layer viewport: ldp x9, x8, [x19, #0x18]
 
-# Both paths in the capture draw join here with the textured rectangle ready. widescreen.c wide_save_thumbnail
-# sets x2 to the draw arguments and centers the crop for the two save targets. The next bl sets x30 again.
-site wide_aspect main 338c19c d100e3a2 946c5361   # sub x2, x29, #56 -> bl page+0xf20
-
 # The game's zstd decoder (BSD zstd, statically linked into main) through the host's libzstd (runtime/ov_zstd.c): the
 # three calls of ZSTD_decompressMultiFrame (main+0xeb380: dctx, dst, capacity, src, size, dict, dict size, ddict) go to
 # the host function on the patch page (+0xff0). main+0xe910c is the file loader's call for a file that fits one read
@@ -183,3 +179,8 @@ set camera_continuity NX2NAVI_CAMERA_CONTINUITY 1
 site camera_continuity main 4c6258 39004a60 95276b3e
 site camera_continuity main 31d33d4 39790a88 947336db
 site camera_continuity main 31d3398 f945fa88 947336e6
+
+# Both paths in the capture draw join here with the textured rectangle ready. save_thumbnail.c save_thumbnail_crop
+# sets x2 to the draw arguments and centers the crop for the two save targets. The next bl sets x30 again.
+set save_thumbnail NX2NAVI_PATCH_SAVE_THUMBNAIL 1
+site save_thumbnail main 338c19c d100e3a2 946c5361   # sub x2, x29, #56 -> bl page+0xf20

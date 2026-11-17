@@ -29,6 +29,7 @@ double gfx_window_refresh_hz(void);                        // refresh rate of th
 int gfx_window_focused(void);
 int vk_hdr_native(void);   // NX2NAVI_HDR = native: the game's own HDR picture (vk_hdr.c)
 int gfx_picture_rect(float out[4]);   // where the last present put the picture, fractions of the swapchain (x, y, w, h); 0 before one
+void gfx_game_picture_size(unsigned *w, unsigned *h);   // game pixels before window fitting, zero until the first game frame
 
 // ---- shader service client (gfx_shader.c)
 enum { GFX_STAGE_VS, GFX_STAGE_TCS, GFX_STAGE_TES, GFX_STAGE_GS, GFX_STAGE_FS, GFX_STAGE_CS,

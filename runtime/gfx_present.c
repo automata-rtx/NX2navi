@@ -638,6 +638,7 @@ int vk_present_captured(const uint8_t **px, int *w, int *h, VkFormat *fmt) {
 }
 
 static float g_pic[4];   // gfx_picture_rect
+static uint64_t g_game_picture_size;   // publish both dimensions from the same game frame
 static volatile int32_t g_pic_ok;
 
 // The captured swapchain image as a PNG (the menu's test hook), RGBA with opaque alpha. From an HDR10 swapchain the
@@ -689,6 +690,12 @@ static void save_capture(const char *path) {
 // on the Steam Deck's 1280x800 screen gets bars of 40 rows above and below; a 16:9 picture in a 21:9 window, bars at the
 // sides).
 // Where the last present put the picture, as fractions of the swapchain (x, y, w, h; g_pic): menu_cursor.c's pointer
+void gfx_game_picture_size(unsigned *w, unsigned *h) {
+    uint64_t size = __atomic_load_n(&g_game_picture_size, __ATOMIC_RELAXED);
+    *w = (unsigned)(size >> 32);
+    *h = (unsigned)size;
+}
+
 int gfx_picture_rect(float out[4]) {
     if (!__atomic_load_n(&g_pic_ok, __ATOMIC_ACQUIRE)) return 0;
     memcpy(out, g_pic, sizeof g_pic);
@@ -1417,6 +1424,8 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     if (cy + ch > h) ch = h - cy;
     if (cw <= 0 || ch <= 0) cx = cy = 0, cw = w, ch = h;   // a crop outside the image (the game's nvnWindowSetCrop):
                                                              // the whole image, not an inverted blit rectangle
+    if (src && cw > 0 && ch > 0)
+        __atomic_store_n(&g_game_picture_size, ((uint64_t)cw << 32) | (unsigned)ch, __ATOMIC_RELAXED);
     window_settings_live();
     cam_speed_tick();
     // The menu overlay: laid out before recording (its first frame starts the ImGui back end and uploads the font)
