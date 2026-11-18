@@ -481,7 +481,9 @@ static void resolve_target(const tex_t *t, const view_t *v, int has_v, int depth
     memset(o, 0, sizeof *o);
     o->tex = t;
     if (!t) return;
-    const VkTexImage *img = vk_texture_get(t);
+    // A render target may have shared immutable contents until this write intent. Detach before caching any view.
+    const VkTexImage *img = vk_texture_get_write(t);
+    if (!img && vk_texture_deferred()) return;
     if (img && !depth_slot && bc_target(t, v, has_v, img, o)) return;   // a 3D BC image: its stand-in
     VkImageUsageFlags need = depth_slot ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     int is3d = img && img->type == VK_IMAGE_TYPE_3D && !depth_slot;   // slices drawn through 2D views (2D_ARRAY_COMPATIBLE)

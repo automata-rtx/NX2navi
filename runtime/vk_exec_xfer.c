@@ -869,7 +869,7 @@ typedef struct {
 
 // Resolves tex, its view and a copy region to image coordinates. 0 (warned) when the copy cannot be replayed.
 static int sub_resolve(const tex_t *t, const view_t *v, int has_v, const NVNcopyRegion *r, int defaults_to_level,
-                       Sub *s) {
+                       int write, Sub *s) {
     memset(s, 0, sizeof *s);
     if (!t) return 0;
     TexVkFormat f;
@@ -878,7 +878,8 @@ static int sub_resolve(const tex_t *t, const view_t *v, int has_v, const NVNcopy
         return 0;
     }
     s->bpb = nvn_fmt_bpb(t->d.format, &s->bw, &s->bh);
-    s->img = vk_texture_get(t);
+    s->img = write ? vk_texture_get_write(t) : vk_texture_get(t);
+    if (!s->img && vk_texture_deferred()) return 0;
     if (!s->img || !s->bpb) {
         warn_once(W_FORMAT, "copy of format %#x texture without an image: skipped", t->d.format);
         return 0;
@@ -952,7 +953,7 @@ static int buffer_side(const VkExec *ex, const Sub *s, uint64_t addr, uint64_t *
 
 static void copy_buffer_image(VkExec *ex, const p_copy_b2t *p, int to_image) {
     Sub s;
-    if (!sub_resolve(p->tex, &p->view, p->has_view, &p->r, 1, &s)) return;
+    if (!sub_resolve(p->tex, &p->view, p->has_view, &p->r, 1, to_image, &s)) return;
     vk_gpu_gap_note(to_image ? VK_GAP_COPY_B2T : VK_GAP_COPY_T2B, (uint64_t)s.w * s.h);
     if (s.img->scale > 1) {   // the buffer holds the game's texel count, the image more
         warn_once(W_REGION, "buffer copy of a shadow map enlarged by NX2NAVI_SHADOW_SCALE: skipped");
@@ -975,8 +976,8 @@ static void copy_buffer_image(VkExec *ex, const p_copy_b2t *p, int to_image) {
 
 static void copy_t2t(VkExec *ex, const p_copy_t2t *p) {
     Sub s, d;
-    if (!sub_resolve(p->src, &p->sv, p->has_sv, &p->sr, 1, &s)) return;
-    if (!sub_resolve(p->dst, &p->dv, p->has_dv, &p->dr, 1, &d)) return;
+    if (!sub_resolve(p->src, &p->sv, p->has_sv, &p->sr, 1, 0, &s)) return;
+    if (!sub_resolve(p->dst, &p->dv, p->has_dv, &p->dr, 1, 1, &d)) return;
     d.nz = s.nz;
     vk_gpu_gap_note(VK_GAP_COPY_T2T, (uint64_t)s.w * s.h);
     int same_size = s.w == d.w && s.h == d.h;
@@ -1110,7 +1111,7 @@ static void clear_tex(VkExec *ex, const p_clear_tex *p) {
     const tex_t *t = p->tex;
     if (!t) return;
     Sub s;
-    if (!sub_resolve(t, &p->view, p->has_view, &p->r, 1, &s)) return;
+    if (!sub_resolve(t, &p->view, p->has_view, &p->r, 1, 1, &s)) return;
     const VkTexImage *img = s.img;
     int is3d = img->type == VK_IMAGE_TYPE_3D;
     uint32_t lw = max1(img->width >> s.level), lh = max1(img->height >> s.level);

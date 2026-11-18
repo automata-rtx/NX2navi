@@ -17,6 +17,7 @@
 #include "host.h"
 #include "nvn_api.h"
 #include "nvn_pool_index.h"
+#include "texture_source.h"
 #include "vk.h"
 #include "replay_phase_trace.h"
 #include "vk_dlaa.h"
@@ -820,6 +821,15 @@ int vk_mem_vram_live(uint64_t *used, uint64_t *budget) {
 #define GEN_PER_CHUNK (1u << (GEN_CHUNK_SHIFT - GEN_PAGE_SHIFT))
 static uint32_t *gen_chunk[GEN_CHUNKS];
 static uint32_t gen_now;                 // last generation handed out
+static uint64_t source_generation_lineage = 1;
+
+// gen_lock held. Preserve the existing page-generation values while giving long-lived source certificates a
+// separate identity for each wrap. Exhaustion disables certificates rather than admitting an ancient generation.
+static uint32_t generation_next(void) {
+    ++gen_now;
+    if (!gen_now && source_generation_lineage) source_generation_lineage++;
+    return gen_now;
+}
 static PlatMutex gen_lock = PLAT_MUTEX_INIT;
 static uint64_t gen_pages[1024];
 // The newest generation stamped on any page of each 2 MiB region (the write-watch snapshot regions below): the mirror
@@ -955,7 +965,7 @@ void vk_guest_written(uint64_t addr, uint64_t size) {
     if (!size || nvn_gpu_only(addr)) return;
     uint64_t lo = addr & ~0xfffull, hi = (addr + size + 0xfff) & ~0xfffull;
     plat_mutex_lock(&gen_lock);
-    stamp_range(lo, hi, ++gen_now);
+    stamp_range(lo, hi, generation_next());
     plat_mutex_unlock(&gen_lock);
 }
 
@@ -963,7 +973,7 @@ int vk_mem_changed(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now) 
     if (!size) { *now = since; return 0; }
     uint64_t lo = addr & ~0xfffull, hi = (addr + size + 0xfff) & ~0xfffull;
     plat_mutex_lock(&gen_lock);
-    uint32_t g = ++gen_now;
+    uint32_t g = generation_next();
     int tracked = 1, frozen = 1;
     for (uint64_t a = lo & ~((1ull << REG_SHIFT) - 1); a < hi && frozen; a += 1ull << REG_SHIFT) frozen = mem_frozen(a);
     while (!frozen) {
@@ -1206,7 +1216,7 @@ static uint64_t snap_regions_for(uint64_t r0, uint64_t r1, uint32_t epoch, int t
         uint64_t protection = mem_protection_serial(), mapping = mem_mapping_serial();
         int tracked = 1, all_zero = 1;
         uint64_t ticks_before = ww_ticks;
-        if (!g) g = ++gen_now;
+        if (!g) g = generation_next();
         int observed_clean = 0;
 #ifdef _WIN32
         int large_texture = snapshot_pair_enabled && texture_list && b - a >= (256ull << 20);
@@ -1324,6 +1334,79 @@ int vk_mem_changed_snap(uint64_t addr, uint64_t size, uint32_t since, uint32_t e
     return untracked ? -1 : changed;
 }
 
+int vk_mem_observe_subresources(uint64_t addr, uint64_t size, const TextureSourceStamp *prior, uint32_t epoch,
+                                const TextureSourceSpan *spans, uint32_t count, TextureSourceObservation *out) {
+    if (!out) return TEX_SOURCE_UNKNOWN;
+    *out = (TextureSourceObservation){0};
+    texture_source_all_dirty(out, count);
+    if (!epoch || addr >= RT_ADDRESS_LIMIT || size > RT_ADDRESS_LIMIT - addr ||
+        !texture_source_spans_valid(size, spans, count)) return TEX_SOURCE_UNKNOWN;
+    uint64_t mapping = mem_mapping_serial(), protection = mem_protection_serial();
+    if (!mapping || !protection) return TEX_SOURCE_UNKNOWN;
+    uint64_t lo = addr & ~0xfffull, hi = (addr + size + 0xfff) & ~0xfffull;
+    uint64_t first = lo >> SNAP_SHIFT, last = (hi - 1) >> SNAP_SHIFT;
+    int exclusive = 0;
+    plat_mutex_lock_shared(&gen_lock);
+    for (uint64_t r = first; r <= last; r++)
+        if (!snap_current((uint32_t)r, epoch) || !snap_lease_valid((uint32_t)r)) { exclusive = 1; break; }
+    if (exclusive) {
+        plat_mutex_unlock_shared(&gen_lock);
+        plat_mutex_lock(&gen_lock);
+        // A remap/thaw in an already observed submission invalidates that snapshot's tracking lease. Query it again
+        // rather than reusing page observations from the previous backing or protection state.
+        for (uint64_t r = first; r <= last; r++)
+            if (snap_current((uint32_t)r, epoch) && !snap_lease_valid((uint32_t)r)) snap_at[r] = 0;
+        n_snap_calls += snap_regions(first, last, epoch);
+    }
+    int tracked = gen_now && source_generation_lineage;
+    for (uint64_t r = first; tracked && r <= last; r++)
+        tracked = snap_current((uint32_t)r, epoch) && !snap_untracked[r] && snap_lease_valid((uint32_t)r);
+    tracked = tracked && mem_mapping_range_unchanged(addr, size, mapping) &&
+              mem_protection_range_unchanged(addr, size, protection);
+    if (!tracked) {
+        __atomic_add_fetch(&n_snap_untracked, 1, __ATOMIC_RELAXED);
+        if (exclusive) plat_mutex_unlock(&gen_lock); else plat_mutex_unlock_shared(&gen_lock);
+        return TEX_SOURCE_UNKNOWN;
+    }
+    // This cutoff precedes the caller's source reads. A later write must retain a newer generation; advancing the
+    // certificate after copying would falsely certify an intervening write that was not copied.
+    out->stamp = (TextureSourceStamp){.mapping = mapping, .protection = protection,
+        .lineage = source_generation_lineage, .generation = gen_now};
+    __atomic_add_fetch(&n_snap_checks, 1, __ATOMIC_RELAXED);
+    if (!texture_source_stamp_valid(prior) || prior->lineage != source_generation_lineage ||
+        prior->generation > gen_now || !mem_mapping_range_unchanged(addr, size, prior->mapping) ||
+        !mem_protection_range_unchanged(addr, size, prior->protection)) {
+        if (exclusive) plat_mutex_unlock(&gen_lock); else plat_mutex_unlock_shared(&gen_lock);
+        return TEX_SOURCE_UNKNOWN;
+    }
+    memset(out->dirty, 0, sizeof out->dirty);
+    int changed = 0;
+    for (uint64_t r = first; r <= last; r++) {
+        if (reg_max[r] <= prior->generation) continue;
+        uint64_t begin = r << REG_SHIFT, end = (r + 1) << REG_SHIFT;
+        if (begin < lo) begin = lo;
+        if (end > hi) end = hi;
+        for (uint64_t page = begin; page < end; page += 1ull << GEN_PAGE_SHIFT) {
+            uint32_t *generation = gen_slot(page, 0);
+            if (!generation || *generation <= prior->generation) continue;
+            uint64_t dirty_lo = page > addr ? page - addr : 0;
+            uint64_t dirty_hi = page + (1ull << GEN_PAGE_SHIFT) - addr;
+            if (dirty_hi > size) dirty_hi = size;
+            texture_source_mark_range(out, spans, count, dirty_lo, dirty_hi);
+            changed = 1;
+        }
+    }
+    if (!mem_mapping_range_unchanged(addr, size, mapping) ||
+        !mem_protection_range_unchanged(addr, size, protection)) {
+        out->stamp = (TextureSourceStamp){0};
+        texture_source_all_dirty(out, count);
+        if (exclusive) plat_mutex_unlock(&gen_lock); else plat_mutex_unlock_shared(&gen_lock);
+        return TEX_SOURCE_UNKNOWN;
+    }
+    if (exclusive) plat_mutex_unlock(&gen_lock); else plat_mutex_unlock_shared(&gen_lock);
+    return changed ? TEX_SOURCE_DIRTY : TEX_SOURCE_CLEAN;
+}
+
 void vk_mem_gen_lock_shared(void) { plat_mutex_lock_shared(&gen_lock); }
 void vk_mem_gen_unlock_shared(void) { plat_mutex_unlock_shared(&gen_lock); }
 
@@ -1434,7 +1517,7 @@ static void observe_after_freeze(uint32_t region) {
     uint64_t protection = mem_protection_region(region), mapping = mem_mapping_region(region);
     int eligible = protection && mapping && mapping <= snap_mapping[region] &&
                    snap_at[region] && !snap_untracked[region] && mem_frozen_stable(addr);
-    enum StampResult result = query_stamp(addr, addr + (1ull << REG_SHIFT), ++gen_now);
+    enum StampResult result = query_stamp(addr, addr + (1ull << REG_SHIFT), generation_next());
     if (eligible && result == STAMP_CLEAN && mem_frozen_stable(addr) &&
         mem_protection_region(region) == protection && mem_mapping_region(region) == mapping) {
         snap_protection[region] = protection;
@@ -1836,7 +1919,7 @@ static void shadow_sync_pool(PoolRec *r, uint32_t epoch, int cpu) {
         for (uint64_t k = r0; k <= r1 && tracked; k++)
             tracked = !snap_untracked[k] && snap_current((uint32_t)k, epoch);
     } else {   // outside the snapshot regions, or before the first guest submission: one query per unfrozen run
-        uint32_t g = ++gen_now;
+        uint32_t g = generation_next();
         for (uint64_t a = lo; a < hi;) {
             uint64_t b = (a | ((1ull << REG_SHIFT) - 1)) + 1;
             if (b > hi) b = hi;
@@ -2006,7 +2089,7 @@ static void table_wb_cb(void *arg) {
     s_tab_wb += moved, s_tab_wb_seen += seen, s_tab_wb_jobs++;
     if (nwrote) {
         plat_mutex_lock(&gen_lock);
-        uint32_t g = ++gen_now;
+        uint32_t g = generation_next();
         for (int i = 0; i < nwrote; i++) stamp_page_as(wrote[i], g, back);
         plat_mutex_unlock(&gen_lock);
     }
@@ -2022,7 +2105,7 @@ static void gpu_written(uint64_t addr, uint64_t size, int back) {
     uint64_t lo = addr & ~0xfffull, hi = (addr + size + 0xfff) & ~0xfffull;
     back = back && wb_no_reup();   // read before gen_lock: its first call logs
     plat_mutex_lock(&gen_lock);
-    uint32_t g = ++gen_now;
+    uint32_t g = generation_next();
     for (uint64_t a = lo; a < hi; a += 1ull << GEN_PAGE_SHIFT) stamp_page_as(a, g, back);
     plat_mutex_unlock(&gen_lock);
 }
@@ -2178,7 +2261,7 @@ void vk_mem_dirty_submit(void) {
         if (r->kind == POOL_IMPORT && r->bufbound) dlist[n++] = r;
     }
     plat_mutex_lock(&gen_lock);
-    uint32_t g = ++gen_now, since = dirty_gen;
+    uint32_t g = generation_next(), since = dirty_gen;
     dirty_gen = g;
     for (int i = 0; i < n;) {   // one query per run of pools (sorted by address)
         uint64_t lo = page_lo(dlist[i]), hi = page_hi(dlist[i]);
@@ -3240,7 +3323,7 @@ static void swb_run(uint64_t a, uint64_t b) {
     if (b <= a || !shadow_write_back(a, b - a) || nvn_gpu_only(a)) return;
     int back = wb_no_reup();
     plat_mutex_lock(&gen_lock);
-    uint32_t g = ++gen_now;
+    uint32_t g = generation_next();
     for (uint64_t x = a & ~0xfffull; x < b; x += 1ull << GEN_PAGE_SHIFT) stamp_page_as(x, g, back);
     plat_mutex_unlock(&gen_lock);
 }

@@ -14,6 +14,7 @@ static MemMapping mapping = {mapping_versions, 2, 8, 21, 0, &mapping_events};
 static MemMapping protection = {protection_versions, 2, 8, 21, 0, &protection_events};
 static uint8_t frozen[8], written[8];
 static uint32_t snap_at[8], reg_max[8], reg_last[8], reg_tried[8], gen_now, ww_ep;
+static uint64_t source_generation_lineage = 1;
 static uint8_t snap_untracked[8];
 static uint64_t snap_protection[8], snap_mapping[8], gen_pages[8], n_snap_calls;
 static int dependency_watch = 1, freeze_idle, nfcand, cfcand;

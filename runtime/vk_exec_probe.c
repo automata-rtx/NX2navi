@@ -115,7 +115,7 @@ static int test_present(const GfxBackend *b, uint8_t *guest, int *w_out, int *h_
     nvn_tex_layout(&t.d, &t.L);
     CHECK(t.L.size <= pool.size, "texture storage %#llx exceeds the pool", (unsigned long long)t.L.size);
     t.pool = &pool, t.off = 0, t.mem = pool.mem, t.serial = 1;
-    const VkTexImage *img = vk_texture_get(&t);
+    const VkTexImage *img = vk_texture_get_write(&t);
     CHECK(img && img->format == VK_FORMAT_R8G8B8A8_UNORM, "vk_texture_get of an RGBA8 texture");
     vk_texture_gpu_written(&t);   // the clear below is its content, not the storage
     const float rgba[4] = {0.2f, 0.4f, 0.6f, 1.0f};

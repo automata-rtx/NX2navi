@@ -3,6 +3,7 @@
 #include <vulkan/vulkan.h>
 #include <stdint.h>
 #include "resource_events.h"
+#include "texture_source.h"
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wnullability-completeness"
 #include "vk_mem_alloc.h"
@@ -572,6 +573,10 @@ const VkTexImage *vk_texture_flat3d_locked(const VkTexImage *img, uint32_t layer
 void vk_hdr_present_source(const VkTexImage *win, VkImage *image, VkFormat *format);
 void vk_hdr_image_gone(VkImage image);
 const VkTexImage *vk_texture_get(const tex_t *t);   // created and made current; NULL for BUFFER or unmapped formats
+const VkTexImage *vk_texture_get_write(const tex_t *t); // private writable contents, before writable view capture
+const VkTexImage *vk_texture_writable_locked(const VkTexImage *img); // texture lock held
+int vk_mem_observe_subresources(uint64_t addr, uint64_t size, const TextureSourceStamp *prior, uint32_t epoch,
+                               const TextureSourceSpan *spans, uint32_t count, TextureSourceObservation *out);
 // A texture slot; a slot whose texture was finalized follows the live texture at the same storage (hle_nvn.c).
 const VkTexImage *vk_texture_by_id(int id, view_t *view, int *has_view);
 // The replay looks up many slots per draw: it takes the texture lock once around them (vk_texture_lock) and uses the
@@ -725,6 +730,7 @@ uint32_t vk_sampler_gen(void);                      // changes whenever a sample
 void vk_texture_gpu_written(const tex_t *t);        // rendered or copied into by the GPU: no re-upload from storage
 // The live image of the given format and img's size at img's storage address, NULL when there is none. Texture lock held.
 const VkTexImage *vk_texture_at_locked(const VkTexImage *img, VkFormat format);
+void vk_texture_storage_written(VkImage image, uint64_t addr); // successful command emission only
 void vk_texture_storage_bound_locked(const VkTexImage *img);   // bound as a storage image in the recording submission
 uint64_t vk_texture_last_write(const tex_t *t);    // timeline value of the newest submission recorded to write it; 0: none
 size_t vk_texture_texel_span(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uint64_t row, uint64_t img);   // bytes ReadTexels spans; 0 for a bad region

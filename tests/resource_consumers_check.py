@@ -26,7 +26,7 @@ from check_content import GENERATED_MARKER
 marker = GENERATED_MARKER.decode() if isinstance(GENERATED_MARKER, bytes) else GENERATED_MARKER
 memory = (ROOT / 'runtime/vk_memory.c').read_text()
 texture = (ROOT / 'runtime/vk_texture.c').read_text()
-names = ('texture_cost_ready', 'texture_cost_observe',
+names = ('generation_next', 'texture_cost_ready', 'texture_cost_observe',
          'snap_lease_valid', 'vk_mem_dependency_sleep_locked', 'snap_current', 'vk_mem_dependency_adopt_locked',
          'vk_mem_dependency_region_locked', 'snap_regions_for', 'snap_regions', 'vk_mem_unchanged_why_locked',
          'vk_mem_snap_range_locked')

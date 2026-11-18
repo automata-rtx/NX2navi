@@ -43,6 +43,8 @@ typedef struct {
 // What makes two images interchangeable: the parameters create_tex makes them with (img_key_of). Image reuse and the
 // memory requirement cache match on it.
 typedef struct { uint32_t flags, type, format, w, h, d, levels, layers, samples, usage; } ImgKey;
+#include "vk_texture_material.h"
+static TextureMaterialLedger material_ledger;
 
 typedef struct Tex {
     VkTexImage pub;               // first: vk_texture_get hands out &pub
@@ -50,6 +52,17 @@ typedef struct Tex {
     tex_t t;                      // the newest texture object seen with this key
     TexVkFormat f;
     VmaAllocation alloc;          // own memory; NULL when bound into pool memory
+    TextureMaterial *material;    // physical owner; alloc/bytes are zero while attached
+    ImgKey material_intent;       // representation requested before content-dependent opacity selection
+    TextureSourceStamp source_stamp;
+    TextureSourceSpan *source_spans;
+    uint32_t source_count;
+    uint8_t *source_copy;         // bounded immutable first-use payload; never an additional persistent asset cache
+    uint64_t source_copy_size;
+    uint8_t source_digest[32];
+    uint8_t source_digest_valid;
+    uint8_t material_prepared;
+    uint8_t material_writable;    // explicit writable use keeps this logical association private
     uint64_t bytes;               // the size of alloc (0 without own memory), for the released entries' total
     VmaAllocation bound_to;       // the pool memory it is bound into
     uint32_t wgen;                // page generation of the last upload check
@@ -98,7 +111,6 @@ typedef struct Tex {
     uint64_t ow_frame;            // gfx_counters.frames when overwritten was set
     uint8_t overwritten;          // released, and a texture at another address was drawn over its storage (overwrite_others)
     uint8_t reclaim;              // pressure/cap destruction: allocation stays pending until the allocator releases it
-    uint32_t content_slot;        // non-owning materialization index, slot + 1; cleared before image mutation
     uint8_t in_gwin;              // in gwin[]
     int pidx;                     // 1 + its index in pent[] (vk_texture_pool_note_locked); 0: not listed
     int ph;                       // 1 + its index in pref[] (pool_ref); 0: none
@@ -687,7 +699,19 @@ static int tex_reuse_on(void) {
 }
 
 static void destroy_tex(Tex *e);
+static _Thread_local int tex_deferred;
 static void content_image_forget(Tex *e);
+static int content_early_prepare(Tex *e);
+static uint64_t content_release(Tex *e, int reclaim);
+static int content_source_gpu_overlap(const Tex *e);
+static void content_write_begin(Tex *e, int preserve);
+static uint64_t content_reclaim(uint64_t wanted);
+static void content_shutdown(void);
+static void content_source_discard(Tex *e);
+static int source_spans_init(Tex *e);
+static int source_observe(Tex *e, const TextureSourceStamp *prior, TextureSourceObservation *out);
+static void source_commit(Tex *e, const TextureSourceStamp *stamp);
+static uint64_t texture_owned_bytes(const Tex *e) { return e->material ? e->material->bytes : e->bytes; }
 
 // Why an entry was destroyed (drop_tex), in the order of drop_names.
 enum { DROP_NONE, DROP_MAX, DROP_CAP, DROP_COMMIT, DROP_VRAM, DROP_IDLE_VRAM, DROP_IDLE_COMMIT, DROP_DISUSE,
@@ -842,7 +866,7 @@ static VkDeviceSize image_size(const VkImageCreateInfo *ci) {
 // A reused image (create_tex) was another texture's: the transition waits for every earlier command, which may still
 // read or write it.
 static void init_image(Tex *e, VkCommandBuffer cb) {
-    content_image_forget(e);
+    if (e->uploaded || e->material) content_image_forget(e);
     e->upload_mapping = 0;
     VkImageMemoryBarrier2 ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
                                 .srcStageMask = e->reused ? VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_2_NONE,
@@ -947,13 +971,13 @@ static int shadow_scale_of(const nvn_texdesc *d, const TexVkFormat *f, uint32_t 
 static uint64_t n_bc1_made, n_bc1_made_bytes, n_bc1_widened, n_bc1_checks, n_bc1_check_ns, n_bc1_check_bytes;
 
 // 1 when every block of t's storage at addr decodes opaque; 0 when one does not or the storage is not mapped.
-static int astc_opaque(const tex_t *t, uint64_t addr, const TexVkFormat *f) {
+static int astc_opaque(const tex_t *t, uint64_t addr, const TexVkFormat *f, int snapshot) {
     uint64_t t0 = kern_now_ns(), n = t->L.size / 16;
-    if (!t->mem || !n || !mem_read_hold(addr, t->L.size)) return 0;
+    if (!t->mem || !n || (!snapshot && !mem_read_hold(addr, t->L.size))) return 0;
     uint32_t decoded = 0;
     int ok = astc_blocks_opaque_mt((const uint8_t *)t->mem, n, f->astc_bw, f->astc_bh, f->astc_srgb != 0,
                                    ASTC_OPAQUE_DECODES, &decoded, NULL);
-    mem_read_release();
+    if (!snapshot) mem_read_release();
     n_bc1_checks++, n_bc1_check_ns += kern_now_ns() - t0, n_bc1_check_bytes += t->L.size;
     return ok;
 }
@@ -1233,6 +1257,34 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
     e->f = f;
     e->pub.addr = k->addr;
     img_key_of(&ci, &e->ik);
+    e->material_intent = e->ik;
+    VkTexImage *p = &e->pub;
+    p->format = f.vk;
+    p->type = type;
+    p->usage = usage;
+    p->aspect = aspect_of(&f);
+    p->width = w, p->height = h, p->depth = depth, p->levels = levels, p->layers = layers, p->samples = samples;
+    p->view_type = type == VK_IMAGE_TYPE_1D ? (d->target == NVN_TEXTURE_TARGET_1D_ARRAY ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_1D)
+                 : type == VK_IMAGE_TYPE_3D ? VK_IMAGE_VIEW_TYPE_3D
+                 : d->target == NVN_TEXTURE_TARGET_CUBEMAP && (flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) ? VK_IMAGE_VIEW_TYPE_CUBE
+                 : d->target == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY && (flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) ? VK_IMAGE_VIEW_TYPE_CUBE_ARRAY
+                 : layers > 1 || d->target == NVN_TEXTURE_TARGET_2D_ARRAY || d->target == NVN_TEXTURE_TARGET_2D_MULTISAMPLE_ARRAY
+                     ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+    p->alpha_one = f.alpha_one;
+    memcpy(p->chan, f.chan, sizeof p->chan);
+    p->swz[0] = (uint8_t)d->swizzle_r, p->swz[1] = (uint8_t)d->swizzle_g;
+    p->swz[2] = (uint8_t)d->swizzle_b, p->swz[3] = (uint8_t)d->swizzle_a;
+    if (!(p->swz[0] | p->swz[1] | p->swz[2] | p->swz[3]))   // descriptors built without nvnTextureBuilderSetDefaults
+        p->swz[0] = NVN_TEXTURE_SWIZZLE_R, p->swz[1] = NVN_TEXTURE_SWIZZLE_G, p->swz[2] = NVN_TEXTURE_SWIZZLE_B,
+        p->swz[3] = NVN_TEXTURE_SWIZZLE_A;
+    p->mirrored = (uint8_t)tex_mirrored(t);
+    p->block_views = (uint8_t)block_views;
+    p->fb_usage = (uint8_t)fb_usage;
+    p->scale = (uint8_t)scale;
+    p->skip = (uint8_t)skip;
+
+    e->bc1_try = (uint8_t)bc1_try;
+    if (content_early_prepare(e)) return e;
     VkImage img = VK_NULL_HANDLE;
     if (scale == 1 && nvn_gpu_only(k->addr)) {   // storage in a physical or virtual pool: alias the pool memory (section 3.2)
         const VkMemoryRequirements *q = nvn_hm_get(&img_reqs, &e->ik);
@@ -1292,6 +1344,8 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
         if (r != VK_SUCCESS) {
             log_limited(&n_failed, "image creation failed (%d): nvn fmt %#x %ux%ux%u target %d levels %u layers %u", (int)r,
                         d->format, w, h, depth, d->target, levels, layers);
+            content_source_discard(e);
+            free(e->source_spans);
             free(e);
             return NULL;
         }
@@ -1315,32 +1369,8 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
             log_limited(&n_stale, "new image %#llx had %d cached views of a destroyed image with its handle; dropped",
                         (unsigned long long)(uintptr_t)img, stale);
     }
-    VkTexImage *p = &e->pub;
-    p->image = img;
-    p->format = f.vk;
-    p->type = type;
-    p->usage = usage;
-    p->aspect = aspect_of(&f);
-    p->width = w, p->height = h, p->depth = depth, p->levels = levels, p->layers = layers, p->samples = samples;
-    p->view_type = type == VK_IMAGE_TYPE_1D ? (d->target == NVN_TEXTURE_TARGET_1D_ARRAY ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_1D)
-                 : type == VK_IMAGE_TYPE_3D ? VK_IMAGE_VIEW_TYPE_3D
-                 : d->target == NVN_TEXTURE_TARGET_CUBEMAP && (flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) ? VK_IMAGE_VIEW_TYPE_CUBE
-                 : d->target == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY && (flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) ? VK_IMAGE_VIEW_TYPE_CUBE_ARRAY
-                 : layers > 1 || d->target == NVN_TEXTURE_TARGET_2D_ARRAY || d->target == NVN_TEXTURE_TARGET_2D_MULTISAMPLE_ARRAY
-                     ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
-    p->alpha_one = f.alpha_one;
-    memcpy(p->chan, f.chan, sizeof p->chan);
-    p->swz[0] = (uint8_t)d->swizzle_r, p->swz[1] = (uint8_t)d->swizzle_g;
-    p->swz[2] = (uint8_t)d->swizzle_b, p->swz[3] = (uint8_t)d->swizzle_a;
-    if (!(p->swz[0] | p->swz[1] | p->swz[2] | p->swz[3]))   // descriptors built without nvnTextureBuilderSetDefaults
-        p->swz[0] = NVN_TEXTURE_SWIZZLE_R, p->swz[1] = NVN_TEXTURE_SWIZZLE_G, p->swz[2] = NVN_TEXTURE_SWIZZLE_B,
-        p->swz[3] = NVN_TEXTURE_SWIZZLE_A;
-    p->mirrored = (uint8_t)tex_mirrored(t);
-    p->bound = e->bound_to != NULL;
-    p->block_views = (uint8_t)block_views;
-    p->fb_usage = (uint8_t)fb_usage;
-    p->scale = (uint8_t)scale;
-    p->skip = (uint8_t)skip;
+    e->pub.image = img;
+    e->pub.bound = e->bound_to != NULL;
 
     if (!defer_init) init_new(e);
     return e;
@@ -1890,6 +1920,7 @@ int vk_texture_pool_fresh_locked(void) {
         if (e->released) continue;
         if (!e->uploaded || e->checked != submit_epoch) {
             make_fresh_snap(e);
+            if (tex_deferred) continue;
             e->checked = submit_epoch;
             n_pool_checks++;
         }
@@ -1936,7 +1967,6 @@ int vk_texture_slot_retry_locked(int id) {
 static void retire_remove(Tex *e);
 
 static void destroy_tex(Tex *e) {
-    content_image_forget(e);
     if (e->retiring) retire_remove(e);
     pool_unlist(e);
     pool_forget(e);
@@ -1954,8 +1984,14 @@ static void destroy_tex(Tex *e) {
             if (p->next_at == e) { p->next_at = e->next_at; break; }
     }
     if (e->released) nreleased--, rel_unlink(e);
-    if (e->pub.image) vk_exec_image_gone(e->pub.image);   // none when another texture took it (create_tex, reuse)
-    vk_defer_image_reclaim(e->pub.image, e->alloc, e->reclaim ? e->bytes : 0);
+    if (e->material) content_release(e, e->reclaim);
+    else {
+        if (e->pub.image) vk_exec_image_gone(e->pub.image);
+        vk_defer_image_reclaim(e->pub.image, e->alloc, e->reclaim ? e->bytes : 0);
+    }
+    content_source_discard(e);
+    free(e->source_spans);
+    e->source_spans = NULL;
     if (e->flat3d) {   // its 3D copy goes the same way
         vk_exec_image_gone(e->flat3d->image);
         vk_defer_image(e->flat3d->image, e->flat3d_alloc);
@@ -2428,6 +2464,7 @@ static uint32_t round_checks;       // slot checks of the submission being recor
 static uint32_t pool_slots;         // registered slots the pool covers (id < VK_POOL_TEX)
 static int pool_ctx;                // the texture pool refresh is looking slots up (vk_texture_pool_ctx)
 static void touch(Tex *e) {
+    if (e->material) texture_material_note_use(e->material, vk_exec_recording_fence(), submit_epoch);
     e->use_round = look_round;
     e->use_frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
     if (!pool_ctx) e->samp_frame = e->use_frame;   // a draw binds it, or the game or the replay reads it otherwise
@@ -2616,7 +2653,7 @@ static uint64_t reclaim_released(uint64_t want, uint64_t *count, int why) {
         reclaim_stats.inspected++;
         if (now - e->rel_frame < STALE_FRAMES) { e = NULL; break; }
         Tex *next = e->rel_next;
-        int eligible = e->bytes && now - e->rel_frame >= stale_after(e) &&
+        int eligible = texture_owned_bytes(e) && now - e->rel_frame >= stale_after(e) &&
                        (e->overwritten || idle(e, now));
         // VRAM pressure has never authorized destroying the only GPU copy of a released texture.
         if (why == DROP_VRAM && !comes_back_intact(e)) eligible = 0;
@@ -2642,8 +2679,9 @@ static uint64_t reclaim_released(uint64_t want, uint64_t *count, int why) {
         Tex **v = kind ? other : recoverable;
         int n = kind ? no : nr;
         for (int i = 0; i < n && dropped < PRESSURE_STEP && freed < want; i++) {
-            freed += v[i]->bytes;
+            uint64_t before = material_ledger.resident_bytes, private_bytes = v[i]->bytes;
             drop_tex(v[i], why);
+            freed += private_bytes + before - material_ledger.resident_bytes;
             dropped++, (*count)++;
         }
     }
@@ -2710,7 +2748,7 @@ static uint64_t evict_idle(uint64_t want, uint64_t used, uint64_t budget, int wh
         uint32_t i = scan_at++;
         reclaim_stats.inspected++;
         Tex *e = by_key.vals[i];
-        if (!e || e->released || e->retiring || !e->bytes || !comes_back_intact(e) || !idle(e, now)) continue;
+        if (!e || e->released || e->retiring || !texture_owned_bytes(e) || !comes_back_intact(e) || !idle(e, now)) continue;
         uint32_t age = look_round - e->use_round;
         int at = nv;
         while (at > 0 && look_round - v[at - 1]->use_round < age) at--;
@@ -2721,7 +2759,11 @@ static uint64_t evict_idle(uint64_t want, uint64_t used, uint64_t budget, int wh
     }
     uint64_t freed = 0;
     int n = 0;
-    for (; n < nv && freed < want; n++) freed += v[n]->bytes, drop_tex(v[n], why);
+    for (; n < nv && freed < want; n++) {
+        uint64_t before = material_ledger.resident_bytes, private_bytes = v[n]->bytes;
+        drop_tex(v[n], why);
+        freed += private_bytes + before - material_ledger.resident_bytes;
+    }
     if (!n) return 0;
     n_evict += (uint64_t)n, n_evict_bytes += freed;
     evict_wait = vk_sync_issued() + 2;
@@ -2913,7 +2955,7 @@ static uint64_t evict_disused(uint64_t want) {
     uint64_t now = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED), disuse = DISUSE_FRAMES;
     for (uint32_t i = 0; i < by_key.cap; i++) {   // the EVICT_STEP least recently sampled candidates, oldest first
         Tex *e = by_key.vals[i];
-        if (!e || e->released || e->retiring || !e->bytes || !comes_back_intact(e) || now - e->samp_frame < disuse)
+        if (!e || e->released || e->retiring || !texture_owned_bytes(e) || !comes_back_intact(e) || now - e->samp_frame < disuse)
             continue;
         int at = nv;
         while (at > 0 && v[at - 1]->samp_frame > e->samp_frame) at--;
@@ -3149,7 +3191,8 @@ static void sweep_pressure(void) {   // tex_lock held
     int held = low && commit_drops_held();   // the commit drops came back (commit_back_note)
     if (rel_head) drop_overwritten();
     uint64_t cap = released_cap_bytes();
-    uint64_t cap_need = rel_bytes > cap ? rel_bytes - cap : 0;
+    uint64_t retained = rel_bytes + material_ledger.retained_bytes;
+    uint64_t cap_need = retained > cap ? retained - cap : 0;
     uint64_t commit_need = low && !held ? commit_deficit : 0;
     uint64_t pressure_need = over > commit_need ? over : commit_need;
     uint64_t want = pressure_need > cap_need ? pressure_need : cap_need;
@@ -3167,7 +3210,8 @@ static void sweep_pressure(void) {   // tex_lock held
     if (want) {
         int why = over ? DROP_VRAM : commit_need ? DROP_COMMIT : DROP_CAP;
         uint64_t *count = why == DROP_VRAM ? &n_pressure_drops : why == DROP_COMMIT ? &n_commit_drops : &n_cap_drops;
-        uint64_t freed = reclaim_released(want, count, why);
+        uint64_t freed = content_reclaim(want);
+        if (freed < want) freed += reclaim_released(want - freed, count, why);
         // Live eviction cannot satisfy a retained-entry cap. It can satisfy only the outstanding measured pressure,
         // sharing the released batch's credit rather than starting an independent fixed-size eviction round.
         if (commit_evict_on < 0) commit_evict_on = rt_knob("TEX_COMMIT_EVICT", "1") == 1;
@@ -3419,8 +3463,11 @@ static int astc_reformat(Tex *e, VkCommandBuffer cb, int bc) {
         return 0;
     }
     content_image_forget(e);
-    vk_exec_image_gone(e->pub.image);
-    vk_defer_image(e->pub.image, e->alloc);
+    if (e->material) content_release(e, 0);
+    else {
+        vk_exec_image_gone(e->pub.image);
+        vk_defer_image(e->pub.image, e->alloc);
+    }
     vk_exec_image_gone(img);   // views cached under the handle of a destroyed image (create_tex)
     int relink = e->ru_on;
     if (relink) ru_unlink(e);
@@ -3461,24 +3508,110 @@ static int astc_copy_opaque(const Tex *e, uint8_t *dst, const uint8_t *src, uint
     return ok;
 }
 
+// The range index contains GPU-authored CPU-addressable images. A page certificate describes guest writes only;
+// it cannot certify a source whose authoritative contents still reside in another image.
+static int content_source_gpu_overlap(const Tex *e) {
+    uint64_t lo = e->pub.addr, size = e->t.L.size;
+    if (!size || size > UINT64_MAX - lo || nvn_gpu_only(lo)) return 1;
+    for (int i = owned_lower(lo > max_owned ? lo - max_owned : 0);
+         i < nowned && owned[i]->pub.addr < lo + size; i++) {
+        const Tex *q = owned[i];
+        if ((q->pub.gpu_owned || q->gpu_dirty || q->material_writable) && q->t.L.size > lo - (q->pub.addr < lo ? q->pub.addr : lo))
+            return 1;
+    }
+    return 0;
+}
+
+// One bounded map of the original padded mip/layer ranges, independent of the resulting Vulkan representation.
+// Unsupported layouts retain the complete-upload path instead of inventing partial coverage.
+static int source_spans_init(Tex *e) {
+    if (e->material_writable) return 0;
+    if (e->source_spans) return e->source_count != 0;
+    const tex_t *t = &e->t;
+    const nvn_texdesc *d = &t->d;
+    if (!e->pub.mirrored || e->pub.gpu_owned || e->material_writable || e->bound_to || e->sfill || e->pub.skip ||
+        e->pub.type != VK_IMAGE_TYPE_2D || e->pub.samples != 1 || !e->pub.levels || !e->pub.layers ||
+        e->pub.layers > TEXTURE_SOURCE_MAX_SPANS / e->pub.levels || nvn_gpu_only(e->pub.addr) ||
+        !t->L.size || !t->L.layer_size || (t->pool_flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL)) return 0;
+    uint32_t count = e->pub.levels * e->pub.layers;
+    TextureSourceSpan spans[TEXTURE_SOURCE_MAX_SPANS];
+    if (nvn_tex_is_linear(d)) {
+        if (count != 1) return 0;
+        spans[0] = (TextureSourceSpan){0, t->L.size};
+    } else {
+        if (e->pub.levels != umax(d->levels, 1) || e->pub.layers != t->L.layers) return 0;
+        for (uint32_t lv = 0; lv < e->pub.levels; lv++) {
+            unsigned th, td;
+            uint64_t first = nvn_tex_level_geometry(d, &t->L, lv, &th, &td);
+            uint64_t end = lv + 1 < e->pub.levels ? nvn_tex_level_geometry(d, &t->L, lv + 1, &th, &td) : t->L.layer_size;
+            if (end <= first || end > t->L.layer_size) return 0;
+            for (uint32_t ly = 0; ly < e->pub.layers; ly++) {
+                if (ly && t->L.layer_size > UINT64_MAX / ly) return 0;
+                uint64_t base = (uint64_t)ly * t->L.layer_size;
+                if (base > t->L.size || end > t->L.size - base) return 0;
+                spans[lv * e->pub.layers + ly] = (TextureSourceSpan){base + first, end - first};
+            }
+        }
+    }
+    if (!texture_source_spans_valid(t->L.size, spans, count)) return 0;
+    e->source_spans = malloc(count * sizeof *spans);
+    if (!e->source_spans) return 0;
+    memcpy(e->source_spans, spans, count * sizeof *spans);
+    e->source_count = count;
+    return 1;
+}
+
+static int source_observe(Tex *e, const TextureSourceStamp *prior, TextureSourceObservation *out) {
+    *out = (TextureSourceObservation){0};
+    if (!source_spans_init(e) || content_source_gpu_overlap(e)) {
+        texture_source_all_dirty(out, e->source_count);
+        return TEX_SOURCE_UNKNOWN;
+    }
+    return vk_mem_observe_subresources(e->pub.addr, e->t.L.size, prior, submit_epoch,
+                                      e->source_spans, e->source_count, out);
+}
+
+static void source_commit(Tex *e, const TextureSourceStamp *stamp) {
+    TextureSourceStamp saved = *stamp;
+    stamp = &saved;
+    e->source_stamp = (TextureSourceStamp){0};
+    if (!texture_source_stamp_valid(stamp) || content_source_gpu_overlap(e) ||
+        !mem_mapping_range_unchanged(e->pub.addr, e->t.L.size, stamp->mapping) ||
+        !mem_protection_range_unchanged(e->pub.addr, e->t.L.size, stamp->protection)) return;
+    e->source_stamp = *stamp;
+    e->wgen = stamp->generation;
+}
+
 #include "vk_texture_content.h"
 
-static void upload(Tex *e, const VkDirtyPages *dirty, int tracked) {
-    content_image_forget(e);
+static void upload(Tex *e, const VkDirtyPages *dirty, int tracked, const TextureSourceObservation *observed) {
+    if (e->material && vk_exec_turn_due()) { tex_deferred = 1; return; }
+    TextureSourceObservation observation = {0};
+    if (observed) observation = *observed;
+    else source_observe(e, NULL, &observation);
+    int snapshot = e->source_copy != NULL;
+    TextureSourceStamp cutoff = snapshot ? e->source_stamp : observation.stamp;
     uint8_t material_digest[32];
-    int material_ready = 0;
+    int material_ready = snapshot && e->source_digest_valid;
+    if (material_ready) memcpy(material_digest, e->source_digest, sizeof material_digest);
+    // Earlier draws keep the old immutable version, even if this is its only current logical association.
+    content_write_begin(e, !snapshot);
+    content_image_forget(e);
     static volatile int32_t n_bad, n_undecoded, n_split;
+    int source_complete = 1;
     int no_mem = 0;   // a part's ASTC decode had no memory: the texture is uploaded again later
-    const tex_t *t = &e->t;
+    tex_t source = e->t;
+    if (snapshot) source.mem = e->source_copy;
+    const tex_t *t = &source;
     const nvn_texdesc *d = &t->d;
     uint64_t prior_map = e->upload_mapping, prior_protection = e->upload_protection;
     uint64_t mapping = 0, protection = 0;
     e->upload_mapping = 0;
     int bw, bh, bpb = nvn_fmt_bpb(d->format, &bw, &bh);
-    if (!bpb || !t->mem) return;
+    if (!bpb || !t->mem) { content_source_discard(e); return; }
     // A stale slot (the bindless pools look every slot up): no upload; a later write to mapped storage uploads it
     // (make_fresh_snap).
-    if (!mem_readable(e->pub.addr, e->t.L.size)) {
+    if (!snapshot && !mem_readable(e->pub.addr, e->t.L.size)) {
         static volatile int32_t n_unmapped;
         log_limited(&n_unmapped, "texture %#llx (%llu bytes): storage not mapped; not uploaded",
                     (unsigned long long)e->pub.addr, (unsigned long long)e->t.L.size);
@@ -3488,9 +3621,9 @@ static void upload(Tex *e, const VkDirtyPages *dirty, int tracked) {
     e->chash_ok = e->t.L.size <= CHASH_MAX;   // the hash of what this upload copies (make_fresh_snap compares it)
     if (e->chash_ok) {
         // read with the storage held mapped, as the copies below: the game unmaps a texture's memory on its own thread
-        if (mem_read_hold(e->pub.addr, e->t.L.size)) {
-            e->chash = content_hash((const void *)(uintptr_t)e->pub.addr, e->t.L.size);
-            mem_read_release();
+        if (snapshot || mem_read_hold(e->pub.addr, e->t.L.size)) {
+            e->chash = content_hash(t->mem, t->L.size);
+            if (!snapshot) mem_read_release();
         } else {
             e->chash_ok = 0;
         }
@@ -3535,12 +3668,13 @@ static void upload(Tex *e, const VkDirtyPages *dirty, int tracked) {
     uint32_t bc1_dec = 0;
     e->bc1_try = 0;
     if ((bc1 || try1) && !gdsw) {
-        opq = astc_opaque(t, e->pub.addr, &e->f);
+        opq = astc_opaque(t, e->pub.addr, &e->f, snapshot);
         if (bc1 && !opq && !astc_reformat(e, VK_NULL_HANDLE, 1)) {
             e->uploaded = 0;
             e->up_retry = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + UP_RETRY_FRAMES;
             __atomic_add_fetch(&n_up_retry, 1, __ATOMIC_RELAXED);
             free(ar), free(rg);
+            content_source_discard(e);
             return;
         }
         if (try1 && opq) astc_reformat(e, VK_NULL_HANDLE, 2);
@@ -3552,7 +3686,34 @@ static void upload(Tex *e, const VkDirtyPages *dirty, int tracked) {
     int can_retain = tracked && gdsw && !bc1 && n > 1 && t->L.size > CHASH_MAX &&
                      e->pub.mirrored && !e->sfill && !e->released && !e->retiring && !e->pub.gpu_owned;
     int partial = 0;
-    if (can_retain && !check && dirty && dirty->hi > dirty->lo && prior_map) {
+    // The caller proved which subresources changed before invalidating the previous certificate for this write.
+    int select = e->uploaded && !snapshot && observed && texture_source_stamp_valid(&observation.stamp) &&
+                 e->source_count == all_regions && !check && !bc1 && !acheck && !sk;
+    if (select) {
+        uint32_t keep = 0;
+        uint64_t included = 0, packed = 0;
+        for (k = 0; k < all_regions; k++) {
+            if (!texture_source_span_dirty(&observation, k)) continue;
+            included += e->source_spans[k].size;
+            if (gdsw) ar[keep] = ar[k];
+            else {
+                VkDeviceSize bytes = (k + 1 < all_regions ? rg[k + 1].bufferOffset : total) - rg[k].bufferOffset;
+                rg[keep] = rg[k];
+                rg[keep].bufferOffset = packed;
+                packed += bytes;
+            }
+            keep++;
+        }
+        if (keep && keep < all_regions) {
+            n = keep;
+            partial = 1;
+            src_bytes = included;
+            if (!gdsw) total = packed;
+            prior_map = observation.stamp.mapping;
+            prior_protection = observation.stamp.protection;
+        }
+    }
+    if (!partial && can_retain && !check && dirty && dirty->hi > dirty->lo && prior_map) {
         uint32_t keep = 0;
         uint64_t included = 0, packed = 0;
         for (k = 0; k < n; k++) {
@@ -3610,18 +3771,19 @@ static void upload(Tex *e, const VkDirtyPages *dirty, int tracked) {
         // held, so a waiting unmap and the guest's memory calls behind it never wait for the staging block or a decode.
         // Storage released since the check above uploads as zeros, as the game no longer has that texture.
         uint8_t **tmps = gdsw ? NULL : calloc(k1 - k0, sizeof *tmps);
-        int held = mem_read_hold(e->pub.addr, e->t.L.size);
+        int lease = !snapshot && mem_read_hold(e->pub.addr, e->t.L.size);
+        int held = snapshot || lease;
         if (held && can_retain) {
             mapping = mem_mapping_serial();
             protection = mem_protection_serial();
         }
         if (partial && (!held || !mem_mapping_range_unchanged(e->pub.addr, t->L.size, prior_map) ||
                         !mem_protection_range_unchanged(e->pub.addr, t->L.size, prior_protection))) {
-            if (held) mem_read_release();
+            if (lease) mem_read_release();
             vk_upload_end();
             free(ar);
             free(rg);
-            upload(e, NULL, tracked);
+            upload(e, NULL, tracked, NULL);
             return;
         }
         if (held) plat_crash_context(ctx);
@@ -3631,6 +3793,7 @@ static void upload(Tex *e, const VkDirtyPages *dirty, int tracked) {
                         (unsigned long long)e->pub.addr, (unsigned long long)e->t.L.size);
             // the image holds zeros, not the bytes hashed above: the same bytes mapped back there upload again
             e->chash_ok = 0;
+            source_complete = 0;
         }
         if (gdsw && !sk && !partial) {
             if (held && check) opq = astc_copy_opaque(e, stg, t->mem, size, &bc1_dec);
@@ -3660,11 +3823,12 @@ static void upload(Tex *e, const VkDirtyPages *dirty, int tracked) {
                 log_limited(&n_bad, "texture %#llx fmt %#x target %d: level %u layer %u has no CPU layout; uploaded as zeros",
                             (unsigned long long)e->pub.addr, d->format, d->target, lv + sk, ly);
                 memset(tmp ? tmp : dst, 0, raw);
+                source_complete = 0;
             }
         }
         if (held) {
             plat_crash_context(NULL);
-            mem_read_release();   // the part's reads of the storage are done
+            if (lease) mem_read_release();   // the part's reads of the storage are done
         }
         for (k = k0; k < k1 && !gdsw; k++) {   // the decodes, from the copies (gdsw: ar already names the blocks)
             uint32_t lv = rg[k].imageSubresource.mipLevel, ly = rg[k].imageSubresource.baseArrayLayer;
@@ -3703,23 +3867,9 @@ static void upload(Tex *e, const VkDirtyPages *dirty, int tracked) {
             int widen_failed = 0;
             if (bc1 && !opq) widen_failed = !astc_reformat(e, cb, 1);
             else if (try1 && opq) astc_reformat(e, cb, 2);
-            int copied = 0;
-            if (!widen_failed && gdsw && !sk && !partial && !acheck && held && content_image_eligible(e)) {
-                // Hash the immutable bytes actually staged for this upload, not an earlier guest-memory read.
-                // Including padding can reject equivalent content but cannot equate differently decoded payloads.
-                uint64_t h0 = kern_now_ns();
-                blake3_hasher material_hasher;
-                blake3_hasher_init(&material_hasher);
-                blake3_hasher_update(&material_hasher, stg, (size_t)size);
-                blake3_hasher_finalize(&material_hasher, material_digest, sizeof material_digest);
-                material_stats.hash_ns += kern_now_ns() - h0;
-                material_stats.hashes++;
-                material_stats.hash_bytes += size;
-                Tex *donor = content_image_find(e, material_digest, size);
-                if (donor) copied = content_image_copy(e, donor, cb, size);
-                material_ready = 1;
-            }
-            checked = widen_failed ? -1 : copied ? 1
+            // Identity was computed from the owned source snapshot before allocation. Upload consumes those same
+            // bytes; no second guest read or late donor-to-destination image copy is needed.
+            checked = widen_failed ? -1
                     : vk_astc_record(cb, sb, size, ar, (int)n, e->f.astc_bw, e->f.astc_bh, e->f.astc_srgb, e->f.astc_bc,
                                      e->pub.image, e->pub.aspect, rbuf);
             if (checked <= 0) material_ready = 0;
@@ -3730,11 +3880,12 @@ static void upload(Tex *e, const VkDirtyPages *dirty, int tracked) {
                             (unsigned long long)e->pub.addr, d->format, d->width, d->height,
                             checked < 0 ? " and tried again later (no memory for the decode)" : "");
                 e->chash_ok = 0;   // the image does not hold the bytes hashed above: the next write uploads, equal or not
-                no_mem |= checked < 0;
+                no_mem = 1;
             }
         } else {
             for (k = k0; k < k1; k++) rg[k].bufferOffset += soff;
             vkCmdCopyBufferToImage(cb, sb, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, k1 - k0, rg + k0);
+            checked = 1;
         }
         barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
         vk_upload_end();
@@ -3795,8 +3946,11 @@ static void upload(Tex *e, const VkDirtyPages *dirty, int tracked) {
     } else {
         e->up_retry = 0;
     }
-    if (material_ready && e->uploaded && !no_mem)
-        content_image_publish(e, material_digest, t->L.size);
+    if (e->uploaded && !no_mem && source_complete) {
+        source_commit(e, &cutoff);
+        if (material_ready) content_image_publish(e, material_digest, t->L.size);
+    }
+    content_source_discard(e);
     perf_end(PERF_TEX, p0);
     vk_texstat_time(VK_TS_UPLOAD, u0);
     vk_texstat_add(VK_TS_UPLOAD, 0, src_bytes);
@@ -3848,37 +4002,51 @@ static int same_content(const Tex *e) {
 // A mirrored texture is uploaded on first use and again when its storage pages carry a newer write generation. So is
 // one split fill fills (from_storage), while it is not released: the game may be unmapping a released one's storage,
 // and nothing keeps a slot from resolving to it as the stale rule does for a CPU-written one (slot_resolve).
-static void make_fresh(Tex *e) {
-    if (!from_storage(e) || e->pub.gpu_owned || (e->sfill && e->released)) return;
-    uint64_t size = e->t.L.size;
-    if (!e->uploaded) {
-        if (up_wait(e)) return;
-        int ch = vk_mem_changed(e->pub.addr, size, 0, &e->wgen);   // resets the write bits before the storage is read
-        upload(e, NULL, ch >= 0);
-        return;
+static int make_fresh_source(Tex *e) {
+    if (!source_spans_init(e) || content_source_gpu_overlap(e)) return 0;
+    if (!e->uploaded && up_wait(e)) return 1;
+    TextureSourceObservation observed;
+    int changed = source_observe(e, e->uploaded ? &e->source_stamp : NULL, &observed);
+    n_checks++;
+    e->last_ch = changed;
+    if (e->uploaded && changed == TEX_SOURCE_CLEAN) {
+        source_commit(e, &observed.stamp);
+        return 1;
     }
-    uint32_t now;
-    int ch = vk_mem_changed(e->pub.addr, size, e->wgen, &now);
-    e->wgen = now;
-    e->last_ch = ch;
-    if (ch && !same_content(e)) upload(e, NULL, ch > 0);
+    // An image replacement belongs at this operation's stream position, after earlier workers captured theirs.
+    if (vk_exec_turn_due() && (e->material || content_image_eligible(e))) {
+        tex_deferred = 1;
+        return 1;
+    }
+    if (!e->source_copy && content_early_prepare(e)) return 1;
+    upload(e, NULL, changed >= 0, &observed);
+    return 1;
 }
 
-// make_fresh for draw bindings: the page check answers from this submission's write-watch snapshot (vk_memory.c
-// vk_mem_changed_snap) instead of a system call per texture. A write the snapshot of the texture's region missed (made
-// after it, during this replay) keeps its write-watch bit and is caught by the next submission's snapshot.
+static void make_fresh(Tex *e) {
+    if (!from_storage(e) || e->pub.gpu_owned || (e->sfill && e->released)) return;
+    if (make_fresh_source(e)) return;
+    if (!e->uploaded && up_wait(e)) return;
+    uint32_t now;
+    int ch = vk_mem_changed(e->pub.addr, e->t.L.size, e->uploaded ? e->wgen : 0, &now);
+    e->last_ch = ch;
+    if (!e->uploaded || (ch && !same_content(e))) upload(e, NULL, ch >= 0, NULL);
+    if (!tex_deferred && e->uploaded && !e->up_retry) e->wgen = now;
+}
+
+// Draw lookups reuse this submission's memory observation. Late guest writes remain visible to the next one.
 static void make_fresh_snap(Tex *e) {
     if (!from_storage(e) || e->pub.gpu_owned || (e->sfill && e->released)) return;
+    if (make_fresh_source(e)) return;
     if (!e->uploaded && up_wait(e)) return;
     uint32_t now;
     n_checks++;
     VkDirtyPages dirty = {0};
     VkDirtyPages *range = e->upload_mapping && e->uploaded && !e->wt_n ? &dirty : NULL;
     int ch = vk_mem_changed_snap(e->pub.addr, e->t.L.size, e->uploaded ? e->wgen : 0, submit_epoch, &now, range);
-    e->wgen = now;
     e->last_ch = ch;
-    if (!e->uploaded || (ch && !same_content(e)))
-        upload(e, range, ch >= 0);
+    if (!e->uploaded || (ch && !same_content(e))) upload(e, range, ch >= 0, NULL);
+    if (!tex_deferred && e->uploaded && !e->up_retry) e->wgen = now;
 }
 
 // ---------------------------------------------------------------- aliases (NX2NAVI_TEX_ALIAS)
@@ -3927,6 +4095,8 @@ static int alias_has_gpu_content(const Tex *src) {
 // their memory and image copies may not overlap; e leaves UNDEFINED between the two halves, so its first transition
 // cannot clobber src's bytes before they are read. 0 when no replay is recording (e is then not initialised yet).
 static int alias_copy(Tex *e, const Tex *src) {
+    e->material_writable = 1;
+    content_write_begin(e, 0);
     content_image_forget(e);
     int reopen;
     VkCommandBuffer cb = vk_exec_inline_begin(&reopen);
@@ -4080,7 +4250,10 @@ static int depth_alias_log(void) {   // NX2NAVI_DEPTH_ALIAS_LOG=1: start_at logs
 // the console still holds what it drew, and a new descriptor made for that picture after the old one was let go read
 // it there (a black frame with FSR 3.1 and its frame generation, two presents long).
 static void start_at(Tex *e, const TexKey *k, int taken_back) {
-    content_image_forget(e);
+    // Early adoption excludes every existing same-address alias. Its immutable contents are already prepared.
+    if (!taken_back && e->material_prepared) return;
+    if (e->material) content_write_begin(e, 0);
+    if (taken_back || !e->source_copy) content_image_forget(e);
     e->upload_mapping = 0;
     int alias = 0;
     int trace = (rt_trace & RT_TRACE_PERF) != 0;
@@ -4189,6 +4362,7 @@ static void start_at(Tex *e, const TexKey *k, int taken_back) {
             e->uploaded = 1;
             pool_gpu_owned(e);
             e->pub.gpu_owned = 1;
+            own_add(e);
         }
         e->chash_ok = 0;
     } else {
@@ -4226,7 +4400,7 @@ static void start_at(Tex *e, const TexKey *k, int taken_back) {
 // A replay worker's chunk before its turn (vk_exec.c "replay workers"): a lookup that would make or take back an entry
 // returns nothing and sets this; the chunk replays the op again once every earlier chunk is done, so entries are made,
 // initialised and taken back in the order of the stream, as the replay would.
-static _Thread_local int tex_deferred;
+
 static volatile uint64_t n_deferred[3];   // by what the lookup found: no entry, a retired one, a released one
 void vk_texture_deferred_stats(uint64_t out[3]) {
     for (int i = 0; i < 3; i++) out[i] = __atomic_exchange_n(&n_deferred[i], 0, __ATOMIC_RELAXED);
@@ -4290,6 +4464,7 @@ static Tex *entry_of(const tex_t *t) {
         e->samp_frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);   // in use again, as a new one
         uint64_t gap = e->samp_frame - e->rel_frame;
         if (gap > e->back_gap) e->back_gap = gap > UINT32_MAX ? UINT32_MAX : (uint32_t)gap;
+        if (e->material) texture_material_set_live(e->material, 1);
         e->released = 0, nreleased--, rel_unlink(e), n_site[2]++, tex_gen_flip(e, e->superseded || e->overwritten);
         e->overwritten = 0;
         e->og_backs++, e->og_back_frame = e->samp_frame;
@@ -4325,8 +4500,32 @@ const VkTexImage *vk_texture_get(const tex_t *t) {
     lock();
     Tex *e = entry_of(t);
     if (e) make_fresh(e);
+    if (tex_deferred) e = NULL;
     unlock();
     return e ? &e->pub : NULL;
+}
+
+// Mutable access is a separate operation from lookup: no writable view can capture an immutable shared image.
+const VkTexImage *vk_texture_writable_locked(const VkTexImage *img) {
+    if (!img || img->gone || !img->image) return NULL;
+    Tex *e = (Tex *)img;
+    if (e->material && vk_exec_turn_due()) { tex_deferred = 1; return NULL; }
+    e->material_writable = 1;
+    content_write_begin(e, 1);
+    return &e->pub;
+}
+
+const VkTexImage *vk_texture_get_write(const tex_t *t) {
+    if (!t || !t->mem) return NULL;
+    lock();
+    Tex *e = entry_of(t);
+    const VkTexImage *result = NULL;
+    if (e) {
+        make_fresh(e);
+        if (!tex_deferred) result = vk_texture_writable_locked(&e->pub);
+    }
+    unlock();
+    return result;
 }
 
 // Render targets the CPU reads without NVN's invalidate (vk_texture_write_back_small); small_pending: one may be dirty.
@@ -4357,6 +4556,7 @@ static int wb_wanted(const Tex *e) { return e->t.L.size <= wb_limit || e->run < 
 static void mark_released(Tex *e) {   // tex_lock held; e is not released
     e->upload_mapping = 0;
     flight_ev(e, FLIGHT_TEX_RELEASE, 0, 0);
+    if (e->material) texture_material_set_live(e->material, 0);
     e->released = 1;
     if (e->pidx) {
         PEnt *p = &pent[e->pidx - 1];
@@ -4389,50 +4589,59 @@ static void overwrite_others(const Tex *e, uint64_t fr) {
     if (released) sweep_released();
 }
 
+// The writable image has already been prepared. Do not refresh it here: when called after command recording that
+// could replace the destination or upload old CPU bytes over the GPU result that the command will produce.
+static void gpu_written_prepared(Tex *e) {
+    vk_exec_frame_written(&e->t);
+    content_image_forget(e);
+    uint64_t now = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+    e->gw_frame = now;
+    if (e->scan_frame != now + 1 && nvn_gpu_only(e->key.addr)) {   // once per frame and entry
+        e->scan_frame = now + 1;
+        overwrite_others(e, now);
+    }
+    pool_gpu_owned(e);
+    e->pub.gpu_owned = 1;
+    e->chash_ok = 0;   // the image now holds the GPU's content: matching storage bytes no longer mean "unchanged"
+    e->upload_mapping = 0;
+    if (e->pub.skip) {   // texture detail leaves out what the GPU can write (detail_skip); said if it ever does
+        static volatile int32_t n_skip_written;
+        log_limited(&n_skip_written, "texture %#llx (fmt %#x %ux%u), made without its top %u levels, was written by "
+                    "the GPU: its levels are not the game's", (unsigned long long)e->pub.addr, e->t.d.format,
+                    e->t.d.width, e->t.d.height, e->pub.skip);
+    }
+    uint64_t f = vk_exec_recording_fence();
+    if (f > e->wr_fence) e->wr_fence = f;
+    if (e->pub.mirrored) {
+        e->gpu_dirty = 1;
+        storage_rewritten(e, 0, &e->gpu_gen);   // CPU writes up to here are older than this render
+        if (wb_exact < 0) wb_exact = cfg_bool("NX2NAVI_WB_EXACT");
+        if (wb_exact && !e->snap && e->t.L.size <= SNAP_MAX && fills_no_page(e) && !(e->snap = malloc(SNAP_MAX)))
+            rt_fatal("vk: out of memory for a texture's storage copy");
+        if (e->snap) memcpy(e->snap, (const void *)(uintptr_t)e->pub.addr, e->t.L.size);
+        e->gpu_seq = ++gpu_writes;
+        e->gpu_fence = vk_exec_recording_fence();
+        uint64_t fr = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+        if (fr != e->run_frame || !e->run) {
+            e->run = fr == e->run_frame + 1 && e->run ? (uint8_t)(e->run < WB_RUN ? e->run + 1 : WB_RUN) : 1;
+            e->run_frame = fr;
+        }
+        wb_cfg_init();
+        if (wb_wanted(e)) __atomic_store_n(&small_pending, 1, __ATOMIC_RELEASE);
+    }
+    // Nonmirrored CPU-address images also exclude overlapping stale CPU material reuse. Only mirrored dirty
+    // images enter the write-back path; all CPU-address GPU owners participate in the authority overlap index.
+    if (!nvn_gpu_only(e->pub.addr)) own_add(e);
+}
+
 void vk_texture_gpu_written(const tex_t *t) {
     if (!t || !t->mem) return;
-    vk_exec_frame_written(t);
     lock();
-    Tex *e = entry_of(t);
+    TexKey key;
+    make_key(t, &key);
+    Tex *e = nvn_hm_get(&by_key, &key);
     if (e) {
-        make_fresh(e);   // a partial render keeps what the storage held before
-        content_image_forget(e);
-        uint64_t now = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
-        e->gw_frame = now;
-        if (e->scan_frame != now + 1 && nvn_gpu_only(e->key.addr)) {   // once per frame and entry
-            e->scan_frame = now + 1;
-            overwrite_others(e, now);
-        }
-        pool_gpu_owned(e);
-        e->pub.gpu_owned = 1;
-        e->chash_ok = 0;   // the image now holds the GPU's content: matching storage bytes no longer mean "unchanged"
-        e->upload_mapping = 0;
-        if (e->pub.skip) {   // texture detail leaves out what the GPU can write (detail_skip); said if it ever does
-            static volatile int32_t n_skip_written;
-            log_limited(&n_skip_written, "texture %#llx (fmt %#x %ux%u), made without its top %u levels, was written by "
-                        "the GPU: its levels are not the game's", (unsigned long long)e->pub.addr, e->t.d.format,
-                        e->t.d.width, e->t.d.height, e->pub.skip);
-        }
-        uint64_t f = vk_exec_recording_fence();
-        if (f > e->wr_fence) e->wr_fence = f;
-        if (e->pub.mirrored) {
-            e->gpu_dirty = 1;
-            storage_rewritten(e, 0, &e->gpu_gen);   // CPU writes up to here are older than this render
-            if (wb_exact < 0) wb_exact = cfg_bool("NX2NAVI_WB_EXACT");
-            if (wb_exact && !e->snap && e->t.L.size <= SNAP_MAX && fills_no_page(e) && !(e->snap = malloc(SNAP_MAX)))
-                rt_fatal("vk: out of memory for a texture's storage copy");
-            if (e->snap) memcpy(e->snap, (const void *)(uintptr_t)e->pub.addr, e->t.L.size);
-            e->gpu_seq = ++gpu_writes;
-            e->gpu_fence = vk_exec_recording_fence();
-            uint64_t fr = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
-            if (fr != e->run_frame || !e->run) {
-                e->run = fr == e->run_frame + 1 && e->run ? (uint8_t)(e->run < WB_RUN ? e->run + 1 : WB_RUN) : 1;
-                e->run_frame = fr;
-            }
-            wb_cfg_init();
-            if (wb_wanted(e)) __atomic_store_n(&small_pending, 1, __ATOMIC_RELEASE);
-            own_add(e);
-        }
+        gpu_written_prepared(e);
     }
     unlock();
 }
@@ -4952,6 +5161,7 @@ const VkTexImage *vk_texture_by_id_locked(int id, view_t *view, int *has_view) {
         // a released entry here is a finalized slot's own (stale_kept): the storage may be the game's to free or reuse
         if (e && !e->released && (!e->uploaded || e->checked != submit_epoch)) {
             if (!pool_deps_certificate(e)) make_fresh_snap(e);
+            if (tex_deferred) return NULL;
             e->checked = submit_epoch;
             touch(e);
         }
@@ -5103,6 +5313,13 @@ void vk_texture_new_submit(void) {
                (unsigned long long)material_stats.lookups, (unsigned long long)material_stats.hits,
                material_stats.copied_bytes / 1048576.0, material_stats.copy_ns / 1e6,
                material_stats.avoided_texels / 1e6, (unsigned long long)material_stats.collisions);
+        rt_log("tex-material: early %llu certificate %llu snapshot %.3f MiB refused %llu; COW %llu %.3f MiB; "
+               "physical %.3f MiB live %.3f MiB retained %.3f MiB retired %.3f MiB",
+               (unsigned long long)material_stats.early_hits, (unsigned long long)material_stats.certificate_hits,
+               material_stats.snapshot_bytes / 1048576.0, (unsigned long long)material_stats.snapshot_refused,
+               (unsigned long long)material_stats.cow, material_stats.cow_bytes / 1048576.0,
+               material_ledger.resident_bytes / 1048576.0, material_ledger.live_bytes / 1048576.0,
+               material_ledger.retained_bytes / 1048576.0, material_stats.retired_bytes / 1048576.0);
         memset(&material_stats, 0, sizeof material_stats);
         n_cap_drops = n_pressure_drops = n_commit_drops = n_commit_past = n_evict = n_evict_bytes = 0;
         n_commit_back = n_commit_held = 0;
@@ -5242,7 +5459,7 @@ static void texels_read_take(const Tex *e, const Region *g, const TexRead *t, ui
 
 // Image <-> caller rows through a staging buffer; the GPU copy is waited for.
 static int image_texels(Tex *e, const Region *g, const NVNcopyRegion *r, uint8_t *mem, int write) {
-    if (write) content_image_forget(e);
+    if (write) { e->material_writable = 1; content_write_begin(e, 1); content_image_forget(e); }
     static volatile int32_t n_astc, n_ds;
     VkCtx *c = vk_ctx();
     VkImageAspectFlags aspect;
@@ -5406,11 +5623,30 @@ typedef struct {
     TexRead t;
 } WbPart;
 
+// Validate every slice through the copy routine's own geometry checks, without touching storage. The empty box
+// at the requested bottom-right corner proves the complete nonempty box fits; zero rows execute no memory access.
+static int write_back_storage_valid(const tex_t *t, const Region *g, const NVNcopyRegion *r) {
+    uint64_t xend = (uint64_t)g->x0 + g->wb, yend = (uint64_t)g->y0 + g->hb;
+    if (xend > UINT32_MAX || yend > UINT32_MAX) return 0;
+    for (int z = 0; z < g->nz; z++) {
+        unsigned layer = g->is3d ? 0 : g->layer0 + (unsigned)r->zoffset + (unsigned)z;
+        uint32_t slice = g->is3d ? (uint32_t)(r->zoffset + z) : 0;
+        if (nvn_texels_box(&t->d, g->level, layer, (uint32_t)xend, (uint32_t)yend, slice, 0, 0,
+                          NULL, NULL, g->row, 1)) return 0;
+    }
+    return 1;
+}
+
 static void write_back_n(Tex **v, int n) {
+    if (n <= 0) return;
     int np = 0, cap = 0;
     WbPart *p = NULL;
+    struct WriteState { int first, count, failed; uint64_t mapping; } *state = calloc((size_t)n, sizeof *state);
+    if (!state) rt_fatal("vk: out of memory for texture write-back status");
     for (int i = 0; i < n; i++) {
         Tex *e = v[i];
+        state[i].first = np;
+        state[i].mapping = mem_mapping_serial();
         const nvn_texdesc *d = &e->t.d;
         int linear = nvn_tex_is_linear(d), is3d = d->target == NVN_TEXTURE_TARGET_3D;
         uint32_t levels = linear ? 1 : e->pub.levels + e->pub.skip, layers = linear || is3d ? 1 : e->pub.layers;
@@ -5426,20 +5662,39 @@ static void write_back_n(Tex **v, int n) {
                 q->r = (NVNcopyRegion){.width = (int)mip(d->width, lv),
                                        .height = d->target == 0 || d->target == 3 ? 1 : (int)mip(d->height, lv),
                                        .depth = is3d ? (int)mip(d->depth, lv) : 1};
-                if (region_of(&e->t, &vw, &q->r, 0, 0, &q->g) && texels_read_record(e, &q->g, &q->r, &q->t)) np++;
+                if (region_of(&e->t, &vw, &q->r, 0, 0, &q->g) && write_back_storage_valid(&e->t, &q->g, &q->r) &&
+                    texels_read_record(e, &q->g, &q->r, &q->t)) np++, state[i].count++;
+                else state[i].failed = 1;
             }
     }
     if (np) vk_upload_flush(1);
-    for (int i = 0; i < np; i++) {
-        WbPart *q = &p[i];
-        uint8_t *buf = malloc(q->g.img * (size_t)q->g.nz);
-        if (!buf) rt_fatal("vk: out of memory for a texture write-back");
-        texels_read_take(q->e, &q->g, &q->t, buf);
-        storage_texels(&q->e->t, &q->g, &q->r, buf, 1);
-        free(buf);
+    for (int i = 0; i < n; i++) {
+        Tex *e = v[i];
+        int held = !state[i].failed && state[i].count && mem_read_hold(e->pub.addr, e->t.L.size);
+        // Mapping changes while the GPU read-back ran mean these bytes no longer belong to this image. Keep the
+        // image authoritative and drain its staging without overwriting replacement memory or claiming success.
+        int copy = held && mem_mapping_range_unchanged(e->pub.addr, e->t.L.size, state[i].mapping);
+        for (int k = state[i].first, end = k + state[i].count; k < end; k++) {
+            WbPart *q = &p[k];
+            uint8_t *buf = malloc(q->g.img * (size_t)q->g.nz);
+            if (!buf) rt_fatal("vk: out of memory for a texture write-back");
+            texels_read_take(q->e, &q->g, &q->t, buf);
+            // All immutable layout checks passed before the first store, and the mapping is held across every
+            // slice. Failure here is an internal contradiction, not recoverable mapping churn.
+            if (copy && !storage_texels(&q->e->t, &q->g, &q->r, buf, 1))
+                rt_fatal("vk: validated texture write-back layout changed");
+            free(buf);
+        }
+        if (held) mem_read_release();
+        // Unlike a buffer mirror write-back, these bytes have changed only in guest memory. Stamp both CPU and
+        // texture consumers explicitly: this submission may already have consumed the operating system's bits.
+        if (copy) {
+            vk_guest_written(e->pub.addr, e->t.L.size);
+            e->gpu_dirty = 0;
+        }
     }
     free(p);
-    for (int i = 0; i < n; i++) v[i]->gpu_dirty = 0;
+    free(state);
 }
 
 // Mirrored textures overlapping [addr, addr+size) that the GPU wrote since their last write-back.
@@ -5462,13 +5717,35 @@ const VkTexImage *vk_texture_at_locked(const VkTexImage *img, VkFormat format) {
     return NULL;
 }
 
-// A storage image may be written by the shaders of the submission being recorded (texture lock held, vk_exec_draw.c
-// tex_info). Its storage is not marked GPU-owned: only the write fence for ReadTexels.
+// An actual storage-writing command was recorded against this already prepared image (texture lock held).
+// Binding or preparing a descriptor alone must not call this: deferred or failed draws have not written anything.
 void vk_texture_storage_bound_locked(const VkTexImage *img) {
     vk_dlaa_hud_write(img->image);
     Tex *e = (Tex *)img;   // pub is the first member
+    e->material_writable = 1;
+    content_image_forget(e);
+    e->chash_ok = 0;
+    e->upload_mapping = 0;
+    memset(&e->source_stamp, 0, sizeof e->source_stamp);
     uint64_t f = vk_exec_recording_fence();
     if (f > e->wr_fence) e->wr_fence = f;
+    // Preserve compute's existing CPU refresh/write-back policy. A dirty page cannot prove that the CPU replaced
+    // every texel the shader wrote. These mixed-authority images and their overlapping aliases stay outside the
+    // immutable source/material path until that finer ownership is represented explicitly.
+    if (!nvn_gpu_only(e->pub.addr)) own_add(e);
+}
+
+// A draw retains only value identifiers while preparing other bindings. A pool can retire its texture meanwhile;
+// never dereference a saved Tex pointer or transfer the old command's authority to a replacement at that address.
+void vk_texture_storage_written(VkImage image, uint64_t addr) {
+    if (!image) return;
+    lock();
+    for (Tex *e = nvn_hm_get(&by_addr, &addr); e; e = e->next_at) {
+        if (e->pub.image != image) continue;
+        vk_texture_storage_bound_locked(&e->pub);
+        break;
+    }
+    unlock();
 }
 
 uint64_t vk_texture_last_write(const tex_t *t) {
@@ -5939,9 +6216,11 @@ void vk_texture_census(VkTexCensus *s) {
             vmaGetAllocationInfo(c->vma, e->alloc, &ai);
             bytes = ai.size;
         }
-        if (e->released) s->released++, s->own_released += e->alloc != NULL, s->bytes_released += bytes;
-        else s->live++, s->own_live += e->alloc != NULL, s->bytes_live += bytes;
+        if (e->released) s->released++, s->own_released += e->alloc != NULL || e->material != NULL, s->bytes_released += bytes;
+        else s->live++, s->own_live += e->alloc != NULL || e->material != NULL, s->bytes_live += bytes;
     }
+    s->bytes_live += material_ledger.live_bytes;
+    s->bytes_released += material_ledger.retained_bytes;
     unlock();
 }
 
@@ -6068,6 +6347,7 @@ void vk_texture_shutdown(void) {
         if (by_key.vals[i]) list[n++] = by_key.vals[i];
     for (int i = 0; i < n; i++) drop_tex(list[i], DROP_SHUTDOWN);
     free(list);
+    content_shutdown();
     for (uint32_t i = 0; i < samplers.cap; i++)
         if (samplers.vals[i] && c) vkDestroySampler(c->device, (VkSampler)samplers.vals[i], NULL);
     free(by_key.keys), free(by_key.vals), free(by_addr.keys), free(by_addr.vals), free(samplers.keys), free(samplers.vals);
@@ -6093,7 +6373,7 @@ void vk_texture_shutdown(void) {
 // reuse keys, and the pool's texture and sampler slots. Counters, and a walk of at most 4096 sampler slots.
 void vk_texture_sizes(PerfSizes *s) {
     lock();
-    uint64_t imgs = by_key.n, rel = (uint64_t)nreleased, relb = rel_bytes, ret = (uint64_t)nretiring, retb = retiring_bytes,
+    uint64_t imgs = by_key.n, rel = (uint64_t)nreleased, relb = rel_bytes + material_ledger.retained_bytes, ret = (uint64_t)nretiring, retb = retiring_bytes,
              smp = samplers.n, reqs = img_reqs.n, hold = holds.n, reuse_keys = reuse.n, tslot = pool_slots, sslot = 0;
     for (int i = 0; i < nsslots; i++) sslot += sslots[i].used != 0;
     unlock();

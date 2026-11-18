@@ -445,6 +445,8 @@ typedef struct DrawCtx {
     VkWriteDescriptorSet bind_w[MAX_BINDINGS];   // bind_resources: write structs, packed descriptors, texel views
     VkDescSlot bind_d[MAX_DESC];
     VkBufferView bind_bv[MAX_DESC];
+    struct { VkImage image; uint64_t addr; } storage_writes[MAX_DESC];
+    uint32_t n_storage_writes;           // prepared write intents; consumed only after a command is emitted
     uint64_t prep_incarnation;
     PreparedBindings prep[PREP_N];
     PreparedBindings *prep_hot[PREP_N]; // logical watch slots; objects swap with the dormant directory
@@ -2363,9 +2365,9 @@ static int tex_info_full(VkExec *ex, const GfxShaderRes *r, uint64_t h, int stor
         // A shader that reads this binding's texels by position, or asks for its size, needs every level of the
         // texture where the game put it (gfx_shader.c reflect_exact): one made without its top levels is made again.
         if (img && img->skip && r->exact) img = vk_texture_exact_by_id_locked((int)(h & 0xfffff), &v, &hv);
+        if (img && storage && (r->flags & 4)) img = vk_texture_writable_locked(img);
         reduced = img && img->skip;
         if (img) view = get_view(ex, img, &v, hv, r->type, storage), *image = img->image;
-        if (img && storage) vk_texture_storage_bound_locked(img);
         if (img && !storage && ex->nfbl && in_fbl(ex, img->image)) layout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
         if (!storage && !separate) {
             // A depth texture sampled without a compare reads one texel on the Switch, whatever the sampler's filter:
@@ -4014,6 +4016,62 @@ static void write_set(const VkPipeInfo *info, uint32_t s, VkDescriptorSet set, c
     vkUpdateDescriptorSets(vk_ctx()->device, i1 - i0, w + i0, 0, NULL);
 }
 
+// A sampled descriptor and a storage descriptor can name the same logical texture. Establish writable ownership
+// first so neither a prepared packet nor a newly resolved sampled view can retain its former shared image while
+// the storage binding writes the detached image. Only actual image bindings resolve; ordinary sampled-only
+// pipelines do not acquire the texture lock or visit texture records here.
+static int prepare_storage_images(VkExec *ex, const VkPipeInfo *info) {
+    int locked = 0;
+    DrawCtx *cx = ex->dc;
+    cx->n_storage_writes = 0;
+    for (uint32_t i = 0; i < info->n_bindings; i++) {
+        const VkPipeBinding *b = &info->bindings[i];
+        if (b->kind != GFX_RES_IMG || b->type != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) continue;
+        const GfxShaderRes *r = b->res;
+        // Reflection's ImageStore flag covers both stores and image atomics. Read-only storage bindings do not
+        // acquire writable authority or detach immutable material merely because they use a storage descriptor.
+        if (!(r->flags & 4)) continue;
+        uint32_t count = b->count ? b->count : 1;
+        if (count > MAX_DESC) rt_fatal("vk: %u storage descriptors exceed the replay's %d", count, MAX_DESC);
+        int st = nvn_stage_of(b->stage);
+        for (uint32_t k = 0; k < count; k++) {
+            int64_t slot = (int64_t)r->slot + k;
+            uint64_t h = slot >= 0 && slot < 32 ? ex->img[st][slot] : 0;
+            if (!h) continue;
+            if (!locked) vk_texture_lock(), locked = 1;
+            view_t v;
+            int hv;
+            const VkTexImage *img = vk_texture_by_id_locked(NVN_HANDLE_TEX(h), &v, &hv);
+            if (img && img->skip && r->exact)
+                img = vk_texture_exact_by_id_locked(NVN_HANDLE_TEX(h), &v, &hv);
+            if (img) img = vk_texture_writable_locked(img);
+            if (vk_texture_deferred()) goto done;
+            if (!img || !get_view(ex, img, &v, hv, r->type, 1)) continue;
+            uint32_t j = 0;
+            for (; j < cx->n_storage_writes && cx->storage_writes[j].image != img->image; j++) {}
+            if (j != cx->n_storage_writes) continue;
+            if (j == MAX_DESC) rt_fatal("vk: too many writable storage images in one command");
+            cx->storage_writes[j].image = img->image;
+            cx->storage_writes[j].addr = img->addr;
+            cx->n_storage_writes++;
+        }
+    }
+done:
+    if (locked) vk_texture_unlock();
+    if (vk_texture_deferred()) cx->n_storage_writes = 0;
+    return !vk_texture_deferred();
+}
+
+// Run immediately after the Vulkan draw/dispatch is recorded. Preparation can fail or be retried, so it must not
+// claim GPU writes. Value tickets cannot accidentally mark a replacement texture after a pool was retired.
+static void storage_images_written(VkExec *ex) {
+    DrawCtx *cx = ex->dc;
+    uint32_t n = cx->n_storage_writes;
+    cx->n_storage_writes = 0;
+    for (uint32_t i = 0; i < n; i++)
+        vk_texture_storage_written(cx->storage_writes[i].image, cx->storage_writes[i].addr);
+}
+
 // Writes the pipeline's sets from the bound state: set 0, and set 1 with independent layouts. Each is pushed into the
 // command buffer, or allocated, written and bound. Prepared packets can retain allocated sets through interleaved
 // pipelines and command buffers in one submission. Graphics and compute track bound sets independently; unchanged
@@ -4028,6 +4086,11 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
     VkDescSlot *d = cx->bind_d;
     VkBufferView *bv = cx->bind_bv;
     if (info->n_bindings > MAX_BINDINGS) rt_fatal("vk: %u descriptor bindings exceed the replay's %d", info->n_bindings, MAX_BINDINGS);
+    if (!prepare_storage_images(ex, info)) {
+        cx->B.res_valid = 0;
+        PC_END(cx, prep_bind_start);
+        return;
+    }
     bind_stats(info);
     // This fullscreen draw binds the reconstructed scene view chosen during replay.
     // Resolve its descriptors here even if a packet was prepared against the guest view.
@@ -6178,8 +6241,10 @@ static int mfb_dispatch(VkExec *ex, const GfxShader *cs, int stage, VkBuffer rec
     ex->dc->mfb_stage = stage;
     bind_resources(ex, info);
     ex->dc->mfb_stage = 0;
+    if (vk_texture_deferred()) return 0;
     VkPassMark *m = dispatch_mark(ex, cs, 0, 0, 0);
     vkCmdDispatchIndirect(ex->cb, rec, at);
+    storage_images_written(ex);
     vk_pass_mark_end(ex->cb, m);
     ex->recorded++;
     return 1;
@@ -6250,6 +6315,7 @@ static void mfb_draw(VkExec *ex, uint32_t count, const VkMemSpan *ind) {
     if (!prepare_draw_ex(ex, prim, 0x7fffffff, 0, 2, 0)) return;
     vk_exec_frame.draws++;
     vkCmdDrawIndirect(ex->cb, rec, at + 32, 1, sizeof(VkDrawIndirectCommand));
+    storage_images_written(ex);
     ex->recorded++;
 }
 
@@ -6276,6 +6342,7 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d) {
     mesh_shading_rate(ex);
     int q = vk_dump_armed ? vk_dump_mesh_begin(ex) : -1;
     rec_draw_mesh(fn, ex->cb, d->count, 1, 1);
+    storage_images_written(ex);
     ex->recorded++;
     vk_dump_mesh_end(ex, q);
 }
@@ -6450,6 +6517,7 @@ static void op_draw_mesh_ind(VkExec *ex, const p_draw_mesh_ind *d) {
     mesh_shading_rate(ex);
     int q = vk_dump_armed ? vk_dump_mesh_begin(ex) : -1;
     rec_draw_mesh_ind(fn, ex->cb, mesh_ring, at, 1, 12);
+    storage_images_written(ex);
     ex->recorded++;
     vk_dump_mesh_end(ex, q);
     vk_mem_count(ip.cls, VK_MUSE_IND, 4);
@@ -6491,6 +6559,7 @@ static void op_draw(VkExec *ex, const p_draw *d) {
     } else {
         vkCmdDraw(ex->cb, n, inst, first, (uint32_t)d->base_instance);
     }
+    storage_images_written(ex);
     if (ex->tonemap_extent.width) ex->tonemap_drawn = 1;
     ex->recorded++;
 }
@@ -6549,6 +6618,7 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
     }
     vkCmdDrawIndexed(ex->cb, (uint32_t)d->count, d->instances > 0 ? (uint32_t)d->instances : 1, 0, d->base_vertex,
                      (uint32_t)d->base_instance);
+    storage_images_written(ex);
     ex->recorded++;
     if (ex->tonemap_extent.width) ex->tonemap_drawn = 1;
     if (RT_V111) shield_capture(ex,d);
@@ -6573,6 +6643,7 @@ static void op_draw_idx_ind(VkExec *ex, const p_draw_idx_ind *d) {
     VK_MEM_USE(ib);
     vkCmdBindIndexBuffer(ex->cb, ib.buffer, ib.offset, d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
     vkCmdDrawIndexedIndirect(ex->cb, ip.buffer, ip.offset, 1, sizeof(VkDrawIndexedIndirectCommand));
+    storage_images_written(ex);
     if (ex->tonemap_extent.width) ex->tonemap_drawn = 1;
     ex->recorded += 2;
     vk_mem_count(ip.cls, VK_MUSE_IND, sizeof(VkDrawIndexedIndirectCommand));
@@ -6775,6 +6846,8 @@ static int aa_dispatch(VkExec *ex, int x, int y, int z) {
         if (!t || (t->format != VK_FORMAT_B10G11R11_UFLOAT_PACK32 && t->format != VK_FORMAT_E5B9G9R9_UFLOAT_PACK32) ||
             t->type != VK_IMAGE_TYPE_2D || t->samples != 1)
             continue;
+        t = vk_texture_writable_locked(t);
+        if (!t) break;
         dst = t;
         if (storage_view_format(t, &v, hv) == VK_FORMAT_R32_UINT) dv = get_view(ex, t, &v, hv, 3, 1);   // 3: Texture2D
     }
@@ -6791,7 +6864,8 @@ static int aa_dispatch(VkExec *ex, int x, int y, int z) {
         sv = get_view(ex, t, &nv, 0, 3, 0);
     }
     uint32_t w = dst ? dst->width : 0, hh = dst ? dst->height : 0;
-    if (dv && sv) vk_texture_storage_bound_locked(dst);   // the GPU writes it below, as the game's pass would have
+    VkImage dst_image = dst ? dst->image : VK_NULL_HANDLE;
+    uint64_t dst_addr = dst ? dst->addr : 0;
     // Left to the game, once logged. Expected while an area loads: the target is then the RGB9E5 image at the same
     // memory, made without storage use, which the game's own pass cannot write either.
     static int told;
@@ -6807,6 +6881,7 @@ static int aa_dispatch(VkExec *ex, int x, int y, int z) {
         RWT_CALL(RWT_STAGE_STATE, vk_exec_barrier_dispatch(ex));   // ends the pass; the composite's writes are visible
         ok = vk_aa_record(ex->cb, mode, sv, dv, w, hh);
         if (ok) {
+            vk_texture_storage_written(dst_image, dst_addr);
             compute_bindings_disturbed(ex->dc);
             ex->recorded++;
             vk_exec_barrier(ex);
@@ -6850,6 +6925,9 @@ static void untranslated_dispatch_fallback(VkExec *ex) {
             (!dst || (uint64_t)t->width * t->height > (uint64_t)dst->width * dst->height))
             dst = t;
     }
+    // Distinct logical textures may share immutable contents. Detach the destination before physical-image
+    // comparisons, otherwise equal contents could be mistaken for an in-place dispatch and skipped entirely.
+    if (dst) dst = vk_texture_writable_locked(dst);
     out = dst;
     for (int i = 0; dst && i < 128; i++) {   // an in-place pass (its output also sampled) is left alone
         uint64_t h = ex->tex[NVN_STAGE_CS][i];
@@ -6873,8 +6951,7 @@ static void untranslated_dispatch_fallback(VkExec *ex) {
             (!src || (uint64_t)t->width * t->height > (uint64_t)src->width * src->height))
             src = t;
     }
-    if (dst && src) vk_texture_storage_bound_locked(dst);
-    else if (knob_log_cs_binds()) log_fallback_skip_locked(ex, out, in_place);
+    if ((!dst || !src) && knob_log_cs_binds()) log_fallback_skip_locked(ex, out, in_place);
     if (dst && src && knob_log_cs_binds()) {   // each distinct (program, source, target) once, 256 at most
         static struct { uint64_t prog, s, d; } seen[256];
         static int n;
@@ -6890,6 +6967,7 @@ static void untranslated_dispatch_fallback(VkExec *ex) {
         }
     }
     VkImage si = src ? src->image : VK_NULL_HANDLE, di = dst ? dst->image : VK_NULL_HANDLE;
+    uint64_t dst_addr = dst ? dst->addr : 0;
     VkFormat sf = src ? src->format : VK_FORMAT_UNDEFINED;
     if (src && dst && fallback_9e5_scene(sf, dst->format)) {   // the image the post pass wrote this frame (raw_9e5_twin)
         const VkTexImage *twin = raw_9e5_twin(src);
@@ -6906,8 +6984,11 @@ static void untranslated_dispatch_fallback(VkExec *ex) {
     uint32_t sw = src ? src->width : 0, sh = src ? src->height : 0, dw = dst ? dst->width : 0, dh = dst ? dst->height : 0;
     VkFormat df = dst ? dst->format : VK_FORMAT_UNDEFINED;
     vk_texture_unlock();
-    if (!si || !di) return;
-    if (packed_scene && vk_dlaa_scene_upscale(ex, sw, sh, dst)) return;
+    if (vk_texture_deferred() || !si || !di) return;
+    if (packed_scene && vk_dlaa_scene_upscale(ex, sw, sh, dst)) {
+        vk_texture_storage_written(di, dst_addr);
+        return;
+    }
     static int logged;
     if (!logged++) rt_log("vk_exec: untranslated compute dispatch: its output image (%ux%u) gets a linear blit of its "
                           "largest input (%ux%u) instead (NX2NAVI_CS_FALLBACK=0 turns this off)", dw, dh, sw, sh);
@@ -6990,6 +7071,7 @@ static void untranslated_dispatch_fallback(VkExec *ex) {
                           .extent = {dw, dh, 1}};
         vkCmdCopyImage(ex->cb, scratch, VK_IMAGE_LAYOUT_GENERAL, di, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
     }
+    vk_texture_storage_written(di, dst_addr);
     ex->recorded++;
     vk_exec_barrier(ex);
 }
@@ -7003,6 +7085,7 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     cb_res(ex);
     dummies_init();
     if (aa_dispatch(ex, d->x, d->y, d->z)) return;   // the game's SMAA left out or replaced (vk_aa.c)
+    if (vk_texture_deferred()) return;
     // A tensor-core program runs the stand-in while NX2NAVI_NATIVE_TENSOR is off, so ask that before translating it.
     // Translating it anyway recorded four AI-upscaler compute shaders of 0.87-4.4M SPIR-V words that this game never
     // dispatches natively, and building them cost gigabytes of memory at boot (NX2NAVI_LIB_PREBUILD_BIG, bg_main).
@@ -7046,6 +7129,7 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     if (vk_texture_deferred()) return;   // past a parallel group: the op goes again once it is done (vk_exec.c op_again)
     VkPassMark *m = dispatch_mark(ex, cs, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
     vkCmdDispatch(ex->cb, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
+    storage_images_written(ex);
     vk_pass_mark_end(ex->cb, m);
     ex->recorded++;
     if (vk_dump_armed) vk_dump_dispatch(ex, cs, p, info, d);
@@ -7062,6 +7146,7 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
     cb_res(ex);
     dummies_init();
     if (aa_dispatch(ex, 0, 0, 0)) return;   // as in op_dispatch
+    if (vk_texture_deferred()) return;
     if (!native_tensor(ex)) { untranslated_dispatch_fallback(ex); return; }   // as in op_dispatch: never translate it
     int present;
     const GfxShader *cs = RWT_CALL(RWT_STAGE_SHADER, shader_for(ex, NVN_STAGE_CS, &present, NULL, 0));
@@ -7099,6 +7184,7 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
     }
     VkPassMark *m = dispatch_mark(ex, cs, 0, 0, 0);
     vkCmdDispatchIndirect(ex->cb, ip.buffer, ip.offset);
+    storage_images_written(ex);
     vk_pass_mark_end(ex->cb, m);
     ex->recorded++;
     vk_mem_count(ip.cls, VK_MUSE_IND, sizeof(VkDispatchIndirectCommand));
