@@ -50,7 +50,7 @@
 #include "prp_file.h"
 #include "spirv_water.h"
 #include "tex.h"
-#include "vk_build_gate.h"
+#include "resource_budget.h"
 #include "vk_cache_file.h"
 #include "vk_save_retry.h"
 #include "vk_warm_progress.h"
@@ -4160,13 +4160,14 @@ static void lib_worker(void *arg) {
     }
 }
 
-// ---- the memory gate of the background builds (vk_build_gate.h)
+// ---- coordinated commit admission of background builds (resource_budget.h)
 // Every pipeline built ahead of its first use passes here before it starts: the recorded pipelines the boot builds
 // (warm_builder), the pool's low queue during play (pipe_worker: the rest of the recorded pipelines and the optimised
 // builds behind a fast link), the compute pipelines and stage libraries of the boot (lb_worker), the library warm
 // (lw_worker) and the large compute shaders (bg_main). A build a draw or a dispatch waits for never does: it is needed
 // now.
-// NX2NAVI_BUILD_FREE_MB (default 4096; 0 no check): the system commit headroom that stays free of them.
+// NX2NAVI_BUILD_FREE_MB (default 4096; 0 no check): minimum commit headroom. The effective margin is also
+// at least the texture-pressure floor, so optional builds cannot compete with textures already giving way.
 // NX2NAVI_BUILD_RESERVE_MB (default 64): what one build under way is taken to cost the driver's compiler while it
 // runs; a large compute shader reserves GATE_BIG_MB. A build starts only when the headroom holds the part kept free,
 // the reservations of the builds under way and its own.
@@ -4174,41 +4175,60 @@ static void lib_worker(void *arg) {
 // recorded pipelines on 16 threads raised the process commit by 3,054 MB in 2.2 s, and the 4,066 compute pipelines and
 // libraries after them, together with the game's own start, by another 9,824 MB. A device was lost on that machine
 // at 56,673 of 65,531 MB system commit right after such a prebuild.
-// The commit is read at most every GATE_SAMPLE_MS: sixteen builders finishing a cached pipeline every half millisecond
-// would otherwise ask the system thousands of times a second. What the builds took since the last reading is covered
-// by their reservations.
+// The commit is normally read every GATE_SAMPLE_MS: sixteen builders finishing a cached pipeline every half millisecond
+// would otherwise ask the system thousands of times a second. Active reservations and completed estimates cover the
+// work since that reading. Before completed estimates can refuse work, a fresh reading replaces those estimates:
+// cache hits can finish hundreds of builds without retaining anything close to their peak compiler reservations.
 #define GATE_BIG_MB 4096.0
 #define GATE_SAMPLE_MS 100.0
 #define GATE_WAIT_MS 30000.0   // how long a boot or warm builder waits for room before it leaves the rest to their first use
 static struct {
     PlatMutex lock;
-    BuildGate g;
-    double est, used, limit, at;
+    ResourceBudget g;
+    double est, used, limit, at, configured_free, texture_free;
     int init;
     int off;   // a preparation run (seed_pipelines): nothing is refused, there is no game to keep room for
     uint64_t refused;
 } GATE = {.lock = PLAT_MUTEX_INIT};
 
-// 1 when a build estimated at est MB may start, and then est is reserved until gate_leave. est 0: an ordinary build
+// 1 when a build estimated at est MB may start. gate_leave settles its reservation until the next fresh usage sample.
+// est 0: an ordinary build
 // (NX2NAVI_BUILD_RESERVE_MB), whose estimate *took returns for gate_leave.
 static int gate_enter(double est, double *took) {
     plat_mutex_lock(&GATE.lock);
     if (!GATE.init) {
         GATE.init = 1;
-        GATE.g.free_mb = strtod(cfg_value("NX2NAVI_BUILD_FREE_MB"), NULL);
+        GATE.configured_free = strtod(cfg_value("NX2NAVI_BUILD_FREE_MB"), NULL);
+        const char *texture = cfg_get("NX2NAVI_TEX_COMMIT_FREE_MB");
+        GATE.texture_free = texture && *texture ? (double)atoll(texture) : -1;
+        if (GATE.texture_free < -1) GATE.texture_free = -1;
+        if (!plat_commit_enforced()) GATE.texture_free = 0;
         GATE.est = strtod(cfg_value("NX2NAVI_BUILD_RESERVE_MB"), NULL);
         if (GATE.est < 0) GATE.est = 0;
         GATE.at = -GATE_SAMPLE_MS;
     }
-    if (GATE.off) GATE.g.free_mb = 0;
     double now = now_ms();
     if (now - GATE.at >= GATE_SAMPLE_MS) {
         double proc;
         plat_commit_info(&proc, &GATE.used, &GATE.limit);
         GATE.at = now;
+        resource_budget_sample(&GATE.g);
     }
+    GATE.g.active.free_mb = GATE.off ? 0 :
+        resource_build_headroom_mb(GATE.limit, GATE.configured_free, GATE.texture_free);
     if (est <= 0) est = GATE.est;
-    int ok = build_gate_enter(&GATE.g, GATE.used, GATE.limit, est);
+    int ok = resource_budget_enter(&GATE.g, GATE.used, GATE.limit, est);
+    if (!ok && GATE.g.completed_mb > 0) {
+        // A failed admission reserved nothing. Keep the lock across sampling and debt settlement so another
+        // compiler cannot complete between them; active compiler reservations survive the fresh sample.
+        double proc;
+        plat_commit_info(&proc, &GATE.used, &GATE.limit);
+        GATE.at = now_ms();
+        resource_budget_sample(&GATE.g);
+        GATE.g.active.free_mb = GATE.off ? 0 :
+            resource_build_headroom_mb(GATE.limit, GATE.configured_free, GATE.texture_free);
+        ok = resource_budget_enter(&GATE.g, GATE.used, GATE.limit, est);
+    }
     if (!ok) GATE.refused++;
     plat_mutex_unlock(&GATE.lock);
     if (took) *took = est;
@@ -4217,16 +4237,16 @@ static int gate_enter(double est, double *took) {
 
 static void gate_leave(double est) {
     plat_mutex_lock(&GATE.lock);
-    build_gate_leave(&GATE.g, est);
+    resource_budget_leave(&GATE.g, est);
     plat_mutex_unlock(&GATE.lock);
 }
 
 // The gate's numbers for a log line that says why a builder stopped or waits.
 static const char *gate_text(char *buf, size_t n) {
     plat_mutex_lock(&GATE.lock);
-    snprintf(buf, n, "system commit %.0f of %.0f MB, %.0f MB reserved for builds under way, %.0f MB kept free "
-                     "(NX2NAVI_BUILD_FREE_MB), %.0f MB a build (NX2NAVI_BUILD_RESERVE_MB)", GATE.used, GATE.limit,
-             GATE.g.reserved_mb, GATE.g.free_mb, GATE.est);
+    snprintf(buf, n, "system commit %.0f of %.0f MB, %.0f MB active reservations, %.0f MB completed since sample, "
+                     "%.0f MB coordinated headroom, %.0f MB per build", GATE.used, GATE.limit,
+             GATE.g.active.reserved_mb, GATE.g.completed_mb, GATE.g.active.free_mb, GATE.est);
     plat_mutex_unlock(&GATE.lock);
     return buf;
 }
@@ -4256,16 +4276,16 @@ int vk_pipeline_probe_buildgate(void) {
     double took = 0, big = 0;
     int fails = 0, in = 0, want = 0;
     int first = gate_enter(0, &took);
-    double free_mb = GATE.g.free_mb, used = GATE.used, limit = GATE.limit, est = took;
+    double free_mb = GATE.g.active.free_mb, used = GATE.used, limit = GATE.limit, est = took;
     if (first) gate_leave(took);
-    printf("probe-buildgate: system commit %.0f of %.0f MB, %.0f MB kept free (NX2NAVI_BUILD_FREE_MB), %.0f MB a build "
+    printf("probe-buildgate: system commit %.0f of %.0f MB, %.0f MB coordinated headroom, %.0f MB a build "
            "(NX2NAVI_BUILD_RESERVE_MB)\n", used, limit, free_mb, est);
-    double room = limit - used - free_mb;
+    double room = limit - used - free_mb - GATE.g.completed_mb;
     for (int i = 0; i < 16; i++) {
         want += free_mb <= 0 || limit < 0 || room - i * est >= est;   // the commit sample stays for GATE_SAMPLE_MS
         in += gate_enter(0, &took);
     }
-    double reserved = GATE.g.reserved_mb;
+    double reserved = GATE.g.active.reserved_mb;
     int big_in = gate_enter(GATE_BIG_MB, &big);
     int big_want = free_mb <= 0 || limit < 0 || room - reserved >= GATE_BIG_MB;
     printf("probe-buildgate: %d of 16 ordinary builds admitted (%d fit), %.0f MB reserved; a large compute build beside "
@@ -4275,14 +4295,14 @@ int vk_pipeline_probe_buildgate(void) {
     if (big_in != big_want) fails++, printf("probe-buildgate: FAIL: the large build was %s\n", big_in ? "admitted" : "refused");
     if (big_in) gate_leave(big);
     for (int i = 0; i < in; i++) gate_leave(est);
-    if (GATE.g.reserved_mb != 0) fails++, printf("probe-buildgate: FAIL: %.0f MB still reserved\n", GATE.g.reserved_mb);
+    if (GATE.g.active.reserved_mb != 0) fails++, printf("probe-buildgate: FAIL: %.0f MB still reserved\n", GATE.g.active.reserved_mb);
     volatile int32_t stop = 1;
     double t0 = now_ms();
     int got = gate_wait("probe", &stop, &took);
     if (got) gate_leave(took);
-    if (got != first || now_ms() - t0 > 1000)
+    if ((free_mb <= 0 && !got) || (limit >= 0 && free_mb > limit && got) || now_ms() - t0 > 1000)
         fails++, printf("probe-buildgate: FAIL: a stopped builder's wait gave %d after %.0f ms\n", got, now_ms() - t0);
-    printf("probe-buildgate: an ordinary build is %s now; %s\n", first ? "admitted" : "refused", fails ? "FAILED" : "passed");
+    printf("probe-buildgate: an ordinary build is %s now; %s\n", got ? "admitted" : "refused", fails ? "FAILED" : "passed");
     return fails ? 1 : 0;
 }
 

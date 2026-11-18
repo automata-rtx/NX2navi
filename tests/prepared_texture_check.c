@@ -2,12 +2,29 @@
 #define main binding_fixture_main
 #include "prepared_bindings_check.c"
 #undef main
+#include "texture_resource.h"
 
 static uint64_t texture_tokens[3], texture_views[3];
 static int texture_locked, texture_mutate_lookup, texture_mutate_lock, texture_refresh_defer, texture_refresh_mutate;
 static int texture_full_defer;
 #define texture_defer test_deferred
 static unsigned texture_mismatches, texture_lookups;
+static VkTexImage sample_image;
+static VkTextureSampleStatus sample_status = VK_TEXTURE_SAMPLE_FALLBACK;
+static unsigned sample_queries, sample_prepares, sample_uses;
+VkTextureSampleStatus vk_texture_sample_query_locked(int id, VkTextureSample *out) {
+    assert(texture_locked && id > 0); sample_queries++;
+    out->image = &sample_image;
+    return sample_status;
+}
+VkTextureSampleStatus vk_texture_sample_prepare_locked(int id, VkTextureSample *out) {
+    assert(texture_locked && id > 0); sample_prepares++;
+    out->image = &sample_image;
+    return VK_TEXTURE_SAMPLE_READY;
+}
+void vk_texture_sample_use_locked(const VkTextureSample *sample) {
+    assert(texture_locked && sample->image == &sample_image); sample_uses++;
+}
 
 static uint64_t bt_now(void) { return 0; }
 static uint64_t token_of(uint64_t h) { assert(h < 3); return texture_tokens[h]; }
@@ -32,10 +49,11 @@ const VkTexImage *vk_texture_by_id_locked(int id, view_t *v, int *have) {
         texture_refresh_mutate=0;
         test_textures++; texture_tokens[id]++; texture_views[id]++;
     }
-    return NULL;
+    return &sample_image;
 }
 static int tex_info_full(VkExec *ex, const GfxShaderRes *r, uint64_t h, int storage, int separate,
-                         VkDescriptorImageInfo *out, VkImage *image) {
+                         VkDescriptorImageInfo *out, VkImage *image, int demanded) {
+    assert(demanded);
     (void)ex; (void)r; (void)storage; (void)separate;
     assert(texture_locked && h > 0 && h < 3); texture_lookups++;
     if (texture_full_defer) texture_defer=1;
@@ -121,6 +139,26 @@ int main(void) {
     vk_texture_lock(); actual_tex_info_lookup(&ex,&texture,1,0,0,&out,&image); vk_texture_unlock();
     test_td=1;
     assert(texture_lookups==5 && (uintptr_t)out.imageView==texture_views[1]);
+    // The integration consumes ready data without preparation, prepares exactly once when requested,
+    // and records use only after a successful result. Special ordered images bypass this API.
+    vk_texture_lock();
+    sample_status=VK_TEXTURE_SAMPLE_READY;
+    sample_queries=sample_prepares=sample_uses=0;
+    assert(sampled_resource(&ex,&texture,1,0,NULL,NULL)==&sample_image);
+    assert(sample_queries==1 && sample_prepares==0 && sample_uses==1);
+    sample_status=VK_TEXTURE_SAMPLE_PREPARE;
+    assert(sampled_resource(&ex,&texture,1,0,NULL,NULL)==&sample_image);
+    assert(sample_prepares==1 && sample_uses==2);
+    sample_status=VK_TEXTURE_SAMPLE_UNAVAILABLE;
+    assert(!sampled_resource(&ex,&texture,1,0,NULL,NULL));
+    assert(sample_uses==2);
+    sample_status=VK_TEXTURE_SAMPLE_DEFERRED;
+    assert(!sampled_resource(&ex,&texture,1,0,NULL,NULL));
+    assert(sample_uses==2);
+    unsigned queried=sample_queries;
+    assert(sampled_resource(&ex,&texture,1,1,NULL,NULL)==&sample_image);
+    assert(sample_queries==queried);
+    vk_texture_unlock();
     context_free(cx); free(recipe);
     puts("prepared_texture: per-member invalidation, lock transitions, shared memo refresh and deferred retry passed");
     return 0;

@@ -3,6 +3,7 @@
 #include <stdio.h>
 
 #include "vk_build_gate.h"
+#include "resource_budget.h"
 
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fails++; printf("FAIL line %d: ", __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
@@ -59,6 +60,46 @@ int main(void) {
     // More leaves than enters never leave a negative reservation behind, which would admit builds for nothing.
     build_gate_leave(&g, est);
     CHECK(g.reserved_mb == 0, "reserved %.0f MB after a leave too many", g.reserved_mb);
+
+    // Speculative work shares the texture-pressure floor, including explicit overrides and gate-off behavior.
+    CHECK(resource_commit_headroom_mb(32768, -1) == 4096, "small-system automatic floor");
+    CHECK(resource_commit_headroom_mb(60000, -1) == 6000, "large-system automatic floor");
+    CHECK(resource_commit_headroom_mb(60000, 0) == 0, "explicit texture floor disable");
+    CHECK(resource_commit_headroom_mb(60000, 8192) == 8192, "explicit texture floor");
+    CHECK(resource_build_headroom_mb(60000, 4096, -1) == 6000, "builds must stop before texture pressure");
+    CHECK(resource_build_headroom_mb(60000, 8192, -1) == 8192, "larger build margin must survive");
+    CHECK(resource_build_headroom_mb(60000, 4096, 0) == 4096, "texture disable must retain build floor");
+    CHECK(resource_build_headroom_mb(60000, 0, -1) == 0, "explicit build gate disable");
+
+    // Two estimates fit. Completing both before a new sample must not admit an unlimited stream of builds using
+    // the old room: the retained results have not yet reached that sample. A measured release restores capacity.
+    ResourceBudget b = {.active = {.free_mb = 6000}};
+    const double b_limit = 60000, b_used = b_limit - b.active.free_mb - 128;
+    CHECK(resource_budget_enter(&b, b_used, b_limit, 64), "first bounded build refused");
+    CHECK(resource_budget_enter(&b, b_used, b_limit, 64), "second bounded build refused");
+    resource_budget_leave(&b, 64);
+    CHECK(b.active.reserved_mb == 64 && b.completed_mb == 64, "completion did not retain the estimate");
+    CHECK(!resource_budget_enter(&b, b_used, b_limit, 64), "completed build reused stale headroom");
+    resource_budget_leave(&b, 64);
+    CHECK(!resource_budget_enter(&b, b_used, b_limit, 64), "serial completions bypassed the gate");
+    resource_budget_sample(&b);
+    CHECK(b.completed_mb == 0, "fresh sample retained settled debt");
+    CHECK(!resource_budget_enter(&b, b_used + 128, b_limit, 64), "measured retained results ignored");
+    CHECK(resource_budget_enter(&b, b_used, b_limit, 64), "measured free capacity did not return");
+
+    // Refreshing usage must not cancel reservations of compilers still working. Completion then carries the
+    // estimate only to the next sample; even a duplicate completion cannot invent additional pending debt.
+    resource_budget_sample(&b);
+    CHECK(b.active.reserved_mb == 64, "fresh sample dropped a live compiler reservation");
+    resource_budget_leave(&b, 64);
+    resource_budget_leave(&b, 64);
+    CHECK(b.completed_mb == 64 && b.active.reserved_mb == 0, "duplicate completion invented debt");
+    resource_budget_sample(&b);
+    CHECK(b.completed_mb == 0, "debt persisted beyond its next sample");
+    CHECK(resource_budget_enter(&b, 1e9, -1, 64), "unknown system limit blocked progress");
+    resource_budget_leave(&b, 64);
+    b.active.free_mb = 0;
+    CHECK(resource_budget_enter(&b, 1e9, b_limit, 64), "disabled gate blocked preparation");
 
     printf("build_gate_check: %s\n", fails ? "FAILED" : "passed");
     return fails ? 1 : 0;

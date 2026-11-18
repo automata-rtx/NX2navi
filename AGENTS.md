@@ -34,7 +34,7 @@ The repository's additions are all rights reserved (`LICENSE-ADDITIONS`). It nev
 
 ## Fork releases
 
-The public name is `2NX2Navi`. Set `VERSION` to `Beta N` for a confirmed baseline. Label each unconfirmed candidate `Beta N - WIP M`, incrementing M for each candidate built against that baseline. Advance N only after confirmation.
+The public name is `2NX2Navi`. Resource-path development uses branch `NEXT` and `VERSION` labels `NEXT - N`, starting at `NEXT - 0`. Increment N for each subsequent candidate iteration; the spaces and hyphen are part of the label. Legacy remains the comparison baseline. This convention supersedes Beta/WIP numbering for this development line.
 
 ## Writing
 

@@ -17,7 +17,31 @@ static uint32_t snap_at[8], reg_max[8], reg_last[8], reg_tried[8], gen_now, ww_e
 static uint8_t snap_untracked[8];
 static uint64_t snap_protection[8], snap_mapping[8], gen_pages[8], n_snap_calls;
 static int dependency_watch = 1, freeze_idle, nfcand, cfcand;
-static uint32_t *fcand;
+typedef struct { uint32_t region, idle; } FreezeCandidate;
+static FreezeCandidate *fcand;
+typedef struct { uint32_t first, last, scan_ns; } TextureScanCost;
+static TextureScanCost texture_cost[SNAP_REGIONS];
+enum { TEXTURE_MIN_IDLE = 96, TEXTURE_HISTORY_GAP = 24, TEXTURE_MIN_COST_NS = 16000,
+       TEXTURE_MAX_COST_NS = 128000, TEXTURE_MAX_SAMPLE_NS = 4000 };
+static uint32_t texture_freeze_ns = 32000, texture_empty_epoch[SNAP_REGIONS];
+static uint8_t texture_queued[SNAP_REGIONS];
+static uint64_t texture_offers, ww_ticks;
+// Optional scheduling hints remain disabled: these tests exercise authoritative invalidation.
+static uint32_t *clean_attempt;
+static void clean_observe(uint32_t lo, uint32_t hi, int zero, uint64_t ns, uint64_t p, uint64_t m) {
+    (void)lo; (void)hi; (void)zero; (void)ns; (void)p; (void)m;
+    assert(!"optional scheduling hint unexpectedly enabled");
+}
+#ifdef _WIN32
+typedef struct { uint64_t lo, hi; } EmptySpan;
+static EmptySpan empty_spans[16];
+static int snapshot_pair_enabled;
+static int peek_large_snapshot(uint64_t a, uint64_t b) {
+    (void)a; (void)b;
+    assert(!"optional large snapshot hint unexpectedly enabled");
+    return 0;
+}
+#endif
 static unsigned queries, notifications, race, untracked;
 static int observer_race;
 static void transition(unsigned r, unsigned value);

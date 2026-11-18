@@ -19,6 +19,8 @@
 #include "cfg.h"
 #include "flight.h"
 #include "fresh_deps.h"
+#include "resource_budget.h"
+#include "texture_resource.h"
 #include "gfx.h"
 #include "host.h"
 #include "nvn_api.h"
@@ -126,6 +128,7 @@ typedef struct {
     uint32_t cepoch;
     view_t cview;
     uint8_t chas_view, used, has_view, finalized;   // finalized survives eviction of the released Tex entry
+    uint8_t sample_owned;         // ce was published by explicit sampled preparation under cgen
     uint8_t cheld;                // ce is NULL as the texture was evicted by disuse, valid while cgen is (held_out)
     uint8_t cwant;                // a shader sampled its stand-in (vk_pool_marks_read): slot_resolve makes it at once
     uint64_t khash;               // hash of the descriptor key and view, 0 for CPU-written textures (vk_texture_slot_khash_locked)
@@ -200,6 +203,10 @@ static uint32_t tex_gen = 1;
 // Bumped with tex_gen and whenever a slot is registered: what vk_texture_by_id returns for any slot may have changed.
 static uint32_t slots_gen = 1;
 static uint32_t samp_gen = 1;   // bumped whenever a sampler slot is registered: vk_sampler_by_id may answer otherwise
+static struct {
+    uint64_t queries, ready, prepared, deferred, unavailable, fallback, used;
+    uint64_t dependency_detach, live_visits, avoided_visits;
+} resource_path;
 static uint64_t n_checks;    // draw-binding storage checks (make_fresh_snap) since the last perf line
 // tex_gen per storage address (hashed): a slot resolves through the entries at its own address only (slot_resolve), so
 // a slot's resolution stays valid while its address's generation does. NX2navi finalizes and initializes transient
@@ -1610,90 +1617,151 @@ static void pool_watch_storage(PEnt *p) {
     if (!p->dep) rt_fatal("vk: out of memory for texture dependency links");
 }
 
-// The entries the pool's slots hold: for each, how many slots' last fill resolved to it (vk_exec_draw.c pool_hold; a fill
-// that shared another slot's lookup counts for the entry that lookup found). The walk over every slot looked each slot
-// up in each submission, which left its entry's use stamp (touch): the idle clock reads it, and start_at's alias rule
-// reads the frame of an entry with GPU content. The check by list is no lookup, so it leaves the stamps from these
-// counts (pool_touch): in each submission for the GPU-owned entries, in turn for the others, each once in
-// POOL_TOUCH_DIV submissions (IDLE_ROUNDS is 240 of them). An entry keeps its place until it is destroyed and no slot
-// holds it any more: a destroyed one is refilled out of its slots by the bump of its bucket.
+// Only entries held by a descriptor pool participate in recurring freshness and use tracking. Retained images
+// without pool users remain in the resource cache, but own no dependency node or active-list traversal cost.
 #define POOL_TOUCH_DIV 64
-typedef struct { Tex *e; uint32_t refs; int next; uint8_t gown; } PRef;   // e NULL: destroyed, or free (refs 0, next)
+// RESOURCE_MEMBERSHIP_BEGIN: the host fixture compiles these production transitions with controlled resources.
+typedef struct {
+    Tex *e;
+    uint32_t refs;
+    int next;
+    uint32_t active_prev, active_next;
+    uint8_t gown, active;
+} PRef;
 static PRef *pref;
-static int npref, cpref, pref_free;   // pref_free: 1 + the first free place
+static int npref, cpref, pref_free;
+static struct { uint32_t head, cursor, count; } pool_active[2];
 static void touch(Tex *e);
+static void pool_list(Tex *e);
+
+static void pool_active_add(uint32_t id) {
+    PRef *q = &pref[id - 1];
+    if (q->active || !q->refs || !q->e) return;
+    unsigned kind = q->gown != 0;
+    q->active_next = pool_active[kind].head;
+    q->active_prev = 0;
+    if (q->active_next) pref[q->active_next - 1].active_prev = id;
+    pool_active[kind].head = id;
+    pool_active[kind].count++;
+    q->active = 1;
+}
+
+static void pool_active_remove(uint32_t id) {
+    PRef *q = &pref[id - 1];
+    if (!q->active) return;
+    unsigned kind = q->gown != 0;
+    if (q->active_prev) pref[q->active_prev - 1].active_next = q->active_next;
+    else pool_active[kind].head = q->active_next;
+    if (q->active_next) pref[q->active_next - 1].active_prev = q->active_prev;
+    if (pool_active[kind].cursor == id)
+        pool_active[kind].cursor = q->active_next ? q->active_next : pool_active[kind].head;
+    pool_active[kind].count--;
+    q->active_prev = q->active_next = 0;
+    q->active = 0;
+}
 
 static uint32_t pool_ref(Tex *e) {
     if (e->ph) return (uint32_t)e->ph;
     int i;
-    if (pref_free) {
-        i = pref_free - 1, pref_free = pref[i].next;
-    } else {
+    if (pref_free) i = pref_free - 1, pref_free = pref[i].next;
+    else {
         if (npref == cpref) {
             int n = cpref ? cpref * 2 : 1024;
             PRef *q = realloc(pref, sizeof *q * (size_t)n);
-            if (!q) rt_fatal("vk: out of memory for the texture pool's entry counts");
+            if (!q) rt_fatal("vk: out of memory for texture pool reference counts");
             pref = q, cpref = n;
         }
         i = npref++;
     }
-    pref[i] = (PRef){e, 0, 0, e->pub.gpu_owned};
+    pref[i] = (PRef){.e = e, .gown = e->pub.gpu_owned};
     return (uint32_t)(e->ph = i + 1);
 }
 
 void vk_texture_pool_hold_locked(uint32_t old, uint32_t ent) {
-    if (ent) pref[ent - 1].refs++;
-    if (old && !--pref[old - 1].refs && !pref[old - 1].e) pref[old - 1].next = pref_free, pref_free = (int)old;
+    // Acquire first: replacing a slot with the same entry must not detach and rebuild its dependencies.
+    if (ent) {
+        PRef *q = &pref[ent - 1];
+        if (!q->refs++ && q->e) {
+            pool_active_add(ent);
+            pool_list(q->e);
+        }
+    }
+    if (old) {
+        PRef *q = &pref[old - 1];
+        if (!--q->refs) {
+            pool_active_remove(old);
+            if (q->e) {
+                if (q->e->pidx) resource_path.dependency_detach++;
+                pool_unlist(q->e);
+            } else q->next = pref_free, pref_free = (int)old;
+        }
+    }
 }
 
-static void pool_forget(Tex *e) {   // destroy_tex
+static void pool_forget(Tex *e) {
     if (!e->ph) return;
     PRef *q = &pref[e->ph - 1];
+    pool_active_remove((uint32_t)e->ph);
     q->e = NULL;
     if (!q->refs) q->next = pref_free, pref_free = e->ph;
     e->ph = 0;
 }
 
 static void pool_touch(void) {
-    static int at;
-    for (int i = 0; i < npref; i++)
-        if (pref[i].gown && pref[i].refs && pref[i].e) touch(pref[i].e);
-    for (int k = (npref + POOL_TOUCH_DIV - 1) / POOL_TOUCH_DIV; k-- > 0;) {
-        if (at >= npref) at = 0;
-        const PRef *q = &pref[at++];
-        if (!q->gown && q->refs && q->e) touch(q->e);
+    uint64_t visits = 0;
+    for (uint32_t id = pool_active[1].head; id; id = pref[id - 1].active_next) {
+        touch(pref[id - 1].e);
+        visits++;
     }
+    uint32_t count = (pool_active[0].count + POOL_TOUCH_DIV - 1) / POOL_TOUCH_DIV;
+    uint32_t id = pool_active[0].cursor ? pool_active[0].cursor : pool_active[0].head;
+    for (uint32_t k = 0; id && k < count; k++) {
+        const PRef *q = &pref[id - 1];
+        touch(q->e);
+        id = q->active_next ? q->active_next : pool_active[0].head;
+        visits++;
+    }
+    pool_active[0].cursor = id;
+    resource_path.live_visits += visits;
+    uint64_t old_visits = (uint64_t)npref + ((uint64_t)npref + POOL_TOUCH_DIV - 1) / POOL_TOUCH_DIV;
+    resource_path.avoided_visits += old_visits > visits ? old_visits - visits : 0;
 }
 
-// e becomes GPU-owned: the list's check does nothing for it any more, and its use stamp is left in each submission.
 static void pool_gpu_owned(Tex *e) {
     pool_unlist(e);
-    if (e->ph) pref[e->ph - 1].gown = 1;
+    if (e->ph) {
+        uint32_t id = (uint32_t)e->ph;
+        pool_active_remove(id);
+        pref[id - 1].gown = 1;
+        pool_active_add(id);
+    }
+}
+// RESOURCE_MEMBERSHIP_END
+
+static void pool_list(Tex *e) {
+    if (e->pidx || !from_storage(e) || e->pub.gpu_owned) return;
+    if (npent == cpent) {
+        int n = cpent ? cpent * 2 : 1024;
+        PEnt *p = realloc(pent, sizeof *p * (size_t)n);
+        int *q = realloc(pq, sizeof *q * ((size_t)n + ((size_t)n + 31) / 32));
+        if (!p || !q) rt_fatal("vk: out of memory for texture pool freshness entries");
+        pent = p, pq = q, cpent = n;
+    }
+    PEnt *p = &pent[npent++];
+    *p = (PEnt){.e = e, .addr = e->pub.addr, .size = e->t.L.size};
+    e->pidx = npent;
+    if (!e->released) pool_watch_storage(p);
 }
 
 int vk_texture_pool_note_locked(int id, uint32_t *ent) {
     *ent = 0;
     if (id < 0 || id >= ntslots || !tslots[id].used) return 0;
-    // The caller's lookups left the slot resolved under its bucket's generation, unless it made none (a fill without a
-    // token or a kind): an entry cached under another generation may be destroyed, so the slot is looked up first.
     if (tslots[id].ce && tslots[id].cgen != agen[sinfo[id] & 0xffff]) vk_texture_by_id_locked(id, NULL, NULL);
     Tex *e = tslots[id].ce;
     if (!e) return 0;
-    if (!e->pidx && from_storage(e) && !e->pub.gpu_owned) {
-        if (npent == cpent) {
-            int n = cpent ? cpent * 2 : 1024;
-            PEnt *p = realloc(pent, sizeof *p * (size_t)n);
-            // The tail holds one bit per entry for ordering dense worklists.
-            int *q = realloc(pq, sizeof *q * ((size_t)n + ((size_t)n + 31) / 32));
-            if (!p || !q) rt_fatal("vk: out of memory for the texture pool's entry list");
-            pent = p, pq = q, cpent = n;
-        }
-        PEnt *p = &pent[npent++];
-        *p = (PEnt){.e = e, .addr = e->pub.addr, .size = e->t.L.size};
-        e->pidx = npent;
-        if (!e->released) pool_watch_storage(p);
-    }
     *ent = pool_ref(e);
+    // A previously retired entry can return while older descriptor pools still hold its reference.
+    if (pref[*ent - 1].refs) pool_list(e);
     return 1;
 }
 
@@ -2457,7 +2525,7 @@ static int commit_is_low(void) {
     int low = 0;
     commit_critical = 0;
     if (commit_free_mb && used >= 0 && limit > 0) {
-        double want = commit_free_mb > 0 ? (double)commit_free_mb : limit / 10 > 4096 ? limit / 10 : 4096;
+        double want = resource_commit_headroom_mb(limit, (double)commit_free_mb);
         low = limit - used < want;
         commit_critical = limit - used < want / 2;   // the pause for drops that come back ends here
     }
@@ -4354,7 +4422,7 @@ void vk_texture_release(const tex_t *t) {
                 n_fin_other++, n_fin_other_hm += terrain_heightmap(&s->t);
                 continue;
             }
-            s->finalized = 1, s->ce = NULL, changed = 1;
+            s->finalized = 1, s->ce = NULL, s->sample_owned = 0, changed = 1;
             n_fin_own++;
         }
     if (e && !e->released) {
@@ -4420,6 +4488,7 @@ void vk_texture_register(int id, const tex_t *t, const view_t *v) {
     s->used = 1;
     s->finalized = 0;
     s->ce = NULL;
+    s->sample_owned = 0;
     s->cheld = 0;
     s->absent_mapping = s->absent_protection = 0;
     slots_gen++;
@@ -4511,6 +4580,23 @@ static int slot_absence_valid(const TexSlot *s, uint32_t generation) {
     return valid;
 }
 
+static void slot_result_view(const TexSlot *s, const Tex *e, view_t *view, int *has_view) {
+    *view = s->v;
+    *has_view = s->has_view;
+    if (!e || (s->has_view && s->v.set_swizzle)) return;
+    const nvn_texdesc *d = &s->t.d;
+    uint8_t sw[4] = {(uint8_t)d->swizzle_r, (uint8_t)d->swizzle_g, (uint8_t)d->swizzle_b, (uint8_t)d->swizzle_a};
+    if (!(sw[0] | sw[1] | sw[2] | sw[3]))
+        sw[0] = NVN_TEXTURE_SWIZZLE_R, sw[1] = NVN_TEXTURE_SWIZZLE_G,
+        sw[2] = NVN_TEXTURE_SWIZZLE_B, sw[3] = NVN_TEXTURE_SWIZZLE_A;
+    if (memcmp(sw, e->pub.swz, sizeof sw)) {
+        if (!s->has_view) memset(view, 0, sizeof *view);
+        memcpy(view->swz, sw, sizeof sw);
+        view->set_swizzle = 1;
+        *has_view = 1;
+    }
+}
+
 static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view) {
     s->absent_mapping = s->absent_protection = 0;
     *view = s->v;
@@ -4574,21 +4660,140 @@ static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view) {
     // A followed texture is another descriptor at the same storage: its image holds the content, but sampling takes the
     // slot descriptor's swizzle. The UI renders text into RGBA8 and samples it through a (A,A,A,A) descriptor; with the
     // render target's RGBA swizzle the text blur saw R = 1 everywhere and drew solid boxes behind tips and labels.
-    if (e && !(s->has_view && s->v.set_swizzle)) {
-        const nvn_texdesc *d = &s->t.d;
-        uint8_t sw[4] = {(uint8_t)d->swizzle_r, (uint8_t)d->swizzle_g, (uint8_t)d->swizzle_b, (uint8_t)d->swizzle_a};
-        if (!(sw[0] | sw[1] | sw[2] | sw[3]))   // descriptors built without nvnTextureBuilderSetDefaults
-            sw[0] = NVN_TEXTURE_SWIZZLE_R, sw[1] = NVN_TEXTURE_SWIZZLE_G, sw[2] = NVN_TEXTURE_SWIZZLE_B,
-            sw[3] = NVN_TEXTURE_SWIZZLE_A;
-        if (memcmp(sw, e->pub.swz, 4)) {
-            if (!s->has_view) memset(view, 0, sizeof *view);
-            memcpy(view->swz, sw, 4);
-            view->set_swizzle = 1;
-            *has_view = 1;
-        }
-    }
+    slot_result_view(s, e, view, has_view);
     return e;
 }
+
+// RESOURCE_SAMPLE_BEGIN: the host fixture compiles the same query/preparation decisions with controlled producers.
+static int sample_slot_eligible(const TexSlot *s) {
+    return s->used && !s->finalized && tex_mirrored(&s->t);
+}
+
+static int sample_entry_eligible(const Tex *e) {
+    return e && e->pub.mirrored && !e->pub.gpu_owned && !e->pub.gone && !e->sfill &&
+           !e->superseded && !e->overwritten;
+}
+
+static int sample_entry_matches(const Tex *e, const TexSlot *s) {
+    TexKey key;
+    make_key(&s->t, &key);
+    return !memcmp(&e->key, &key, sizeof key);
+}
+
+static void sample_result(const TexSlot *s, VkTextureSample *out) {
+    out->image = &s->ce->pub;
+    out->view = s->cview;
+    out->has_view = s->chas_view;
+}
+
+VkTextureSampleStatus vk_texture_sample_query_locked(int id, VkTextureSample *out) {
+    *out = (VkTextureSample){0};
+    resource_path.queries++;
+    if (id < 0 || id >= ntslots || !sample_slot_eligible(&tslots[id])) {
+        resource_path.fallback++;
+        return VK_TEXTURE_SAMPLE_FALLBACK;
+    }
+    const TexSlot *s = &tslots[id];
+    // A stale cached pointer must not be dereferenced: another entry in its address bucket may have been freed.
+    if (!s->ce || s->cgen != agen[sinfo[id] & 0xffff]) return VK_TEXTURE_SAMPLE_PREPARE;
+    if (!s->sample_owned) return VK_TEXTURE_SAMPLE_PREPARE;
+    const Tex *e = s->ce;
+    if (!sample_entry_eligible(e)) {
+        resource_path.fallback++;
+        return VK_TEXTURE_SAMPLE_FALLBACK;
+    }
+    if (e->released || e->retiring || !e->uploaded || e->up_retry ||
+        e->checked != submit_epoch || s->cepoch != submit_epoch) return VK_TEXTURE_SAMPLE_PREPARE;
+    sample_result(s, out);
+    resource_path.ready++;
+    return VK_TEXTURE_SAMPLE_READY;
+}
+
+VkTextureSampleStatus vk_texture_sample_prepare_locked(int id, VkTextureSample *out) {
+    *out = (VkTextureSample){0};
+    if (id < 0 || id >= ntslots || !sample_slot_eligible(&tslots[id])) {
+        resource_path.fallback++;
+        return VK_TEXTURE_SAMPLE_FALLBACK;
+    }
+    TexSlot *s = &tslots[id];
+    uint32_t gen = agen[sinfo[id] & 0xffff];
+    Tex *e = s->ce && s->cgen == gen ? s->ce : NULL;
+    int own_identity = e && s->sample_owned;
+    if (!e) {
+        TexKey key;
+        make_key(&s->t, &key);
+        e = nvn_hm_get(&by_key, &key);
+        // Aliased GPU content requires the existing target/view resolution rules, even for a CPU-accessible pool.
+        // Cold ordinary textures still enter preparation here; absence is not itself a fallback condition.
+        for (Tex *p = nvn_hm_get(&by_addr, &key.addr); p; p = p->next_at)
+            if (p->pub.gpu_owned || alias_has_gpu_content(p) || (!e && !p->released)) {
+                resource_path.fallback++;
+                return VK_TEXTURE_SAMPLE_FALLBACK;
+            }
+    }
+    if (e && (!sample_entry_eligible(e) || (!own_identity && !sample_entry_matches(e, s)))) {
+        resource_path.fallback++;
+        return VK_TEXTURE_SAMPLE_FALLBACK;
+    }
+    resource_path.prepared++;
+    if (!e || e->released || e->retiring) {
+        // Allocation/revival is an explicit preparation operation. No pool-refresh mode or speculative creation
+        // budget is consulted here: this is a demanded sampled resource, ordered at the replay's current position.
+        // The compatibility identity owner may restore a bucket's earlier generation on revival. Preparation,
+        // like the old resolver, must invalidate a remembered state whose finalized-slot relationship changes.
+        int prior_lookup = in_lookup;
+        in_lookup = 1;
+        e = entry_of(&s->t);
+        in_lookup = prior_lookup;
+        if (!e) {
+            if (vk_texture_deferred()) {
+                resource_path.deferred++;
+                return VK_TEXTURE_SAMPLE_DEFERRED;
+            }
+            resource_path.unavailable++;
+            return VK_TEXTURE_SAMPLE_UNAVAILABLE;
+        }
+        if (!sample_entry_eligible(e)) {
+            resource_path.fallback++;
+            return VK_TEXTURE_SAMPLE_FALLBACK;
+        }
+    }
+    if (!e->uploaded || e->checked != submit_epoch) {
+        if (!pool_deps_certificate(e)) make_fresh_snap(e);
+        if (vk_texture_deferred()) {
+            resource_path.deferred++;
+            return VK_TEXTURE_SAMPLE_DEFERRED;
+        }
+        e->checked = submit_epoch;
+    }
+    if (!e->uploaded || e->up_retry) {
+        // Failed uploads have an explicit later retry. An allocated but unpopulated image is not ready data.
+        resource_path.unavailable++;
+        return VK_TEXTURE_SAMPLE_UNAVAILABLE;
+    }
+    // The image can change during upload (for example an opaque ASTC image selecting its final format), so publish
+    // the address generation after preparation, never the value observed before allocation/conversion.
+    if (s->cepoch != submit_epoch) round_checks++;
+    s->ce = e;
+    s->sample_owned = 1;
+    s->cgen = agen[sinfo[id] & 0xffff];
+    s->cepoch = submit_epoch;
+    int has_view;
+    slot_result_view(s, e, &s->cview, &has_view);
+    s->chas_view = (uint8_t)has_view;
+    s->cheld = 0;
+    s->cwant = 0;
+    s->absent_mapping = s->absent_protection = 0;
+    sample_result(s, out);
+    return VK_TEXTURE_SAMPLE_READY;
+}
+
+void vk_texture_sample_use_locked(const VkTextureSample *sample) {
+    if (!sample || !sample->image) return;
+    touch((Tex *)sample->image);
+    resource_path.used++;
+}
+// RESOURCE_SAMPLE_END
 
 void vk_texture_lock(void) { lock(); }
 void vk_texture_unlock(void) { unlock(); }
@@ -4638,6 +4843,16 @@ void vk_texture_bucket_stats(char *out, size_t n) {
     if (used < n)
         snprintf(out + used, n - used, "; pool slots hold %d entries, %d of them GPU-owned (stamped in each submission "
                  "checked by list)", held, gown);
+    used = strlen(out);
+    if (used < n)
+        snprintf(out + used, n - used, "; resource path query/ready/prepare/defer/unavailable/fallback/use %llu/%llu/%llu/%llu/%llu/%llu/%llu; "
+                 "live visits %llu, avoided capacity visits %llu, dependency detaches %llu",
+                 (unsigned long long)resource_path.queries, (unsigned long long)resource_path.ready,
+                 (unsigned long long)resource_path.prepared, (unsigned long long)resource_path.deferred,
+                 (unsigned long long)resource_path.unavailable, (unsigned long long)resource_path.fallback,
+                 (unsigned long long)resource_path.used, (unsigned long long)resource_path.live_visits,
+                 (unsigned long long)resource_path.avoided_visits, (unsigned long long)resource_path.dependency_detach);
+    memset(&resource_path, 0, sizeof resource_path);
     n_bumps = n_undone = n_pool_checks = n_pool_skips = n_presnap_q = 0;
     memset(n_pool_miss, 0, sizeof n_pool_miss);
     memset(n_site, 0, sizeof n_site);
@@ -4675,6 +4890,7 @@ const VkTexImage *vk_texture_by_id_locked(int id, view_t *view, int *has_view) {
         int hv;
         resolve_held = 0;
         in_lookup = 1;
+        s->sample_owned = 0;
         s->ce = slot_resolve(s, &v, &hv);   // entry_of may create an entry and bump g: g read before it
         in_lookup = 0;
         s->cview = v, s->chas_view = (uint8_t)hv;

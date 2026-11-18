@@ -23,6 +23,7 @@
 #include "nvn_api.h"
 #include "nvn_hmap.h"
 #include "vk.h"
+#include "texture_resource.h"
 
 #ifndef NX2NAVI_TONEMAP_STANDIN
 #define NX2NAVI_TONEMAP_STANDIN 1   // vk_tonemap.c, see untranslated_dispatch_fallback
@@ -2253,7 +2254,29 @@ static void feedback_written(VkExec *ex, const VkPipeState *s, uint32_t sampled)
 }
 
 static int tex_info_full(VkExec *ex, const GfxShaderRes *r, uint64_t h, int storage, int separate,
-                         VkDescriptorImageInfo *out, VkImage *image);
+                         VkDescriptorImageInfo *out, VkImage *image, int demanded);
+
+static _Thread_local int twin_dispatch;
+
+// Ordinary sampled images use an explicit readiness boundary. Storage writes and reconstruction substitutions
+// retain their ordered path; querying a ready CPU image neither allocates nor uploads it.
+static const VkTexImage *sampled_resource(VkExec *ex, const GfxShaderRes *r, uint64_t h, int storage,
+                                         view_t *view, int *has_view) {
+    int id = (int)(h & 0xfffff);
+    if (storage || r->exact || vk_dlaa_swap_img || twin_dispatch || ex->dc->mo_ovr_on)
+        return vk_texture_by_id_locked(id, view, has_view);
+    VkTextureSample sample = {0};
+    VkTextureSampleStatus status = vk_texture_sample_query_locked(id, &sample);
+    if (status == VK_TEXTURE_SAMPLE_PREPARE)
+        status = vk_texture_sample_prepare_locked(id, &sample);
+    if (status == VK_TEXTURE_SAMPLE_FALLBACK)
+        return vk_texture_by_id_locked(id, view, has_view);
+    if (status != VK_TEXTURE_SAMPLE_READY) return NULL;
+    vk_texture_sample_use_locked(&sample);
+    if (view) *view = sample.view;
+    if (has_view) *has_view = sample.has_view;
+    return sample.image;
+}
 
 // Sampled-texture descriptors per (handle, resource type, separate), kept while nothing they derive from changed: the
 // slot's resolution and texture entry (slot_still) and the samplers (vk_sampler_gen); the layout is set again on every
@@ -2279,7 +2302,7 @@ static void tex_info_lookup(VkExec *ex, const GfxShaderRes *r, uint64_t h, int s
     int td_on = td_mode();
     VkImage image = VK_NULL_HANDLE;
     if (!h || storage || !td_on) {
-        tex_info_full(ex, r, h, storage, separate, out, &image);
+        tex_info_full(ex, r, h, storage, separate, out, &image, 1);
         if (img_out) *img_out = image;
         return;
     }
@@ -2289,13 +2312,13 @@ static void tex_info_lookup(VkExec *ex, const GfxShaderRes *r, uint64_t h, int s
         !(m->reduced && r->exact) && slot_still(&m->gen, m->tok, h, gen)) {
         int incomplete = vk_texture_deferred();
         if (m->epoch != ep) {   // the slot's first binding in this submission: only its storage check is due
-            vk_texture_by_id_locked((int)(h & 0xfffff), NULL, NULL);
+            const VkTexImage *fresh = sampled_resource(ex, r, h, storage, NULL, NULL);
             incomplete = vk_texture_deferred();
             if (incomplete) m->valid = 0;
             else {
                 // The storage check can take back or replace the entry. Its old descriptor is reusable only if
                 // that check preserved the slot token; an incomplete check must be retried in stream order.
-                if (!slot_still(&m->gen, m->tok, h, vk_texture_slots_gen())) goto resolve;
+                if (!fresh || !slot_still(&m->gen, m->tok, h, vk_texture_slots_gen())) goto resolve;
                 m->epoch = ep;
             }
         }
@@ -2305,7 +2328,7 @@ static void tex_info_lookup(VkExec *ex, const GfxShaderRes *r, uint64_t h, int s
         if (img_out) *img_out = m->image;
         if (td_on == 2 && !incomplete) {
             VkDescriptorImageInfo full;
-            tex_info_full(ex, r, h, storage, separate, &full, &image);
+            tex_info_full(ex, r, h, storage, separate, &full, &image, 1);
             if (vk_texture_deferred()) m->valid = 0;
             else if (full.sampler != out->sampler || full.imageView != out->imageView || full.imageLayout != out->imageLayout)
                 rt_fatal("vk_exec: texture descriptor memo of handle %#llx type %#x differs from a lookup",
@@ -2315,7 +2338,7 @@ static void tex_info_lookup(VkExec *ex, const GfxShaderRes *r, uint64_t h, int s
     }
 resolve:;
     uint64_t tok = token_of(h);   // before the lookup
-    int reduced = tex_info_full(ex, r, h, storage, separate, out, &image);
+    int reduced = tex_info_full(ex, r, h, storage, separate, out, &image, 1);
     // a lookup that made the texture whole again changed the slot's resolution after the stamps above were read: the
     // entry never matches, and the next binding fills it
     *m = (typeof(*m)){.h = h, .tok = tok, .gen = gen, .epoch = ep, .sgen = sg, .type = r->type,
@@ -2326,7 +2349,7 @@ resolve:;
 
 // Returns whether the image bound was made without its top mip levels (texture detail, VkTexImage.skip).
 static int tex_info_full(VkExec *ex, const GfxShaderRes *r, uint64_t h, int storage, int separate,
-                         VkDescriptorImageInfo *out, VkImage *image) {
+                         VkDescriptorImageInfo *out, VkImage *image, int demanded) {
     int ms = (r->type & 0x200) != 0, reduced = 0;
     *image = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
@@ -2335,7 +2358,8 @@ static int tex_info_full(VkExec *ex, const GfxShaderRes *r, uint64_t h, int stor
     if (h) {
         view_t v;
         int hv;
-        const VkTexImage *img = vk_texture_by_id_locked((int)(h & 0xfffff), &v, &hv);
+        const VkTexImage *img = demanded ? sampled_resource(ex, r, h, storage, &v, &hv)
+            : vk_texture_by_id_locked((int)(h & 0xfffff), &v, &hv);
         // A shader that reads this binding's texels by position, or asks for its size, needs every level of the
         // texture where the game put it (gfx_shader.c reflect_exact): one made without its top levels is made again.
         if (img && img->skip && r->exact) img = vk_texture_exact_by_id_locked((int)(h & 0xfffff), &v, &hv);
@@ -2782,7 +2806,7 @@ static void pool_catch_up(uint64_t from, uint64_t to) {
     pool_flush();
     PL.switches++;
     if (PL.switches % 3600 == 0) {   // diagnosis: what invalidates the slots (vk_texture.c vk_texture_bucket_stats)
-        char bs[768];
+        char bs[1536];
         vk_texture_bucket_stats(bs, sizeof bs);
         rt_log("vk: texture pool buckets over 3600 switches: %s", bs);
     }
@@ -2950,7 +2974,7 @@ static int pool_fill(VkExec *ex, uint32_t id, uint32_t mask, uint64_t tok) {
         r.type = pool_kind_type(k);
         VkDescriptorImageInfo ii;
         VkImage img;
-        tex_info_full(ex, &r, tok ? id | 1ull << 63 : 0, 0, 1, &ii, &img);
+        tex_info_full(ex, &r, tok ? id | 1ull << 63 : 0, 0, 1, &ii, &img, 0);
         VkImageView *e = &PL.view[(size_t)k * VK_POOL_TEX + id];
         if (*e != ii.imageView) *e = ii.imageView, pool_write((uint32_t)k, id, ii.imageView, VK_NULL_HANDLE);
     }
@@ -3363,7 +3387,6 @@ typedef struct { VkImage src, img; VmaAllocation mem; VkImageView view[2]; uint3
 static Twin twins[TWINS];
 static unsigned twin_next;
 // op_dispatch*: the resources being bound are a dispatch's, on this thread (the replay workers record draws meanwhile)
-static _Thread_local int twin_dispatch;
 static VkBuffer twin_buf;
 static VmaAllocation twin_buf_mem;
 static VkDeviceSize twin_buf_cap;

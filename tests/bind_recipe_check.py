@@ -90,7 +90,8 @@ static void *prepared_test_memset(void *, int, size_t);
     td = draw[draw.index("#define TD_N"):draw.index("static void tex_info_lookup(")]
     lookup = function(draw, "tex_info_lookup").replace("tex_info_lookup(", "actual_tex_info_lookup(")
     lookup = lookup.replace("slot_still(", "texture_slot_still(")
-    (work / "prepared_images_under_test.h").write_text(f"// {marker}\n" + still + "\n" + td + lookup + images)
+    sampled = function(draw, "sampled_resource")
+    (work / "prepared_images_under_test.h").write_text(f"// {marker}\n" + still + "\n" + sampled + td + lookup + images)
     includes = [ROOT / "runtime", work, cc_path.parent.parent / "include/vma"]
     includes += [Path(p) for p in env.get("BIND_RECIPE_INCLUDE_DIRS", "").split(os.pathsep) if p]
     flags = [arg for p in includes if p.is_dir() for arg in ("-I", str(p))]
