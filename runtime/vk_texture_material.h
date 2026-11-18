@@ -6,9 +6,11 @@
 #include <stdint.h>
 #include <string.h>
 
+struct TextureMaterial;
 typedef struct {
     uint64_t resident_bytes, live_bytes, retained_bytes;
-    uint64_t owners, next_id;
+    uint64_t owners, next_id, retained_owners;
+    struct TextureMaterial *retained_head, *retained_scan_next;
 } TextureMaterialLedger;
 
 typedef struct TextureMaterial {
@@ -20,10 +22,34 @@ typedef struct TextureMaterial {
     uint32_t last_use_epoch;
     uint32_t refs, live_refs; // Logical associations; a cache pin is separate from these counts.
     uint32_t index_slot;
-    uint8_t cached, ready, reclaim, retired;
+    uint8_t cached, ready, reclaim, retired, retained_queued;
     TextureMaterialLedger *ledger;
     struct TextureMaterial *prev, *next;
 } TextureMaterial;
+
+static inline void texture_material_retained_insert(TextureMaterial *m) {
+    TextureMaterialLedger *ledger = m->ledger;
+    assert(!m->retained_queued && !m->live_refs && !m->retired && m->image);
+    m->next = ledger->retained_head;
+    m->prev = NULL;
+    if (m->next) m->next->prev = m;
+    ledger->retained_head = m;
+    if (!ledger->retained_scan_next) ledger->retained_scan_next = m;
+    m->retained_queued = 1;
+    ledger->retained_owners++;
+}
+
+static inline void texture_material_retained_remove(TextureMaterial *m) {
+    TextureMaterialLedger *ledger = m->ledger;
+    assert(m->retained_queued && ledger->retained_owners);
+    if (ledger->retained_scan_next == m) ledger->retained_scan_next = m->next;
+    if (m->prev) m->prev->next = m->next;
+    else ledger->retained_head = m->next;
+    if (m->next) m->next->prev = m->prev;
+    m->prev = m->next = NULL;
+    m->retained_queued = 0;
+    ledger->retained_owners--;
+}
 
 static inline void texture_material_reclassify(TextureMaterial *m, int was_live) {
     int live = m->live_refs != 0;
@@ -32,10 +58,12 @@ static inline void texture_material_reclassify(TextureMaterial *m, int was_live)
         assert(m->ledger->retained_bytes >= m->bytes);
         m->ledger->retained_bytes -= m->bytes;
         m->ledger->live_bytes += m->bytes;
+        texture_material_retained_remove(m);
     } else {
         assert(m->ledger->live_bytes >= m->bytes);
         m->ledger->live_bytes -= m->bytes;
         m->ledger->retained_bytes += m->bytes;
+        texture_material_retained_insert(m);
     }
 }
 
@@ -57,7 +85,10 @@ static inline void texture_material_init(TextureMaterial *m, TextureMaterialLedg
     ledger->owners++;
     ledger->resident_bytes += bytes;
     if (live) ledger->live_bytes += bytes;
-    else ledger->retained_bytes += bytes;
+    else {
+        ledger->retained_bytes += bytes;
+        texture_material_retained_insert(m);
+    }
 }
 
 static inline void texture_material_acquire(TextureMaterial *m, int live) {
@@ -121,12 +152,22 @@ static inline void texture_material_note_use(TextureMaterial *m, uint64_t fence,
     m->last_use_epoch = epoch;
 }
 
+// Each step visits one retained physical owner, without inspecting active owners or individual associations.
+// The caller caps steps at the retained-owner count and its work budget. Removal repairs the cursor before a
+// candidate becomes live or can be freed; an owner enters this queue only at the last live association's release.
+static inline TextureMaterial *texture_material_scan_next(TextureMaterialLedger *ledger) {
+    TextureMaterial *m = ledger->retained_scan_next ? ledger->retained_scan_next : ledger->retained_head;
+    if (m) ledger->retained_scan_next = m->next;
+    return m;
+}
+
 // The caller purges cached views and defers the image exactly once after this succeeds, preserving both upload
 // completion and recording/submission lifetime. Never purge global image views when merely detaching one Tex.
 static inline uint64_t texture_material_retire(TextureMaterial *m) {
     assert(m && !m->retired && texture_material_unreferenced(m) && !m->live_refs);
     TextureMaterialLedger *ledger = m->ledger;
     assert(ledger->owners && ledger->resident_bytes >= m->bytes && ledger->retained_bytes >= m->bytes);
+    texture_material_retained_remove(m);
     ledger->owners--;
     ledger->resident_bytes -= m->bytes;
     ledger->retained_bytes -= m->bytes;

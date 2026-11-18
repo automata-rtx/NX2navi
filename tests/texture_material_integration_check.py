@@ -27,6 +27,61 @@ typedef struct { uint32_t flags,type,format,w,h,d,levels,layers,samples,usage; }
 #include "vk_texture_material.h"
 
 static const ImgKey image_key = {.format=37,.w=256,.h=128,.d=1,.levels=4,.layers=8,.samples=1,.usage=7};
+static void assert_retained_queue(const TextureMaterialLedger *ledger) {
+    uint64_t count=0,bytes=0;
+    const TextureMaterial *previous=NULL;
+    int cursor_found=ledger->retained_scan_next==NULL;
+    for(const TextureMaterial *m=ledger->retained_head;m;m=m->next) {
+        assert(++count<=ledger->owners); // Also detects a linked-list cycle.
+        assert(m->ledger==ledger && !m->retired && !m->live_refs && m->retained_queued && m->image);
+        assert(m->prev==previous);
+        bytes+=m->bytes;
+        cursor_found|=m==ledger->retained_scan_next;
+        previous=m;
+    }
+    assert(count==ledger->retained_owners && bytes==ledger->retained_bytes && cursor_found);
+}
+
+static void retained_queue_transitions(void) {
+    TextureMaterialLedger ledger={0};
+    TextureMaterial a,b,c;
+    texture_material_init(&a,&ledger,1,(void *)(uintptr_t)11,&image_key,1024,0);
+    texture_material_init(&b,&ledger,2,(void *)(uintptr_t)12,&image_key,2048,0);
+    texture_material_init(&c,&ledger,3,(void *)(uintptr_t)13,&image_key,4096,0);
+    assert_retained_queue(&ledger);
+    assert(texture_material_scan_next(&ledger)==&a);
+    assert(texture_material_scan_next(&ledger)==&c && ledger.retained_scan_next==&b);
+    // One live association removes a physical owner even while another association remains released.
+    texture_material_acquire(&b,1);
+    assert(b.refs==2 && b.live_refs==1 && !b.retained_queued && ledger.retained_scan_next==&a);
+    assert_retained_queue(&ledger);
+    assert(texture_material_scan_next(&ledger)==&a);
+    assert(texture_material_scan_next(&ledger)==&c && ledger.retained_scan_next==&a);
+    // Retiring exactly the next victim repairs the cursor before its address can be freed or reused.
+    assert(texture_material_release(&a,0));
+    assert(texture_material_retire(&a)==1024 && !ledger.retained_scan_next);
+    assert(texture_material_scan_next(&ledger)==&c);
+    assert_retained_queue(&ledger);
+    texture_material_acquire(&c,0);
+    assert(c.refs==2 && ledger.retained_owners==1);
+    texture_material_set_live(&c,1);
+    assert(!ledger.retained_head && !ledger.retained_scan_next && !ledger.retained_owners);
+    assert(!texture_material_scan_next(&ledger));
+    assert(!texture_material_release(&c,0));
+    texture_material_set_live(&c,0);
+    assert(ledger.retained_head==&c && ledger.retained_scan_next==&c);
+    assert_retained_queue(&ledger);
+    assert(texture_material_release(&c,0));
+    texture_material_retire(&c);
+    assert(!texture_material_release(&b,1));
+    assert(b.refs==1 && !b.live_refs && b.retained_queued);
+    assert_retained_queue(&ledger);
+    assert(texture_material_release(&b,0));
+    texture_material_retire(&b);
+    assert_retained_queue(&ledger);
+    assert(!ledger.owners && !ledger.retained_head && !texture_material_scan_next(&ledger));
+}
+
 static void basic_ownership(void) {
     TextureMaterialLedger ledger = {0};
     TextureMaterial m;
@@ -120,18 +175,25 @@ static void churn(void) {
             for(unsigned j=0;j<ASSOCIATIONS;j++)if(owner[j]==(int)i){refs++;live_refs+=(unsigned)live[j];}
             if(!m[i].ledger || m[i].retired){assert(!refs);continue;}
             assert(m[i].refs==refs && m[i].live_refs==live_refs);
+            assert(m[i].retained_queued==!live_refs);
             bytes+=m[i].bytes;owners++;
             if(live_refs)active+=m[i].bytes;else retained+=m[i].bytes;
         }
         assert(ledger.owners==owners && ledger.resident_bytes==bytes && ledger.live_bytes==active && ledger.retained_bytes==retained);
+        assert_retained_queue(&ledger);
+        if(ledger.retained_owners) {
+            TextureMaterial *candidate=texture_material_scan_next(&ledger);
+            assert(candidate && candidate->retained_queued && !candidate->live_refs);
+        } else assert(!texture_material_scan_next(&ledger));
     }
     for(unsigned i=0;i<ASSOCIATIONS;i++)if(owner[i]>=0)texture_material_release(&m[owner[i]],live[i]);
     for(unsigned i=0;i<N;i++)if(m[i].ledger && !m[i].retired){texture_material_cache(&m[i],0);texture_material_retire(&m[i]);}
     assert(!ledger.owners && !ledger.resident_bytes && !ledger.live_bytes && !ledger.retained_bytes);
+    assert_retained_queue(&ledger);
 }
 
 int main(void) {
-    basic_ownership();separate_versions();churn();
+    basic_ownership();separate_versions();retained_queue_transitions();churn();
     puts("texture material ownership: retained identity, separate versions and unique budget accounting passed");
     return 0;
 }
@@ -344,7 +406,7 @@ if(!setjmp(fatal_jump)){content_write_begin(&a,1);assert(0);}
 assert(a.material==old && a.pub.image==prior && old->refs==1 && !retired && purged==cow_purges);
 allocation_failure=expect_fatal=0;
 assert(!content_release(&a,0));assert(old->refs==0 && old->cached && !retired);
-material_reclaim_cursor=old->index_slot-1;assert(content_reclaim(64)==64);
+assert(content_reclaim(64)==64);
 assert(retired==1 && last_retired==1 && reclaim_credit==64 && !material_ledger.resident_bytes);
 Tex stale=make_tex(8192,original);observes=0;assert(!content_early_prepare(&stale));assert(stale.source_copy);content_source_discard(&stale);
 Tex bad=make_tex(12288,original);observes=0;invalid_mapping=1;

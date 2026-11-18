@@ -21,7 +21,6 @@ typedef struct {
 static MaterialSlot material_slots[MATERIAL_SLOTS];
 static MaterialCertificate material_certificates[MATERIAL_SLOTS];
 static uint64_t material_snapshot_bytes;
-static uint32_t material_reclaim_cursor;
 static struct {
     uint64_t hashes, hash_bytes, hash_ns, lookups, hits, copy_ns, copied_bytes, avoided_texels, collisions;
     uint64_t early_hits, certificate_hits, snapshot_bytes, snapshot_refused, cow, cow_bytes, retired_bytes, same_owner_hits;
@@ -97,20 +96,23 @@ static uint64_t content_release(Tex *e, int reclaim) {
     e->bytes = 0;
     return texture_material_release(m, !e->released) ? content_retire(m) : 0;
 }
-// Only an orphan yields physical credit here. Released logical associations use the normal released list.
+// Walk physical retained owners directly, not the content hash table. This first residency transition can retire
+// orphans only; finalized logical consumers still require the existing release policy until they have an explicit
+// residency guarantee. The bound includes every visited owner, not just successful destruction.
 static uint64_t content_reclaim(uint64_t wanted) {
     uint64_t freed = 0;
-    for (unsigned n = 0; n < MATERIAL_RECLAIM_SCAN && freed < wanted; n++) {
-        unsigned at = material_reclaim_cursor++ & (MATERIAL_SLOTS - 1);
-        TextureMaterial *m = material_slots[at].material;
-        if (m && !m->refs) freed += content_unpin(at, 1);
+    uint64_t visits = material_ledger.retained_owners;
+    if (visits > MATERIAL_RECLAIM_SCAN) visits = MATERIAL_RECLAIM_SCAN;
+    for (uint64_t n = 0; n < visits && freed < wanted; n++) {
+        TextureMaterial *m = texture_material_scan_next(&material_ledger);
+        if (!m) break;
+        if (!m->refs && m->cached) freed += content_unpin(m->index_slot - 1, 1);
     }
     return freed;
 }
 static void content_shutdown(void) {
     for (unsigned i = 0; i < MATERIAL_SLOTS; i++) content_unpin(i, 0);
     memset(material_certificates, 0, sizeof material_certificates);
-    material_reclaim_cursor = 0;
 }
 static int content_slot_matches(const MaterialSlot *s, const Tex *e, const uint8_t digest[32]) {
     TexKey key = content_image_key(e);
