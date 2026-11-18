@@ -36,6 +36,15 @@ The repository's additions are all rights reserved (`LICENSE-ADDITIONS`). It nev
 
 The public name is `2NX2Navi`. Resource-path development uses branch `NEXT` and `VERSION` labels `NEXT - N`, starting at `NEXT - 0`. Increment N for each subsequent candidate iteration; the spaces and hyphen are part of the label. Legacy remains the comparison baseline. This convention supersedes Beta/WIP numbering for this development line.
 
+## NEXT governing objective
+
+Make the complete resource-handling chain deliver correct GPU work with substantially less processing and waiting. Reuse is a means, not the objective. Evaluate connected consequences: a 0.01 ms validity check that avoids 0.001 ms locally can still be worthwhile if its result eliminates 0.3 ms downstream. Conversely, fewer operations or more hits do not establish a net benefit. FPS alone neither accepts nor rejects an unfinished architectural replacement.
+
+- Design authoritative facts, ownership, invalidation and all relevant consumers together. Change stage boundaries or remove stages where this simplifies the complete path; do not preserve the old sequence by default.
+- Before implementation or delegation, name the connected chain, enabled downstream changes, introduced costs, dependencies and completion evidence. Distinguish demonstrated effects from hypotheses. Include contention, memory pressure and required-submission timing.
+- Current scope is the ordinary CPU-sampled texture lifecycle through preparation, binding, release, reclamation and reacquisition. Preserve useful correctness contracts, tests and checkpoint recovery; reconsider existing algorithms, including recent NEXT additions.
+- Do not divert to unrelated optimizations or leave this replacement unfinished to polish local wins. Necessary correctness fixes and diagnostics must serve this scope. If evidence changes the approach, state why while keeping the whole-system objective fixed. Update the maintained plan in place; do not accumulate review history.
+
 ## Writing
 
 Code, comments, docs and commit messages are in English. Commit messages are plain sentences without type prefixes.
