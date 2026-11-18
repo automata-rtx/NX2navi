@@ -305,10 +305,26 @@ assert(!content_early_prepare(&a));assert(a.source_copy && material_snapshot_byt
 uint8_t original[64];memcpy(original,a.source_copy,64);memset(bytes,9,64);
 assert(!memcmp(a.source_copy,original,64));publish_snapshot(&a,1);TextureMaterial *old=a.material;
 assert(!memcmp(physical[1],original,64) && old->refs==1 && old->cached && material_ledger.resident_bytes==64);
-Tex b=make_tex(8192,original);observes=0;assert(content_early_prepare(&b));
+Tex b=make_tex(8192,original);observes=0;unsigned adopted_generation=generations;
+assert(content_early_prepare(&b));assert(generations==adopted_generation+1 && b.n_up==1);
 assert(b.material==old && old->refs==2 && !b.source_copy && !material_snapshot_bytes && !allocations);
+// Verifying the same immutable owner must preserve every binding-facing identity and lifetime count.
+VkTexImage unchanged_pub=b.pub;unsigned unchanged_uploads=b.n_up,unchanged_generation=generations;
+unsigned unchanged_refs=old->refs,unchanged_live=old->live_refs,unchanged_hashes=hashes;
+uint64_t unchanged_resident=material_ledger.resident_bytes;
+observes=0;current_stamp.generation++;assert(content_early_prepare(&b));
+assert(hashes==unchanged_hashes && b.source_stamp.generation==current_stamp.generation);
+assert(!memcmp(&b.pub,&unchanged_pub,sizeof b.pub) && b.n_up==unchanged_uploads && generations==unchanged_generation);
+assert(old->refs==unchanged_refs && old->live_refs==unchanged_live && material_ledger.resident_bytes==unchanged_resident);
+content_image_forget(&b);observes=0;current_stamp.generation++;
+assert(content_early_prepare(&b));assert(hashes==unchanged_hashes+1 && !b.source_copy && !material_snapshot_bytes);
+assert(b.source_stamp.generation==current_stamp.generation && b.source_digest_valid);
+assert(!memcmp(&b.pub,&unchanged_pub,sizeof b.pub) && b.n_up==unchanged_uploads && generations==unchanged_generation);
+assert(old->refs==unchanged_refs && old->live_refs==unchanged_live && material_ledger.resident_bytes==unchanged_resident);
+assert(material_stats.same_owner_hits==2);
 unsigned hash_count=hashes;Tex same=make_tex(8192,original);observes=0;
 assert(content_early_prepare(&same));assert(hashes==hash_count && same.material==old && old->refs==3);
+assert(material_stats.same_owner_hits==2);
 content_release(&same,0);assert(!retired);
 unsigned before=generations;content_write_begin(&b,1);
 assert(b.pub.image!=1 && !b.material && a.material==old && old->refs==1 && old->cached);

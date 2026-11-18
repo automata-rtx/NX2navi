@@ -24,7 +24,7 @@ static uint64_t material_snapshot_bytes;
 static uint32_t material_reclaim_cursor;
 static struct {
     uint64_t hashes, hash_bytes, hash_ns, lookups, hits, copy_ns, copied_bytes, avoided_texels, collisions;
-    uint64_t early_hits, certificate_hits, snapshot_bytes, snapshot_refused, cow, cow_bytes, retired_bytes;
+    uint64_t early_hits, certificate_hits, snapshot_bytes, snapshot_refused, cow, cow_bytes, retired_bytes, same_owner_hits;
 } material_stats;
 
 static unsigned content_image_bucket(const uint8_t digest[32]) {
@@ -127,6 +127,19 @@ static void content_certificate(Tex *e, unsigned slot) {
 static void content_adopt(Tex *e, unsigned at, const TextureSourceStamp *stamp) {
     const MaterialSlot *s = &material_slots[at];
     TextureMaterial *m = s->material;
+    if (e->material == m && e->pub.image == m->image && e->uploaded && !e->up_retry) {
+        // A newer source proof for identical contents does not replace the image or change any binding. Preserve
+        // descriptor and derived-view generations; only the evidence about the guest source advances.
+        source_commit(e, stamp);
+        memcpy(e->source_digest, s->digest, 32);
+        e->source_digest_valid = 1;
+        texture_material_note_use(m, vk_exec_recording_fence(), submit_epoch);
+        content_certificate(e, at);
+        material_stats.hits++;
+        material_stats.early_hits++;
+        material_stats.same_owner_hits++;
+        return;
+    }
     texture_material_acquire(m, !e->released);
     if (e->material) content_release(e, 0);
     else if (e->pub.image) {
