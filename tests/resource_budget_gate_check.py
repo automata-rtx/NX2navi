@@ -65,7 +65,7 @@ int main(void) {
     assert(!gate_enter(0, &held)); assert(samples == before); // no repeated sample when settled debt is gone
     // A changed system limit recalculates the shared floor on the immediate fresh sample.
     actual_limit = 80000; actual_used = 70000; GATE.g.completed_mb = 1000;
-    assert(gate_enter(0, &held)); assert(GATE.g.active.free_mb == 8000);
+    assert(gate_enter(0, &held)); assert(GATE.g.active.free_mb == 8250);
     gate_leave(held);
     // Unknown limits and explicit gate disable still make progress without unnecessary denial retries.
     fake_now += 100; actual_limit = -1; actual_used = 1e9;

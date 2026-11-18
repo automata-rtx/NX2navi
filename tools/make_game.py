@@ -159,7 +159,9 @@ RUNTIME_LIB = 'libnx2navirt.a'
 FFX4_DLLS = ('amd_fidelityfx_loader_vk.dll', 'amd_fidelityfx_upscaler_vk.dll')   # AMD's FSR SDK 2.4, for FSR 4
 FFX4_FG_DLL = 'amd_fidelityfx_framegeneration_vk.dll'   # ... and its frame generation, with the two above
 RUNTIME_PATTERNS = ('*.c', '*.cpp', 'platform/*.c', 'ui/*.cpp', 'third_party/imgui/*.cpp',
-                    'third_party/imgui/backends/*.cpp', 'third_party/monocypher/*.c')
+                    'third_party/imgui/backends/*.cpp', 'third_party/monocypher/*.c',
+                    'third_party/blake3/*.c',
+                    'third_party/blake3/*_windows_gnu.S' if WIN else 'third_party/blake3/*_unix.S')
 INCLUDE = re.compile(r'^[ \t]*#[ \t]*include[ \t]+"([^"]+)"', re.M)
 
 # Runs a script the way `python script.py` does, with the script's folder first on sys.path. The launcher's
@@ -1444,6 +1446,7 @@ def runtime_cmd(clang, clangxx, inc, level=0, fast=None, msys=None, first=(), ta
     and its command, which is part of its objects' keys, stays as it was."""
     def cmd_for(src, dst):
         cpp = src.suffix in ('.cpp', '.cxx')
+        assembly = src.suffix == '.S'
         # the lifted code at -O1 (its size makes -O2 slow to build), the runtime at -O2; neither may assume strict
         # aliasing: the lifted code reaches guest memory through casts of one address to several types
         # (tools/build_game.py's flags). The lifted code is built for this PC's level (cpu_level); the runtime
@@ -1456,7 +1459,8 @@ def runtime_cmd(clang, clangxx, inc, level=0, fast=None, msys=None, first=(), ta
         optimization = ['-O1' if guest else '-O2']
         if target == 'znver4' and dst.name in TUNED_RENDERER_OBJECTS:
             optimization = ['-O3', '-flto=thin', '-march=znver4', '-ffp-contract=off']
-        return [*cc, '-c', '-std=gnu++17' if cpp else '-std=gnu11', *optimization,
+        standard = [] if assembly else ['-std=gnu++17' if cpp else '-std=gnu11']
+        return [*cc, '-c', *standard, *optimization,
                 *march, '-fno-strict-aliasing', '-w', *declspec, *([] if guest else first), *inc, '-o', str(dst), str(src)]
     return cmd_for
 

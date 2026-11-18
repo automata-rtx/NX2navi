@@ -479,6 +479,10 @@ void vk_texstat_time(int kind, uint64_t t0);
 void vk_texstat_add(int kind, uint64_t n, uint64_t bytes);
 // Deferred destruction: freed once the upload batches recorded so far and the timeline value last noted have completed.
 void vk_defer_image(VkImage img, VmaAllocation alloc);   // alloc NULL: vkDestroyImage only
+// Same lifetime as vk_defer_image; charge owned allocation bytes until actual allocator destruction completes.
+// Pending bytes prevent duplicate reclamation, not a promise of system commit relief (VMA may retain its blocks).
+void vk_defer_image_reclaim(VkImage img, VmaAllocation alloc, uint64_t bytes);
+uint64_t vk_mem_reclaim_pending(void);
 void vk_defer_view(VkImageView view);
 // free(p) once the GPU is past the submission being recorded, as vk_defer_image: a host record other threads may still
 // read (a destroyed texture's, vk_texture.c destroy_tex).

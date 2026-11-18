@@ -66,7 +66,7 @@ int main(void) {
     CHECK(resource_commit_headroom_mb(60000, -1) == 6000, "large-system automatic floor");
     CHECK(resource_commit_headroom_mb(60000, 0) == 0, "explicit texture floor disable");
     CHECK(resource_commit_headroom_mb(60000, 8192) == 8192, "explicit texture floor");
-    CHECK(resource_build_headroom_mb(60000, 4096, -1) == 6000, "builds must stop before texture pressure");
+    CHECK(resource_build_headroom_mb(60000, 4096, -1) == 6187.5, "builds must leave the texture recovery margin");
     CHECK(resource_build_headroom_mb(60000, 8192, -1) == 8192, "larger build margin must survive");
     CHECK(resource_build_headroom_mb(60000, 4096, 0) == 4096, "texture disable must retain build floor");
     CHECK(resource_build_headroom_mb(60000, 0, -1) == 0, "explicit build gate disable");

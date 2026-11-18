@@ -21,6 +21,7 @@
 #include "fresh_deps.h"
 #include "resource_budget.h"
 #include "texture_resource.h"
+#include "third_party/blake3/blake3.h"
 #include "gfx.h"
 #include "host.h"
 #include "nvn_api.h"
@@ -65,7 +66,7 @@ typedef struct Tex {
     int uploaded, released;
     uint64_t up_retry;            // gfx_counters.frames from which an upload that had no memory is tried again (upload)
     uint64_t uid;                 // names the entry in its bucket's released set (tex_gen_flip); 0 until its first release
-    uint64_t rel_frame;           // gfx_counters.frames when it was released (drop_stale)
+    uint64_t rel_frame;           // gfx_counters.frames when it was released (reclaim_released)
     uint32_t back_gap;            // most presents between a release and its taking back so far (stale_after)
     uint32_t n_up;                // uploads of this entry (vk_texture_debug)
     int last_ch;                  // last vk_mem_changed result of make_fresh: 1 written, 0 clean, -1 not tracked
@@ -96,6 +97,8 @@ typedef struct Tex {
     uint64_t scan_frame;          // one more than the frame vk_texture_gpu_written last looked for overwritten entries
     uint64_t ow_frame;            // gfx_counters.frames when overwritten was set
     uint8_t overwritten;          // released, and a texture at another address was drawn over its storage (overwrite_others)
+    uint8_t reclaim;              // pressure/cap destruction: allocation stays pending until the allocator releases it
+    uint32_t content_slot;        // non-owning materialization index, slot + 1; cleared before image mutation
     uint8_t in_gwin;              // in gwin[]
     int pidx;                     // 1 + its index in pent[] (vk_texture_pool_note_locked); 0: not listed
     int ph;                       // 1 + its index in pref[] (pool_ref); 0: none
@@ -629,7 +632,7 @@ static uint64_t n_restarts;              // superseded entries taken back (start
 // (nvn_gpu_only), each entry at another address whose storage overlaps it is marked overwritten and released as if
 // the game had finalized it. Its image then goes to the next texture made with the same parameters (create_tex), or
 // away OVERWRITTEN_KEEP presents later (drop_overwritten), or as early as an intact entry's while memory is short
-// (drop_stale). Left alone are an entry at the same address (start_at decides about those), an entry the written
+// (reclaim_released). Left alone are an entry at the same address (start_at decides about those), an entry the written
 // texture lies inside (a level or a layer of it, which a game draws through a texture of its own) and an entry
 // written in this frame or the one before: two layouts that take turns within a frame keep their images. The mark
 // goes when the game takes the entry back (entry_of).
@@ -684,6 +687,7 @@ static int tex_reuse_on(void) {
 }
 
 static void destroy_tex(Tex *e);
+static void content_image_forget(Tex *e);
 
 // Why an entry was destroyed (drop_tex), in the order of drop_names.
 enum { DROP_NONE, DROP_MAX, DROP_CAP, DROP_COMMIT, DROP_VRAM, DROP_IDLE_VRAM, DROP_IDLE_COMMIT, DROP_DISUSE,
@@ -838,6 +842,7 @@ static VkDeviceSize image_size(const VkImageCreateInfo *ci) {
 // A reused image (create_tex) was another texture's: the transition waits for every earlier command, which may still
 // read or write it.
 static void init_image(Tex *e, VkCommandBuffer cb) {
+    content_image_forget(e);
     e->upload_mapping = 0;
     VkImageMemoryBarrier2 ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
                                 .srcStageMask = e->reused ? VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_2_NONE,
@@ -1411,8 +1416,14 @@ static void rel_append(Tex *e) {
 }
 
 static Tex *sweep_at;   // where sweep_released goes on
+static Tex *reclaim_at; // bounded pressure scan; rel_unlink keeps this pointer live
+static int reclaim_gpu_phase; // GPU-only candidates wait until a complete reproducible-content sweep
+static int reclaim_cpu_seen;  // eligible reproducible content anywhere in the current bounded sweep
+static Tex *overwritten_at;  // independent bounded scan for overwritten images
 static void rel_unlink(Tex *e) {
     if (sweep_at == e) sweep_at = e->rel_next;
+    if (reclaim_at == e) reclaim_at = e->rel_next;
+    if (overwritten_at == e) overwritten_at = e->rel_next;
     ru_unlink(e);
     rel_bytes -= e->bytes;
     if (e->rel_prev) e->rel_prev->rel_next = e->rel_next;
@@ -1925,6 +1936,7 @@ int vk_texture_slot_retry_locked(int id) {
 static void retire_remove(Tex *e);
 
 static void destroy_tex(Tex *e) {
+    content_image_forget(e);
     if (e->retiring) retire_remove(e);
     pool_unlist(e);
     pool_forget(e);
@@ -1943,7 +1955,7 @@ static void destroy_tex(Tex *e) {
     }
     if (e->released) nreleased--, rel_unlink(e);
     if (e->pub.image) vk_exec_image_gone(e->pub.image);   // none when another texture took it (create_tex, reuse)
-    vk_defer_image(e->pub.image, e->alloc);
+    vk_defer_image_reclaim(e->pub.image, e->alloc, e->reclaim ? e->bytes : 0);
     if (e->flat3d) {   // its 3D copy goes the same way
         vk_exec_image_gone(e->flat3d->image);
         vk_defer_image(e->flat3d->image, e->flat3d_alloc);
@@ -2151,6 +2163,8 @@ static void write_back_n(Tex **v, int n);
 static uint64_t n_drop_wb;   // entries written back before their drop since the last perf line
 
 static void drop_tex(Tex *e, int why) {
+    e->reclaim = why == DROP_CAP || why == DROP_COMMIT || why == DROP_VRAM ||
+                 why == DROP_IDLE_COMMIT || why == DROP_IDLE_VRAM;
     flight_ev(e, FLIGHT_TEX_DROP, (uint32_t)why, 0);
     if (why == DROP_COMMIT || why == DROP_IDLE_COMMIT) commit_drop_note(e);
     if (e->gpu_dirty && why != DROP_OVERWRITTEN && why != DROP_SHUTDOWN) {
@@ -2260,7 +2274,7 @@ static int others_at(char *out, size_t n, const Tex *e, const Tex *skip) {
 // frames every 40-50 s on a GTX 1050 Ti, then the textures still in use were created and uploaded again.
 //
 // The one that goes is the oldest release that nothing sampled or drew into lately (samp_frame) or whose content is
-// gone (overwritten), not the oldest release as such. A released entry is not dead to the game (drop_stale, below, has the
+// gone (overwritten), not the oldest release as such. A released entry is not dead to the game (reclaim_released, below, has the
 // reasons): a descriptor registered for it still resolves to it. Ocarina reads its scene picture in every frame through
 // a second descriptor at the picture's address (RGB9E5, 1920x1080, the input of its own upscaler) whose entry was
 // released once, a few seconds into the area, and was looked up from then on: it headed the list for the rest of
@@ -2308,7 +2322,7 @@ static int others_at(char *out, size_t n, const Tex *e, const Tex *skip) {
 // of the route early and 2,300 to 2,500 in the others; frame times and the peak of the device memory in use were the
 // same in all three forms, the device memory at the end of a run 0.3 to 0.5 GiB higher with 6,200 kept.
 // A kept entry bound into pool memory owns no memory and goes with its pool (vk_texture_range_gone); the memory of
-// the others is bounded by NX2NAVI_TEX_RELEASED_MB (drop_stale).
+// the others is bounded by NX2NAVI_TEX_RELEASED_MB (reclaim_released).
 // Each call looks at up to SWEEP_LOOK entries from where the last one stopped (sweep_at; rel_unlink moves it off an
 // entry that leaves): with thousands of entries that stay, a walk from the head at every release would cross them all.
 // RELEASED_MAX is the floor of that limit; released_max raises it by the card (NX2NAVI_TEX_RELEASED_MAX sets it).
@@ -2423,38 +2437,12 @@ void vk_texture_pool_ctx(int on) { pool_ctx = on; }
 
 static int idle(const Tex *e, uint64_t now);
 
-// NX2NAVI_TEX_RELEASED_MB (default a thirty-second of the installed memory, 512 MiB to 2 GiB, or more by the card's
-// budget, released_cap_bytes; 0 = no limit) bounds the
-// own memory of the released entries: RELEASED_MAX alone kept 5-7 GiB of released render targets and decoded textures
-// after an hour of play at a 2160p game resolution, device memory the driver also charges to the system's commit (the
-// process's private bytes reached 31 GiB). A sixteenth (1 to 4 GiB) still let them hold 1.3 GiB on a 32 GB PC whose
-// commit then ran out at an area load (device lost); only entries released STALE_FRAMES presents ago go, so the
-// transient ones the game takes back within frames stay. NX2NAVI_TEX_COMMIT_FREE_MB (default the larger of 4 GiB and a tenth of the commit
-// limit; 0 = off) lowers that bound to COMMIT_LOW_KEEP while less of the system's commit is free: an allocation that
-// fails there ends the game. On Linux nothing fails at the limit: the OOM killer ends the game when its cgroup or the
-// machine runs out of memory, and plat_commit_info reports the tighter of the two. Both drop only stale entries
-// (drop_stale), a few per check like the VRAM pressure.
-//
-// NX2NAVI_TEX_PROC_COMMIT_MB (default the installed memory, at least PROC_COMMIT_MIN_MB; 0 = off) is a bound on this
-// process's own commit that is logged when passed; it counted the commit as low too until it was found that no texture
-// dropped could bring the process back under it (commit_is_low, at its end). The system's figure depends on the page file and on what else
-// runs: with a 64 GB limit it turned low at 59 GB in use, when this process alone held 42 GB on a PC with 32 GB of
-// memory, about half of it device memory, with the textures of five areas left behind. A process is not meant to need
-// more commit than the PC has memory: beyond that it lives on the page file, whatever its size. The bound holds until
-// the process is a thirty-second under it, so that it does not flip with every texture freed. The floor keeps it out
-// of the way on PCs with less memory, where a bound at the installed memory could hold all through play: the system's
-// figure decides there, as before. On Linux the process's figure is its resident anonymous memory, which cannot pass
-// the installed memory, so only a bound set below that holds there; a cgroup's limit and the machine's RAM act through
-// the system's figure.
-// Where a discrete GPU's memory counts against the commit (plat_commit_counts_vram: Windows), the bound compares the
-// commit less the device-local memory the driver reports in use (vk_mem_vram): that memory is on the card, not in RAM
-// or the page file, and the VRAM pressure and tex_disuse already bound it. Counted in, it held the bound all through
-// Hyrule Field on a 16 GB PC with a 16 GB card (RTX 5060 Ti): the process at 28.9 to 30.7 GB, 9 to 10 GB of it video
-// memory, while the system had 8 to 10 GB of its 49 GB limit free, and the ground flickered white as textures gave way.
-// So on such a PC the 42 GB process above, half of it device memory, no longer reaches this bound: the system's
-// figure and the VRAM pressure are what act there. The part of a card's memory the driver has moved into shared
-// system memory is subtracted too, which it should not be; the driver does not report it apart.
-#define COMMIT_LOW_KEEP ((uint64_t)256 << 20)
+// Retained textures have a size cap scaled to the machine (released_cap_bytes), but actual VRAM and system commit
+// pressure take priority. System pressure is measured independently of resident RAM: commit is an allocation
+// guarantee, not evidence of paging. The automatic headroom floor and a small recovery band are shared with optional
+// pipeline admission (resource_budget.h). Reclamation targets the measured deficit rather than shrinking retained
+// contents to a fixed minimum. The process-only threshold remains diagnostic; dropping device allocations cannot
+// reliably reduce the non-device part of that figure.
 #define PROC_COMMIT_MIN_MB 24576
 static uint64_t released_cap;   // bytes; 0 = not read yet, UINT64_MAX = no limit
 #define RELEASED_CAP_MAX_MB 8192
@@ -2462,6 +2450,7 @@ static long long commit_free_mb = -2;   // -2: not read yet, -1: the default
 static long long proc_commit_mb;        // this process's bound in MB; 0 = none
 static int commit_low, commit_logs;     // commit_low: either of the two below at the last check
 static int sys_low, proc_high;          // the system's commit is low; this process's is above its bound
+static uint64_t commit_deficit;        // measured bytes needed to recover headroom; never credits deferred frees
 static uint64_t n_cap_drops, n_commit_drops, n_commit_past;
 
 static uint64_t released_cap_bytes(void) {
@@ -2481,7 +2470,7 @@ static uint64_t released_cap_bytes(void) {
             // from then on each release dropped an older one that was decoded and encoded again on its way back,
             // hundreds a second, on a card with 30 GiB free. The two pressure rules still come first: released
             // entries go before anything else above NX2NAVI_TEX_VRAM_PRESSURE of the budget, and the bound falls to
-            // COMMIT_LOW_KEEP while the commit is low.
+            // the measured deficit while the commit is low.
             uint64_t vused = 0, vbudget = 0;
             int exact = 0;
             if (vk_mem_vram(&vused, &vbudget, &exact) && total > 0) {
@@ -2519,16 +2508,22 @@ static int commit_is_low(void) {
                    "textures give way only when the system's commit is low",
                    plat_commit_counts_vram() ? ", less the video memory in use on a discrete card," : "", proc_commit_mb);
     }
-    if (!commit_free_mb && !proc_commit_mb) return 0;
+    if (!commit_free_mb && !proc_commit_mb) {
+        commit_deficit = 0;
+        __atomic_store_n(&commit_low, 0, __ATOMIC_RELAXED);
+        return 0;
+    }
     double proc, used, limit;
     plat_commit_info(&proc, &used, &limit);
-    int low = 0;
+    int low = sys_low;
+    commit_deficit = 0;
     commit_critical = 0;
     if (commit_free_mb && used >= 0 && limit > 0) {
         double want = resource_commit_headroom_mb(limit, (double)commit_free_mb);
-        low = limit - used < want;
+        double deficit = resource_commit_deficit_mb(&low, used, limit, want);
+        commit_deficit = deficit > 0 ? (uint64_t)ceil(deficit * 1048576.0) : 0;
         commit_critical = limit - used < want / 2;   // the pause for drops that come back ends here
-    }
+    } else low = 0;
     double dev = 0;   // device-local memory in use, MB: in the commit (plat_commit_counts_vram), not in RAM (see above)
     VkCtx *c = vk_ctx();
     uint64_t dev_used, dev_budget;
@@ -2570,26 +2565,16 @@ static int commit_is_low(void) {
     // back under, and textures went one after the other for as long as the rest of the process stayed large, the ground
     // flickering white with the system's commit to spare (#434). What is above it is the host's own memory (the
     // game's heap, pipelines, caches); the bound is logged, and the system's figure still acts when the commit runs low.
-    return commit_low = low;
+    __atomic_store_n(&commit_low, low, __ATOMIC_RELAXED);
+    return low;
 }
 
 int vk_texture_commit_low(void) { return __atomic_load_n(&commit_low, __ATOMIC_RELAXED); }
 
-// Drops up to PRESSURE_STEP released entries that own memory and were released STALE_FRAMES presents ago or earlier,
-// oldest first and the intact ones before the others, while the released entries own more than keep. A transient
-// texture is taken back within frames, so dropping it frees nothing: the game initializes it again and it is created
-// again, empty if it is a render target. Under commit pressure that a system-managed page file never relieves, dropping
-// young ones destroyed 2160p render targets about every frame for whole sessions. Frame generation also reads a frame's
-// depth target at the host present (vk_dlssg.c vk_dlssg_frame tags it), after the blit deferred destruction waits for.
-//
-// A released entry is not dead to the game. A descriptor registered for a render target still resolves to its released
-// entry (slot_resolve: a finalized slot with no live texture at its storage gets its own), and the game can sample it
-// or take it back long after the release. In Kakariko Village, with the system's commit low, render targets dropped at
-// STALE_FRAMES came back empty and the scene was drawn black for one frame every two to three seconds (interface
-// intact), for as long as the commit stayed low. So no entry goes while lookups still reach it (idle), and one whose
-// content exists only in its image waits GPU_STALE_FRAMES, or GAP_TIMES the longest it stayed released before the game
-// took it back when that is longer. An overwritten entry has no content left to wait for (overwrite_others): it goes
-// with the intact ones, whether or not a descriptor still names it.
+// Released does not mean unused: descriptors and unfinished submissions can still name the image. Preserve
+// lookup/age protections, and give GPU-only content its longer retention interval. An overwritten entry no longer
+// owns recoverable content. The bounded reclaim scan below prioritizes reproducible images and leaves actual
+// allocation destruction to the existing upload/submission lifetime gates.
 #define STALE_FRAMES PRESENTS(120)
 #define GPU_STALE_FRAMES PRESENTS(1800)
 #define GAP_TIMES 8
@@ -2617,33 +2602,71 @@ static uint64_t stale_after(const Tex *e) {
     return gap > GPU_STALE_FRAMES ? gap : GPU_STALE_FRAMES;
 }
 
-static int drop_stale(uint64_t keep, uint64_t *count, int why) {   // returns the entries dropped: PRESSURE_STEP, more may follow
-    uint64_t now = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
-    int dropped = 0;
-    const uint64_t stale = STALE_FRAMES;
-    for (int any = 0; any < 2; any++)
-        for (Tex *e = rel_head, *next; e && now - e->rel_frame >= stale; e = next) {   // in release order
-            if (dropped == PRESSURE_STEP || rel_bytes <= keep) return dropped;
-            next = e->rel_next;
-            if (!e->bytes || (!any && !comes_back_intact(e) && !e->overwritten)) continue;
-            if (now - e->rel_frame < stale_after(e) || (!e->overwritten && !idle(e, now))) continue;
-            drop_tex(e, why);
+// All reasons share one bounded inspection budget. Keep the cursor across checks instead of repeatedly walking
+// the same protected entries; unlink updates it if a game thread takes back or destroys the pointed-to texture.
+#define RECLAIM_LOOK 512
+static struct { uint64_t checks, inspected, scheduled, pending, ns; } reclaim_stats;
+static uint64_t reclaim_released(uint64_t want, uint64_t *count, int why) {
+    if (why == DROP_VRAM) reclaim_gpu_phase = 0;
+    uint64_t now = frames_now(), freed = 0;
+    Tex *recoverable[PRESSURE_STEP], *other[PRESSURE_STEP];
+    int nr = 0, no = 0, dropped = 0;
+    Tex *e = reclaim_at ? reclaim_at : rel_head;
+    for (int n = 0; e && n < RECLAIM_LOOK && nr < PRESSURE_STEP; n++) {
+        reclaim_stats.inspected++;
+        if (now - e->rel_frame < STALE_FRAMES) { e = NULL; break; }
+        Tex *next = e->rel_next;
+        int eligible = e->bytes && now - e->rel_frame >= stale_after(e) &&
+                       (e->overwritten || idle(e, now));
+        // VRAM pressure has never authorized destroying the only GPU copy of a released texture.
+        if (why == DROP_VRAM && !comes_back_intact(e)) eligible = 0;
+        if (eligible) {
+            if (comes_back_intact(e) || e->overwritten) {
+                recoverable[nr++] = e;
+                reclaim_cpu_seen = 1;
+            }
+            else if (reclaim_gpu_phase && no < PRESSURE_STEP) other[no++] = e;
+        }
+        e = next;
+    }
+    reclaim_at = e;
+    if (!e) {
+        // A slice can observe more reproducible candidates than this byte target needs. Finish a whole sweep
+        // without any such candidates before permitting GPU-only content on the next sweep.
+        reclaim_gpu_phase = why != DROP_VRAM && !reclaim_gpu_phase && !reclaim_cpu_seen;
+        reclaim_cpu_seen = 0;
+    }
+    // Preserve the previous priority: reproducible/overwritten content first, GPU-only content only after its
+    // stronger age and lookup protections qualified it. All selected pointers remain protected by tex_lock.
+    for (int kind = 0; kind < 2 && freed < want; kind++) {
+        Tex **v = kind ? other : recoverable;
+        int n = kind ? no : nr;
+        for (int i = 0; i < n && dropped < PRESSURE_STEP && freed < want; i++) {
+            freed += v[i]->bytes;
+            drop_tex(v[i], why);
             dropped++, (*count)++;
         }
-    return dropped;
+    }
+    return freed;
 }
 
 // Drops up to PRESSURE_STEP entries that were marked overwritten OVERWRITTEN_KEEP presents ago or earlier
 // (overwrite_others): the image reuse found no texture to give their images to in that time.
 static void drop_overwritten(void) {
     uint64_t now = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
-    int dropped = 0;
-    for (Tex *e = rel_head, *next; e && now - e->rel_frame >= OVERWRITTEN_KEEP && dropped < PRESSURE_STEP; e = next) {
-        next = e->rel_next;
-        if (!e->overwritten || now - e->ow_frame < OVERWRITTEN_KEEP) continue;
-        drop_tex(e, DROP_OVERWRITTEN);
-        dropped++, n_over_drops++;
+    int dropped = 0, inspected = 0;
+    Tex *e = overwritten_at ? overwritten_at : rel_head;
+    while (e && inspected++ < RECLAIM_LOOK && dropped < PRESSURE_STEP) {
+        reclaim_stats.inspected++;
+        if (now - e->rel_frame < OVERWRITTEN_KEEP) { e = NULL; break; }
+        Tex *next = e->rel_next;
+        if (e->overwritten && now - e->ow_frame >= OVERWRITTEN_KEEP) {
+            drop_tex(e, DROP_OVERWRITTEN);
+            dropped++, n_over_drops++;
+        }
+        e = next;
     }
+    overwritten_at = e;
 }
 
 // NX2NAVI_TEX_EVICT (default on; 0 = only released entries go under VRAM pressure, as before): above the VRAM pressure
@@ -2680,7 +2703,12 @@ static uint64_t evict_idle(uint64_t want, uint64_t used, uint64_t budget, int wh
     Tex *v[EVICT_STEP];
     int nv = 0;
     uint64_t now = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
-    for (uint32_t i = 0; i < by_key.cap; i++) {   // the EVICT_STEP oldest candidates, oldest first
+    static uint32_t scan_at;
+    uint32_t checks = by_key.cap < RECLAIM_LOOK ? by_key.cap : RECLAIM_LOOK;
+    for (uint32_t k = 0; k < checks; k++) {   // oldest eligible entries within a bounded slice of the table
+        if (scan_at >= by_key.cap) scan_at = 0;
+        uint32_t i = scan_at++;
+        reclaim_stats.inspected++;
         Tex *e = by_key.vals[i];
         if (!e || e->released || e->retiring || !e->bytes || !comes_back_intact(e) || !idle(e, now)) continue;
         uint32_t age = look_round - e->use_round;
@@ -3075,34 +3103,10 @@ void vk_pool_marks_read(const uint32_t *marks, uint32_t n) {
     unlock();
 }
 
-// NX2NAVI_TEX_COMMIT_EVICT (default on; 0 = off): while the commit is low (commit_is_low), idle live textures go as
-// under VRAM pressure (evict_idle), COMMIT_EVICT_STEP at a time, once the released entries gave what they could: they
-// are down to COMMIT_LOW_KEEP, or drop_stale found less than a full step to drop. The driver charges device memory to
-// the commit too, and the eviction above starts only at NX2NAVI_TEX_VRAM_PRESSURE of the device's budget: on a 16-32 GB
-// card the textures of every area visited stayed until the commit ran out (27-37 GB processes, then a failed
-// allocation or a device lost, #177 #203 #215), as nothing else gave them back while they stayed below that share of
-// the video memory. Waiting for the released entries to be down to COMMIT_LOW_KEEP, as before, never ended where the
-// game releases and takes back 200-300 textures a frame: 2,048 released entries held 1.4-2.0 GiB, none of them stale,
-// and with the commit low for minutes no live texture went (a 42 GB process). The entries the game takes back stay
-// either way: drop_stale leaves them, and the evictions below take live textures only.
-#define COMMIT_EVICT_STEP ((uint64_t)256 << 20)
+// Commit and VRAM pressure share a byte target. Idle live entries are eligible only after released entries have
+// contributed toward that target. Their existing lifetime and content checks remain authoritative; disuse eviction
+// remains separately disabled by default. A retained-size cap alone never authorizes live-entry eviction.
 static int commit_evict_on = -1;
-static void commit_evict(void) {   // tex_lock held, the commit is low and the released entries gave what they could
-    if (commit_evict_on < 0) commit_evict_on = rt_knob("TEX_COMMIT_EVICT", "1") == 1;
-    if (!commit_evict_on || !tex_evict) return;
-    if (rel_bytes > COMMIT_LOW_KEEP) {
-        static int logs;
-        if (!n_commit_past++ && logs < 4) {
-            logs++;
-            rt_log("vk: commit low: the %d released textures keep %.0f MiB the game still takes back or looks up; "
-                   "live textures nothing sampled go without waiting for them", nreleased, rel_bytes / 1048576.0);
-        }
-    }
-    uint64_t used = 0, budget = 0;
-    vk_mem_vram_live(&used, &budget);
-    uint64_t freed = evict_idle(COMMIT_EVICT_STEP, used, budget, DROP_IDLE_COMMIT);
-    if (freed < COMMIT_EVICT_STEP) evict_disused(COMMIT_EVICT_STEP - freed);
-}
 
 static void sweep_pressure(void) {   // tex_lock held
     if (vram_pressure < 0) {
@@ -3119,8 +3123,10 @@ static void sweep_pressure(void) {   // tex_lock held
     }
     retire_sweep();
     if (submit_epoch & 7) return;   // the budget and commit queries every 8 submits
-    uint64_t used, budget;
-    int exact, dropped = 0;
+    uint64_t started = kern_now_ns();
+    reclaim_stats.checks++;
+    uint64_t used = 0, budget = 0;
+    int exact;
     uint64_t wanted = tex_evict ? (uint64_t)plat_xchg64(&room_wanted, 0) : 0;
     int known = vram_pressure && (rel_head || tex_evict || wanted) &&
                 (tex_evict ? vk_mem_vram_live(&used, &budget) : vk_mem_vram(&used, &budget, &exact));
@@ -3139,35 +3145,42 @@ static void sweep_pressure(void) {   // tex_lock held
             if (used - room_level > over) over = used - room_level;
         }
     }
-    if (over) {
-        // Released entries that come back intact, by the rule drop_stale keeps: released STALE_FRAMES ago and reached by
-        // no lookup since (idle). The game releases and takes back hundreds of textures a frame in towns, and the
-        // release list is mostly those: dropped, each was made and uploaded again within frames and freed nothing.
-        // With the budget taken as 7.5 GiB (NX2NAVI_VRAM_BUDGET_MB), teleports from Hyrule Field through Kakariko
-        // Village, the Graveyard, Death Mountain Trail and Kokiri Forest dropped 82,288 under the pressure and the card
-        // stayed over its budget throughout; with this rule 34,699 went, a fifth fewer textures were made again, the
-        // render thread waited a third less on textures, and 4 draws met a texture gone where 11 had.
-        uint64_t freed = 0, now = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
-        for (Tex *e = rel_head, *next; e && dropped < PRESSURE_STEP && now - e->rel_frame >= STALE_FRAMES; e = next) {
-            next = e->rel_next;
-            if (!comes_back_intact(e) || !idle(e, now)) continue;
-            freed += e->bytes;
-            drop_tex(e, DROP_VRAM);
-            dropped++, n_pressure_drops++;
-        }
-        if (tex_evict && freed < over) freed += evict_idle(over - freed, used, budget, DROP_IDLE_VRAM);
-        if (tex_evict && freed < over) evict_disused(over - freed);
-    }
-    int low = commit_is_low(), more = 0;   // more: the released entries have stale ones left for the next check
+    int low = commit_is_low();
     int held = low && commit_drops_held();   // the commit drops came back (commit_back_note)
-    if (rel_head) {
-        drop_overwritten();
-        uint64_t cap = released_cap_bytes();
-        if (rel_bytes > cap) drop_stale(cap, &n_cap_drops, DROP_CAP);
-        if (rel_bytes > COMMIT_LOW_KEEP && low && !held)
-            more = drop_stale(COMMIT_LOW_KEEP, &n_commit_drops, DROP_COMMIT) == PRESSURE_STEP;
+    if (rel_head) drop_overwritten();
+    uint64_t cap = released_cap_bytes();
+    uint64_t cap_need = rel_bytes > cap ? rel_bytes - cap : 0;
+    uint64_t commit_need = low && !held ? commit_deficit : 0;
+    uint64_t pressure_need = over > commit_need ? over : commit_need;
+    uint64_t want = pressure_need > cap_need ? pressure_need : cap_need;
+    uint64_t pending = vk_mem_reclaim_pending();
+    // Pending allocation destruction is not free memory. Allow the collector to finish before deciding another
+    // ordinary batch from a fresh sample. Critical pressure can make progress toward the remaining byte deficit.
+    if (pending && !commit_critical) {
+        reclaim_stats.pending++;
+        want = 0;
+    } else if (pending) {
+        // Unlinked entries already reduced rel_bytes, so only physical-pressure demand receives pending credit.
+        uint64_t remaining = pressure_need > pending ? pressure_need - pending : 0;
+        want = remaining > cap_need ? remaining : cap_need;
     }
-    if (low && !more && !held) commit_evict();
+    if (want) {
+        int why = over ? DROP_VRAM : commit_need ? DROP_COMMIT : DROP_CAP;
+        uint64_t *count = why == DROP_VRAM ? &n_pressure_drops : why == DROP_COMMIT ? &n_commit_drops : &n_cap_drops;
+        uint64_t freed = reclaim_released(want, count, why);
+        // Live eviction cannot satisfy a retained-entry cap. It can satisfy only the outstanding measured pressure,
+        // sharing the released batch's credit rather than starting an independent fixed-size eviction round.
+        if (commit_evict_on < 0) commit_evict_on = rt_knob("TEX_COMMIT_EVICT", "1") == 1;
+        uint64_t live_need = over > (commit_evict_on ? commit_need : 0) ? over : (commit_evict_on ? commit_need : 0);
+        if (pending) live_need = live_need > pending ? live_need - pending : 0;
+        if (tex_evict && freed < live_need) {
+            n_commit_past += (uint64_t)(!over && commit_need != 0);
+            freed += evict_idle(live_need - freed, used, budget, over ? DROP_IDLE_VRAM : DROP_IDLE_COMMIT);
+            if (freed < live_need) evict_disused(live_need - freed);
+        }
+        reclaim_stats.scheduled += freed;
+    }
+    reclaim_stats.ns += kern_now_ns() - started;
 }
 
 // ---------------------------------------------------------------- per-frame texture work (vk.h VK_TS_*)
@@ -3405,6 +3418,7 @@ static int astc_reformat(Tex *e, VkCommandBuffer cb, int bc) {
                     e->t.d.width, e->t.d.height, bc == 2 ? "BC1" : "BC3");
         return 0;
     }
+    content_image_forget(e);
     vk_exec_image_gone(e->pub.image);
     vk_defer_image(e->pub.image, e->alloc);
     vk_exec_image_gone(img);   // views cached under the handle of a destroyed image (create_tex)
@@ -3447,7 +3461,12 @@ static int astc_copy_opaque(const Tex *e, uint8_t *dst, const uint8_t *src, uint
     return ok;
 }
 
+#include "vk_texture_content.h"
+
 static void upload(Tex *e, const VkDirtyPages *dirty, int tracked) {
+    content_image_forget(e);
+    uint8_t material_digest[32];
+    int material_ready = 0;
     static volatile int32_t n_bad, n_undecoded, n_split;
     int no_mem = 0;   // a part's ASTC decode had no memory: the texture is uploaded again later
     const tex_t *t = &e->t;
@@ -3684,9 +3703,26 @@ static void upload(Tex *e, const VkDirtyPages *dirty, int tracked) {
             int widen_failed = 0;
             if (bc1 && !opq) widen_failed = !astc_reformat(e, cb, 1);
             else if (try1 && opq) astc_reformat(e, cb, 2);
-            checked = widen_failed ? -1
+            int copied = 0;
+            if (!widen_failed && gdsw && !sk && !partial && !acheck && held && content_image_eligible(e)) {
+                // Hash the immutable bytes actually staged for this upload, not an earlier guest-memory read.
+                // Including padding can reject equivalent content but cannot equate differently decoded payloads.
+                uint64_t h0 = kern_now_ns();
+                blake3_hasher material_hasher;
+                blake3_hasher_init(&material_hasher);
+                blake3_hasher_update(&material_hasher, stg, (size_t)size);
+                blake3_hasher_finalize(&material_hasher, material_digest, sizeof material_digest);
+                material_stats.hash_ns += kern_now_ns() - h0;
+                material_stats.hashes++;
+                material_stats.hash_bytes += size;
+                Tex *donor = content_image_find(e, material_digest, size);
+                if (donor) copied = content_image_copy(e, donor, cb, size);
+                material_ready = 1;
+            }
+            checked = widen_failed ? -1 : copied ? 1
                     : vk_astc_record(cb, sb, size, ar, (int)n, e->f.astc_bw, e->f.astc_bh, e->f.astc_srgb, e->f.astc_bc,
                                      e->pub.image, e->pub.aspect, rbuf);
+            if (checked <= 0) material_ready = 0;
             perf_end(PERF_ASTC, a0);
             vk_texstat_time(VK_TS_ASTC, a0);
             if (checked <= 0) {
@@ -3759,6 +3795,8 @@ static void upload(Tex *e, const VkDirtyPages *dirty, int tracked) {
     } else {
         e->up_retry = 0;
     }
+    if (material_ready && e->uploaded && !no_mem)
+        content_image_publish(e, material_digest, t->L.size);
     perf_end(PERF_TEX, p0);
     vk_texstat_time(VK_TS_UPLOAD, u0);
     vk_texstat_add(VK_TS_UPLOAD, 0, src_bytes);
@@ -3889,6 +3927,7 @@ static int alias_has_gpu_content(const Tex *src) {
 // their memory and image copies may not overlap; e leaves UNDEFINED between the two halves, so its first transition
 // cannot clobber src's bytes before they are read. 0 when no replay is recording (e is then not initialised yet).
 static int alias_copy(Tex *e, const Tex *src) {
+    content_image_forget(e);
     int reopen;
     VkCommandBuffer cb = vk_exec_inline_begin(&reopen);
     if (!cb) return 0;
@@ -4041,6 +4080,7 @@ static int depth_alias_log(void) {   // NX2NAVI_DEPTH_ALIAS_LOG=1: start_at logs
 // the console still holds what it drew, and a new descriptor made for that picture after the old one was let go read
 // it there (a black frame with FSR 3.1 and its frame generation, two presents long).
 static void start_at(Tex *e, const TexKey *k, int taken_back) {
+    content_image_forget(e);
     e->upload_mapping = 0;
     int alias = 0;
     int trace = (rt_trace & RT_TRACE_PERF) != 0;
@@ -4356,6 +4396,7 @@ void vk_texture_gpu_written(const tex_t *t) {
     Tex *e = entry_of(t);
     if (e) {
         make_fresh(e);   // a partial render keeps what the storage held before
+        content_image_forget(e);
         uint64_t now = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
         e->gw_frame = now;
         if (e->scan_frame != now + 1 && nvn_gpu_only(e->key.addr)) {   // once per frame and entry
@@ -5048,6 +5089,21 @@ void vk_texture_new_submit(void) {
                (unsigned long long)n_disuse_back, holds.n, marks_reads, (unsigned long long)n_reused,
                (unsigned long long)n_reuse_new, (unsigned long long)n_bind_skips, (unsigned long long)n_restarts,
                (unsigned long long)n_overwritten, (unsigned long long)n_over_drops);
+        rt_log("perf: frame %llu: resource reclaim checks %llu, inspected %llu, scheduled %.2f MiB, "
+               "waiting for allocator %llu, pending %.2f MiB, CPU %.3f ms, commit deficit %.2f MiB",
+               (unsigned long long)f * 60, (unsigned long long)reclaim_stats.checks,
+               (unsigned long long)reclaim_stats.inspected, reclaim_stats.scheduled / 1048576.0,
+               (unsigned long long)reclaim_stats.pending, vk_mem_reclaim_pending() / 1048576.0,
+               reclaim_stats.ns / 1e6, commit_deficit / 1048576.0);
+        memset(&reclaim_stats, 0, sizeof reclaim_stats);
+        rt_log("perf: frame %llu: material reuse hashes %llu (%.2f MiB, %.3f ms CPU), lookups %llu, "
+               "copy hits %llu (%.2f MiB source, %.3f ms CPU recording), avoided decode %.2f M texels, collisions %llu",
+               (unsigned long long)f * 60, (unsigned long long)material_stats.hashes,
+               material_stats.hash_bytes / 1048576.0, material_stats.hash_ns / 1e6,
+               (unsigned long long)material_stats.lookups, (unsigned long long)material_stats.hits,
+               material_stats.copied_bytes / 1048576.0, material_stats.copy_ns / 1e6,
+               material_stats.avoided_texels / 1e6, (unsigned long long)material_stats.collisions);
+        memset(&material_stats, 0, sizeof material_stats);
         n_cap_drops = n_pressure_drops = n_commit_drops = n_commit_past = n_evict = n_evict_bytes = 0;
         n_commit_back = n_commit_held = 0;
         n_disuse = n_disuse_bytes = n_disuse_back = n_retire_freed = n_retire_cancel = 0;
@@ -5186,6 +5242,7 @@ static void texels_read_take(const Tex *e, const Region *g, const TexRead *t, ui
 
 // Image <-> caller rows through a staging buffer; the GPU copy is waited for.
 static int image_texels(Tex *e, const Region *g, const NVNcopyRegion *r, uint8_t *mem, int write) {
+    if (write) content_image_forget(e);
     static volatile int32_t n_astc, n_ds;
     VkCtx *c = vk_ctx();
     VkImageAspectFlags aspect;
@@ -5321,6 +5378,7 @@ void vk_write_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r, co
     }
     lock();
     Tex *e = entry_of(t);
+    if (e) content_image_forget(e);
     if (e && e->pub.mirrored) {
         if (!storage_texels(t, &g, r, (uint8_t *)src, 1))
             log_limited(&n_bad, "WriteTexels: region outside level %u of texture %#llx", g.level, (unsigned long long)e->pub.addr);
@@ -6022,7 +6080,10 @@ void vk_texture_shutdown(void) {
     samplers = (nvn_hmap){.klen = sizeof(samp_par)};
     free(tslots), free(sslots);
     tslots = NULL, sslots = NULL, ntslots = nsslots = 0, nreleased = 0, pool_slots = 0;
-    rel_head = rel_tail = NULL, rel_bytes = 0;
+    rel_head = rel_tail = reclaim_at = overwritten_at = NULL, rel_bytes = 0;
+    reclaim_gpu_phase = reclaim_cpu_seen = 0;
+    memset(material_slots, 0, sizeof material_slots);
+    memset(&material_stats, 0, sizeof material_stats);
     if (sinfo) memset(sinfo, 0, sizeof *sinfo << 20);   // no slot is registered: tokens 0
     unlock();
 }

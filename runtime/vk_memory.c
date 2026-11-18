@@ -4612,7 +4612,15 @@ typedef struct {
 } Batch;
 
 enum { DEAD_IMAGE = 1, DEAD_IMAGE_VMA, DEAD_VIEW, DEAD_BUFFER_VMA, DEAD_HOST };
-typedef struct { int kind; uint64_t handle; VmaAllocation alloc; uint64_t seq, tl; } Dead;
+typedef struct { int kind; uint64_t handle; VmaAllocation alloc; uint64_t seq, tl, reclaim_bytes; } Dead;
+
+// Allocation bytes selected for pressure reclamation but not yet destroyed. This includes objects handed to
+// vk_mem_collect's out-of-lock destruction loop; fence completion alone does not release their allocation.
+static uint64_t reclaim_pending_bytes;
+
+uint64_t vk_mem_reclaim_pending(void) {
+    return __atomic_load_n(&reclaim_pending_bytes, __ATOMIC_ACQUIRE);
+}
 
 static PlatRMutex cmd_lock;
 static PlatOnce cmd_once = PLAT_ONCE_INIT;
@@ -4723,6 +4731,7 @@ static void destroy_dead(VkCtx *c, const Dead *d) {
     case DEAD_VIEW: vkDestroyImageView(c->device, (VkImageView)(uintptr_t)d->handle, NULL); break;
     case DEAD_BUFFER_VMA: vmaDestroyBuffer(c->vma, (VkBuffer)(uintptr_t)d->handle, d->alloc); break;
     }
+    if (d->reclaim_bytes) __atomic_fetch_sub(&reclaim_pending_bytes, d->reclaim_bytes, __ATOMIC_RELEASE);
 }
 
 // The objects the GPU is done with: destroyed here (out != NULL: moved to *out, for the caller to destroy without
@@ -5052,7 +5061,7 @@ uint64_t vk_upload_flush(int wait) {
     return seq;
 }
 
-static void defer(int kind, uint64_t handle, VmaAllocation alloc) {
+static void defer(int kind, uint64_t handle, VmaAllocation alloc, uint64_t reclaim_bytes) {
     plat_once(&cmd_once, cmd_init, NULL);
     plat_rmutex_lock(&cmd_lock);
     if (ndead == cap_dead) grow((void **)&dead, &cap_dead, sizeof *dead);
@@ -5072,7 +5081,11 @@ static void defer(int kind, uint64_t handle, VmaAllocation alloc) {
     // the submission another thread records meanwhile: that one is issued + 1 (vk_sync_submit sets issued after it).
     if (stamp && !rf) rf = vk_sync_issued() + 1;
     if (rf > tl) tl = rf;
-    dead[ndead++] = (Dead){kind, handle, alloc, open_active ? open_b.seq : next_seq, tl};
+    // Publish the outstanding charge before the record can reach either collector. Only actual owned image
+    // allocations count; destroying an image bound to somebody else's memory releases no allocation bytes.
+    if (kind != DEAD_IMAGE_VMA || !alloc) reclaim_bytes = 0;
+    if (reclaim_bytes) __atomic_fetch_add(&reclaim_pending_bytes, reclaim_bytes, __ATOMIC_RELEASE);
+    dead[ndead++] = (Dead){kind, handle, alloc, open_active ? open_b.seq : next_seq, tl, reclaim_bytes};
     if (kind != DEAD_HOST)
         rec_check_handle(kind == DEAD_VIEW ? REC_VIEW : kind == DEAD_BUFFER_VMA ? REC_BUFFER : REC_IMAGE, handle, 0, tl,
                          vk_sync_fence_done());
@@ -5088,12 +5101,15 @@ static int dead_pending(void) {
 }
 
 void vk_defer_image(VkImage img, VmaAllocation alloc) {
-    if (img) defer(alloc ? DEAD_IMAGE_VMA : DEAD_IMAGE, (uint64_t)(uintptr_t)img, alloc);
+    if (img) defer(alloc ? DEAD_IMAGE_VMA : DEAD_IMAGE, (uint64_t)(uintptr_t)img, alloc, 0);
 }
-void vk_defer_view(VkImageView view) { if (view) defer(DEAD_VIEW, (uint64_t)(uintptr_t)view, NULL); }
-void vk_defer_free(void *p) { if (p) defer(DEAD_HOST, (uint64_t)(uintptr_t)p, NULL); }
+void vk_defer_image_reclaim(VkImage img, VmaAllocation alloc, uint64_t bytes) {
+    if (img) defer(alloc ? DEAD_IMAGE_VMA : DEAD_IMAGE, (uint64_t)(uintptr_t)img, alloc, bytes);
+}
+void vk_defer_view(VkImageView view) { if (view) defer(DEAD_VIEW, (uint64_t)(uintptr_t)view, NULL, 0); }
+void vk_defer_free(void *p) { if (p) defer(DEAD_HOST, (uint64_t)(uintptr_t)p, NULL, 0); }
 void vk_defer_buffer(VkBuffer buf, VmaAllocation alloc) {
-    if (buf) defer(DEAD_BUFFER_VMA, (uint64_t)(uintptr_t)buf, alloc);
+    if (buf) defer(DEAD_BUFFER_VMA, (uint64_t)(uintptr_t)buf, alloc, 0);
 }
 
 void vk_mem_note_submit(uint64_t timeline_value) {

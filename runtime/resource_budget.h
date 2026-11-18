@@ -8,10 +8,24 @@ static inline double resource_commit_headroom_mb(double limit_mb, double configu
     return limit_mb > 40960.0 ? limit_mb / 10.0 : 4096.0;
 }
 
+// A small recovery band prevents admission and reclamation alternating at the same threshold. It is a target for
+// measured free commit, not permission to count deferred frees or allocator slack as available system memory.
+static inline double resource_commit_recovery_mb(double floor_mb) {
+    double margin = floor_mb / 32.0;
+    return floor_mb > 0 ? floor_mb + (margin < 256.0 ? margin : 256.0) : 0;
+}
+
+static inline double resource_commit_deficit_mb(int *pressured, double used_mb, double limit_mb, double floor_mb) {
+    if (used_mb < 0 || limit_mb <= 0 || floor_mb <= 0) { *pressured = 0; return 0; }
+    double free_mb = limit_mb - used_mb, recover = resource_commit_recovery_mb(floor_mb);
+    *pressured = *pressured ? free_mb < recover : free_mb < floor_mb;
+    return *pressured ? recover - free_mb : 0;
+}
+
 // Background preparation must stop before textures give way. An explicitly disabled build gate stays disabled.
 static inline double resource_build_headroom_mb(double limit_mb, double build_mb, double texture_mb) {
     if (build_mb <= 0) return 0;
-    double texture = resource_commit_headroom_mb(limit_mb, texture_mb);
+    double texture = resource_commit_recovery_mb(resource_commit_headroom_mb(limit_mb, texture_mb));
     return build_mb > texture ? build_mb : texture;
 }
 
