@@ -44,6 +44,23 @@ typedef struct {
 } AudrenWaveBuffer;
 _Static_assert(sizeof(AudrenWaveBuffer) == 0x38, "wave buffer");
 
+typedef struct { int32_t start, end; } AudioWaveRange;
+
+// Offsets within a pass are relative to this range. The first pass plays the normal range.
+static inline AudioWaveRange audio_wave_range(const AudrenWaveBuffer *b, int32_t repeats) {
+    if (repeats && b->loop_start >= 0 && b->loop_end > b->loop_start)
+        return (AudioWaveRange){b->loop_start, b->loop_end};
+    if (repeats && !b->loop_end && b->loop_start > b->start && b->loop_start < b->end)
+        return (AudioWaveRange){b->loop_start, b->end};
+    return (AudioWaveRange){b->start, b->end};
+}
+
+static inline int audio_wave_repeat(const AudrenWaveBuffer *b, int32_t *repeats) {
+    if (!b->loop || (b->loop_count >= 0 && *repeats >= b->loop_count)) return 0;
+    *repeats = b->loop_count < 0 ? 1 : *repeats + 1;
+    return 1;
+}
+
 typedef struct {
     uint32_t id, node_id;
     uint8_t is_new, in_use, play_state, sample_format;
@@ -143,7 +160,9 @@ typedef struct {
     int32_t loops_done;
     uint64_t played;
     uint32_t consumed, drops;
-    struct { int16_t history[2]; int32_t buffer; uint64_t at; } adpcm;   // DSP-ADPCM decode cursor (buffer slot, next sample) and history
+    struct { int16_t history[2]; unsigned slot_plus_one; uint64_t at; } adpcm;
+    uint8_t restart_mix, mixed;    // a new voice can reuse the slot before the next mix releases its old output
+    float mixed_gain;
     float biquad_state[2][6][2];   // filter, channel: transposed direct-form II delays
     uint64_t dry_pass;             // NX2NAVI_AUDIO_STATS: 1 + the render pass in which the voice ran out of queued
                                    // buffers before its end of stream (audren.c advance_voice), 0 otherwise

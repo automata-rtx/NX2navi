@@ -130,6 +130,7 @@ static void voice_reset(ServerVoice *v) {
     v->consumed = 0;
     v->loops_done = 0;
     memset(&v->adpcm, 0, sizeof v->adpcm);
+    v->restart_mix = 1;
     memset(v->biquad_state, 0, sizeof v->biquad_state);
     v->dry_pass = 0;
 }
@@ -161,7 +162,7 @@ static void update_voice(AudioRenderer *r, const AudrenVoiceIn *in) {
 
 // No samples (no memory, no size or an empty range): the DSP counts the buffer as played when it reaches it, so a
 // stream's empty last buffer does not hold up the buffers queued behind it.
-int audio_buffer_empty(const AudrenWaveBuffer *b) { return !b->address || !b->size || b->end <= b->start; }
+int audio_buffer_empty(const AudrenWaveBuffer *b) { return !b->address || !b->size || b->start < 0 || b->end <= b->start; }
 
 static void skip_empty(AudioRenderer *r, ServerVoice *v) {
     while (v->valid[v->index] && audio_buffer_empty(&v->buffers[v->index])) {
@@ -214,6 +215,7 @@ static void voices_prepare(AudioRenderer *r) {
             v->played = 0;
             v->fraction = 0;
             v->loops_done = 0;
+            memset(&v->adpcm, 0, sizeof v->adpcm);
             v->state = SV_STOPPED;
             v->dry_pass = 0;
             continue;
@@ -223,6 +225,7 @@ static void voices_prepare(AudioRenderer *r) {
                 if (v->pending[i]) {
                     v->pending[i] = 0;
                     v->valid[i] = 1;
+                    if (v->adpcm.slot_plus_one == (unsigned)i + 1) v->adpcm.slot_plus_one = 0;
                     if ((unsigned)i == v->index) {
                         v->offset = 0;
                         v->loops_done = 0;
@@ -415,15 +418,15 @@ static void advance_voice(AudioRenderer *r, ServerVoice *v) {
         AudrenWaveBuffer *b = &v->buffers[v->index];
         if (audio_buffer_empty(b)) break;   // an endless empty loop skip_empty kept: it starves the voice, and its
                                             // zero length would make the loop below go round for good
-        uint64_t length = (uint64_t)(b->end - b->start), left = length - v->offset;
+        AudioWaveRange range = audio_wave_range(b, v->loops_done);
+        uint64_t length = (uint64_t)(range.end - range.start), left = length - v->offset;
         uint64_t step = samples < left ? samples : left;
         v->offset += step;
         v->played += step;
         samples -= step;
         if (v->offset < length) break;
-        if (b->loop && (b->loop_count < 0 || v->loops_done < b->loop_count)) {
-            v->loops_done++;
-            v->offset = b->loop_start > b->start && b->loop_start < b->end ? (uint64_t)(b->loop_start - b->start) : 0;
+        if (audio_wave_repeat(b, &v->loops_done)) {
+            v->offset = 0;
             continue;
         }
         v->valid[v->index] = 0;

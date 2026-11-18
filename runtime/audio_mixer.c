@@ -34,6 +34,7 @@
 #include "ipc.h"
 
 #define MAX_FRAME 1024
+#define MAX_MIX_BUFFERS 512
 #define RING_FRAMES 16384            // output frames, about 340 ms at 48 kHz
 #define OUT_MAX 6                    // output channels at most: 5.1
 #define QUEUE_SLACK_MS 40            // queued audio above the target plus the device's request that ring_pull skips
@@ -41,7 +42,13 @@
 #define SPLITTER_UNUSED 0xffffffffu
 #define dm_guest_write_prepare(p, n) ((void)(p), (void)(n))   // guest memory is plain host memory on Windows
 
-typedef struct { float vol[24]; int32_t dest; uint8_t used; AudrenBiquadFloat biquads[2]; float state[2][2]; } SplitDest;
+typedef struct {
+    float vol[24], previous_vol[24];
+    int32_t dest, previous_dest;
+    uint8_t used, previously_used;
+    AudrenBiquadFloat biquads[2];
+    float state[2][2];
+} SplitDest;
 typedef struct { int32_t ndest; int32_t *ids; } SplitInfo;
 typedef struct {
     Reverb3d *reverb; Reverb3dParam param; int pending;
@@ -52,6 +59,10 @@ typedef struct {
 typedef struct Mixer {
     float *buf; int nbuf, frame;
     int *offset;                                   // first mix buffer of each mix id
+    float *voice_ends;                             // last routed sample per voice and mix buffer
+    float (*channel_gains)[24];                    // channel resource gains from the last rendered block
+    struct { int mix, channel; } last_layout[MAX_MIX_BUFFERS];
+    int last_buffer_count;
     SplitInfo *split; int nsplit; SplitDest *dest; int ndest;
     SDL_AudioStream *stream; int device_ok, rate;
     SDL_AudioDeviceID device;                      // the explicitly chosen device, 0 while the system default is open
@@ -564,14 +575,17 @@ void audio_mixer_open(AudioRenderer *r) {
     m->frame = r->param.sample_count;
     m->nbuf = r->param.mix_buffer_count;
     m->rate = r->param.sample_rate;
-    if (m->frame <= 0 || m->frame > MAX_FRAME || m->nbuf <= 0 || m->nbuf > 512) rt_fatal("audio mixer frame / buffer count");
+    if (m->frame <= 0 || m->frame > MAX_FRAME || m->nbuf <= 0 || m->nbuf > MAX_MIX_BUFFERS) rt_fatal("audio mixer frame / buffer count");
     m->buf = calloc((size_t)m->nbuf * (size_t)m->frame, sizeof(float));
+    m->voice_ends = calloc((size_t)m->nbuf * (size_t)r->param.voice_count, sizeof(float));
+    m->channel_gains = calloc((size_t)r->param.voice_count * 6, sizeof *m->channel_gains);
     m->offset = calloc((size_t)r->param.submix_count + 1, sizeof(int));
     m->nsplit = r->param.splitter_count;
     m->ndest = r->param.splitter_destination_count;
     m->split = calloc((size_t)(m->nsplit ? m->nsplit : 1), sizeof *m->split);
     m->dest = calloc((size_t)(m->ndest ? m->ndest : 1), sizeof *m->dest);
-    if (!m->buf || !m->offset || !m->split || !m->dest) rt_fatal("audio mixer tables");
+    if (!m->buf || !m->voice_ends || !m->channel_gains || !m->offset || !m->split || !m->dest)
+        rt_fatal("audio mixer tables");
     m->effect = calloc((size_t)(r->param.effect_count ? r->param.effect_count : 1), sizeof *m->effect);
     m->effect_order = calloc((size_t)(r->param.effect_count ? r->param.effect_count : 1), sizeof *m->effect_order);
     if (!m->effect || !m->effect_order) rt_fatal("audio effect tables");
@@ -626,6 +640,8 @@ void audio_mixer_close(AudioRenderer *r) {
     free(m->effect);
     free(m->effect_order);
     free(m->buf);
+    free(m->voice_ends);
+    free(m->channel_gains);
     free(m->offset);
     free(m->split);
     free(m->dest);
@@ -742,7 +758,18 @@ void audio_mixer_update_effects(AudioRenderer *r) {
 }
 
 /* ---------- voice decoding along the voice clock's sample path ---------- */
-typedef struct { ServerVoice *v; unsigned index; uint64_t offset; int32_t loops; uint8_t valid[4]; int ended; int16_t h1, h2; int32_t abuf; uint64_t aat; } Walk;
+typedef struct {
+    ServerVoice *v;
+    unsigned index;
+    uint64_t offset;
+    int32_t loops;
+    uint8_t valid[4];
+    int ended;
+    AudioWaveRange range;
+    int16_t h1, h2;
+    unsigned slot_plus_one;   // zero until the current pass loads its decoder context
+    uint64_t aat;
+} Walk;
 static int fmt_bytes(int f) { return f == FMT_PCM8 ? 1 : f == FMT_PCM16 ? 2 : f==FMT_PCM24?3:f == FMT_PCM32 || f == FMT_PCMF32 ? 4 : 0; }
 /* DSP-ADPCM: 8-byte frames of a predictor/scale byte and 14 4-bit samples; the history runs across samples. */
 static int16_t adpcm_next(Walk *w, const AudrenWaveBuffer *b, const int16_t *coef, uint64_t i) {
@@ -758,15 +785,20 @@ static int16_t adpcm_next(Walk *w, const AudrenWaveBuffer *b, const int16_t *coe
 static float sample_at(Walk *w, int ch) {
     if (w->ended || !w->valid[w->index]) return 0;
     ServerVoice *v = w->v; const AudrenWaveBuffer *b = &v->buffers[w->index];
-    uint64_t i = (uint64_t)b->start + w->offset; int f = v->in.sample_format, cc = (int)v->in.channel_count;
+    uint64_t i = (uint64_t)w->range.start + w->offset; int f = v->in.sample_format, cc = (int)v->in.channel_count;
     if (f == FMT_ADPCM) {
         if (cc != 1 || !v->in.extra_address || v->in.extra_size < 32) return 0;
         const int16_t *coef = (const int16_t *)(uintptr_t)v->in.extra_address;
-        if (w->abuf != (int32_t)w->index || w->aat > i + 1) {   /* (re)start this buffer: from its context, else from the frame boundary with carried history */
-            w->abuf = (int32_t)w->index;
-            if (b->context_address && b->context_size >= 6) { const int16_t *c = (const int16_t *)(uintptr_t)b->context_address; w->h1 = c[1]; w->h2 = c[2]; w->aat = (uint64_t)b->start; }
-            else w->aat = (uint64_t)b->start - (uint64_t)b->start % 14;
-            if (i < w->aat) w->aat = i;
+        if (w->slot_plus_one != w->index + 1) {
+            w->slot_plus_one = w->index + 1;
+            w->aat = (uint64_t)w->range.start;
+            if (b->context_address && b->context_size >= 6) {
+                const int16_t *context = (const int16_t *)(uintptr_t)b->context_address;
+                w->h1 = context[1];
+                w->h2 = context[2];
+            } else {
+                w->aat -= w->aat % 14;
+            }
         }
         while (w->aat <= i) adpcm_next(w, b, coef, w->aat++);
         return w->h1 / 32768.0f;
@@ -783,21 +815,28 @@ static float sample_at(Walk *w, int ch) {
     default: { float s; memcpy(&s, p, 4); return s; }
     }
 }
-static void walk_skip_empty(Walk *w) {   /* the same as skip_empty in audio_renderer.c: no samples, played on arrival */
+static void walk_skip_empty(Walk *w) {   /* Match audren.c skip_empty when crossing queued buffers. */
     while (!w->ended && w->valid[w->index] && audio_buffer_empty(&w->v->buffers[w->index])) {
         const AudrenWaveBuffer *b = &w->v->buffers[w->index];
-        if (b->loop && b->loop_count < 0) break;
+        if (b->loop && b->loop_count < 0) { w->ended = 1; break; }
         w->valid[w->index] = 0; w->offset = 0; w->loops = 0; w->index = (w->index + 1) & 3;
         if (b->end_of_stream) w->ended = 1;
     }
+    w->range = audio_wave_range(&w->v->buffers[w->index], w->loops);
 }
-static void walk_step(Walk *w) {   /* the same transitions as advance_voice in audio_renderer.c */
+static void walk_step(Walk *w) {
     if (w->ended || !w->valid[w->index]) { w->ended = 1; return; }
     const AudrenWaveBuffer *b = &w->v->buffers[w->index];
-    uint64_t length = (uint64_t)(b->end - b->start);
-    if (++w->offset < length) return;
-    if (b->loop && (b->loop_count < 0 || w->loops < b->loop_count)) { w->loops++; w->offset = b->loop_start > b->start && b->loop_start < b->end ? (uint64_t)(b->loop_start - b->start) : 0; return; }
-    w->valid[w->index] = 0; w->offset = 0; w->loops = 0; w->index = (w->index + 1) & 3;
+    if (w->offset + 1 < (uint64_t)(w->range.end - w->range.start)) { w->offset++; return; }
+    // Downsampling can skip the last compressed samples. Finish their history before entering the next buffer.
+    if (w->v->in.sample_format == FMT_ADPCM) sample_at(w, 0);
+    w->offset = 0;
+    w->slot_plus_one = 0;
+    if (audio_wave_repeat(b, &w->loops)) {
+        w->range = audio_wave_range(b, w->loops);
+        return;
+    }
+    w->valid[w->index] = 0; w->loops = 0; w->index = (w->index + 1) & 3;
     if (b->end_of_stream) w->ended = 1;
     walk_skip_empty(w);
 }
@@ -825,17 +864,27 @@ uint64_t audio_voice_consumed(const AudioRenderer *r, ServerVoice *v, int frames
 }
 static void voice_render(AudioRenderer *r, ServerVoice *v, float out[6][MAX_FRAME], int frames) {
     const double step = voice_step(r, v);
-    Walk w = {v, v->index, v->offset, v->loops_done, {0}, 0, v->adpcm.history[0], v->adpcm.history[1], v->adpcm.buffer, v->adpcm.at};
+    Walk w = {.v = v, .index = v->index, .offset = v->offset, .loops = v->loops_done,
+              .h1 = v->adpcm.history[0], .h2 = v->adpcm.history[1],
+              .slot_plus_one = v->adpcm.slot_plus_one, .aat = v->adpcm.at};
     memcpy(w.valid, v->valid, sizeof w.valid);
     walk_skip_empty(&w);
     int cc = (int)v->in.channel_count; double frac = v->fraction;
     for (int k = 0; k < frames; k++) {
-        Walk next = w; walk_step(&next);
-        for (int c = 0; c < cc; c++) { float s0 = sample_at(&w, c), s1 = sample_at(&next, c); out[c][k] = (float)(s0 + (s1 - s0) * frac); }
+        for (int c = 0; c < cc; c++) out[c][k] = sample_at(&w, c);
+        if (frac > 0) {
+            Walk next = w;
+            walk_step(&next);
+            for (int c = 0; c < cc; c++) {
+                float first = out[c][k];
+                out[c][k] = (float)(first + (sample_at(&next, c) - first) * frac);
+            }
+        }
         frac += step;
         while (frac >= 1.0) { frac -= 1.0; walk_step(&w); }
     }
-    v->adpcm.history[0] = w.h1; v->adpcm.history[1] = w.h2; v->adpcm.buffer = w.abuf; v->adpcm.at = w.aat;
+    v->adpcm.history[0] = w.h1; v->adpcm.history[1] = w.h2;
+    v->adpcm.slot_plus_one = w.slot_plus_one; v->adpcm.at = w.aat;
 }
 
 /* ---------- mixing ---------- */
@@ -845,6 +894,36 @@ static void accumulate(Mixer *m, int buffer, const float *src, float vol, int fr
     float *d = mixbuf(m, buffer); for (int k = 0; k < frames; k++) d[k] += src[k] * vol;
 }
 static int mix_valid(AudioRenderer *r, int32_t id) { return id >= 0 && id <= r->param.submix_count && r->mixes[id].in_use; }
+
+// The two passes can have different mix layouts. Decay each old contribution in its original mix and channel.
+static void release_voice_output(AudioRenderer *r, const float *ends) {
+    Mixer *m = r->mixer;
+    int frames = m->rate / 500;   // at most two milliseconds, completed before the next render pass
+    if (frames > m->frame) frames = m->frame;
+    for (int i = 0; i < m->last_buffer_count; i++) {
+        if (ends[i] == 0 || !isfinite(ends[i])) continue;
+        int mix = m->last_layout[i].mix, channel = m->last_layout[i].channel;
+        if (!mix_valid(r, mix) || channel >= r->mixes[mix].buffer_count) continue;
+        float *dst = mixbuf(m, m->offset[mix] + channel);
+        for (int k = 0; k < frames; k++)
+            dst[k] += ends[i] * ((float)(frames - 1 - k) / frames);
+    }
+}
+
+static void mix_voice_channel(Mixer *m, int buffer, const float *src, float route_gain, float previous_route_gain,
+                              const ServerVoice *v, float *ends) {
+    if (buffer < 0 || buffer >= m->nbuf) return;
+    float gain = v->in.volume * route_gain;
+    float from = v->mixed_gain * previous_route_gain;
+    if (from == gain) {
+        accumulate(m, buffer, src, gain, m->frame);
+    } else {
+        float step = (gain - from) / m->frame;
+        float *dst = mixbuf(m, buffer);
+        for (int k = 0; k < m->frame; k++) dst[k] += src[k] * (from + step * (k + 1));
+    }
+    ends[buffer] += src[m->frame - 1] * gain;
+}
 static int mix_depth(AudioRenderer *r, int id) {
     int d = 0;
     for (int guard = 0; id > 0 && guard < 64; guard++, d++) {
@@ -1041,15 +1120,38 @@ void audio_mixer_render(AudioRenderer *r, double seconds) {
     const int frames = m->frame, mc = r->param.submix_count + 1;
     memset(m->buf, 0, (size_t)m->nbuf * (size_t)frames * sizeof(float));
     int at = 0;
-    for (int i = 0; i < mc; i++) { m->offset[i] = at; if (r->mixes[i].in_use) at += r->mixes[i].buffer_count; }
-    if (at > m->nbuf) { rt_log("audio: mixes use %d buffers, renderer has %d", at, m->nbuf); rt_fatal("audio mix buffer layout"); }
+    for (int i = 0; i < mc; i++) {
+        m->offset[i] = at;
+        if (!r->mixes[i].in_use) continue;
+        int count = r->mixes[i].buffer_count;
+        if (count < 0 || count > m->nbuf - at) rt_fatal("audio mix buffer layout");
+        at += count;
+    }
 
     float (*vs)[MAX_FRAME]=m->voice_scratch,*filtered=m->filter_scratch;
     m->trace_pass++;
     for (int i = 0; i < r->param.voice_count; i++) {
         ServerVoice *v = &r->voices[i];
-        if (!v->in.in_use || v->state != SV_STARTED || !v->in.sample_rate || !v->valid[v->index]) continue;
-        int cc = (int)v->in.channel_count; if (cc < 1 || cc > 6) { report_once(m, 2, "voice channel count unsupported", cc); continue; }
+        int playing = v->in.in_use && v->state == SV_STARTED && v->in.sample_rate && v->valid[v->index];
+        int cc = (int)v->in.channel_count;
+        if (playing && (cc < 1 || cc > 6)) {
+            report_once(m, 2, "voice channel count unsupported", cc);
+            playing = 0;
+        }
+        float *ends = m->voice_ends + (size_t)i * m->nbuf;
+        int continuing = v->mixed && !v->restart_mix;
+        if (v->mixed) {
+            if (v->state != SV_STARTED || v->restart_mix) {
+                release_voice_output(r, ends);
+                v->mixed_gain = 0;
+            }
+            memset(ends, 0, (size_t)m->nbuf * sizeof *ends);
+        } else {
+            v->mixed_gain = v->in.volume;
+        }
+        v->mixed = playing;
+        v->restart_mix = 0;
+        if (!playing) continue;
         {   /* each sample format a started voice uses, logged once: one the mixer cannot decode plays as silence */
             static volatile uint32_t seen;
             unsigned f = v->in.sample_format & 31;
@@ -1095,15 +1197,41 @@ void audio_mixer_render(AudioRenderer *r, double seconds) {
                 SplitDest *d = &m->dest[s->ids[k]];
                 if (!d->used || !mix_valid(r, d->dest)) continue;
                 const float *source=splitter_filter(d,vs[c],filtered,frames);
-                for (int b = 0; b < r->mixes[d->dest].buffer_count && b < 24; b++) accumulate(m, m->offset[d->dest] + b, source, d->vol[b] * v->in.volume, frames);
+                int same_destination = continuing && d->previously_used && d->previous_dest == d->dest;
+                for (int b = 0; b < r->mixes[d->dest].buffer_count && b < 24; b++) {
+                    float previous = same_destination ? d->previous_vol[b] : d->vol[b];
+                    mix_voice_channel(m, m->offset[d->dest] + b, source, d->vol[b], previous, v, ends);
+                }
             }
         } else if (mix_valid(r, v->in.mix_id)) {
             for (int c = 0; c < cc; c++) {
                 int32_t id = v->in.channel_ids[c]; if (id < 0 || id >= r->param.voice_count * 6) continue;
                 const AudrenChannelIn *ch = &r->channels[id];
-                for (int b = 0; b < r->mixes[v->in.mix_id].buffer_count && b < 24; b++) accumulate(m, m->offset[v->in.mix_id] + b, vs[c], ch->mix[b] * v->in.volume, frames);
+                for (int b = 0; b < r->mixes[v->in.mix_id].buffer_count && b < 24; b++) {
+                    float previous = continuing ? m->channel_gains[id][b] : ch->mix[b];
+                    mix_voice_channel(m, m->offset[v->in.mix_id] + b, vs[c], ch->mix[b], previous, v, ends);
+                }
             }
         }
+        v->mixed_gain = v->in.volume;
+    }
+    for (int mix = 0; mix < mc; mix++) {
+        if (!r->mixes[mix].in_use) continue;
+        for (int b = 0; b < r->mixes[mix].buffer_count; b++) {
+            int index = m->offset[mix] + b;
+            m->last_layout[index].mix = mix;
+            m->last_layout[index].channel = b;
+        }
+    }
+    m->last_buffer_count = at;
+    // RequestUpdate can run several times between blocks. Ramp from the values that reached the output.
+    for (int id = 0; id < r->param.voice_count * 6; id++)
+        memcpy(m->channel_gains[id], r->channels[id].mix, sizeof m->channel_gains[id]);
+    for (int id = 0; id < m->ndest; id++) {
+        SplitDest *d = &m->dest[id];
+        memcpy(d->previous_vol, d->vol, sizeof d->previous_vol);
+        d->previous_dest = d->dest;
+        d->previously_used = d->used;
     }
     if (rt_trace & RT_TRACE_AUDIO) {
         // Voices mixed in the last pass and not in this one, and why; then voices that read the same wave buffer memory
