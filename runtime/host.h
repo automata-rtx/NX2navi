@@ -15,6 +15,7 @@
 #include "cpu.h"
 #include "dispatch.h"
 #include "resource_events.h"
+#include "resource_core_backing.h"
 
 // ---- logging and results
 void rt_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));   // "[host] <msg>\n" to the log, one write
@@ -220,6 +221,48 @@ int mem_protection_range_unchanged(uint64_t addr, uint64_t size, uint64_t observ
 int mem_frozen_stable(uint64_t addr); // strictly frozen with a stable protection version, never a thaw in flight
 int mem_read_hold(uint64_t a, uint64_t n);   // mem_readable that keeps the range mapped until mem_read_release
 void mem_read_release(void);
+// Captures the managed host topology independently of Vulkan pools. A hole or an untracked host address has no
+// canonical certificate. The caller owns the capture and may borrow its immutable intervals until release.
+typedef struct MemBackingCapture MemBackingCapture;
+typedef struct {
+    const MemBackingCapture *backing;
+    uint64_t address, bytes;
+    int needs_readable;
+} MemMappingReadRange;
+// The backing captures stay borrowed from the caller. The returned watermark belongs to the
+// validated host topology snapshot. This function does not call back into the renderer.
+uint64_t mem_mapping_validate_read_ranges(const MemMappingReadRange *, uint32_t count, uint64_t before);
+// Capture owns immutable byte identities. Actual host reads acquire a current mapping hold; the capture keeps
+// no native allocation or historical byte contents alive.
+RcBackingResult mem_backing_capture(uint64_t address, uint64_t size, MemBackingCapture **);
+typedef struct MemBackingCapturePlan {
+    uint64_t address, size, latest_mapping;
+    size_t bytes;
+    uint32_t count;
+} MemBackingCapturePlan;
+RcBackingResult mem_backing_capture_plan(uint64_t address, uint64_t size, MemBackingCapturePlan *);
+RcBackingResult mem_backing_capture_bounded(const MemBackingCapturePlan *, MemBackingCapture **);
+const RcInterval *mem_backing_intervals(const MemBackingCapture *, uint32_t *count);
+int mem_backing_current(const MemBackingCapture *);
+int mem_backing_current_range(const MemBackingCapture *, uint64_t address, uint64_t size);
+// On success holds the same shared lock as mem_read_hold. The copy still needs producer and CPU dirty/protection
+// checks. Current identity alone does not guarantee readable pages or unchanged bytes.
+int mem_backing_read_hold(const MemBackingCapture *);
+int mem_backing_read_hold_at(const MemBackingCapture *, uint64_t address, uint64_t size);
+// Also excludes lazy writeback and fault probes during a short CPU copy. Callers do not wait or allocate.
+int mem_backing_read_hold_no_fault_at(const MemBackingCapture *, uint64_t address, uint64_t size);
+void mem_backing_read_release_no_fault(void);
+// Notify intersections without allocating. The held variant uses the validated original mapping and its
+// existing read lock, or a verified legacy hold when canonical capture was unavailable.
+void mem_backing_cpu_changed(uint64_t address, uint64_t size);
+struct RcRegistryVisibility;
+void mem_backing_cpu_changed_held(const MemBackingCapture *, uint64_t address, uint64_t size,
+                                  const struct RcRegistryVisibility *overwritten);
+// As with mem_backing_read_hold, release the held mapping with mem_read_release.
+int mem_backing_write_hold(const MemBackingCapture *);
+void mem_backing_release(MemBackingCapture **);
+// Loader publication after native commit, relocation and final permissions. Modules stay resident for the process.
+void mem_backing_publish_module(uint64_t address, uint64_t size);
 uint32_t mem_map_physical(uint64_t a, uint64_t n);                              // 0x2C
 uint32_t mem_unmap_physical(uint64_t a, uint64_t n);                            // 0x2D
 int mem_info(uint32_t id, uint64_t *out);                  // GetInfo memory ids 2-7, 12-17, 21, 22, 28; 0 if not a memory id
@@ -234,6 +277,10 @@ uint64_t mem_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, uint64
 uint64_t mem_written_peek(uint64_t addr, uint64_t size, uint64_t *pages, uint64_t max);
                                                            // the same without the reset: the bits stay for the next
                                                            // mem_written_pages (verify checks only)
+typedef struct { uint64_t before, after, mapping; } MemFreezeTransition;
+// A nonzero transition identifies only a newly completed freeze under unchanged backing. It does not certify
+// contents: the consumer must drain pending writes and verify these regional versions again before retaining proof.
+int mem_freeze_observed(uint64_t a, MemFreezeTransition *transition);
 int mem_freeze(uint64_t a);                                // makes the 2 MiB region at a (2 MiB aligned, watched,
                                                            // committed PAGE_READWRITE) read-only until a write or
                                                            // mem_thaw thaws it; 1 frozen (or already), 0 refused
@@ -252,11 +299,34 @@ void mem_freeze_stats(uint64_t *frozen, uint64_t *freezes, uint64_t *fault_thaws
                       uint64_t *hot_holds);   // hot_holds: quick thaws that held their region thawed (memory.c "Hot regions")
 // NX2NAVI_WB_PROBE=1 (memory.c, "Probed regions"): who reads what the GPU wrote back into guest memory.
 // NX2NAVI_WB_LAZY (memory.c, "Lazy write-back"): pages the GPU wrote that come down only when the CPU touches them.
-int mem_lazy_enable(void (*fetch)(uint64_t h0, uint64_t h1, uint64_t off, uint64_t size),
-                    int (*clean)(uint64_t lo, uint64_t hi, void *ctx));
+typedef int (*MemLazyFetchVerified)(uint64_t mirror, uint64_t import_buffer, uint64_t offset,
+    uint64_t size, uint64_t guest_address, void *provider);
+int mem_lazy_enable(void (*fetch)(uint64_t h0, uint64_t h1, uint64_t off, uint64_t size, uint64_t guest_addr, void *provider),
+                    int (*clean)(uint64_t lo, uint64_t hi, void *ctx), MemLazyFetchVerified fetch_verified);
 uint64_t mem_lazy_arm(uint64_t a, uint64_t n, uint64_t h0, uint64_t h1, uint64_t off, void *ctx);
-int mem_lazy_skip(uint64_t a, uint64_t n, uint64_t h0, int64_t delta, uint64_t out[][2], int max);
+int mem_lazy_skip(uint64_t a, uint64_t n, uint64_t h0, int64_t delta, void *provider, uint64_t out[][2], int max);
 int mem_lazy_armed(uint64_t a, uint64_t n);
+// Check a retained native provider without fetching. A successful try holds lazy topology through end.
+typedef struct MemLazyWriteRange {
+    struct MemLazyWriteRange *next;
+    uint64_t address, size, mirror, offset;
+} MemLazyWriteRange;
+typedef enum {
+    MEM_LAZY_WRITE_READY,
+    MEM_LAZY_WRITE_BUSY,
+    MEM_LAZY_WRITE_NEEDS_FETCH,
+    MEM_LAZY_WRITE_FETCH_FAILED,
+    MEM_LAZY_WRITE_FOREIGN,
+    MEM_LAZY_WRITE_INVALID,
+} MemLazyWriteResult;
+// A successful lease prevents arming intersecting guest or mirror pages until release.
+// The exact stale owner can be settled only when the caller has parked its recorder.
+MemLazyWriteResult mem_lazy_write_acquire(MemLazyWriteRange *, uint64_t address, uint64_t size,
+    uint64_t mirror, uint64_t import_buffer, uint64_t offset, const void *provider, int parked);
+void mem_lazy_write_release(MemLazyWriteRange *);
+int mem_lazy_provider_transition_try(void);
+int mem_lazy_provider_borrowed(const void *provider, uint64_t native_buffer);
+void mem_lazy_provider_transition_end(void);
 // Copies the ranges src[i] = {address, bytes} of guest memory whose pages read without a fault to dst[i], ok[i] set.
 int mem_copy_readable(uint8_t *const *dst, const uint64_t (*src)[2], int n, uint8_t *ok);
 void mem_lazy_window(int open);
@@ -383,6 +453,7 @@ void dynres_frame(void);                                   // dynamic resolution
 const char *dynres_override(void);                         // the DLSS mode dynamic resolution uses now, NULL: the setting's
 void res_fn_hit(uint64_t addr, uint64_t x0);               // main.c fnprof_hit: catches the renderer at start
 void res_present(Cpu *c);                                  // nvnQueuePresentTexture: applies a pending scene size
+int res_output_size_current(unsigned out[2]);          // already published size, without deciding settings
 void res_sizes(unsigned out[2], unsigned scene[2]);      // the output and scene sizes in effect (the game's own
                                                            // until res_init switched the sets on)
 int res_adjustable(void);                                  // the build has the output and scene patch sets

@@ -259,10 +259,77 @@ _Static_assert(offsetof(pin_t, t) == 0, "ops hold pins as tex_t pointers");
 typedef struct { pin_t *p; uint64_t at; } pin_due;
 static PlatMutex pin_lock = PLAT_MUTEX_INIT;   // lock order: copy_lock, then pin_lock
 static nvn_hmap pins = {.klen = 8};         // serial -> pin_t
+typedef struct PinAttachment {
+    struct PinAttachment *next;
+    void *owner;
+    void (*release)(void *);
+} PinAttachment;
+static nvn_hmap pin_attachments = {.klen = 8}; // sparse, keyed only by verified pin serial
+static uint32_t pin_attachment_count;       // atomic hint before taking pin_lock for a lookup
 static pin_due *pin_q;                      // pins with no counted copy, oldest first: [pin_qh, pin_qn)
 static size_t pin_qh, pin_qn, pin_qcap;
 static uint64_t pins_live, pins_freed;
 static uint64_t nsubmits;                   // QueueSubmitCommands calls so far
+
+static int pin_matches(const tex_t *t) {
+    const pin_t *p = nvn_hm_get(&pins, &t->serial);
+    return p && &p->t == t;
+}
+
+void *nvn_texture_pin_attachment(const tex_t *t) {
+    if (!t || !__atomic_load_n(&pin_attachment_count, __ATOMIC_ACQUIRE)) return NULL;
+    plat_mutex_lock_shared(&pin_lock);
+    const PinAttachment *attachment = pin_matches(t) ? nvn_hm_get(&pin_attachments, &t->serial) : NULL;
+    void *owner = attachment ? attachment->owner : NULL;
+    plat_mutex_unlock_shared(&pin_lock);
+    return owner;
+}
+
+int nvn_texture_pin_attach(const tex_t *t, void *owner, void (*release)(void *)) {
+    if (!t || !owner || !release) return 0;
+    plat_mutex_lock(&pin_lock);
+    int attached = pin_matches(t) && !nvn_hm_get(&pin_attachments, &t->serial);
+    if (attached) {
+        PinAttachment *attachment = malloc(sizeof *attachment);
+        if (!attachment) rt_fatal("nvn: texture pin attachment");
+        *attachment = (PinAttachment){.owner = owner, .release = release};
+        nvn_hm_put(&pin_attachments, &t->serial, attachment);
+        __atomic_store_n(&pin_attachment_count, pin_attachments.n, __ATOMIC_RELEASE);
+    }
+    plat_mutex_unlock(&pin_lock);
+    return attached;
+}
+
+static void pin_attachment_release(void *arg) {
+    PinAttachment *attachment = arg;
+    attachment->release(attachment->owner);
+    free(attachment);
+}
+
+int nvn_texture_pin_unattach(const tex_t *t, const void *owner) {
+    if (!t || !owner) return 0;
+    plat_mutex_lock(&pin_lock);
+    PinAttachment *attachment = pin_matches(t) ? nvn_hm_get(&pin_attachments, &t->serial) : NULL;
+    if (attachment && attachment->owner == owner) {
+        nvn_hm_del(&pin_attachments, &t->serial);
+        __atomic_store_n(&pin_attachment_count, pin_attachments.n, __ATOMIC_RELEASE);
+    } else attachment = NULL;
+    plat_mutex_unlock(&pin_lock);
+    if (!attachment) return 0;
+    pin_attachment_release(attachment);
+    return 1;
+}
+
+void nvn_texture_pin_attachments_clear(void) {
+    plat_mutex_lock(&pin_lock);
+    nvn_hmap detached = pin_attachments;
+    pin_attachments = (nvn_hmap){.klen = 8};
+    __atomic_store_n(&pin_attachment_count, 0, __ATOMIC_RELEASE);
+    plat_mutex_unlock(&pin_lock);
+    nvn_hm_clear(&detached, pin_attachment_release);
+    free(detached.keys);
+    free(detached.vals);
+}
 
 static void pin_queue(pin_t *p, uint64_t at) {   // pin_lock held
     if (p->queued) return;
@@ -278,15 +345,17 @@ static void pin_queue(pin_t *p, uint64_t at) {   // pin_lock held
     p->queued = 1;
 }
 
-static const tex_t *tex_pin(const NVNtexture *nt) {
-    const tex_t *t = (const tex_t *)nt;
+static const tex_t *tex_pin_access(const tex_t *t, int retain) {
     if (!t) return NULL;
     uint64_t serial = t->serial;
     if (!serial) rt_fatal("nvn: a recording references the uninitialized texture object %p", (const void *)t);
     uint64_t now = __atomic_load_n(&nsubmits, __ATOMIC_RELAXED);
     plat_mutex_lock_shared(&pin_lock);   // nvn_pins_sweep frees under the exclusive lock
     pin_t *r = nvn_hm_get(&pins, &serial);
-    if (r) __atomic_store_n(&r->last_use, now, __ATOMIC_RELAXED);
+    if (r) {
+        __atomic_store_n(&r->last_use, now, __ATOMIC_RELAXED);
+        if (retain) __atomic_add_fetch(&r->refs, 1, __ATOMIC_RELAXED);
+    }
     plat_mutex_unlock_shared(&pin_lock);
     if (r) return &r->t;
     plat_mutex_lock(&pin_lock);
@@ -299,8 +368,17 @@ static const tex_t *tex_pin(const NVNtexture *nt) {
         pin_queue(r, now);   // freed like any other if no copy ever names it
     }
     __atomic_store_n(&r->last_use, now, __ATOMIC_RELAXED);
+    if (retain) __atomic_add_fetch(&r->refs, 1, __ATOMIC_RELAXED);
     plat_mutex_unlock(&pin_lock);
     return &r->t;
+}
+
+static const tex_t *tex_pin(const NVNtexture *nt) {
+    return tex_pin_access((const tex_t *)nt, 0);
+}
+
+const tex_t *nvn_texture_pin_acquire(const tex_t *immutable_descriptor) {
+    return tex_pin_access(immutable_descriptor, 1);
 }
 
 // The ops whose payload names pins (op_pins): five of the op kinds. The walks over every record of a recording
@@ -350,6 +428,20 @@ static void pin_ref(const tex_t *t, int delta, uint64_t now) {
     plat_mutex_unlock(&pin_lock);
 }
 
+const tex_t *nvn_texture_pin_retain_attachment(uint64_t serial, const void *owner) {
+    if (!serial || !owner) return NULL;
+    plat_mutex_lock_shared(&pin_lock);
+    const PinAttachment *attachment = nvn_hm_get(&pin_attachments, &serial);
+    pin_t *p = attachment && attachment->owner == owner ? nvn_hm_get(&pins, &serial) : NULL;
+    if (p) pin_ref(&p->t, 1, 0);
+    plat_mutex_unlock_shared(&pin_lock);
+    return p ? &p->t : NULL;
+}
+
+void nvn_texture_pin_release(const tex_t *t) {
+    if (t) pin_ref(t, -1, __atomic_load_n(&nsubmits, __ATOMIC_RELAXED));
+}
+
 // Counts (delta 1) or uncounts (-1) the pins named by the copy at handle, OP_BEGIN to OP_END; returns how many.
 static uint32_t pin_refs(const uint8_t *copy, int delta) {
     uint64_t now = __atomic_load_n(&nsubmits, __ATOMIC_RELAXED);
@@ -375,6 +467,7 @@ void nvn_pins_sweep(uint64_t now, const tex_t *const *keep, int nkeep) {
     }
     if (!on) { RP_VALUE(RPK_OUTCOME, RPO_DISABLED); return; }
     static uint64_t logged;
+    PinAttachment *detached = NULL;
     plat_mutex_lock(&pin_lock);
 #if NX2NAVI_REPLAY_PHASES
     uint64_t rp_freed = pins_freed;
@@ -394,6 +487,11 @@ void nvn_pins_sweep(uint64_t now, const tex_t *const *keep, int nkeep) {
             continue;
         }
         nvn_hm_del(&pins, &p->t.serial);
+        PinAttachment *attachment = nvn_hm_del(&pin_attachments, &p->t.serial);
+        if (attachment) {
+            attachment->next = detached;
+            detached = attachment;
+        }
         free(p);
         pins_live--, pins_freed++;
     }
@@ -403,7 +501,13 @@ void nvn_pins_sweep(uint64_t now, const tex_t *const *keep, int nkeep) {
                (unsigned long long)pins_live, (unsigned long long)(pin_qn - pin_qh), (unsigned long long)pins_freed);
     }
     RP_VALUE(RPK_PINS_FREED, pins_freed - rp_freed);
+    if (detached) __atomic_store_n(&pin_attachment_count, pin_attachments.n, __ATOMIC_RELEASE);
     plat_mutex_unlock(&pin_lock);
+    while (detached) {
+        PinAttachment *attachment = detached;
+        detached = attachment->next;
+        pin_attachment_release(attachment);
+    }
 }
 
 void nvn_pins_stats(uint64_t *live, uint64_t *freed) {
@@ -419,7 +523,7 @@ void nvn_pins_stats(uint64_t *live, uint64_t *freed) {
 // copies per page), and the recording threads waited on it.
 // deferred: 0 unknown, 1 none, 2 some; pins: texture pins its ops name, counted in their refs (pin_refs)
 typedef struct {
-    uint64_t magic, bytes, made_at, used_at, deferred, pins;
+    uint64_t magic, bytes, made_at, used_at, deferred, pins, max_ordered_scratch_bytes;
     // Immutable offsets into the command bytes, stored after the OP_END record. Clones copy this tail as well, so
     // their deferred payloads can change without rebasing any metadata or sharing mutable state with another submit.
     uint32_t indexed, plan_complete;
@@ -563,6 +667,40 @@ uint64_t nvn_handle_bytes(uint64_t handle) {
     uint64_t n = pf ? pf->bytes : 0;
     plat_mutex_unlock_shared(&copy_lock);
     return n;
+}
+
+static copy_prefix *copy_find_submitted(uint64_t handle) { // copy_lock held
+    copy_prefix *pf = copy_find(handle);
+    if (!pf) pf = nvn_hm_get(&copy_indexed, &handle);
+    for (uint32_t i = 0; !pf && i < nzombies; ++i)
+        if ((uint64_t)(uintptr_t)(zombies[i] + 1) == handle) pf = zombies[i];
+    return pf;
+}
+
+uint64_t nvn_submission_handle_bytes(uint64_t handle) {
+    plat_mutex_lock_shared(&copy_lock);
+    const copy_prefix *pf = copy_find_submitted(handle);
+    uint64_t n = pf ? pf->bytes : 0;
+    plat_mutex_unlock_shared(&copy_lock);
+    return n;
+}
+
+int nvn_submission_ordered_scratch_max(const uint64_t *handles, int n, uint64_t *bytes) {
+    *bytes = 0;
+    if (n < 0 || (n && !handles)) return 0;
+    uint64_t max = 0;
+    plat_mutex_lock_shared(&copy_lock);
+    for (int i = 0; i < n; ++i) {
+        const copy_prefix *pf = copy_find_submitted(handles[i]);
+        if (!pf) {
+            plat_mutex_unlock_shared(&copy_lock);
+            return 0;
+        }
+        if (pf->max_ordered_scratch_bytes > max) max = pf->max_ordered_scratch_bytes;
+    }
+    plat_mutex_unlock_shared(&copy_lock);
+    *bytes = max;
+    return 1;
 }
 
 // Marks a live copy used by submission now; its size from OP_BEGIN to OP_END inclusive.
@@ -717,13 +855,13 @@ static void span_finish_draw(span_list *s) {
 }
 
 static void span_add(span_list *s, const op_hdr *h, size_t at) {
-    uint32_t kind = nvn_record_op_class(h->op);
+    uint32_t kind = nvn_record_span_class(h);
     uint32_t draw = h->op == OP_DRAW || h->op == OP_DRAW_IDX || h->op == OP_DRAW_IDX_IND || kind == NVN_PLAN_MESH;
     uint32_t stride = draw && kind == NVN_PLAN_RUN ? h->size : 0;
     if (s->n && s->v[s->n - 1].draw_stride != stride) span_finish_draw(s);
     NvnRecordSpan *last = s->n ? &s->v[s->n - 1] : NULL;
     // Bounded ordinary spans keep the replay's finite read-ahead limit exact. State-dependent boundaries are
-    // single-operation spans, so replay still inspects the target, mesh mode and update order at their original place.
+    // single-operation spans, so replay inspects their payload and ordering at their original place.
     if (kind == NVN_PLAN_RUN && last && last->kind == kind && last->draw_stride == stride && last->ops < 1024) {
         last->end = at + h->size;
         last->ops++;
@@ -818,6 +956,7 @@ static void exec_build(exec_builder *b, const uint8_t *commands, size_t bytes) {
 static void front_build(exec_builder *b, const uint8_t *commands, size_t bytes) {
     if (!b->n) return;
     size_t primary_state_bytes = b->bytes;
+    size_t ordered = 0;
     for (size_t primary = 0; primary < b->n;) {
         const NvnExecStep *first = &b->steps[primary];
         if (first->opcode != NVN_EXEC_STATE && !(first->flags & NVN_EXEC_STATE_INPUT)) {
@@ -826,16 +965,25 @@ static void front_build(exec_builder *b, const uint8_t *commands, size_t bytes) 
             primary++;
             continue;
         }
+        if (ordered <= primary) {
+            // Search each primary step at most once for the next recorder-only draw.
+            for (ordered = primary + 1; ordered < b->n; ordered++) {
+                const NvnExecStep *step = &b->steps[ordered];
+                if (step->opcode == OP_DRAW &&
+                    nvn_record_span_class((const op_hdr *)(commands + step->begin)) == NVN_PLAN_GENERATED_INDEX)
+                    break;
+            }
+        }
         size_t at = first->begin;
         size_t state_at = b->bytes;
         b->emits = 0, b->failed = 0;
         NvnExecFrontComposeSpan span = {0};
         // Appending the summary can reallocate b->state. The composer finishes its reads before invoking exec_emit;
         // every invocation receives the current pointer, with a bound that excludes previously appended summaries.
-        if (nvn_exec_front_compose(commands, bytes, b->steps, b->n, b->state, primary_state_bytes,
+        if (nvn_exec_front_compose(commands, bytes, b->steps, ordered, b->state, primary_state_bytes,
                                     primary, exec_emit, b, &span)) {
             if (!b->failed && (b->emits != 1 || span.end <= at || span.end > bytes || (span.end & 7) ||
-                span.end_step <= primary || span.end_step > b->n ||
+                span.end_step <= primary || span.end_step > ordered ||
                 span.end != b->steps[span.end_step - 1].end ||
                 span.draws < 2 || span.draws > 16 || span.ops < span.draws + 2 || span.ops > 1024 ||
                 span.ops > (span.end - at) / sizeof(op_hdr)))
@@ -912,7 +1060,7 @@ static void copy_exec_check(const copy_prefix *pf) {
         at = s->begin;
         while (at < s->end) {
             const op_hdr *h = (const op_hdr *)(commands + at);
-            if (nvn_record_op_class(h->op) != NVN_PLAN_RUN || h->op == OP_REPORT_COUNTER ||
+            if (nvn_record_span_class(h) != NVN_PLAN_RUN || h->op == OP_REPORT_COUNTER ||
                 h->op == OP_RESET_COUNTER || h->op == OP_RENDER_ENABLE || h->op == OP_RENDER_COND ||
                 h->op == OP_SET_TEX_POOL || h->op == OP_SET_SAMP_POOL)
                 rt_fatal("nvn: front summary crosses an ordered operation");
@@ -942,12 +1090,12 @@ static void copy_plan_check(const copy_prefix *pf) {
     size_t at = 0;
     for (size_t i = 0; i < pf->nspans; i++) {
         const NvnRecordSpan *s = &spans[i];
-        if (s->begin != at || s->end <= at || s->end > pf->bytes || s->kind > NVN_PLAN_UPDATE)
+        if (s->begin != at || s->end <= at || s->end > pf->bytes || s->kind > NVN_PLAN_GENERATED_INDEX)
             rt_fatal("nvn: replay plan coverage mismatch");
         uint32_t ops = 0, draws = 0;
         while (at < s->end) {
             const op_hdr *h = (const op_hdr *)(cmd + at);
-            if (nvn_record_op_class(h->op) != s->kind) rt_fatal("nvn: replay plan operation mismatch");
+            if (nvn_record_span_class(h) != s->kind) rt_fatal("nvn: replay plan operation mismatch");
             if (s->draw_stride && (h->size != s->draw_stride ||
                 (h->op != OP_DRAW && h->op != OP_DRAW_IDX && h->op != OP_DRAW_IDX_IND)))
                 rt_fatal("nvn: replay plan draw stride mismatch");
@@ -1010,12 +1158,41 @@ static void copy_index_check(const copy_prefix *pf) {
     copy_plan_check(pf);
 }
 
+static void ordered_scratch_max(const op_hdr *h, uint64_t *max) {
+    uint64_t bytes = 0;
+    if (h->op == OP_UPDATE_UB) {
+        size_t overhead = sizeof *h + offsetof(p_update_ub, data);
+        if (h->size < overhead) rt_fatal("nvn: truncated inline uniform update");
+        const p_update_ub *update = nvn_op_payload(h);
+        if (update->size > h->size - overhead) rt_fatal("nvn: inline uniform update exceeds its recording");
+        bytes = update->size;
+    } else if (h->op == OP_DRAW) {
+        if (h->size < sizeof *h + sizeof(p_draw)) rt_fatal("nvn: truncated direct draw");
+        bytes = nvn_generated_draw_index_bytes(nvn_op_payload(h));
+    }
+    if (bytes > *max) *max = bytes;
+}
+
 #include "nvn_parent_plan.h"
+
+void *nvn_record_retain_pins(uint64_t handle) {
+    plat_mutex_lock(&copy_lock);
+    copy_prefix *pf = copy_find_submitted(handle);
+    if (pf && pf->pins) pf->plan_readers++;
+    else pf = NULL;
+    plat_mutex_unlock(&copy_lock);
+    return pf;
+}
+
+void nvn_record_release_pins(void *lease) {
+    copy_prefix *pf = lease;
+    if (pf) plan_drop_readers(&pf, 1);
+}
 
 // Validate newly recorded bytes and build their indexes. Child interiors have already passed this exact walk.
 static inline uint64_t index_range(const uint8_t *p, size_t n, size_t at, size_t end, int indexed,
                                    offset_list *uniform, offset_list *deferred, offset_list *pinops,
-                                   offset_list *capture, capture_set *captured, span_list *spans) {
+                                   offset_list *capture, capture_set *captured, span_list *spans, uint64_t *max_scratch) {
     uint64_t pins_named = 0;
     while (at < end) {
         if (end - at < sizeof(op_hdr)) rt_fatal("nvn: recording has no complete end record");
@@ -1027,6 +1204,8 @@ static inline uint64_t index_range(const uint8_t *p, size_t n, size_t at, size_t
         const tex_t *pinned[9];
         int pinop = h.op < 64 && (PIN_OPS >> h.op & 1);
         int k = pinop ? op_pins(h.op, p + at + 8, pinned) : 0;
+        const op_hdr *record = (const op_hdr *)(p + at);
+        if (h.op == OP_UPDATE_UB || h.op == OP_DRAW) ordered_scratch_max(record, max_scratch);
         for (int i = 0; i < k; i++) pin_ref(pinned[i], 1, 0);
         pins_named += (uint64_t)k;
         if (indexed) {
@@ -1035,9 +1214,9 @@ static inline uint64_t index_range(const uint8_t *p, size_t n, size_t at, size_t
                 offset_add(uniform, at);
                 if (capture_add(captured, (const p_bind_buf *)(p + at + sizeof(op_hdr)))) offset_add(capture, at);
             }
-            if (op_deferred((const op_hdr *)(p + at))) offset_add(deferred, at);
+            if (op_deferred(record)) offset_add(deferred, at);
             if (pinop) offset_add(pinops, at);
-            span_add(spans, &h, at);
+            span_add(spans, record, at);
         }
         at += h.size;
         if (h.op == OP_END) {
@@ -1064,19 +1243,19 @@ static uint8_t *flatten_planned(const uint8_t *p, size_t n, parent_plan *parent)
     exec_builder executable = scratch ? scratch->exec : (exec_builder){0};
     uniform.n = deferred.n = pinops.n = capture.n = spans.n = 0;
     if (indexed) capture_reset(&captured);
-    uint64_t pins_named = 0;
+    uint64_t pins_named = 0, max_scratch = 0;
     int selected = indexed && parent;
     size_t cursor = 0;
     if (selected) {
         for (size_t i = 0; i < parent->eligible; i++) {
             const plan_piece *part = &parent->interior[i];
             pins_named += index_range(p, n, cursor, part->first + part->delta, indexed, &uniform, &deferred,
-                                      &pinops, &capture, &captured, &spans);
-            pins_named += import_resources(part, p, &uniform, &deferred, &pinops, &capture, &captured, &spans);
+                                      &pinops, &capture, &captured, &spans, &max_scratch);
+            pins_named += import_resources(part, p, &uniform, &deferred, &pinops, &capture, &captured, &spans, &max_scratch);
             cursor = part->end + part->delta;
         }
     }
-    pins_named += index_range(p, n, cursor, n, indexed, &uniform, &deferred, &pinops, &capture, &captured, &spans);
+    pins_named += index_range(p, n, cursor, n, indexed, &uniform, &deferred, &pinops, &capture, &captured, &spans, &max_scratch);
     int imported = selected && parent_plan_build(parent, p, n);
     // The rare invalid relocation retries only the executable metadata; pin references were already acquired.
 build_metadata:
@@ -1099,6 +1278,7 @@ build_metadata:
     copy_prefix *pf = realloc_wait(NULL, bytes, "command copy");
     if (!pf) rt_fatal("nvn: command copy allocation");
     *pf = (copy_prefix){.magic = COPY_MAGIC, .bytes = n, .pins = pins_named, .indexed = (uint32_t)indexed,
+                       .max_ordered_scratch_bytes = max_scratch,
                        .plan_complete = imported || (indexed && !executable.failed && ne),
                        .deferred = indexed ? (deferred.n ? 2 : 1) : 0,
                        .nuniform = uniform.n, .ndeferred = deferred.n, .npinops = pinops.n,
@@ -1744,8 +1924,13 @@ NVN_API(nvnCommandBufferSetColorReductionThresholds) { (void)c; }
 // void nvnCommandBufferBarrier(NVNcommandBuffer *cmd, int bits)
 NVN_API(nvnCommandBufferBarrier) { REC(cmd_of(c), OP_BARRIER, p_barrier)->bits = (int)arg_x(c, 1); }
 // void nvnCommandBufferSetTexturePool / SetSamplerPool(NVNcommandBuffer *cmd, const NVNtexturePool / NVNsamplerPool *)
-NVN_API(nvnCommandBufferSetTexturePool) { REC(cmd_of(c), OP_SET_TEX_POOL, p_set_pool)->pool = arg_p(c, 1); }
-NVN_API(nvnCommandBufferSetSamplerPool) { REC(cmd_of(c), OP_SET_SAMP_POOL, p_set_pool)->pool = arg_p(c, 1); }
+NVN_API(nvnCommandBufferSetTexturePool) {
+    const dpool_t *pool = arg_p(c, 1);
+    *REC(cmd_of(c), OP_SET_TEX_POOL, p_set_pool) = (p_set_pool){pool, pool ? pool->incarnation : 0, pool ? pool->n : 0};
+}
+NVN_API(nvnCommandBufferSetSamplerPool) {
+    *REC(cmd_of(c), OP_SET_SAMP_POOL, p_set_pool) = (p_set_pool){.pool = arg_p(c, 1)};
+}
 // void nvnCommandBufferCopyBufferToTexture(NVNcommandBuffer *cmd, NVNbufferAddress src, const NVNtexture *dst,
 // const NVNtextureView *view, const NVNcopyRegion *region, int flags)
 NVN_API(nvnCommandBufferCopyBufferToTexture) {

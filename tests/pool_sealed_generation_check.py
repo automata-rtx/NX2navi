@@ -5,21 +5,20 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tests"))
 from bind_recipe_check import function
 
 
-def main():
+def run_checks(work):
     cc = os.environ.get("CC") or shutil.which("clang")
     if not cc:
         raise SystemExit("Set CC to MSYS2 UCRT64 Clang")
     content_root = next(p for p in (ROOT, *ROOT.parents) if (p / "tools/check_content.py").is_file())
     sys.path.insert(0, str(content_root / "tools"))
     from check_content import GENERATED_MARKER
-    work = ROOT / "build/test/pool_sealed_generation"
-    work.mkdir(parents=True, exist_ok=True)
     source = (ROOT / "runtime/vk_exec_draw.c").read_text()
     def definition(name):
         # Select a definition, not a prototype or a call inside an earlier function.
@@ -28,7 +27,12 @@ def main():
             raise RuntimeError("Missing production definition " + name)
         return function(source[match.start():], name)
     selected = "\n".join(definition(name) for name in
-                         ("vk_exec_pool_generation", "pool_sync_complete", "pool_current", "pool_take_set", "pool_sync"))
+                         ("pool_order_current", "vk_exec_pool_generation", "pool_sync_complete", "pool_current",
+                          "pool_can_stay", "pool_next_set", "pool_take_set", "vk_exec_pool_registration_needs_prefix",
+                          "pool_release_completed_set",
+                          "vk_exec_pool_registration_prefix_complete", "pool_sync"))
+    replay = (ROOT / "runtime/vk_exec.c").read_text()
+    selected += "\n" + function(replay[replay.index("static void cont_registration_select("):], "cont_registration_select")
     (work / "pool_sealed_under_test.h").write_text("// " + GENERATED_MARKER + "\n" + selected)
     exe = work / ("pool_sealed_generation_check" + (".exe" if os.name == "nt" else ""))
     env = dict(os.environ)
@@ -40,6 +44,13 @@ def main():
     result = subprocess.run([str(exe)], capture_output=True, text=True, check=True, env=env)
     (work / "result.txt").write_text(result.stdout)
     print(result.stdout, end="")
+
+
+def main():
+    parent = ROOT / "build/test"
+    parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="pool-sealed-", dir=parent) as temporary:
+        run_checks(Path(temporary))
 
 
 if __name__ == "__main__":

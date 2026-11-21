@@ -14,6 +14,12 @@ import sys
 from pathlib import Path
 
 MAX_BYTES = 1024 * 1024
+# These maintained renderer units exceed the ordinary source limit. Keep the allowance
+# confined to these paths and run the full content scan over their source.
+LARGE_SOURCE_LIMITS = {
+    "runtime/vk_exec_draw.c": 2 * MAX_BYTES,
+    "runtime/vk_texture.c": 2 * MAX_BYTES,
+}
 
 # Switch containers, executables and game data formats.
 BLOCKED_SUFFIXES = {
@@ -53,7 +59,8 @@ def staged_bytes(path: Path) -> bytes | None:
     return r.stdout if r.returncode == 0 else None
 
 
-def problems_for(path: Path, allow_large: bool = False, data: bytes | None = None) -> list[str]:
+def problems_for(path: Path, allow_large: bool = False, data: bytes | None = None, *,
+                 max_bytes: int = MAX_BYTES) -> list[str]:
     """allow_large: files over MAX_BYTES (toolchain binaries in a release folder) are checked for the generated marker
     only, not refused. data: the content to check in place of the file on disk (the staged one, for --staged)."""
     found = []
@@ -67,18 +74,28 @@ def problems_for(path: Path, allow_large: bool = False, data: bytes | None = Non
         size = path.stat().st_size
     else:
         size = len(data)
-    if size > MAX_BYTES and allow_large:
+    if size > max_bytes and allow_large:
         if GENERATED_MARKER.encode() in (path.read_bytes() if data is None else data):
             found.append("generated from game code")
         return found
-    if size > MAX_BYTES:
-        found.append(f"{size // 1024} KiB, over the {MAX_BYTES // 1024} KiB limit")
+    if size > max_bytes:
+        found.append(f"{size // 1024} KiB, over the {max_bytes // 1024} KiB limit")
         return found
     if data is None:
         data = path.read_bytes()
     if GENERATED_MARKER.encode() in data:
         found.append("generated from game code")
-    if KEY_LINE.search(data.decode("utf-8", errors="ignore")):
+    if size > MAX_BYTES:
+        try:
+            source = data.decode("utf-8")
+        except UnicodeDecodeError:
+            found.append("large maintained source is not UTF-8 text")
+            source = data.decode("utf-8", errors="ignore")
+        if "\0" in source:
+            found.append("large maintained source contains binary data")
+    else:
+        source = data.decode("utf-8", errors="ignore")
+    if KEY_LINE.search(source):
         found.append("contains a key in prod.keys format")
     return found
 
@@ -118,7 +135,8 @@ def main() -> int:
         # --staged checks what the commit takes: a marker staged and then removed from the working copy alone
         # passed when the file on disk was read
         data = staged_bytes(path) if args.staged else None
-        problems = problems_for(path, data=data)
+        limit = LARGE_SOURCE_LIMITS.get(path.as_posix(), MAX_BYTES)
+        problems = problems_for(path, data=data, max_bytes=limit)
         if compiled_shader(path):
             problems.append("compiled shader: the repository holds the source, tools/build_shaders.py builds this")
         if recorded_in_play(path, data):

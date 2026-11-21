@@ -15,6 +15,7 @@
 #include "platform/platform.h"
 #include "vk_dlaa.h"
 #include "vk_fg.h"
+#include "vk_gpa.h"
 #include "vk_dlssg.h"
 
 // The loader's vkGetDeviceProcAddr until Streamline is on the device (see vk.h).
@@ -24,6 +25,8 @@ static uint32_t g_gfx_queues = 1;   // queues the graphics family offers (pick_d
 
 static VkCtx g_vk;
 static int g_ready;
+// The admission adapters need the new physical device and allocator during private startup.
+static _Thread_local int admitting_startup;
 static PlatMutex g_lock = PLAT_MUTEX_INIT;
 // The fence vk_device_lost_poll asks about. Nothing submits with it, so its status is "not ready" for as long as the
 // device lives.
@@ -290,6 +293,7 @@ typedef struct {
     VkPhysicalDeviceVulkan12Features f12;
     VkPhysicalDeviceVulkan13Features f13;
     VkPhysicalDeviceDepthClipControlFeaturesEXT clip;
+    VkPhysicalDeviceIndexTypeUint8FeaturesKHR index_u8;
     VkPhysicalDeviceCustomBorderColorFeaturesEXT cbc;
     VkPhysicalDeviceExtendedDynamicStateFeaturesEXT eds;
     VkPhysicalDeviceExtendedDynamicState2FeaturesEXT eds2;
@@ -338,6 +342,12 @@ static int create_device(void) {
     CHAIN(f12, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES);
     CHAIN(f13, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES);
     CHAIN(clip, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT);
+    const char *index_u8 = has_ext(ep, ne, VK_KHR_INDEX_TYPE_UINT8_EXTENSION_NAME) ? VK_KHR_INDEX_TYPE_UINT8_EXTENSION_NAME :
+                           has_ext(ep, ne, VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME) ? VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME : NULL;
+    if (index_u8) {
+        ext[n_ext++] = index_u8;
+        CHAIN(index_u8, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_KHR);
+    }
 #define OPTIONAL_EXT(flag, name, member, stype) do { \
         if (has_ext(ep, ne, name)) { g_vk.flag = 1; ext[n_ext++] = name; CHAIN(member, stype); } } while (0)
     OPTIONAL_EXT(has_custom_border_color, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME, cbc, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT);
@@ -435,6 +445,7 @@ static int create_device(void) {
     // The driver fills the chain with what it supports; the same chain then enables all of it (robustBufferAccess
     // stays on: guest shaders index constant buffers freely and out-of-range reads must stay harmless).
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &c->f2);
+    const int index_type_uint8 = index_u8 && c->index_u8.indexTypeUint8;
     vk_caps_features(&c->f2.features);
     if (gpl_link) {
         VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT gp = {
@@ -512,9 +523,23 @@ static int create_device(void) {
     }
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &c->f2, .queueCreateInfoCount = nqi,
                              .pQueueCreateInfos = qi, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
+    int bounded_storage_writes = g_vk.has_robustness2 && c->rob2.robustBufferAccess2;
+    int robust_image_access = c->f13.robustImageAccess || (g_vk.has_robustness2 && c->rob2.robustImageAccess2);
     VkResult r = vk_dlssg_create_device(g_vk.instance, g_vk.phys, &di, &g_vk.device);
     free(c);
+    vk_caps.storage_write_alignment = 0;
     if (r != VK_SUCCESS) { rt_log("vk: vkCreateDevice failed (%d)", (int)r); return 0; }
+    g_vk.has_index_type_uint8 = index_type_uint8;
+    rt_log("vk: native 8-bit index input %s", index_type_uint8 ? "enabled" : "unavailable");
+    vk_caps.robust_image_access = robust_image_access;
+    memset(vk_caps.storage_image_format_support, 0, sizeof vk_caps.storage_image_format_support);
+    if (bounded_storage_writes) {
+        VkPhysicalDeviceRobustness2PropertiesEXT bounds = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 properties = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &bounds};
+        vkGetPhysicalDeviceProperties2(g_vk.phys, &properties);
+        vk_caps.storage_write_alignment = bounds.robustStorageBufferAccessSizeAlignment;
+    }
     vk_dlssg_device_ready(g_vk.phys, g_vk.device);
     if (vk_dlssg_dpa()) {   // Streamline's, so its plugins hook every entry point the replay fetches
         vk_dpa = vk_dlssg_dpa();
@@ -538,10 +563,6 @@ static int create_device(void) {
     VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &emh};
     vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
     g_vk.min_imported_host_alignment = (uint32_t)emh.minImportedHostPointerAlignment;
-    vk_caps_init(&g_vk);
-    vk_mem_lazy_decide();   // the driver is known: the lazy write-back's default depends on it
-    rt_fatal_note_add(fatal_note);
-
     VmaAllocatorCreateInfo ai = {.physicalDevice = g_vk.phys, .device = g_vk.device, .instance = g_vk.instance,
                                  .vulkanApiVersion = VK_API_VERSION_1_3,
                                  .flags = (g_vk.has_buffer_device_address ? VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT : 0) |
@@ -549,8 +570,6 @@ static int create_device(void) {
                                  .preferredLargeHeapBlockSize = vk_vma_block_size(),
                                  .pDeviceMemoryCallbacks = vk_headroom_callbacks()};
     if ((r = vmaCreateAllocator(&ai, &g_vk.vma)) != VK_SUCCESS) { rt_log("vk: vmaCreateAllocator failed (%d)", (int)r); return 0; }
-    vk_mem_ballast(g_vk.vma);
-
     VkSemaphoreTypeCreateInfo st = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
                                     .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE, .initialValue = 0};
     VkSemaphoreCreateInfo si = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &st};
@@ -558,6 +577,21 @@ static int create_device(void) {
         rt_log("vk: timeline semaphore creation failed (%d)", (int)r);
         return 0;
     }
+    // Before shaders or pool projections can depend on BDA, prepare its required table and all companions.
+    // Device startup owns this attempt; admission failure terminates it before publishing a usable device.
+    admitting_startup = 1;
+    VkResult gpa_failure;
+    VkGpaPrepareResult gpa = vk_gpa_prepare(&gpa_failure);
+    admitting_startup = 0;
+    if (gpa != VK_GPA_READY && gpa != VK_GPA_DISABLED) {
+        rt_log("vk: required GPA table startup failed (%s, Vulkan %d)",
+               gpa == VK_GPA_NO_CAPACITY ? "capacity" : "initialization", (int)gpa_failure);
+        return 0;
+    }
+    vk_caps_init(&g_vk);
+    vk_mem_lazy_decide();   // the driver is known: the lazy write-back's default depends on it
+    rt_fatal_note_add(fatal_note);
+    vk_mem_ballast(g_vk.vma);
     vk_crumbs_init(&g_vk);
     return 1;
 }
@@ -566,7 +600,15 @@ static long g_errors_total;     // outlives the device so the probe can print it
 
 static void destroy_all(void) {
     gfx_window_release_vk();
-    if (g_vk.device) { if (vk_ctx()) vk_device_wait_idle(); else vkDeviceWaitIdle(g_vk.device); }
+    if (g_vk.device) {
+        VkResult idle = vk_ctx() ? vk_device_wait_idle() : vkDeviceWaitIdle(g_vk.device);
+        if (idle == VK_SUCCESS) vk_dlaa_motion_shutdown();
+        if (vk_gpa_on()) {
+            vk_device_lost_check(idle, "retiring the GPA device address table");
+            if (idle != VK_SUCCESS) rt_fatal("vk: could not retire the GPA device address table (%d)", (int)idle);
+            vk_gpa_shutdown();
+        }
+    }
     if (g_vk.device) vk_dlaa_release();   // the DLSS features and NGX: the allocator and the device still live
     if (g_vk.device) vk_astc_release();
     if (g_vk.device) vk_crumbs_release();
@@ -607,7 +649,7 @@ void vk_shutdown(void) {
     plat_mutex_unlock(&g_lock);
 }
 
-VkCtx *vk_ctx(void) { return g_ready ? &g_vk : NULL; }
+VkCtx *vk_ctx(void) { return g_ready || admitting_startup ? &g_vk : NULL; }
 
 static const char *fault_address_type(VkDeviceFaultAddressTypeEXT t) {
     switch (t) {

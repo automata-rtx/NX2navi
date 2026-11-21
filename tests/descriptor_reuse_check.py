@@ -27,7 +27,8 @@ def main():
     sys.path.insert(0, str(content_root / "tools"))
     from check_content import GENERATED_MARKER
     selected = "\n".join(function(source, name) for name in
-                         ("descriptor_packet_equal", "descriptor_packet_match", "pool_sync_draw"))
+                         ("descriptor_packet_equal", "descriptor_packet_match", "pool_sync_draw_resolve"))
+    selected = selected.replace("pool_sync_draw_resolve(", "pool_sync_draw(")
     (work / "descriptor_under_test.h").write_text("// " + GENERATED_MARKER + "\n" + selected)
     decision = "// " + GENERATED_MARKER + "\n"
     if args.baseline:

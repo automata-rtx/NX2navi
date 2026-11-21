@@ -25,6 +25,8 @@ void vk_fg_frame(VkCommandBuffer cb, VkSwapchainKHR sc, VkFormat fmt, VkExtent2D
                  const int pic[4]);
 uint64_t vk_fg_presents(VkSwapchainKHR sc);   // frames the swapchain presented, generated ones included (0: off)
 PFN_vkSetHdrMetadataEXT vk_fg_hdr_metadata_fn(void);   // AMD's replacement for vkSetHdrMetadataEXT while active, else NULL
+// Disable and detach input tags, then finish the exact SDK swapchain's already queued presents.
+VkResult vk_fg_finish_inputs(VkSwapchainKHR sc);
 void vk_fg_release(void);
 
 // The same through AMD's FSR SDK 2.4 (vk_fg4.cpp), for vk_fg.cpp alone: it takes this path while FSR 4 is the upscaler,
@@ -43,4 +45,5 @@ VkResult vk_fg4_present(const VkPresentInfoKHR *pi);
 void vk_fg4_frame(VkCommandBuffer cb, VkSwapchainKHR sc, VkFormat fmt, VkExtent2D ext, VkImage hudless, const int pic[4]);
 uint64_t vk_fg4_presents(VkSwapchainKHR sc);
 PFN_vkSetHdrMetadataEXT vk_fg4_hdr_metadata_fn(void);
+VkResult vk_fg4_finish_inputs(VkSwapchainKHR sc);
 void vk_fg4_release(void);

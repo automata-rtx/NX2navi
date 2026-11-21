@@ -1,0 +1,42 @@
+#version 450
+
+// One invocation per word. Combine issued fragment stores and the real snapshot comparisons
+// into a tail mask, then copy each selected word back to the guest's imported buffer once.
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) readonly buffer Source { uint words[]; } source;
+layout(std430, set = 0, binding = 1) readonly buffer Mirror { uint words[]; } mirror_data;
+layout(std430, set = 0, binding = 2) buffer Conditions { uint words[]; } conditions;
+layout(std430, set = 0, binding = 3) writeonly buffer Import { uint words[]; } import_data;
+layout(push_constant) uniform Merge {
+    uint mode;
+    uint count;
+    uint source_word;
+    uint mirror_word;
+    uint mask_word;
+    uint mask_plane;
+} pc;
+
+void main() {
+    uint word = gl_GlobalInvocationID.x;
+    if (word >= pc.count) return;
+    uint source_word = pc.source_word + word;
+    uint mirror_word = pc.mirror_word + word;
+    if (pc.mode == 3u) {
+        uint value = mirror_data.words[mirror_word];
+        if (source.words[source_word] != value)
+            import_data.words[mirror_word] = value;
+        return;
+    }
+    uint mask_word = pc.mask_word + word;
+    uint dword = pc.mask_plane + (mask_word >> 5);
+    uint bit = 1u << (mask_word & 31u);
+    if (pc.mode == 0u) {
+        if ((source.words[1u + (source_word >> 5)] & (1u << (source_word & 31u))) != 0u)
+            atomicOr(conditions.words[dword], bit);
+    } else if (pc.mode == 1u) {
+        if (source.words[source_word] != mirror_data.words[mirror_word])
+            atomicOr(conditions.words[dword], bit);
+    } else if ((conditions.words[dword] & bit) != 0u) {
+        import_data.words[mirror_word] = mirror_data.words[mirror_word];
+    }
+}

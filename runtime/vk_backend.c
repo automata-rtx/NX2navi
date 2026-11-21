@@ -35,10 +35,19 @@
 #include "vk_dlaa.h"
 #include "vk_dlssg.h"
 #include "vk_fg.h"
+#include "vk_mesh_fb.h"
 
 #define WEAK __attribute__((weak))
 
-typedef struct { VkImage image; VkFormat format; int w, h, has_crop, crop[4]; uint64_t frame, at, queued, value; } PresentJob;
+typedef struct {
+    VkTexturePresentSource *source;
+    VkDlaaFgSizeUse *temporal;
+    VkDlaaHudSource *hud;
+    VkImage image;
+    VkFormat format;
+    int w, h, has_crop, crop[4];
+    uint64_t frame, at, queued, value;
+} PresentJob;
 
 static PlatMutex pl = PLAT_MUTEX_INIT;
 static PlatCond pcv = PLAT_COND_INIT;   // job queued, job taken, job submitted
@@ -81,16 +90,64 @@ static void present_main(void *arg) {
     for (;;) {
         while (!pending) plat_cond_wait(&pcv, &pl);
         PresentJob j = job;
+        job = (PresentJob){0};
         pending = 0;
         busy = 1;
         plat_cond_broadcast(&pcv);
         plat_mutex_unlock(&pl);
+        if (vk_sync_stopping() || vk_device_is_lost()) {
+            vk_texture_present_release(j.source);
+            if (j.temporal) vk_dlaa_fg_release(j.temporal);
+            vk_dlaa_hud_source_release(j.hud);
+            plat_mutex_lock(&pl);
+            busy = 0;
+            plat_cond_broadcast(&pcv);
+            continue;
+        }
         if (flight_on || vk_dump_white) vk_thumbs_frame(j.frame);   // NX2NAVI_DUMP_WHITE reads them too
         vk_dlssg_present_frame(j.frame);
-        vk_present_blit(j.image, VK_IMAGE_LAYOUT_GENERAL, j.format, j.w, j.h, j.has_crop ? j.crop : NULL);
-        uint64_t f = vk_sync_submit(NULL, 0);   // a timeline value after the blit: deferred destruction waits for the blit too
+        if (j.hud) {
+            // H can still own the sealed source. Flush its real native work
+            // before the composition records reads of these images.
+            vk_queue_lock();
+            vk_queue_unlock();
+        }
+        VkPresentSourceHandoff handed;
+        do {
+            VkPresentConfigRetry retry = {0};
+            handed = vk_present_blit(j.image, VK_IMAGE_LAYOUT_GENERAL, j.format, j.w, j.h,
+                                     j.has_crop ? j.crop : NULL, j.frame, &j.source, &j.temporal, &j.hud, &retry);
+            if (handed != VK_PRESENT_SOURCE_PENDING) break;
+            if (vk_sync_stopping() || vk_device_is_lost()) {
+                handed = VK_PRESENT_SOURCE_UNSENT;
+                break;
+            }
+            if (retry.older_config) {
+                VkResult r = vk_present_config_drain(&retry);
+                vk_device_lost_check(r, "retiring previous Streamline configuration");
+                if (r != VK_SUCCESS) rt_fatal("vk: cannot retire earlier Streamline configuration (%d)", (int)r);
+                resource_core_budget_refresh();
+            } else if (!retry.reprepare) {
+                RcBudgetProgress progress;
+                resource_core_budget_service(0, &retry.peak, &progress);
+                resource_core_budget_wait_since(progress.event, 100);
+            }
+        } while (handed == VK_PRESENT_SOURCE_PENDING);
+        if (j.temporal) vk_dlaa_fg_release(j.temporal);
+        vk_dlaa_hud_source_release(j.hud);
+        if (handed == VK_PRESENT_SOURCE_UNSENT) vk_texture_present_release(j.source);
+        else if (j.source) rt_fatal("vk: present did not adopt its source");
+        if (handed == VK_PRESENT_SOURCE_UNCERTAIN) {
+            if (!vk_device_is_lost()) rt_fatal("vk: the present source submission could not be proven");
+            plat_mutex_lock(&pl);
+            busy = 0;
+            plat_cond_broadcast(&pcv);
+            continue;
+        }
+        // Guest cadence uses its reserved timeline value. The graphics fence owns the submitted source.
+        uint64_t f = vk_sync_present_complete();
         vk_dlssg_submitted(j.frame);
-        if (j.value && f != j.value)
+        if (j.value && f != j.value && !vk_sync_stopping() && !vk_device_is_lost())
             rt_fatal("vk: the present of frame %llu signalled %llu, queued as %llu", (unsigned long long)j.frame,
                      (unsigned long long)f, (unsigned long long)j.value);
         plat_mutex_lock(&pl);
@@ -242,12 +299,14 @@ static int frame_hold(uint32_t skipped, int resized, uint64_t frame) {
 // presented; value: the timeline value queued for this present (asynchronous replay), 0 for the next one (synchronous).
 static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uint64_t queued, uint64_t frame,
                           uint64_t value) {
+    if (vk_sync_stopping() || vk_device_is_lost()) return;
     static volatile int32_t n_skipped;
     static int vram_probe;
     if (!vram_probe) vram_probe = 1, perfmon_set_vram_game(vk_mem_device_used_mb);   // the overlay's "game" beside VRAM
     vk_exec_frame_log(t, frame);
     dynres_frame();   // before vk_dlaa_frame reads the DLSS mode it may override
     vk_exec_barrier_log(frame);
+    vk_dlaa_hud_frame(frame);
     vk_dlaa_frame();
     vk_sampler_aniso_live();   // NX2NAVI_ANISO changed in the menu: the surface textures' samplers take the new level
     vk_mvsurvey_frame();
@@ -256,33 +315,45 @@ static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uin
     vk_gpu_passes_frame(frame);
     if (vk_dump_armed) vk_dump_present(frame);
     __atomic_store_n(&gfx_counters.validation_errors, (uint64_t)vk_validation_errors_total(), __ATOMIC_RELAXED);
-    const VkTexImage *img = vk_texture_get(t);
     int held = frame_hold(vk_exec_pending_draws_take(), vk_dlaa_resized_take(), frame);
-    if (held || !img || !(img->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) {
+    VkTexImage img;
+    VkTexturePresentSource *source = NULL;
+    if (held) (void)vk_texture_get(t);
+    else source = vk_texture_present_capture(t, &img);
+    if (!source) {
+        vk_dlaa_hud_take(frame, NULL);
+        vk_dlaa_fg_discard_current();
         if (!held && plat_inc32(&n_skipped) <= 8)
             rt_log("vk: present of texture %p (format %#x) skipped: no colour image", (const void *)t, t ? t->d.format : 0);
         if (value) {   // the queued value is still signalled, in order
             vk_present_drain();
             uint64_t f = vk_sync_submit(NULL, 0);
-            if (f != value) rt_fatal("vk: skipped present signalled %llu, queued as %llu", (unsigned long long)f, (unsigned long long)value);
+            if (f != value && !vk_sync_stopping() && !vk_device_is_lost()) rt_fatal("vk: skipped present signalled %llu, queued as %llu", (unsigned long long)f, (unsigned long long)value);
         }
         vk_dlssg_submitted(frame);
         return;
     }
-    PresentJob j = {.image = img->image, .format = img->format, .w = (int)img->width, .h = (int)img->height, .frame = frame,
+    PresentJob j = {.source = source, .image = img.image, .format = img.format, .w = (int)img.width, .h = (int)img.height, .frame = frame,
+                    .temporal = vk_dlaa_fg_capture(), .hud = vk_dlaa_hud_take(frame, &img),
                     .at = at_ns, .queued = queued, .value = value};
-    vk_hdr_present_source(img, &j.image, &j.format);   // NX2NAVI_HDR: the float picture the game copied into it, same size
     if (crop) {
         j.has_crop = 1;
         for (int i = 0; i < 4; i++) j.crop[i] = crop[i];
     }
     vk_upload_flush(0);   // an upload vk_texture_get just recorded goes before the blit
     plat_mutex_lock(&pl);
+    while (pending) plat_cond_wait(&pcv, &pl);   // one present in waiting at most
+    if (vk_sync_stopping() || vk_device_is_lost()) {
+        plat_mutex_unlock(&pl);
+        vk_texture_present_release(j.source);
+        if (j.temporal) vk_dlaa_fg_release(j.temporal);
+        vk_dlaa_hud_source_release(j.hud);
+        return;
+    }
     if (!present_thread) {
         if (!plat_thread_spawn(present_main, NULL, "vk present", 0)) rt_fatal("vk: cannot start the present thread");
         present_thread = 1;
     }
-    while (pending) plat_cond_wait(&pcv, &pl);   // one present in waiting at most
     job = j;
     pending = 1;
     plat_cond_broadcast(&pcv);
@@ -296,20 +367,42 @@ typedef struct {
     int kind, n, has_crop, crop[4];
     uint64_t value, submit_no, at, queued;
     uint64_t *h;
-    const tex_t *tex;   // RI_RELEASE: a copy the item owns (the game may reuse the object's memory)
+    RcBudgetTicket handle_budget;
+    VkReplayCaptureBundle captures;
+    VkTextureRegistrationScope *registrations;
+    tex_t *tex;   // RI_PRESENT and RI_RELEASE own the captured guest descriptor until replay consumes it.
 } ReplayItem;
+
+static void replay_handles_release(ReplayItem *item) {
+    vk_replay_metadata_free(item->h, &item->handle_budget);
+    item->h = NULL;
+}
+
+static tex_t *replay_copy_texture(const tex_t *texture) {
+    if (!texture) return NULL;
+    tex_t *copy = malloc(sizeof *copy);
+    if (!copy) rt_fatal("vk: texture descriptor capture allocation failed");
+    *copy = *texture;
+    return copy;
+}
 #define RQ_CAP 1024   // a frame queues 1 submit and 1 present, and up to a few hundred releases
 enum { DR_POOL_FINI, DR_MAP_VIRTUAL, DR_TEX_RELEASE, DR_PROG_RELEASE, DR_FINISH, DR_READ_TEXELS, DR_WRITE_TEXELS,
-       DR_GUEST_READ, DR_FRAME, DR_FULL, DR_CHECK, DR_N };
+       DR_GUEST_READ, DR_FRAME, DR_FULL, DR_CHECK, DR_GATE, DR_CAPTURE, DR_REGISTRATION, DR_N };
 static const char *const dr_name[DR_N] = {
     "pool_fini", "map_virtual", "texture_release (queued)", "program_release", "finish", "read_texels (writer fence)",
-    "write_texels", "guest_read (writer fence)", "frame bound", "queue full", "check drain"};
+    "write_texels", "guest_read (writer fence)", "frame bound", "queue full", "check drain", "snapshot leading event",
+    "older queued capture", "queued texture registration"};
 
 static PlatMutex rl = PLAT_MUTEX_INIT;
+static PlatMutex replay_registration_order = PLAT_MUTEX_INIT;
 static PlatCond rcv = PLAT_COND_INIT;   // item queued, item taken, item done
 static ReplayItem rq[RQ_CAP];
-static int rq_head, rq_n, r_busy, r_started;
+static int rq_head, rq_n, r_busy, r_started, r_frontend_calls;
+// Projection of successful FIFO admissions. The NVN frontend serializes asynchronous submit calls.
+static VkUsnapBindingState r_uniforms;
 static uint64_t r_presents_queued, r_presents_done, r_submit_done, game_frames;
+// Accepted registration-bearing scopes are in publication order because enqueue validates under the order lock.
+static uint64_t r_registration_issued, r_registration_done, r_registration_publication;
 // Under rl: calls, calls that waited and the time waited per cause, since the last replay_log line and over the run.
 static uint64_t dr_calls[DR_N], dr_waits[DR_N], dr_ns[DR_N], dr_tcalls[DR_N], dr_twaits[DR_N], dr_tns[DR_N];
 // NX2NAVI_REPLAY_CHECK: ReadTexels compared with a read after a full drain (under rl): checked, differing, differing
@@ -366,8 +459,8 @@ uint64_t gfx_replayed_submits(void) {
 #define PH_MAX 8
 static struct {
     int on;                      // a present waits
-    const tex_t *t;
-    int crop[4], has_crop;
+    tex_t texture;
+    int has_texture, crop[4], has_crop;
     uint64_t at_ns, queued, frame, since;   // since: vk_exec_submit_seq when it began to wait
     uint64_t waited, ran, after, capped, next, logged;   // presents that waited; held work run first at a present;
                                                          // presents out after the held work, at PH_MAX, at the next present
@@ -380,6 +473,8 @@ static int present_held_on(void) {
 }
 
 static uint64_t submit_sync(const uint64_t *handles, int n);
+static uint64_t submit_sync_capture(const uint64_t *handles, int n, VkReplayCaptureBundle *queued,
+                                    VkTextureRegistrationScope *registrations);
 
 // The held work that can go on now, in a submission of its own (vk_exec_record syncs it like any other: held_sync).
 // The present thread first finishes what it was handed: its empty submission replays held work and frees what it
@@ -401,7 +496,7 @@ static void ph_flush(uint64_t *why) {
                             (unsigned long long)(vk_exec_submit_seq - PH.since), vk_exec_held(),
                             why == &PH.after ? "the held work was replayed" : why == &PH.capped ? "PH_MAX reached"
                                                                                          : "the next present came");
-    present_image(PH.t, PH.has_crop ? PH.crop : NULL, PH.at_ns, PH.queued, PH.frame, 0);
+    present_image(PH.has_texture ? &PH.texture : NULL, PH.has_crop ? PH.crop : NULL, PH.at_ns, PH.queued, PH.frame, 0);
     if (PH.waited % 600 == 0)
         rt_log("vk: presents that waited for held work: %llu (held work run at the present %llu times; out after it %llu, "
                "at %d submissions %llu, at the next present %llu)", (unsigned long long)PH.waited,
@@ -409,7 +504,8 @@ static void ph_flush(uint64_t *why) {
                (unsigned long long)PH.next);
 }
 
-static uint64_t submit_sync(const uint64_t *handles, int n) {
+static uint64_t submit_sync_capture(const uint64_t *handles, int n, VkReplayCaptureBundle *queued,
+                                    VkTextureRegistrationScope *registrations) {
     RP_SCOPE(rp_request, RP_REQUEST);
     RP_VALUE(RPK_HANDLES, n);
     vk_sync_start();
@@ -418,9 +514,13 @@ static uint64_t submit_sync(const uint64_t *handles, int n) {
         if (!vk_exec_held()) ph_flush(&PH.after);
     }
     RP_CALL(RP_PRESENT_DRAIN, vk_present_drain());
-    RP_CALL(RP_GATE_WAIT, vk_exec_gate_wait(handles, n));   // a submission that begins with a wait for the CPU's signal: before its copies
+    if (!queued) (void)RP_CALL(RP_GATE_WAIT, vk_exec_gate_wait(handles, n)); // a closed gate can pause synchronous replay
     RP_CALL(RP_TEXTURE_SUBMIT, vk_texture_new_submit());
-    uint64_t f = vk_sync_submit(handles, n);
+    VkTextureRegistrationScope *prior = vk_exec_texture_registration_select(registrations);
+    uint64_t f = queued ? vk_sync_submit_bundle(handles, n, *queued) : vk_sync_submit(handles, n);
+    if (queued) *queued = (VkReplayCaptureBundle){0};
+    vk_exec_texture_registration_select(prior);
+    vk_texture_registration_scope_end(registrations);
     // The submission stopped at a wait whose signal the CPU gave while it was being replayed (vk_exec_xfer.c "events
     // the CPU signals"): it goes on now, in a submission of its own with copies taken after the signal, and that
     // submission's value is the one the game's fence stands for.
@@ -430,6 +530,10 @@ static uint64_t submit_sync(const uint64_t *handles, int n) {
         else if (vk_exec_submit_seq - PH.since >= PH_MAX) ph_flush(&PH.capped);
     }
     return f;
+}
+
+static uint64_t submit_sync(const uint64_t *handles, int n) {
+    return submit_sync_capture(handles, n, NULL, NULL);
 }
 
 int vk_sub_in_frame;
@@ -442,31 +546,40 @@ static void replay_main(void *arg) {
     for (;;) {
         while (!rq_n) plat_cond_wait(&rcv, &rl);
         ReplayItem it = rq[rq_head];
+        rq[rq_head] = (ReplayItem){0};
         rq_head = (rq_head + 1) % RQ_CAP;
         rq_n--;
         r_busy = 1;
         plat_cond_broadcast(&rcv);
         plat_mutex_unlock(&rl);
         if (it.kind == RI_SUBMIT) {
-            vk_sub_in_frame = sub_idx++;
-            if (!vk_sub_in_frame) vk_dlssg_render_start(__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1);
-            uint64_t f = submit_sync(it.h, it.n);
-            if (f != it.value)
-                rt_fatal("vk: replayed submission signalled %llu, queued as %llu", (unsigned long long)f,
-                         (unsigned long long)it.value);
-            free(it.h);
+            if (vk_sync_stopping() || vk_device_is_lost()) {
+                vk_usnap_queue_bundle_cancel(&it.captures);
+                vk_texture_registration_scope_end(it.registrations);
+            } else {
+                vk_sub_in_frame = sub_idx++;
+                if (!vk_sub_in_frame) vk_dlssg_render_start(__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1);
+                uint64_t f = submit_sync_capture(it.h, it.n, &it.captures, it.registrations);
+                if (f != it.value && !vk_sync_stopping() && !vk_device_is_lost())
+                    rt_fatal("vk: replayed submission signalled %llu, queued as %llu", (unsigned long long)f,
+                             (unsigned long long)it.value);
+            }
+            replay_handles_release(&it);
         } else if (it.kind == RI_RELEASE) {
             vk_present_drain();
-            vk_texture_release(it.tex);
-            free((void *)it.tex);
-        } else {
+            vk_texture_release_replayed(it.tex);
+        } else if (!vk_sync_stopping() && !vk_device_is_lost()) {
             uint64_t frame = __atomic_add_fetch(&gfx_counters.frames, 1, __ATOMIC_RELAXED);
             vk_dlssg_render_start(frame);   // the blit can be the first submission of an otherwise empty frame
             present_image(it.tex, it.has_crop ? it.crop : NULL, it.at, it.queued, frame, it.value);
             sub_idx = 0;
         }
+        if (it.kind != RI_SUBMIT) free(it.tex);
         plat_mutex_lock(&rl);
-        if (it.kind == RI_SUBMIT) r_submit_done = it.submit_no;
+        if (it.kind == RI_SUBMIT) {
+            r_submit_done = it.submit_no;
+            if (it.n) r_registration_done++;
+        }
         else r_presents_done++;
         r_busy = 0;
         plat_cond_broadcast(&rcv);
@@ -479,6 +592,21 @@ static void wait_counted(int why, uint64_t t0) {   // rl held
     dr_waits[why]++, dr_twaits[why]++;
     dr_ns[why] += d, dr_tns[why] += d;
     perf_end(PERF_DRAIN, t0);
+}
+
+static int replay_frontend_begin(void) {
+    plat_mutex_lock(&rl);
+    int admitted = !vk_sync_stopping() && !vk_device_is_lost();
+    if (admitted) r_frontend_calls++;
+    plat_mutex_unlock(&rl);
+    return admitted;
+}
+
+static void replay_frontend_end(void) {
+    plat_mutex_lock(&rl);
+    r_frontend_calls--;
+    plat_cond_broadcast(&rcv);
+    plat_mutex_unlock(&rl);
 }
 
 // A guest thread waiting for the replay gives its virtual core up, as around any blocking host wait (NVN_BLOCKING):
@@ -513,12 +641,61 @@ static uint64_t replay_enqueue(ReplayItem *it) {
         wait_counted(DR_FULL, p0);
         core_back_unlocked(&away);
     }
+    if (it->kind == RI_SUBMIT && (vk_sync_stopping() || vk_device_is_lost())) {
+        plat_mutex_unlock(&rl);
+        return 0;
+    }
+    if (it->kind == RI_SUBMIT && it->n && !vk_texture_registration_scope_current(it->registrations)) {
+        plat_mutex_unlock(&rl);
+        return 0; // This attempt has not promised either capture to the guest.
+    }
     it->value = it->kind == RI_RELEASE ? 0 : vk_sync_reserve();   // a release signals nothing
     rq[(rq_head + rq_n) % RQ_CAP] = *it;
+    if (it->kind == RI_SUBMIT && it->n) {
+        r_registration_issued++;
+        r_registration_publication = vk_texture_registration_scope_publication(it->registrations);
+    }
+    it->h = NULL;
+    it->handle_budget = (RcBudgetTicket){0};
+    it->captures = (VkReplayCaptureBundle){0};
+    it->registrations = NULL;
     rq_n++;
     plat_cond_broadcast(&rcv);
     plat_mutex_unlock(&rl);
     return it->value;
+}
+
+// Called with registration publication serialized. Only older admitted submissions can require a wait.
+static uint64_t replay_registration_cutoff(uint64_t *publication, uint64_t *recording) {
+    plat_mutex_lock(&rl);
+    uint64_t cutoff = r_registration_issued > r_registration_done ? r_registration_issued : 0;
+    *publication = cutoff ? r_registration_publication : 0;
+    *recording = vk_texture_registration_record_revision();
+    plat_mutex_unlock(&rl);
+    return cutoff;
+}
+
+void vk_backend_registration_record_progress(void) {
+    plat_mutex_lock(&rl);
+    plat_cond_broadcast(&rcv);
+    plat_mutex_unlock(&rl);
+}
+
+static int replay_registration_pending(uint64_t cutoff, uint64_t recording) {
+    return r_registration_done < cutoff || (recording && recording == vk_texture_registration_record_revision());
+}
+
+static void replay_registration_wait(uint64_t cutoff, uint64_t recording) {
+    plat_mutex_lock(&rl);
+    dr_calls[DR_REGISTRATION]++, dr_tcalls[DR_REGISTRATION]++;
+    if (replay_registration_pending(cutoff, recording)) {
+        uint64_t start = perf_begin();
+        int away = core_away_unlocked();
+        while (replay_registration_pending(cutoff, recording)) plat_cond_wait(&rcv, &rl);
+        wait_counted(DR_REGISTRATION, start);
+        core_back_unlocked(&away);
+    }
+    plat_mutex_unlock(&rl);
 }
 
 // Returns once every queued item was replayed and submitted. Back-end entries only: the replay thread never calls them.
@@ -567,6 +744,7 @@ void gfx_exit_log(void) {
 }
 
 static void vk_be_present(const tex_t *t, const int crop[4], uint64_t at_ns) {
+    if (!replay_frontend_begin()) return;
     motion_owner_present();
     vk_sync_start();
     gfx_tl_present();
@@ -582,13 +760,17 @@ static void vk_be_present(const tex_t *t, const int crop[4], uint64_t at_ns) {
             if (PH.on) held_resume(), ph_flush(&PH.next);   // the last present still waits: out now
             if (vk_exec_held()) held_resume();
             if (vk_exec_held()) {
-                PH.on = 1, PH.t = t, PH.has_crop = crop != NULL, PH.at_ns = at_ns, PH.queued = queued, PH.frame = frame;
+                PH.on = 1, PH.has_texture = t != NULL, PH.has_crop = crop != NULL;
+                if (t) PH.texture = *t;
+                PH.at_ns = at_ns, PH.queued = queued, PH.frame = frame;
                 if (crop) memcpy(PH.crop, crop, sizeof PH.crop);
                 PH.since = vk_exec_submit_seq, PH.waited++;
+                replay_frontend_end();
                 return;
             }
         }
         present_image(t, crop, at_ns, queued, frame, 0);
+        replay_frontend_end();
         return;
     }
     // Frame bound: the replay thread handled the previous present before this one is queued.
@@ -604,18 +786,26 @@ static void vk_be_present(const tex_t *t, const int crop[4], uint64_t at_ns) {
     uint64_t frame = ++game_frames;
     perf_present(frame);
     if (frame % 1800 == 0) replay_log(frame, 0);
-    ReplayItem it = {.kind = RI_PRESENT, .tex = t, .at = at_ns, .queued = kern_now_ns()};
+    ReplayItem it = {.kind = RI_PRESENT, .tex = replay_copy_texture(t), .at = at_ns, .queued = kern_now_ns()};
     if (crop) {
         it.has_crop = 1;
         for (int i = 0; i < 4; i++) it.crop[i] = crop[i];
     }
     replay_enqueue(&it);
+    replay_frontend_end();
 }
 
 // vk_pipeline.c drops a released program's pipelines here.
 WEAK void vk_program_release(const prog_t *p) { (void)p; }
 
-static int vk_be_pool_init(pool_t *p) { vk_sync_start(); return vk_pool_init(p); }
+static int vk_be_pool_init(pool_t *p, const pool_t *setup) {
+    vk_sync_start();
+    if (p->magic == NVN_POOL_MAGIC) {
+        replay_drain(DR_POOL_FINI);
+        vk_present_drain();
+    }
+    return vk_pool_init_setup(p, setup);
+}
 static void vk_be_pool_fini(pool_t *p) { vk_sync_start(); replay_drain(DR_POOL_FINI); vk_present_drain(); vk_pool_fini(p); }
 static int vk_be_pool_map_virtual(pool_t *v, int n, const void *requests) {
     vk_sync_start();
@@ -623,48 +813,195 @@ static int vk_be_pool_map_virtual(pool_t *v, int n, const void *requests) {
     vk_present_drain();
     return vk_pool_map_virtual(v, n, requests);
 }
-static void vk_be_texture_register(int id, const tex_t *t, const view_t *v) { vk_sync_start(); vk_texture_register(id, t, v); }
+static void vk_be_texture_register(uint64_t pool, int id, const tex_t *t, const view_t *v) {
+    if (!replay_frontend_begin()) return;
+    vk_sync_start();
+    for (;;) {
+        plat_mutex_lock(&replay_registration_order);
+        uint64_t publication, recording;
+        uint64_t cutoff = replay_registration_cutoff(&publication, &recording);
+        int published = vk_texture_register_in_pool_ordered(pool, id, t, v, publication);
+        plat_mutex_unlock(&replay_registration_order);
+        if (published) break;
+        replay_registration_wait(cutoff, recording);
+    }
+    replay_frontend_end();
+}
+static void vk_be_texture_pool_release(uint64_t pool) {
+    if (!replay_frontend_begin()) return;
+    for (;;) {
+        plat_mutex_lock(&replay_registration_order);
+        uint64_t publication, recording;
+        uint64_t cutoff = replay_registration_cutoff(&publication, &recording);
+        int released = vk_texture_pool_release_ordered(pool, publication);
+        plat_mutex_unlock(&replay_registration_order);
+        if (released) break;
+        replay_registration_wait(cutoff, recording);
+    }
+    replay_frontend_end();
+}
 static void vk_be_sampler_register(int id, const samp_par *s) { vk_sync_start(); vk_sampler_register(id, s); }
 // Asynchronous: the release is queued behind the submissions before it, so their replay still resolves the texture's
 // slots to its image (a released slot follows another live texture at the storage), and the ones after it see it
 // released, the order of the synchronous replay. vk_texture_release reads only the object's key fields: a copy.
 static void vk_be_texture_release(const tex_t *t) {
+    if (!t || !t->mem || !replay_frontend_begin()) return;
     vk_sync_start();
-    if (!gfx_replay_async()) {
-        vk_present_drain();
-        vk_texture_release(t);
-        return;
+    int asynchronous = gfx_replay_async();
+    if (!asynchronous) vk_present_drain();
+    ReplayItem it = {.kind = RI_RELEASE, .tex = asynchronous ? replay_copy_texture(t) : NULL};
+    for (;;) {
+        plat_mutex_lock(&replay_registration_order);
+        uint64_t publication, recording;
+        uint64_t cutoff = replay_registration_cutoff(&publication, &recording);
+        int released = asynchronous ? vk_texture_finalize_registration_ordered(t, publication) :
+            vk_texture_release_ordered(t, publication);
+        if (released && asynchronous) {
+            plat_mutex_lock(&rl);
+            dr_calls[DR_TEX_RELEASE]++, dr_tcalls[DR_TEX_RELEASE]++;
+            plat_mutex_unlock(&rl);
+            replay_enqueue(&it);
+        }
+        plat_mutex_unlock(&replay_registration_order);
+        if (released) break;
+        replay_registration_wait(cutoff, recording);
     }
-    if (!t || !t->mem) return;
-    tex_t *copy = malloc(sizeof *copy);
-    if (!copy) rt_fatal("vk: out of memory (replay queue)");
-    *copy = *t;
-    ReplayItem it = {.kind = RI_RELEASE, .tex = copy};
-    plat_mutex_lock(&rl);
-    dr_calls[DR_TEX_RELEASE]++, dr_tcalls[DR_TEX_RELEASE]++;
-    plat_mutex_unlock(&rl);
-    replay_enqueue(&it);
+    replay_frontend_end();
 }
 static void vk_be_program_release(const prog_t *p) { replay_drain(DR_PROG_RELEASE); vk_program_release(p); }
+
+static uint64_t replay_capture(ReplayItem *item, const VkUsnapInputs *inputs, uint64_t max_update) {
+    int serialize_registration = 0;
+    while (!vk_sync_stopping() && !vk_device_is_lost()) {
+        // FIFO work can open the leading event, and another CPU signal can rearm it
+        // while prior capture capacity drains. Observe it again before each attempt.
+        if (!vk_exec_gate_wait(inputs->handles, inputs->nhandles)) {
+            replay_drain(DR_GATE);
+            vk_present_drain();
+            vk_sync_finish();
+            if (vk_sync_stopping() || vk_device_is_lost()) return 0;
+            if (!vk_exec_gate_wait(inputs->handles, inputs->nhandles))
+                rt_fatal("vk: asynchronous replay cannot capture a submission before its leading event opens");
+        }
+        if (serialize_registration) plat_mutex_lock(&replay_registration_order);
+        if (item->n) item->registrations = vk_texture_registration_scope_begin();
+        VkReplayCaptureWait wait;
+        VkResult result = vk_usnap_queue_bundle(inputs, max_update, &item->captures, &wait);
+        if (result == VK_SUCCESS) {
+            if ((item->n && !item->captures.snapshot) || (max_update && !item->captures.scratch))
+                rt_fatal("vk: successful queue admission omitted a required capture");
+            if (!serialize_registration) plat_mutex_lock(&replay_registration_order);
+            uint64_t value = replay_enqueue(item);
+            plat_mutex_unlock(&replay_registration_order);
+            if (value) return value;
+            vk_usnap_queue_bundle_cancel(&item->captures);
+            vk_texture_registration_scope_end(item->registrations);
+            item->registrations = NULL;
+            // A concurrent publication invalidated the provisional combination. Serialize the next
+            // capture with publication instead of repeatedly discarding successful native allocations.
+            serialize_registration = 1;
+            continue;
+        }
+        if (serialize_registration) plat_mutex_unlock(&replay_registration_order);
+        vk_texture_registration_scope_end(item->registrations);
+        item->registrations = NULL;
+        if (vk_sync_stopping() || vk_device_is_lost()) return 0;
+        if (result != VK_NOT_READY) rt_fatal("vk: queuing submission capture failed (%d)", (int)result);
+        if (wait.kind == VK_REPLAY_CAPTURE_WAIT_DRAIN_OLDER) {
+            replay_drain(DR_CAPTURE);
+            vk_present_drain();
+            vk_sync_finish();
+        } else if (wait.kind == VK_REPLAY_CAPTURE_WAIT_PRODUCER) {
+            vk_usnap_wait_producer(wait.producer_epoch, 16);
+        } else if (wait.kind == VK_REPLAY_CAPTURE_WAIT_BUDGET) {
+            vk_queue_lock();
+            vk_queue_unlock();
+            RcBudgetProgress progress;
+            resource_core_budget_service(1, &wait.peak, &progress);
+            RcBudgetReadiness now;
+            resource_core_budget_readiness(1, &now);
+            if (!resource_core_budget_peak_progress(&wait.peak, &wait.before, &now))
+                resource_core_budget_wait_since(progress.event, 16);
+        } else rt_fatal("vk: queuing submission capture omitted its retry cause");
+    }
+    return 0;
+}
+
+static int replay_handles_clone(ReplayItem *item, const uint64_t *handles) {
+    if (!item->n) return 1;
+    if (item->n < 0 || !handles || (size_t)item->n > SIZE_MAX / sizeof *item->h)
+        rt_fatal("vk: invalid replay handle array");
+    const size_t bytes = (size_t)item->n * sizeof *item->h;
+    RcAdmissionVector peak = {0};
+    if (!vk_replay_metadata_peak_add(&peak, bytes))
+        rt_fatal("vk: replay handle allocation size overflow");
+    while (!vk_sync_stopping() && !vk_device_is_lost()) {
+        void *copy;
+        VkResult result = vk_replay_metadata_allocate(bytes, 0, RC_BUDGET_SNAPSHOT, &item->handle_budget, &copy);
+        if (result == VK_SUCCESS) {
+            item->h = copy;
+            if (vk_sync_stopping() || vk_device_is_lost()) return 0;
+            memcpy(item->h, handles, bytes);
+            return 1;
+        }
+        if (vk_sync_stopping() || vk_device_is_lost()) return 0;
+        if (result != VK_NOT_READY) rt_fatal("vk: replay handle allocation failed (%d)", (int)result);
+        RcBudgetProgress progress;
+        resource_core_budget_service(1, &peak, &progress);
+        RcBudgetReadiness now;
+        resource_core_budget_readiness(1, &now);
+        if (!resource_core_budget_peak_ready(&peak, &now) &&
+            !vk_sync_stopping() && !vk_device_is_lost())
+            resource_core_budget_wait_since(progress.event, 16);
+    }
+    return 0;
+}
+
 // Asynchronous: the handles (nvn_submit_prepare_async ran under the front end's submit lock) are copied and queued;
 // the value returned is the one the replay will signal.
-static uint64_t vk_be_submit(const uint64_t *handles, int n) {
+static uint64_t replay_submit(const uint64_t *handles, int n) {
     if (!gfx_replay_async()) {
         vk_sub_in_frame = __atomic_load_n(&nvn_submits_in_frame, __ATOMIC_RELAXED);   // the front end counts it up after the submit returns
         if (!vk_sub_in_frame) vk_dlssg_render_start(__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1);
         return submit_sync(handles, n);
     }
     vk_sync_start();
+    if (n > 0 && !vk_sync_prepare_draw()) return 0;
     ReplayItem it = {.kind = RI_SUBMIT, .n = n, .submit_no = nvn_submit_count()};
-    if (n > 0) {
-        it.h = malloc(sizeof *it.h * (size_t)n);
-        if (!it.h) rt_fatal("vk: out of memory (replay queue)");
-        memcpy(it.h, handles, sizeof *it.h * (size_t)n);
+    if (!replay_handles_clone(&it, handles)) {
+        replay_handles_release(&it);
+        return 0;
     }
-    // The game may still be filling uniforms until it opens the leading CPU event.
-    vk_exec_gate_wait(handles, n);
-    vk_usnap_take(handles, n);   // the uniform blocks as they are now: the game writes on once this returns
-    return replay_enqueue(&it);
+    VkUsnapBindingState next_uniforms = r_uniforms;
+    uint64_t max_update;
+    if (!nvn_submission_ordered_scratch_max(it.h, n, &max_update)) {
+        replay_handles_release(&it);
+        rt_fatal("vk: asynchronous replay cannot determine the retained command scratch requirement");
+    }
+    if (!vk_usnap_project(it.h, n, &next_uniforms)) {
+        replay_handles_release(&it);
+        rt_fatal("vk: asynchronous replay cannot determine the inherited uniform bindings");
+    }
+    VkUsnapInputs inputs = {.handles = it.h, .nhandles = n};
+    if (n) {
+        inputs.inherited = r_uniforms.slots;
+        inputs.ninherited = sizeof r_uniforms.slots / sizeof r_uniforms.slots[0];
+    }
+    uint64_t value = replay_capture(&it, &inputs, max_update);
+    if (value) r_uniforms = next_uniforms;
+    else {
+        vk_usnap_queue_bundle_cancel(&it.captures);
+        vk_texture_registration_scope_end(it.registrations);
+        replay_handles_release(&it);
+    }
+    return value;
+}
+
+static uint64_t vk_be_submit(const uint64_t *handles, int n) {
+    if (!replay_frontend_begin()) return 0;
+    uint64_t value = replay_submit(handles, n);
+    replay_frontend_end();
+    return value;
 }
 static void vk_be_finish(void) { vk_sync_start(); replay_drain(DR_FINISH); vk_present_drain(); vk_sync_finish(); }
 static int replay_check(void) {
@@ -677,7 +1014,8 @@ static int replay_check(void) {
     return on;
 }
 
-// ReadTexels with the replay queued: waits for the newest submission recorded to write the texture (replayed and
+// Ordered projected reads need every older asynchronous item to declare its potential writes. Legacy
+// ReadTexels with the replay queued waits for the newest submission recorded to write the texture (replayed and
 // completed), not for the whole queue. The readback copy goes through the upload batch on the same queue, after every
 // submission the replay has submitted. Submissions still queued or being recorded run after the copy, as on hardware
 // when the GPU has not reached them yet: the game only sees their texels after waiting on a sync, and every sync
@@ -685,34 +1023,75 @@ static int replay_check(void) {
 static void vk_be_read_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uint8_t *dst, uint64_t row,
                               uint64_t img) {
     vk_sync_start();
-    if (!gfx_replay_async()) {
-        vk_read_texels(t, v, r, dst, row, img);
-        return;
+    const int async = gfx_replay_async();
+    const int candidate = vk_texture_cpu_read_candidate(t, v);
+    // Preserve the descriptor and requested box across the asynchronous declaration drain.
+    tex_t texture;
+    view_t view;
+    NVNcopyRegion box;
+    if (candidate) {
+        texture = *t;
+        t = &texture;
+        if (v) { view = *v; v = &view; }
+        box = *r;
+        r = &box;
     }
-    uint64_t f = vk_texture_last_write(t);
-    plat_mutex_lock(&rl);
-    dr_calls[DR_READ_TEXELS]++, dr_tcalls[DR_READ_TEXELS]++;
-    int idle = !rq_n && !r_busy;
-    plat_mutex_unlock(&rl);
-    if (f && vk_sync_fence_done() < f) {
-        uint64_t t0 = kern_now_ns();
-        vk_sync_fence_wait(f, UINT64_MAX);   // counts as a fence wait in perf
-        uint64_t d = kern_now_ns() - t0;
+    uint64_t selected_fence = 0;
+    VkTextureCpuReadResult selected = VK_TEXTURE_CPU_READ_OUTSIDE;
+    int idle = 0;
+    if (async) {
         plat_mutex_lock(&rl);
-        dr_waits[DR_READ_TEXELS]++, dr_twaits[DR_READ_TEXELS]++;
-        dr_ns[DR_READ_TEXELS] += d, dr_tns[DR_READ_TEXELS] += d;
+        idle = !rq_n && !r_busy;
         plat_mutex_unlock(&rl);
+        if (candidate) replay_drain(DR_READ_TEXELS);
     }
-    vk_read_texels(t, v, r, dst, row, img);
-    if (!replay_check()) return;
+    if (candidate) {
+        selected = vk_texture_cpu_read_texels(t, v, r, dst, row, img, !vk_exec_held(), &selected_fence);
+        if (selected == VK_TEXTURE_CPU_READ_STOPPED) return;
+        if (selected == VK_TEXTURE_CPU_READ_REFUSED) {
+            rt_fatal("vk: ReadTexels could not complete its required ordered texture read");
+            return;
+        }
+    }
+    if (selected == VK_TEXTURE_CPU_READ_OUTSIDE) {
+        if (async) {
+            const uint64_t f = vk_texture_last_write(t);
+            if (!candidate) {
+                plat_mutex_lock(&rl);
+                dr_calls[DR_READ_TEXELS]++, dr_tcalls[DR_READ_TEXELS]++;
+                plat_mutex_unlock(&rl);
+            }
+            if (f && vk_sync_fence_done() < f) {
+                const uint64_t t0 = kern_now_ns();
+                vk_sync_fence_wait(f, UINT64_MAX);
+                if (!candidate) {
+                    const uint64_t elapsed = kern_now_ns() - t0;
+                    plat_mutex_lock(&rl);
+                    dr_waits[DR_READ_TEXELS]++, dr_twaits[DR_READ_TEXELS]++;
+                    dr_ns[DR_READ_TEXELS] += elapsed, dr_tns[DR_READ_TEXELS] += elapsed;
+                    plat_mutex_unlock(&rl);
+                }
+            }
+        }
+        vk_read_texels(t, v, r, dst, row, img);
+    }
+    if (!async || !replay_check()) return;
     size_t n = vk_texture_texel_span(t, v, r, row, img);
     uint8_t *again = n ? malloc(n) : NULL;
     if (!again) return;
     memcpy(again, dst, n);   // bytes between the rows stay the caller's
-    uint64_t f0 = vk_texture_last_write(t);
+    uint64_t f0 = selected == VK_TEXTURE_CPU_READ_READY ? selected_fence : vk_texture_last_write(t);
     replay_drain(DR_CHECK);
-    uint64_t f1 = vk_texture_last_write(t);
-    vk_read_texels(t, v, r, again, row, img);
+    uint64_t f1;
+    if (selected == VK_TEXTURE_CPU_READ_READY) {
+        if (vk_texture_cpu_read_texels(t, v, r, again, row, img, !vk_exec_held(), &f1) != VK_TEXTURE_CPU_READ_READY) {
+            free(again);
+            return;
+        }
+    } else {
+        f1 = vk_texture_last_write(t);
+        vk_read_texels(t, v, r, again, row, img);
+    }
     int differ = memcmp(again, dst, n) != 0;
     static volatile int32_t n_logged;
     if (differ && plat_inc32(&n_logged) <= 40) {
@@ -739,6 +1118,10 @@ static void vk_be_write_texels(const tex_t *t, const view_t *v, const NVNcopyReg
     replay_drain(DR_WRITE_TEXELS);
     vk_present_drain();
     vk_write_texels(t, v, r, src, row, img);
+}
+static void vk_be_write_packaged_texture(const tex_t *t, const void *src) {
+    vk_sync_start();
+    vk_write_packaged_texture(t, src);
 }
 static void vk_be_guest_written(uint64_t addr, uint64_t size) { vk_sync_start(); vk_guest_written(addr, size); }
 // A CPU read of GPU-written mirrored storage (memcpy, pool invalidate). With the replay queued it waits for the newest
@@ -799,6 +1182,7 @@ const GfxBackend gfx_vulkan_backend = {
     .pool_fini = vk_be_pool_fini,
     .pool_map_virtual = vk_be_pool_map_virtual,
     .texture_register = vk_be_texture_register,
+    .texture_pool_release = vk_be_texture_pool_release,
     .sampler_register = vk_be_sampler_register,
     .texture_release = vk_be_texture_release,
     .program_release = vk_be_program_release,
@@ -811,16 +1195,46 @@ const GfxBackend gfx_vulkan_backend = {
     .finish = vk_be_finish,
     .read_texels = vk_be_read_texels,
     .write_texels = vk_be_write_texels,
+    .write_packaged_texture = vk_be_write_packaged_texture,
     .guest_written = vk_be_guest_written,
     .guest_read = vk_be_guest_read,
     .cpu_synced = vk_be_cpu_synced,
 };
 
 void vk_backend_shutdown(void) {
+    // Unblock required preparation before joining replay; queued, unissued work is canceled explicitly.
+    vk_sync_stop_submissions();
+    vk_pipeline_stop_preparation();
+    plat_mutex_lock(&rl);
+    while (r_frontend_calls) plat_cond_wait(&rcv, &rl);
+    plat_mutex_unlock(&rl);
+    vk_exec_draw_mfb_stop();
     replay_drain(DR_FINISH);
+    vk_exec_discard_held();
     gfx_exit_log();
     vk_present_drain();
+    vk_gpu_passes_stop_capture();
     vk_sync_shutdown();
+    if (vk_device_is_lost()) return; // no proof that possibly executing allocations can be destroyed
+    vk_pipeline_shutdown();
+    if (vk_device_is_lost()) return;
+    gfx_window_release_vk();
+    if (vk_device_is_lost()) return;
+    VkResult mesh_idle = vk_meshfb_shutdown();
+    if (mesh_idle != VK_SUCCESS) {
+        vk_device_lost_check(mesh_idle, "draining mesh fallback resources");
+        rt_fatal("vk: cannot retire mesh fallback resources without idle proof (%d)", (int)mesh_idle);
+    }
+    vk_exec_draw_mfb_shutdown();
+    vk_exec_draw_native_mesh_shutdown();
+    vk_dlaa_size_shutdown();
+    vk_dlaa_hud_shutdown();
+    vk_usnap_shutdown();
+    vk_exec_draw_scratch_shutdown();
+    vk_exec_draw_descriptor_shutdown();
+    vk_exec_draw_bindless_shutdown();
+    vk_exec_draw_fallback_shutdown();
+    vk_exec_draw_fixed_shutdown();
     vk_mem_shutdown();
     vk_shutdown();
 }

@@ -42,7 +42,6 @@
 #include "input.h"
 uint64_t vk_exec_cs_storage_addr(const VkExec *ex, const GfxShaderRes *r);   // vk_exec_draw.c
 uint64_t vk_exec_storage_addr(const VkExec *ex, int st, const GfxShaderRes *r);   // vk_exec_draw.c
-int vk_exec_raw_9e5(VkImage img, VkFormat f);                               // vk_exec_draw.c
 #include "platform/platform.h"
 
 #define MAX_PASSES 400
@@ -1013,8 +1012,24 @@ void vk_dump_dispatch(VkExec *ex, const GfxShader *cs, VkPipeline p, const VkPip
         uint64_t h = handle_of(ex, 5, bd->res->slot, 1);
         view_t v;
         int hv = 0;
-        const VkTexImage *t = h ? vk_texture_by_id(NVN_HANDLE_TEX(h), &v, &hv) : NULL;
-        if (!t) continue;
+        VkTexImage image = {0};
+        VkFormat format = VK_FORMAT_UNDEFINED;
+        vk_texture_lock();
+        const VkTexImage *selected = h ? vk_texture_current_registration_locked(NVN_HANDLE_TEX(h), &v, &hv) : NULL;
+        if (selected) {
+            image = *selected;
+            format = image.format;
+            if (format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 &&
+                (!hv || ((!v.set_levels || !v.base_level) && (!v.set_layers || !v.min_layer)))) {
+                RcRegistryPosition cut = vk_exec_resource_position();
+                if (rc_registry_position_valid(cut)) cut.ordinal |= 1;
+                if (rc_registry_position_valid(vk_texture_packed_storage_output_locked(selected, cut)))
+                    format = VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
+            }
+        }
+        vk_texture_unlock();
+        if (!image.image) continue;
+        const VkTexImage *t = &image;
         uint32_t lv = hv && v.set_levels ? v.base_level : 0, layer = hv && v.set_layers ? v.min_layer : 0;
         if (lv >= t->levels || layer >= t->layers) continue;
         uint32_t w = t->width >> lv ? t->width >> lv : 1, hh = t->height >> lv ? t->height >> lv : 1;
@@ -1027,8 +1042,7 @@ void vk_dump_dispatch(VkExec *ex, const GfxShader *cs, VkPipeline p, const VkPip
                 if (luts_done[k] == t->image) luts_done[k] = VK_NULL_HANDLE;
         }
         const char *why = t->samples > 1 ? "multisampled" :
-                          copy_out(ex, t->image, vk_exec_raw_9e5(t->image, t->format) ? VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 : t->format,
-                                   t->aspect, lv, layer, w, hh, dd, name);
+                          copy_out(ex, t->image, format, t->aspect, lv, layer, w, hh, dd, name);
         fprintf(passes_f, "  writes img slot %d level %u layer %u depth %u -> %s.png%s%s\n", bd->res->slot, lv, layer,
                 dd, name, why ? " skipped: " : "", why ? why : "");
     }

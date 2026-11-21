@@ -9,8 +9,9 @@
 // declaration order, the Itanium C++ ABI (the Linux core, built with GCC) in declaration order. vtable_ok checks the
 // layout with a set-then-get round trip before anything relies on it.
 //
-// NGX and DLAA's resources live as long as the device: vk_dlaa_init brings NGX up on the new device, and
-// vk_dlaa_release (Linux) frees everything DLAA made and shuts NGX down before the device is destroyed.
+// vk_dlaa_init brings NGX up on the new device. Temporal size groups retire
+// when their replay and graphics-composition uses are done. vk_dlaa_release
+// also frees the remaining DLAA resources and shuts down NGX on Linux.
 //
 // Where DLAA runs in the frame, the jitter and the motion vectors: see the sections below.
 #ifdef _WIN32
@@ -32,7 +33,12 @@
 #include "vk_dlaa.h"
 #include "vk_dlssg.h"
 #include "vk_exec.h"
+#include "resource_core_vma.h"
+#include "resource_command_effects.h"
+#include "resource_image_write.h"
+#include "texture_resource.h"
 #include "vk_ffx.h"
+#include "vk_fg.h"
 #include "vk_rec.h"
 #include "dlaa_mv_spv.h"
 
@@ -43,6 +49,12 @@ typedef int NgxResult;   // NVSDK_NGX_Result: 1 success, 0xBAD00000 | n failures
 #define NGX_PERFQ_DLAA 5   // NVSDK_NGX_PerfQuality_Value: 0 performance, 1 balanced, 2 quality, 3 ultra performance
 typedef struct NgxParam NgxParam;
 typedef struct NgxHandle NgxHandle;
+typedef enum { NGX_SR_EMPTY, NGX_SR_OPAQUE_READY, NGX_SR_FAILED } NgxSrState;
+typedef struct {
+    NgxHandle *handle;
+    uint64_t scene;
+    NgxSrState state;
+} NgxSrFeature;
 typedef struct { void *slot[17]; } NgxParamVtbl;
 struct NgxParam { const NgxParamVtbl *vt; };
 typedef struct {   // NVSDK_NGX_ImageViewInfo_VK
@@ -490,9 +502,17 @@ static struct {
         VmaAllocation dist_mem[2];
         VkImageView dist_view[2];
         int dist_cur, dist_ok;   // as chars_cur and chars_ok
-        NgxHandle *feat;
+        NgxSrFeature sr;
         uint64_t used;           // evals count when it last ran
+        uint64_t generation;
+        uint64_t last_scene;
+        uint32_t scene_users, present_users;
+        unsigned retired, initialized;
     } sizes[DLSS_SIZES], *last;  // last: the one the previous DLAA frame ran with
+    struct Size *swap_size;
+    struct Size *fg_size;
+    VkTexturePresentSource *fg_depth_owner;
+    int size_hook_open;
     VkImage last_color;          // the target DLAA ran on last frame: another one means a new history
     NgxParam *params;
     int failed, reset;
@@ -509,6 +529,10 @@ static struct {
     uint64_t holds, jittered;   // jitter holds; evaluations of a jittered scene
     uint64_t jdraws, jfixed;    // draws into a scene-size depth that took the jitter / that did not (full-screen)
     // camera (vk_dlaa_draw) and motion vectors (mv_pass)
+    VkMemoryImageHold *camera_depth_owner;
+    VkImage camera_depth;
+    VkFormat camera_depth_format;
+    uint32_t camera_depth_level, camera_depth_layer, camera_depth_layers;
     uint64_t cam_addr;           // this frame's scene camera block (vk_dlaa_draw), 0: none seen
     uint32_t cam_size, cam_vp;   // its size and the offset of its view-projection rows
     struct {                     // Ocarina: this frame's scene contexts of light-target draws
@@ -560,21 +584,353 @@ static struct {
     float fg_jx, fg_jy;
     int fg_fresh, fg_reset;      // fresh: not handed out yet (vk_dlaa_fg_inputs)
     uint64_t presents;           // vk_dlaa_frame calls so far
-    uint64_t fg_at, hl_at;       // presents when the inputs and the HUD-less picture were made (fg_current)
-    // the picture without the HUD for frame generation (vk_dlaa_fg_hudless): DLSS's output encoded to sRGB as the game's
-    // last pass encodes its picture, then copied bit for bit into an RGBA8 UNORM image, the format the present reads; with
-    // HDR on, DLSS's output as RGBA16F, as the game's float picture the present encodes (hl_srgb unused)
-    VkImage hl_srgb, hl;
-    VmaAllocation hl_srgb_mem, hl_mem;
-    VkImageView hl_view;
-    uint32_t hl_w, hl_h;
-    VkFormat hl_fmt;
-    int hl_fresh;
-    VkImage hud_target;
-    VkNgxImage alpha, present_alpha[2];
-    VmaAllocation alpha_mem, present_alpha_mem[2];
-    int alpha_incomplete;
+    uint64_t fg_at;             // presents when the depth and motion were recorded
+    VkNgxImage present_alpha[2];
+    VmaAllocation present_alpha_mem[2];
 } D = {.mv_ok = -1, .cfg_seen = ~0u};
+typedef struct {
+    VkTexImage image;
+    VkMemoryImageHold *native;
+    VkTextureAliasRead *seed;
+    const tex_t *pin;
+    uint32_t refs;
+    int canceled;
+    RcBudgetTicket metadata;
+} DlaaTargetOwner;
+
+enum { DLAA_TARGET_COLOR, DLAA_TARGET_DEPTH, DLAA_TARGET_IDS, DLAA_TARGET_COUNT };
+static DlaaTargetOwner *frame_targets[DLAA_TARGET_COUNT];
+
+static int dlaa_target_valid(const DlaaTargetOwner *owner) {
+    return !owner || !__atomic_load_n(&owner->canceled, __ATOMIC_ACQUIRE);
+}
+
+static DlaaTargetOwner *dlaa_target_capture(const VkExecTarget *selected, VkTextureAliasRead *seed) {
+    if (!selected->exact_snapshot || !selected->tex || !selected->img || !selected->image ||
+        selected->img->image != selected->image || selected->img->gone || selected->bc_backing ||
+        (seed && !vk_texture_alias_target_current(seed, selected->image))) return NULL;
+    const tex_t *pin = nvn_texture_pin_acquire(selected->tex);
+    if (!pin) return NULL;
+    void *storage = NULL;
+    RcBudgetTicket metadata = {0};
+    if (vk_replay_metadata_allocate(sizeof(DlaaTargetOwner), 1, RC_BUDGET_TEXTURE, &metadata, &storage) != VK_SUCCESS) {
+        nvn_texture_pin_release(pin);
+        return NULL;
+    }
+    // Caller owns the exact admitted native image while this reference is acquired. The frame never
+    // dereferences the pass's copied metadata or the mutable registration entry after adoption.
+    DlaaTargetOwner *owner = storage;
+    *owner = (DlaaTargetOwner){.image = *selected->img, .pin = pin, .refs = 1, .metadata = metadata};
+    if (seed) owner->seed = vk_texture_alias_read_retain(seed);
+    else owner->native = vk_mem_image_hold(selected->image);
+    // A recorded use can survive later retirement of the original image cache entry.
+    owner->image.gone = 1;
+    return owner;
+}
+
+static void dlaa_target_release(void *opaque) {
+    DlaaTargetOwner *owner = opaque;
+    if (!owner || __atomic_sub_fetch(&owner->refs, 1, __ATOMIC_ACQ_REL)) return;
+    if (owner->native) vk_mem_image_release(owner->native);
+    vk_texture_alias_read_cancel(owner->seed);
+    nvn_texture_pin_release(owner->pin);
+    RcBudgetTicket metadata = owner->metadata;
+    vk_replay_metadata_free(owner, &metadata);
+}
+
+static void dlaa_target_cancel(void *opaque, int may_have_executed) {
+    (void)may_have_executed;
+    DlaaTargetOwner *owner = opaque;
+    __atomic_store_n(&owner->canceled, 1, __ATOMIC_RELEASE);
+    dlaa_target_release(owner);
+}
+
+static void dlaa_target_use_cancel(void *opaque, int may_have_executed) {
+    (void)may_have_executed;
+    dlaa_target_release(opaque);
+}
+
+static void dlaa_target_record(VkExec *ex, DlaaTargetOwner *owner, int publishes) {
+    if (!owner) return;
+    if (!__atomic_add_fetch(&owner->refs, 1, __ATOMIC_RELAXED))
+        rt_fatal("dlaa: prepared target owner reference count exhausted");
+    vk_completion_add_owned(ex->fence, dlaa_target_release,
+        publishes ? dlaa_target_cancel : dlaa_target_use_cancel, owner);
+}
+
+static VkExecTarget dlaa_owned_target(const VkExecTarget *selected, DlaaTargetOwner *owner) {
+    VkExecTarget target = *selected;
+    if (owner) {
+        target.img = &owner->image;
+        target.tex = owner->pin;
+    }
+    return target;
+}
+
+static void dlaa_frame_target_set(unsigned slot, DlaaTargetOwner *owner) {
+    dlaa_target_release(frame_targets[slot]);
+    frame_targets[slot] = owner;
+}
+
+static int dlaa_camera_depth_matches(const VkExecTarget *depth) {
+    return D.camera_depth_owner && D.camera_depth == depth->image && D.camera_depth_format == depth->format &&
+        D.camera_depth_level == depth->level && D.camera_depth_layer == depth->base_layer &&
+        D.camera_depth_layers == depth->layers;
+}
+
+static void dlaa_camera_depth_close(void) {
+    if (D.camera_depth_owner) vk_mem_image_release(D.camera_depth_owner);
+    D.camera_depth_owner = NULL;
+    D.cam_addr = 0;
+    D.nviews = 0;
+}
+
+static void dlaa_camera_depth_select(const VkExecTarget *depth) {
+    if (dlaa_camera_depth_matches(depth)) return;
+    dlaa_camera_depth_close();
+    // The accepted draw owns this physical image. Holding it prevents handle
+    // reuse from matching a camera observed on a different allocation.
+    D.camera_depth_owner = vk_mem_image_hold(depth->image);
+    D.camera_depth = depth->image;
+    D.camera_depth_format = depth->format;
+    D.camera_depth_level = depth->level;
+    D.camera_depth_layer = depth->base_layer;
+    D.camera_depth_layers = depth->layers;
+}
+
+static void dlaa_frame_targets_close(void) {
+    dlaa_camera_depth_close();
+    if (frame_targets[DLAA_TARGET_COLOR]) D.color.img = NULL, D.color.tex = NULL;
+    if (frame_targets[DLAA_TARGET_DEPTH]) D.depth.img = NULL, D.depth.tex = NULL;
+    if (frame_targets[DLAA_TARGET_IDS]) D.ids.img = NULL, D.ids.tex = NULL;
+    for (unsigned i = 0; i < DLAA_TARGET_COUNT; ++i) dlaa_frame_target_set(i, NULL);
+}
+
+static int dlaa_targets_armed(void) {
+    return D.armed && dlaa_target_valid(frame_targets[DLAA_TARGET_COLOR]) &&
+           dlaa_target_valid(frame_targets[DLAA_TARGET_DEPTH]);
+}
+
+static VkTexturePresentSource *dlaa_present_target(const DlaaTargetOwner *owner, VkImage exact) {
+    if (!owner || !dlaa_target_valid(owner) || owner->image.image != exact) return NULL;
+    return owner->seed ? vk_texture_present_retain_alias_image(owner->seed, exact) :
+        vk_texture_present_retain_held_image(owner->native, exact);
+}
+
+static int dlaa_selected_image_matches(const VkTexImage *current, const VkTexImage *selected,
+                                         const DlaaTargetOwner *owner) {
+    if (!owner) return current == selected;
+    return dlaa_target_valid(owner) && current && !current->gone && selected == &owner->image &&
+        current->image == selected->image && current->addr == selected->addr && current->format == selected->format &&
+        current->width == selected->width && current->height == selected->height && current->aspect == selected->aspect &&
+        current->samples == selected->samples && current->levels == selected->levels && current->layers == selected->layers;
+}
+
+static uint64_t size_generation;
+
+struct VkDlaaHudSource {
+    VkDlaaHudImages images;
+    VkNgxImage coverage;
+    VkImage srgb;
+    VmaAllocation color_mem, coverage_mem, srgb_mem;
+    VkTexturePresentSource *target_owner;
+    VkImage target;
+    VkFormat target_format;
+    uint64_t turn, last_scene;
+    uint32_t scenes, presents, invalid, alpha_seen, alpha_bad;
+    int initialized;
+};
+
+// Two composition fence slots, one active job, one queued job and one recorder.
+#define HUD_SOURCE_GROUPS 5
+static struct {
+    VkDlaaHudSource groups[HUD_SOURCE_GROUPS];
+    VkDlaaHudSource *open, *sealed;
+    uint64_t generation;
+    int forward_pending;
+} hud_sources;
+
+static int hud_group_idle(const VkDlaaHudSource *use) {
+    return !__atomic_load_n(&use->scenes, __ATOMIC_ACQUIRE) &&
+           !__atomic_load_n(&use->presents, __ATOMIC_ACQUIRE);
+}
+
+static void hud_group_complete(void *object) {
+    VkDlaaHudSource *use = object;
+    if (!__atomic_fetch_sub(&use->scenes, 1, __ATOMIC_ACQ_REL))
+        rt_fatal("dlaa: HUD source has no recording owner");
+    resource_core_budget_progress();
+}
+
+static void hud_group_cancel(void *object, int may_have_executed) {
+    // Completion owns the proof that an uncertain batch has stopped using the images.
+    (void)may_have_executed;
+    VkDlaaHudSource *use = object;
+    __atomic_store_n(&use->invalid, 1, __ATOMIC_RELEASE);
+    hud_group_complete(use);
+}
+
+static void hud_group_record(const VkExec *ex, VkDlaaHudSource *use) {
+    uint64_t prior = __atomic_load_n(&use->last_scene, __ATOMIC_RELAXED);
+    for (;;) {
+        if (prior == ex->fence) return;
+        if (!ex->fence || prior > ex->fence) rt_fatal("dlaa: HUD source recording is out of order");
+        if (__atomic_compare_exchange_n(&use->last_scene, &prior, ex->fence, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+            break;
+    }
+    __atomic_fetch_add(&use->scenes, 1, __ATOMIC_RELAXED);
+    vk_completion_add_owned(ex->fence, hud_group_complete, hud_group_cancel, use);
+}
+
+void vk_dlaa_hud_frame(uint64_t frame) {
+    VkDlaaHudSource *use = hud_sources.open;
+    hud_sources.open = NULL;
+    hud_sources.sealed = NULL;
+    __atomic_store_n(&hud_sources.forward_pending, 0, __ATOMIC_RELEASE);
+    if (!use || use->turn != D.presents || __atomic_load_n(&use->invalid, __ATOMIC_ACQUIRE)) return;
+    use->images.frame = frame;
+    use->images.alpha = (VkNgxImage){0};
+    if (D.fg_at == use->turn && __atomic_load_n(&use->alpha_seen, __ATOMIC_ACQUIRE) &&
+        !__atomic_load_n(&use->alpha_bad, __ATOMIC_ACQUIRE))
+        use->images.alpha = use->coverage;
+    hud_sources.sealed = use;
+}
+
+VkDlaaHudSource *vk_dlaa_hud_take(uint64_t frame, const VkTexImage *selected) {
+    VkDlaaHudSource *use = hud_sources.sealed;
+    if (!use || use->images.frame != frame) return NULL;
+    hud_sources.sealed = NULL;
+    if (!selected || selected->width != use->images.color.w || selected->height != use->images.color.h ||
+        __atomic_load_n(&use->invalid, __ATOMIC_ACQUIRE)) return NULL;
+    // A distinct SDR output needs a committed final encode witness. Preserve
+    // the existing HUD colors on those frames as an explicit compatibility use.
+    use->images.exact = use->target_owner && use->target == selected->image &&
+                        use->target_format == selected->format;
+    if (__atomic_fetch_add(&use->presents, 1, __ATOMIC_ACQ_REL))
+        rt_fatal("dlaa: the same HUD source was captured twice");
+    return use;
+}
+
+const VkDlaaHudImages *vk_dlaa_hud_source_images(const VkDlaaHudSource *use, uint64_t frame) {
+    if (!use || use->images.frame != frame || !__atomic_load_n(&use->presents, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&use->invalid, __ATOMIC_ACQUIRE) || vk_device_is_lost() ||
+        __atomic_load_n(&use->last_scene, __ATOMIC_ACQUIRE) > vk_sync_handed_fence()) return NULL;
+    return &use->images;
+}
+
+void vk_dlaa_hud_source_release(VkDlaaHudSource *use) {
+    if (!use) return;
+    if (__atomic_fetch_sub(&use->presents, 1, __ATOMIC_ACQ_REL) != 1)
+        rt_fatal("dlaa: HUD source has no composition owner");
+    resource_core_budget_progress();
+}
+
+struct VkDlaaFgSizeUse {
+    struct Size *size;
+    VkTexturePresentSource *depth_owner;
+    uint64_t generation;
+    VkFfxImage depth, mv;
+    VkImageView depth_view, mv_view;
+    VkDlaaCamera camera;
+    float jx, jy;
+    int reset, camera_ok, consumed;
+};
+static _Thread_local VkDlaaFgSizeUse *fg_compose;
+
+static void size_drop_present(struct Size *s) {
+    if (!__atomic_fetch_sub(&s->present_users, 1, __ATOMIC_ACQ_REL))
+        rt_fatal("dlaa: unowned present generation");
+    resource_core_budget_progress();
+}
+
+static void fg_drop_depth(VkImageView view, VkTexturePresentSource *owner) {
+    if (view) vkDestroyImageView(vk_ctx()->device, view, NULL);
+    vk_texture_present_release(owner);
+}
+
+static void fg_forget_size(void) {
+    if (D.fg_size) {
+        fg_drop_depth(D.fg_depth_view, D.fg_depth_owner);
+        size_drop_present(D.fg_size);
+    }
+    D.fg_depth_owner = NULL;
+    D.fg_depth_view = VK_NULL_HANDLE;
+    D.fg_size = NULL;
+    D.fg_fresh = 0;
+}
+
+void vk_dlaa_fg_discard_current(void) { fg_forget_size(); }
+
+static void fg_publish_size(struct Size *s, const VkExecTarget *depth) {
+    fg_forget_size();
+    if (!vk_dlssg_active() && !vk_fg_active() && !vk_ngxfg_on()) return;
+    static unsigned depth_refusals;
+    const DlaaTargetOwner *selected = frame_targets[DLAA_TARGET_DEPTH];
+    VkTexturePresentSource *owner = selected && depth->img == &selected->image ?
+        dlaa_present_target(selected, depth->image) :
+        vk_texture_present_retain_image(depth->img, depth->image);
+    if (!owner) {
+        if (depth_refusals++ < 8)
+            rt_log("dlaa: frame generation input unavailable for frame %llu, exact depth image %p could not be retained",
+                   (unsigned long long)(D.presents + 1), (void *)depth->image);
+        return;
+    }
+    VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image = depth->image, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = depth->format,
+        .subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, depth->level, 1, depth->base_layer, 1}};
+    VkImageView view = VK_NULL_HANDLE;
+    VkResult r = vkCreateImageView(vk_ctx()->device, &vi, NULL, &view);
+    if (r != VK_SUCCESS) {
+        vk_texture_present_release(owner);
+        if (depth_refusals++ < 8)
+            rt_log("dlaa: frame generation input unavailable for frame %llu, depth view creation failed (%d)",
+                   (unsigned long long)(D.presents + 1), (int)r);
+        vk_device_lost_check(r, "frame generation depth view");
+        return;
+    }
+    __atomic_fetch_add(&s->present_users, 1, __ATOMIC_RELAXED);
+    D.fg_size = s;
+    D.fg_depth_owner = owner;
+    D.fg_depth_view = view;
+    D.fg_fresh = 1;
+}
+
+VkDlaaFgSizeUse *vk_dlaa_fg_capture(void) {
+    struct Size *s = D.fg_size;
+    if (!s) return NULL;
+    if (!D.fg_fresh || D.failed || D.presents != D.fg_at + 1 ||
+        __atomic_load_n(&s->retired, __ATOMIC_ACQUIRE)) {
+        fg_forget_size();
+        return NULL;
+    }
+    VkDlaaFgSizeUse *use = malloc(sizeof *use);
+    if (!use) rt_fatal("dlaa: cannot retain frame generation inputs");
+    *use = (VkDlaaFgSizeUse){.size = s, .depth_owner = D.fg_depth_owner, .generation = s->generation,
+        .depth = D.fg_depth, .mv = D.fg_mv,
+        .depth_view = D.fg_depth_view, .mv_view = D.fg_mv_view, .camera = D.fg_cam,
+        .jx = D.fg_jx, .jy = D.fg_jy, .reset = D.fg_reset, .camera_ok = D.fg_cam_ok};
+    D.fg_depth_owner = NULL;
+    D.fg_depth_view = VK_NULL_HANDLE;
+    D.fg_size = NULL;
+    D.fg_fresh = 0;
+    return use;
+}
+
+void vk_dlaa_fg_compose_select(VkDlaaFgSizeUse *use) {
+    if (use && fg_compose) rt_fatal("dlaa: nested frame generation composition owner");
+    fg_compose = use;
+}
+
+int vk_dlaa_fg_compose_consumed(const VkDlaaFgSizeUse *use) { return use && use->consumed; }
+
+void vk_dlaa_fg_release(VkDlaaFgSizeUse *use) {
+    if (!use) return;
+    if (use->size->generation != use->generation || use == fg_compose)
+        rt_fatal("dlaa: invalid frame generation release");
+    fg_drop_depth(use->depth_view, use->depth_owner);
+    size_drop_present(use->size);
+    free(use);
+}
 
 // What this frame drew into a D32F depth at least DLAA_SCENE_MIN_W wide before DLSS ran (vk_dlaa_draw), for the line a
 // frame without a camera logs (cam_note); cleared at each present (vk_dlaa_frame).
@@ -591,32 +947,16 @@ static struct {
     VkImage second_img;
 } F;
 
-// What an evaluation left for frame generation is for the present of its own frame. Frame generation takes it only
-// while its swapchain is in place, so with frame generation off the last evaluation's images stayed marked fresh for
-// as long as it was off. Among them is the game's own depth target, which the game replaces when the scene's size
-// changes: switching the upscaler off and on again with frame generation set (the menu's Upscaling row passes through
-// its choices without one) handed that destroyed image to frame generation's preparation, and AMD's driver ended the
-// process. Images made more than FG_INPUT_PRESENTS presents ago are therefore never handed out, and vk_dlaa_frame
-// drops them when the upscaler goes off or on.
-#define FG_INPUT_PRESENTS 4   // an evaluation is taken at its own present, or the one after when the present thread is behind
-static int fg_current(uint64_t made) { return D.presents - made <= FG_INPUT_PRESENTS; }
-
-int vk_dlaa_fg_hudless(VkImage *img, VkImageView *view, uint32_t *w, uint32_t *h, VkFormat *fmt) {
-    if (!D.hl_fresh) return 0;
-    D.hl_fresh = 0;
-    if (!fg_current(D.hl_at)) return 0;
-    *img = D.hl, *view = D.hl_view, *w = D.hl_w, *h = D.hl_h, *fmt = D.hl_fmt;
-    return 1;
-}
-
 int vk_dlaa_fg_views(VkImageView *depth, VkImageView *mv) {
-    *depth = D.fg_depth_view, *mv = D.fg_mv_view;
-    return D.fg_depth_view && D.fg_mv_view;
+    if (!fg_compose || !fg_compose->consumed) return 0;
+    *depth = fg_compose->depth_view;
+    *mv = fg_compose->mv_view;
+    return *depth && *mv;
 }
 
 int vk_dlaa_fg_camera(VkDlaaCamera *c) {
-    if (!D.fg_cam_ok) return 0;
-    *c = D.fg_cam;
+    if (!fg_compose || !fg_compose->consumed || !fg_compose->camera_ok) return 0;
+    *c = fg_compose->camera;
     return 1;
 }
 
@@ -625,25 +965,54 @@ int vk_dlaa_fg_camera(VkDlaaCamera *c) {
 // travels about 4.7 units a second while he runs; in centimetres (the 0.01 FSR had) he would be 4 cm from the camera.
 #define VIEW_METERS 1.0f
 
+static VkFfxCamera ffx_camera(const VkDlaaCamera *camera) {
+    return (VkFfxCamera){camera->fov_y, camera->znear, camera->zfar, VIEW_METERS};
+}
+
 int vk_dlaa_ffx_camera(VkFfxCamera *c) {
-    if (!D.fg_cam_ok) return 0;
-    *c = (VkFfxCamera){D.fg_cam.fov_y, D.fg_cam.znear, D.fg_cam.zfar, VIEW_METERS};
+    if (!fg_compose || !fg_compose->consumed || !fg_compose->camera_ok) return 0;
+    *c = ffx_camera(&fg_compose->camera);
+    return 1;
+}
+
+int vk_dlaa_fg_describe(const VkDlaaFgSizeUse *use, VkFfxImage *depth, VkFfxImage *mv) {
+    if (!use) return 0;
+    if (use->consumed || use->size->generation != use->generation ||
+        __atomic_load_n(&use->size->retired, __ATOMIC_ACQUIRE)) return -1;
+    if (!use->depth_view || !use->mv_view) return -1;
+    if (!use->camera_ok) return 0;
+    *depth = use->depth;
+    *mv = use->mv;
+    return 1;
+}
+
+int vk_dlaa_fg_compose_peek(VkFfxImage *depth, VkFfxImage *mv, VkImageView *depth_view, VkImageView *mv_view,
+                            VkDlaaCamera *camera, float *jx, float *jy, int *reset) {
+    const VkDlaaFgSizeUse *use = fg_compose;
+    int describe = vk_dlaa_fg_describe(use, depth, mv);
+    if (describe != 1) return describe;
+    *depth_view = use->depth_view;
+    *mv_view = use->mv_view;
+    *camera = use->camera;
+    *jx = use->jx;
+    *jy = use->jy;
+    *reset = use->reset;
     return 1;
 }
 
 int vk_dlaa_fg_inputs(VkFfxImage *depth, VkFfxImage *mv, float *jx, float *jy, int *reset) {
-    if (!D.fg_fresh || D.failed) return 0;
-    D.fg_fresh = 0;
-    if (!fg_current(D.fg_at)) return 0;
-    // reset: DLSS started a new history on this frame (evaluate). Handed out as 0 before, so frame generation was never
-    // told of a camera cut, another scene size or another target, and interpolated across them: an area load
-    // generated frames between two unrelated pictures.
-    *depth = D.fg_depth, *mv = D.fg_mv, *jx = D.fg_jx, *jy = D.fg_jy, *reset = D.fg_reset;
+    VkDlaaFgSizeUse *use = fg_compose;
+    if (!use || use->consumed) return 0;
+    if (use->size->generation != use->generation ||
+        __atomic_load_n(&use->size->retired, __ATOMIC_ACQUIRE)) return 0;
+    use->consumed = 1;
+    *depth = use->depth, *mv = use->mv, *jx = use->jx, *jy = use->jy, *reset = use->reset;
     return 1;
 }
 
 const VkTexImage *vk_dlaa_swap_img;
 VkImageView vk_dlaa_swap_view;
+VkImage vk_dlaa_swap_output;
 
 static int dl_active(void) { return N.available && !D.failed && D.on; }
 // The upscaler this frame runs with, as vk_dlaa_frame read it. The menu can set NX2NAVI_TAA to dlss between that and
@@ -651,73 +1020,464 @@ static int dl_active(void) { return N.available && !D.failed && D.on; }
 // with NGX's functions not loaded, a call to address 0 (issue #325).
 static int use_fsr(void) { return !N.ngx_up && fsr_frame; }
 
+int vk_dlaa_temporal_hook_needs_recorder(void) {
+    return __atomic_load_n(&D.size_hook_open, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&hud_sources.forward_pending, __ATOMIC_ACQUIRE);
+}
+
+static void size_hook_close(void) {
+    __atomic_store_n(&D.size_hook_open, 0, __ATOMIC_RELEASE);
+}
+
 static int dl_fail(const char *what, NgxResult r) {
+    size_hook_close();
     rt_log("dlaa: %s failed (%08x): DLAA off for this run", what, (unsigned)r);
     D.failed = 1;
     return 0;
 }
 
+static VkImageCreateInfo dlaa_image_2d_info(uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags usage) {
+    return (VkImageCreateInfo){.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
+        .format = format, .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = usage,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+}
+
+static VkResult dlaa_image_2d_view(VkDevice device, VkImage image, VkFormat format, VkImageView *view) {
+    VkImageAspectFlags aspect = format == VK_FORMAT_D32_SFLOAT ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+    VkImageViewCreateInfo info = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = image,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = format, .subresourceRange = {aspect, 0, 1, 0, 1}};
+    return vkCreateImageView(device, &info, NULL, view);
+}
+
+enum { DLAA_SIZE_NATIVE_IMAGES = 7 };
+typedef struct {
+    uint32_t w, h, ow, oh;
+    VkImageCreateInfo images[DLAA_SIZE_NATIVE_IMAGES];
+    VmaAllocationCreateInfo placements[DLAA_SIZE_NATIVE_IMAGES];
+    RcAdmissionVector peak;
+} DlaaSizeNativePlan;
+
+typedef enum {
+    DLAA_SIZE_NATIVE_READY, DLAA_SIZE_NATIVE_PENDING, DLAA_SIZE_NATIVE_STOPPED, DLAA_SIZE_NATIVE_TERMINAL
+} DlaaSizeNativeState;
+
+typedef struct {
+    DlaaSizeNativeState state;
+    VkResult vk_result;
+    RcAdmissionStatus admission;
+    RcAdmissionVector peak;
+    RcBudgetReadiness before;
+    RcVmaDependency child;
+} DlaaSizeNativeOutcome;
+
+typedef struct {
+    VkImage *image;
+    VmaAllocation *allocation;
+    VkImageView *view;
+} DlaaSizeNativeMember;
+
+static void dlaa_size_native_members(struct Size *size, DlaaSizeNativeMember members[DLAA_SIZE_NATIVE_IMAGES]) {
+    const DlaaSizeNativeMember native[DLAA_SIZE_NATIVE_IMAGES] = {
+        {&size->out, &size->out_mem, &size->out_view},
+        {&size->mv, &size->mv_mem, &size->mv_view},
+        {&size->mask, &size->mask_mem, &size->mask_view},
+        {&size->chars[0], &size->chars_mem[0], &size->chars_view[0]},
+        {&size->chars[1], &size->chars_mem[1], &size->chars_view[1]},
+        {&size->dist[0], &size->dist_mem[0], &size->dist_view[0]},
+        {&size->dist[1], &size->dist_mem[1], &size->dist_view[1]},
+    };
+    memcpy(members, native, sizeof native);
+}
+
+// A stopped request cannot publish a tentative bundle. Relay native loss to the caller for its loss handling.
+static int dlaa_size_native_stopped(DlaaSizeNativeOutcome *outcome) {
+    if (outcome->vk_result == VK_ERROR_DEVICE_LOST || vk_device_is_lost()) {
+        outcome->state = DLAA_SIZE_NATIVE_STOPPED;
+        outcome->vk_result = VK_ERROR_DEVICE_LOST;
+    } else if (vk_sync_stopping()) {
+        outcome->state = DLAA_SIZE_NATIVE_STOPPED;
+        outcome->vk_result = VK_NOT_READY;
+    }
+    return outcome->state == DLAA_SIZE_NATIVE_STOPPED;
+}
+
+// Unpublished groups and old groups with an external retirement proof share this native destruction path.
+static void dlaa_size_native_destroy(struct Size *group) {
+    const VkCtx *c = vk_ctx();
+    DlaaSizeNativeMember members[DLAA_SIZE_NATIVE_IMAGES];
+    dlaa_size_native_members(group, members);
+    for (unsigned i = 0; i < DLAA_SIZE_NATIVE_IMAGES; ++i) {
+        DlaaSizeNativeMember member = members[i];
+        if (*member.view) vkDestroyImageView(c->device, *member.view, NULL);
+        if (*member.image || *member.allocation)
+            resource_core_vma_destroy_image(c->vma, *member.image, *member.allocation);
+        *member.view = VK_NULL_HANDLE;
+        *member.image = VK_NULL_HANDLE;
+        *member.allocation = NULL;
+    }
+}
+
+static DlaaSizeNativeOutcome dlaa_size_native_plan(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh,
+                                                   DlaaSizeNativePlan *out) {
+    DlaaSizeNativeOutcome outcome = {.state = DLAA_SIZE_NATIVE_TERMINAL,
+        .vk_result = VK_ERROR_INITIALIZATION_FAILED, .admission = RC_ADMISSION_INVALID};
+    if (dlaa_size_native_stopped(&outcome)) return outcome;
+    const VkCtx *c = vk_ctx();
+    if (!c || !out || !w || !h || !ow || !oh) return outcome;
+    const VkImageUsageFlags storage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    const VkImageUsageFlags transfer = storage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    DlaaSizeNativePlan next = {.w = w, .h = h, .ow = ow, .oh = oh, .images = {
+        dlaa_image_2d_info(ow, oh, VK_FORMAT_R16G16B16A16_SFLOAT, transfer),
+        dlaa_image_2d_info(w, h, VK_FORMAT_R16G16_SFLOAT, transfer | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT),
+        dlaa_image_2d_info(w, h, VK_FORMAT_R8_UNORM, storage),
+        dlaa_image_2d_info(w, h, VK_FORMAT_R8_UNORM, storage),
+        dlaa_image_2d_info(w, h, VK_FORMAT_R8_UNORM, storage),
+        dlaa_image_2d_info(w, h, VK_FORMAT_R32_SFLOAT, storage),
+        dlaa_image_2d_info(w, h, VK_FORMAT_R32_SFLOAT, storage),
+    }};
+    // Each image has a pinned placement and its own native requirement. A default-pool growth block per
+    // member would count backing that these seven long-lived dedicated allocations will not allocate.
+    const VmaAllocationCreateInfo dedicated = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        .flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT};
+    const RcVmaRequest request = {.producer = RC_BUDGET_TEXTURE, .required = 1};
+    for (unsigned i = 0; i < DLAA_SIZE_NATIVE_IMAGES; ++i) {
+        if (dlaa_size_native_stopped(&outcome)) return outcome;
+        const VkImageCreateInfo *image = &next.images[i];
+        VkImageFormatProperties properties;
+        outcome.vk_result = vkGetPhysicalDeviceImageFormatProperties(c->phys, image->format, image->imageType,
+                                                                      image->tiling, image->usage, image->flags, &properties);
+        if (outcome.vk_result == VK_SUCCESS &&
+            (image->extent.width > properties.maxExtent.width || image->extent.height > properties.maxExtent.height))
+            outcome.vk_result = VK_ERROR_FORMAT_NOT_SUPPORTED;
+        RcAdmissionVector member;
+        if (outcome.vk_result == VK_SUCCESS)
+            outcome.vk_result = resource_core_vma_image_peak(&request, image, &dedicated, &next.placements[i], &member);
+        if (outcome.vk_result != VK_SUCCESS) {
+            if (outcome.vk_result == VK_ERROR_FORMAT_NOT_SUPPORTED || outcome.vk_result == VK_ERROR_FEATURE_NOT_PRESENT ||
+                outcome.vk_result == VK_ERROR_OUT_OF_DEVICE_MEMORY)
+                outcome.admission = RC_ADMISSION_UNSUPPORTED;
+            dlaa_size_native_stopped(&outcome);
+            return outcome;
+        }
+        for (uint32_t d = 0; d < RC_ADMISSION_MAX_DOMAINS; ++d) {
+            if (member.amount[d] > UINT64_MAX - next.peak.amount[d]) {
+                outcome.vk_result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+                outcome.admission = RC_ADMISSION_OVERFLOW;
+                return outcome;
+            }
+            next.peak.amount[d] += member.amount[d];
+        }
+    }
+    outcome.peak = next.peak;
+    // Individual valid allocations can still be impossible simultaneously on the same selected heap.
+    for (uint32_t heap = 0; heap < RC_BUDGET_GPU_HEAPS && heap < c->mem_props.memoryHeapCount; ++heap) {
+        if (next.peak.amount[RC_BUDGET_GPU_FIRST + heap] > c->mem_props.memoryHeaps[heap].size) {
+            outcome.vk_result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+            outcome.admission = RC_ADMISSION_UNSUPPORTED;
+            return outcome;
+        }
+    }
+    if (dlaa_size_native_stopped(&outcome)) return outcome;
+    *out = next;
+    outcome.state = DLAA_SIZE_NATIVE_READY;
+    outcome.admission = RC_ADMISSION_OK;
+    return outcome;
+}
+
+// Materialize an unpublished exact plan. The renderer owns the subsequent barrier, validation and publication.
+static DlaaSizeNativeOutcome dlaa_size_native_create(const DlaaSizeNativePlan *plan, struct Size *out) {
+    DlaaSizeNativeOutcome outcome = {.state = DLAA_SIZE_NATIVE_TERMINAL,
+        .vk_result = VK_ERROR_INITIALIZATION_FAILED, .admission = RC_ADMISSION_INVALID};
+    if (dlaa_size_native_stopped(&outcome)) return outcome;
+    const VkCtx *c = vk_ctx();
+    if (!c || !plan || !out) return outcome;
+    outcome.peak = plan->peak;
+    resource_core_budget_readiness(1, &outcome.before);
+    RcBudgetTicket ticket = {0};
+    outcome.admission = resource_core_budget_reserve(RC_BUDGET_TEXTURE, 1, &plan->peak, &ticket);
+    if (outcome.admission != RC_ADMISSION_OK) {
+        if (outcome.admission == RC_ADMISSION_REFUSED || outcome.admission == RC_ADMISSION_NO_RECORDS) {
+            outcome.state = DLAA_SIZE_NATIVE_PENDING;
+            outcome.vk_result = VK_NOT_READY;
+        } else if (outcome.admission == RC_ADMISSION_UNSUPPORTED) {
+            outcome.vk_result = VK_ERROR_FEATURE_NOT_PRESENT;
+        }
+        dlaa_size_native_stopped(&outcome);
+        return outcome;
+    }
+
+    struct Size next = {.w = plan->w, .h = plan->h, .ow = plan->ow, .oh = plan->oh};
+    DlaaSizeNativeMember members[DLAA_SIZE_NATIVE_IMAGES];
+    dlaa_size_native_members(&next, members);
+    RcVmaRequest request = {.producer = RC_BUDGET_TEXTURE, .required = 1, .peak_ticket = &ticket,
+                            .dependency = &outcome.child};
+    outcome.vk_result = VK_SUCCESS;
+    for (unsigned i = 0; i < DLAA_SIZE_NATIVE_IMAGES; ++i) {
+        if (dlaa_size_native_stopped(&outcome)) break;
+        DlaaSizeNativeMember member = members[i];
+        outcome.vk_result = resource_core_vma_create_image(&request, c->vma, &plan->images[i], &plan->placements[i],
+                                                            member.image, member.allocation, NULL, &outcome.admission);
+        if (outcome.vk_result != VK_SUCCESS || dlaa_size_native_stopped(&outcome)) break;
+        if (!*member.image || !*member.allocation) {
+            outcome.vk_result = VK_ERROR_INITIALIZATION_FAILED;
+            break;
+        }
+        VkImageView view = VK_NULL_HANDLE;
+        outcome.vk_result = dlaa_image_2d_view(c->device, *member.image, plan->images[i].format, &view);
+        if (outcome.vk_result != VK_SUCCESS) break;
+        if (!view) {
+            outcome.vk_result = VK_ERROR_INITIALIZATION_FAILED;
+            break;
+        }
+        *member.view = view;
+    }
+
+    if (resource_core_budget_cancel(&ticket) != RC_ADMISSION_OK)
+        rt_fatal("dlaa: work images lost their capacity reservation");
+    dlaa_size_native_stopped(&outcome);
+    if (outcome.state != DLAA_SIZE_NATIVE_STOPPED && outcome.vk_result == VK_SUCCESS) {
+        *out = next;
+        outcome.state = DLAA_SIZE_NATIVE_READY;
+        outcome.admission = RC_ADMISSION_OK;
+        outcome.child = (RcVmaDependency){0};
+        return outcome;
+    }
+
+    // These images have never reached a recorder. Driver loss and partial materialization can still unwind them.
+    dlaa_size_native_destroy(&next);
+    if (outcome.state != DLAA_SIZE_NATIVE_STOPPED && outcome.vk_result == VK_NOT_READY &&
+        (outcome.admission == RC_ADMISSION_REFUSED || outcome.admission == RC_ADMISSION_NO_RECORDS))
+        outcome.state = DLAA_SIZE_NATIVE_PENDING;
+    return outcome;
+}
+
 static int image2d(uint32_t w, uint32_t h, VkFormat f, VkImageUsageFlags usage, VkImage *img, VmaAllocation *mem,
                    VkImageView *view) {
     const VkCtx *c = vk_ctx();
-    VkImageCreateInfo ii = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = f,
-                            .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
-                            .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = usage,
-                            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+    VkImageCreateInfo ii = dlaa_image_2d_info(w, h, f, usage);
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
     if (vmaCreateImage(c->vma, &ii, &ai, img, mem, NULL) != VK_SUCCESS) return 0;
-    VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = *img,
-                                .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = f,
-                                .subresourceRange = {f == VK_FORMAT_D32_SFLOAT ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
-    return vkCreateImageView(c->device, &vi, NULL, view) == VK_SUCCESS;
+    return dlaa_image_2d_view(c->device, *img, f, view) == VK_SUCCESS;
 }
 
 // The guest draws its tonemap at scene size. Give that same draw output-sized attachments
 // so its scene sample retains DLSS detail. The depth attachment matches the pipeline
 // format; this fullscreen pass has depth testing and writes disabled.
-static struct {
-    VkImage color, depth;
-    VkImageView cv, zv;
-    VmaAllocation cm, zm;
+enum { POST_COLOR, POST_DEPTH, POST_IMAGES };
+typedef struct {
+    struct {
+        VkImage image;
+        VmaAllocation allocation;
+        VkImageView view;
+    } member[POST_IMAGES];
     VkExtent2D size;
-    int ready;
+    RcBudgetTicket metadata;
+    uint64_t last_scene;
+    uint32_t refs;
+    unsigned initialized, canceled;
+} DlaaPostImages;
+
+static struct {
+    DlaaPostImages *cached, *frame;
+    VkExtent2D refused;
 } post;
 
-static void release_post(void) {
-    const VkCtx *c = vk_ctx();
-    if (post.cv) vkDestroyImageView(c->device, post.cv, NULL);
-    if (post.zv) vkDestroyImageView(c->device, post.zv, NULL);
-    if (post.color) vmaDestroyImage(c->vma, post.color, post.cm);
-    if (post.depth) vmaDestroyImage(c->vma, post.depth, post.zm);
-    memset(&post, 0, sizeof post);
+static DlaaPostImages *post_retain(DlaaPostImages *images) {
+    if (!__atomic_fetch_add(&images->refs, 1, __ATOMIC_RELAXED))
+        rt_fatal("dlaa: tonemap attachments have no owner");
+    return images;
 }
 
-static int post_images(VkCommandBuffer cb, VkExtent2D size) {
-    if (size.width == post.size.width && size.height == post.size.height) return post.ready;
-    if (post.color || post.depth) {
-        vk_queue_lock(), vk_device_wait_idle(), vk_queue_unlock();
-        release_post();
+static void post_release(void *arg) {
+    DlaaPostImages *images = arg;
+    if (!images) return;
+    unsigned refs = __atomic_fetch_sub(&images->refs, 1, __ATOMIC_ACQ_REL);
+    if (!refs) rt_fatal("dlaa: tonemap attachment ownership underflow");
+    if (refs != 1) return;
+
+    RcBudgetTicket metadata = images->metadata;
+    if (resource_core_budget_retire(&metadata) != RC_ADMISSION_OK)
+        rt_fatal("dlaa: tonemap attachments lost their metadata reservation");
+    const VkCtx *c = vk_ctx();
+    for (unsigned i = 0; i < POST_IMAGES; ++i) {
+        if (images->member[i].view) vkDestroyImageView(c->device, images->member[i].view, NULL);
+        if (images->member[i].image || images->member[i].allocation)
+            resource_core_vma_destroy_image(c->vma, images->member[i].image, images->member[i].allocation);
     }
-    post.size = size;
-    if (!image2d(size.width, size.height, VK_FORMAT_B10G11R11_UFLOAT_PACK32,
-                 VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                 &post.color, &post.cm, &post.cv) ||
-        !image2d(size.width, size.height, VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
-                 &post.depth, &post.zm, &post.zv)) {
-        rt_log("dlaa: output-sized tonemap attachments unavailable at %ux%u", size.width, size.height);
-        return 0;
+    free(images);
+    if (resource_core_budget_destroyed(&metadata) != RC_ADMISSION_OK)
+        rt_fatal("dlaa: tonemap attachment metadata destruction failed");
+}
+
+static int post_current(const DlaaPostImages *images) {
+    return images && !__atomic_load_n(&images->canceled, __ATOMIC_ACQUIRE);
+}
+
+static void post_cancel(void *arg, int may_have_executed) {
+    (void)may_have_executed; // Sync dispatches cancellation only after native retirement is safe.
+    DlaaPostImages *images = arg;
+    __atomic_store_n(&images->canceled, 1, __ATOMIC_RELEASE);
+    post_release(images);
+}
+
+static void post_scene_use(VkExec *ex, DlaaPostImages *images) {
+    if (!ex->fence) rt_fatal("dlaa: tonemap attachments require a recording scene");
+    uint64_t prior = __atomic_load_n(&images->last_scene, __ATOMIC_RELAXED);
+    for (;;) {
+        if (prior == ex->fence) return;
+        if (prior > ex->fence) rt_fatal("dlaa: invalid tonemap attachment scene");
+        if (__atomic_compare_exchange_n(&images->last_scene, &prior, ex->fence, 0,
+                                        __ATOMIC_RELAXED, __ATOMIC_RELAXED)) break;
     }
-    VkImageMemoryBarrier2 ib[2];
-    for (int i = 0; i < 2; i++)
-        ib[i] = (VkImageMemoryBarrier2){.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-            .dstStageMask = VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT, .dstAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
-            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = i ? post.depth : post.color,
-            .subresourceRange = {i ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
-    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 2, .pImageMemoryBarriers = ib};
-    vkCmdPipelineBarrier2(cb, &di);
-    return post.ready = 1;
+    vk_completion_add_owned(ex->fence, post_release, post_cancel, post_retain(images));
+}
+
+static void post_frame_end(void) {
+    DlaaPostImages *images = post.frame;
+    post.frame = NULL;
+    post_release(images);
+    if (post.cached && !post_current(post.cached)) {
+        images = post.cached;
+        post.cached = NULL;
+        post_release(images);
+    }
+}
+
+static void release_post(void) {
+    if (!vk_ctx() || vk_device_is_lost()) return;
+    post_frame_end();
+    DlaaPostImages *images = post.cached;
+    post.cached = NULL;
+    post.refused = (VkExtent2D){0};
+    post_release(images);
+}
+
+static VkResult post_create(VkExtent2D size, DlaaPostImages **out) {
+    const VkCtx *c = vk_ctx();
+    if (!size.width || !size.height) return VK_ERROR_INITIALIZATION_FAILED;
+    const VkImageCreateInfo info[POST_IMAGES] = {
+        dlaa_image_2d_info(size.width, size.height, VK_FORMAT_B10G11R11_UFLOAT_PACK32,
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT),
+        dlaa_image_2d_info(size.width, size.height, VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)
+    };
+    const VmaAllocationCreateInfo dedicated = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        .flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT};
+    const RcAdmissionVector host = {.amount = {[RC_BUDGET_RAM] = sizeof(DlaaPostImages),
+                                             [RC_BUDGET_COMMIT] = sizeof(DlaaPostImages)}};
+    RcVmaRequest request = {.producer = RC_BUDGET_TEXTURE};
+    RcAdmissionVector peak = host;
+    VmaAllocationCreateInfo placements[POST_IMAGES];
+    for (unsigned i = 0; i < POST_IMAGES; ++i) {
+        VkImageFormatProperties limits;
+        VkResult result = vkGetPhysicalDeviceImageFormatProperties(c->phys, info[i].format, info[i].imageType,
+            info[i].tiling, info[i].usage, info[i].flags, &limits);
+        if (result != VK_SUCCESS) return result;
+        if (size.width > limits.maxExtent.width || size.height > limits.maxExtent.height)
+            return VK_ERROR_FORMAT_NOT_SUPPORTED;
+        RcAdmissionVector cost;
+        result = resource_core_vma_image_peak(&request, &info[i], &dedicated, &placements[i], &cost);
+        if (result != VK_SUCCESS) return result;
+        for (unsigned d = 0; d < RC_ADMISSION_MAX_DOMAINS; ++d) {
+            if (cost.amount[d] > UINT64_MAX - peak.amount[d]) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+            peak.amount[d] += cost.amount[d];
+        }
+    }
+
+    RcBudgetTicket joint = {0};
+    if (resource_core_budget_reserve(request.producer, request.required, &peak, &joint) != RC_ADMISSION_OK)
+        return VK_NOT_READY;
+    request.peak_ticket = &joint;
+    RcBudgetTicket metadata = {0};
+    DlaaPostImages *images = NULL;
+    VkResult result = VK_NOT_READY;
+    if (resource_core_budget_split(&joint, &host, request.producer, &metadata) == RC_ADMISSION_OK) {
+        images = calloc(1, sizeof *images);
+        result = images ? VK_SUCCESS : VK_ERROR_OUT_OF_HOST_MEMORY;
+        if (images) {
+            images->refs = 1;
+            images->size = size;
+            if (!rc_admission_accounted(resource_core_budget_materialize(&metadata, &host)))
+                rt_fatal("dlaa: tonemap attachment metadata settlement failed");
+            images->metadata = metadata;
+        } else if (resource_core_budget_cancel(&metadata) != RC_ADMISSION_OK) {
+            rt_fatal("dlaa: tonemap attachment metadata cancellation failed");
+        }
+    }
+    for (unsigned i = 0; result == VK_SUCCESS && i < POST_IMAGES; ++i) {
+        if (vk_sync_stopping() || vk_device_is_lost()) {
+            result = vk_device_is_lost() ? VK_ERROR_DEVICE_LOST : VK_NOT_READY;
+            break;
+        }
+        result = resource_core_vma_create_image(&request, c->vma, &info[i], &placements[i],
+            &images->member[i].image, &images->member[i].allocation, NULL, NULL);
+        if (result != VK_SUCCESS) break;
+        if (vk_sync_stopping() || vk_device_is_lost()) {
+            result = vk_device_is_lost() ? VK_ERROR_DEVICE_LOST : VK_NOT_READY;
+            break;
+        }
+        if (!images->member[i].image || !images->member[i].allocation) {
+            result = VK_ERROR_INITIALIZATION_FAILED;
+            break;
+        }
+        VkImageView view = VK_NULL_HANDLE;
+        result = dlaa_image_2d_view(c->device, images->member[i].image, info[i].format, &view);
+        if (result != VK_SUCCESS) break;
+        if (!view) result = VK_ERROR_INITIALIZATION_FAILED;
+        else images->member[i].view = view;
+    }
+    if (resource_core_budget_cancel(&joint) != RC_ADMISSION_OK)
+        rt_fatal("dlaa: tonemap attachments lost their admission reservation");
+    if (result == VK_SUCCESS && (vk_sync_stopping() || vk_device_is_lost()))
+        result = vk_device_is_lost() ? VK_ERROR_DEVICE_LOST : VK_NOT_READY;
+    if (result == VK_SUCCESS) *out = images;
+    else post_release(images);
+    return result;
+}
+
+static int post_images(VkExec *ex, VkExtent2D size) {
+    if (vk_sync_stopping() || vk_device_is_lost()) return 0;
+    DlaaPostImages *images = post.cached;
+    if (!post_current(images) || images->size.width != size.width || images->size.height != size.height) {
+        VkResult result = post_create(size, &images);
+        if (result != VK_SUCCESS) {
+            vk_device_lost_check(result, "preparing output-sized tonemap attachments");
+            if (post.refused.width != size.width || post.refused.height != size.height) {
+                post.refused = size;
+                rt_log("dlaa: output-sized tonemap attachments unavailable at %ux%u (%d)",
+                       size.width, size.height, (int)result);
+            }
+            return 0;
+        }
+        DlaaPostImages *old = post.cached;
+        post.cached = images;
+        post_release(old);
+    }
+    post.refused = (VkExtent2D){0};
+    post_scene_use(ex, images);
+    if (!images->initialized) {
+        VkImageMemoryBarrier2 barriers[POST_IMAGES];
+        for (unsigned i = 0; i < POST_IMAGES; ++i)
+            barriers[i] = (VkImageMemoryBarrier2){.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+                .dstStageMask = VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+                .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = images->member[i].image,
+                .subresourceRange = {i == POST_DEPTH ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT,
+                                     0, 1, 0, 1}};
+        VkDependencyInfo dependency = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .imageMemoryBarrierCount = POST_IMAGES, .pImageMemoryBarriers = barriers};
+        vkCmdPipelineBarrier2(ex->cb, &dependency);
+        images->initialized = 1;
+        ex->recorded++;
+    }
+    if (post.frame != images) {
+        DlaaPostImages *old = post.frame;
+        post.frame = post_retain(images);
+        post_release(old);
+    }
+    return 1;
 }
 
 // Which features may stay alive when another is made (NX2NAVI_DLSS_IDLE_FREE). A feature made while one with a larger
@@ -747,57 +1507,253 @@ static int idle_free(void) {
     return m;
 }
 
-// The images and views of a size, then its feature. The device must be idle: free_size waits for it, vk_dlaa_release
-// has. Whatever was not made is skipped, so a half-made size goes the same way.
-static void destroy_size(struct Size *e) {
-    const VkCtx *c = vk_ctx();
-    if (e->out_view) vkDestroyImageView(c->device, e->out_view, NULL);
-    if (e->mv_view) vkDestroyImageView(c->device, e->mv_view, NULL);
-    if (e->out) vmaDestroyImage(c->vma, e->out, e->out_mem);
-    if (e->mv) vmaDestroyImage(c->vma, e->mv, e->mv_mem);
-    if (e->mask_view) vkDestroyImageView(c->device, e->mask_view, NULL);
-    if (e->mask) vmaDestroyImage(c->vma, e->mask, e->mask_mem);
-    for (int i = 0; i < 2; i++) {
-        if (e->chars_view[i]) vkDestroyImageView(c->device, e->chars_view[i], NULL);
-        if (e->chars[i]) vmaDestroyImage(c->vma, e->chars[i], e->chars_mem[i]);
-        if (e->dist_view[i]) vkDestroyImageView(c->device, e->dist_view[i], NULL);
-        if (e->dist[i]) vmaDestroyImage(c->vma, e->dist[i], e->dist_mem[i]);
+static int size_idle(const struct Size *e) {
+    return !__atomic_load_n(&e->scene_users, __ATOMIC_ACQUIRE) &&
+           !__atomic_load_n(&e->present_users, __ATOMIC_ACQUIRE);
+}
+
+static void size_scene_complete(void *arg) {
+    struct Size *e = arg;
+    if (!__atomic_fetch_sub(&e->scene_users, 1, __ATOMIC_ACQ_REL))
+        rt_fatal("dlaa: unowned replay generation");
+    resource_core_budget_progress();
+}
+
+static void size_scene_cancel(void *arg, int may_have_executed) {
+    (void)may_have_executed;  // both paths invalidate the history; vk_sync owns the native retirement proof
+    struct Size *e = arg;
+    __atomic_store_n(&e->retired, 1, __ATOMIC_RELEASE);
+    size_scene_complete(e);
+}
+
+static void size_scene_use(VkExec *ex, struct Size *e) {
+    uint64_t prior = __atomic_load_n(&e->last_scene, __ATOMIC_RELAXED);
+    for (;;) {
+        if (prior == ex->fence) return;
+        if (prior > ex->fence) rt_fatal("dlaa: replay used an older scene generation");
+        if (__atomic_compare_exchange_n(&e->last_scene, &prior, ex->fence, 0,
+                                        __ATOMIC_RELAXED, __ATOMIC_RELAXED)) break;
     }
-    if (e->feat && N.release) N.release(e->feat), feat_released = 1;
+    __atomic_fetch_add(&e->scene_users, 1, __ATOMIC_RELAXED);
+    vk_completion_add_owned(ex->fence, size_scene_complete, size_scene_cancel, e);
+}
+
+void vk_dlaa_swap_use(VkExec *ex) {
+    if (!D.swap_size || D.swap_size->out != vk_dlaa_swap_output ||
+        __atomic_load_n(&D.swap_size->retired, __ATOMIC_ACQUIRE))
+        rt_fatal("dlaa: reconstructed binding lost its native generation");
+    size_scene_use(ex, D.swap_size);
+}
+
+static void size_mark_retired(struct Size *e) {
+    __atomic_store_n(&e->retired, 1, __ATOMIC_RELEASE);
+    if (D.last == e) D.last = NULL;
+    if (D.fg_size == e) fg_forget_size();
+    if (D.swap_size == e) {
+        D.swap_size = NULL;
+        vk_dlaa_swap_img = NULL, vk_dlaa_swap_view = VK_NULL_HANDLE, vk_dlaa_swap_output = VK_NULL_HANDLE;
+    }
+}
+
+// Actual SDK recordings share the Size scene receipt. Presentation and later
+// ordinary sampling may retain the images without using the SDK handle.
+static void ngx_sr_scene_use(VkExec *ex, struct Size *e) {
+    if (e->sr.scene > ex->fence) rt_fatal("dlaa: replay used an older SR feature scene");
+    size_scene_use(ex, e);
+    e->sr.scene = ex->fence;
+}
+
+// Only the recorder or the drained teardown owner calls the SDK. Release is
+// handle retirement; NGX may keep its own cache and no budget credit follows.
+static void ngx_sr_release(NgxSrFeature *sr) {
+    if (sr->handle) {
+        if (!N.release) rt_fatal("dlaa: release missing for an owned DLSS SR feature");
+        NgxResult result = N.release(sr->handle);
+        if (!NGX_OK(result)) rt_fatal("dlaa: DLSS SR feature release failed (%08x)", (unsigned)result);
+    }
+    *sr = (NgxSrFeature){0};
+}
+
+static void destroy_size(struct Size *e) {
+    if (!size_idle(e)) rt_fatal("dlaa: destroy of an executing size generation");
+    int had_feature = e->sr.handle != NULL;
+    ngx_sr_release(&e->sr);
+    if (had_feature) feat_released = 1;
+    dlaa_size_native_destroy(e);
     memset(e, 0, sizeof *e);
 }
 
-static void free_size(struct Size *e) {
-    vk_queue_lock(), vk_device_wait_idle(), vk_queue_unlock();   // a third scene size: the evicted images may still be in flight
-    destroy_size(e);
+static int size_collect_retired(void) {
+    int collected = 0;
+    for (int i = 0; i < DLSS_SIZES; ++i) {
+        struct Size *e = &D.sizes[i];
+        if (e->generation && __atomic_load_n(&e->retired, __ATOMIC_ACQUIRE) && size_idle(e)) {
+            size_mark_retired(e);
+            destroy_size(e);
+            ++collected;
+        }
+    }
+    return collected;
 }
 
-// The entry for a scene and output size: its output (RGBA16F at the output size, written by DLSS, then blitted into
-// the target) and motion vectors (RG16F at the scene size, render pixels), both kept in GENERAL like every image of the
-// back end. NX2navi's dynamic resolution switches between a few sizes; each keeps its feature, the least recently used
-// goes for a new one.
-static struct Size *size_for(VkCommandBuffer cb, uint32_t w, uint32_t h, uint32_t ow, uint32_t oh) {
-    struct Size *e = NULL, *lru = &D.sizes[0];
-    for (int i = 0; i < DLSS_SIZES; i++) {
-        if (D.sizes[i].w == w && D.sizes[i].h == h && D.sizes[i].ow == ow && D.sizes[i].oh == oh) return &D.sizes[i];
-        if (!D.sizes[i].out && !e) e = &D.sizes[i];
-        if (D.sizes[i].used < lru->used) lru = &D.sizes[i];
+void vk_dlaa_size_shutdown(void) {
+    if (!vk_ctx() || vk_device_is_lost()) return;
+    vk_dlaa_swap_img = NULL, vk_dlaa_swap_view = VK_NULL_HANDLE, vk_dlaa_swap_output = VK_NULL_HANDLE;
+    dlaa_frame_targets_close();
+    fg_forget_size();
+    for (int i = 0; i < DLSS_SIZES; ++i) {
+        struct Size *e = &D.sizes[i];
+        if (!e->generation) continue;
+        size_mark_retired(e);
+        destroy_size(e);
     }
-    if (!e) {
-        if (D.last == lru) D.last = NULL;
-        free_size(e = lru);
+    size_hook_close();
+}
+
+typedef struct {
+    uint32_t w, h, ow, oh;
+    uint64_t scene;
+    struct Size *ready;
+    DlaaSizeNativeOutcome outcome;
+    RcBudgetReadiness observed;
+    const char *failure;
+} DlaaSizeRequest;
+
+static struct Size *size_find(const DlaaSizeRequest *request) {
+    if (D.preset_dirty) return NULL;
+    for (int i = 0; i < DLSS_SIZES; ++i) {
+        struct Size *e = &D.sizes[i];
+        if (e->generation && !__atomic_load_n(&e->retired, __ATOMIC_ACQUIRE) &&
+            e->w == request->w && e->h == request->h && e->ow == request->ow && e->oh == request->oh)
+            return e;
     }
-    VkImageUsageFlags u = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                          VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    VkImageUsageFlags u8 = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    if (!image2d(ow, oh, VK_FORMAT_R16G16B16A16_SFLOAT, u, &e->out, &e->out_mem, &e->out_view) ||
-        !image2d(w, h, VK_FORMAT_R16G16_SFLOAT, u | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, &e->mv, &e->mv_mem, &e->mv_view) ||
-        !image2d(w, h, VK_FORMAT_R8_UNORM, u8, &e->mask, &e->mask_mem, &e->mask_view) ||
-        !image2d(w, h, VK_FORMAT_R8_UNORM, u8, &e->chars[0], &e->chars_mem[0], &e->chars_view[0]) ||
-        !image2d(w, h, VK_FORMAT_R8_UNORM, u8, &e->chars[1], &e->chars_mem[1], &e->chars_view[1]) ||
-        !image2d(w, h, VK_FORMAT_R32_SFLOAT, u8, &e->dist[0], &e->dist_mem[0], &e->dist_view[0]) ||
-        !image2d(w, h, VK_FORMAT_R32_SFLOAT, u8, &e->dist[1], &e->dist_mem[1], &e->dist_view[1]))
-        return NULL;
+    return NULL;
+}
+
+static struct Size *size_candidate(const DlaaSizeRequest *request, int allow_empty) {
+    struct Size *candidate = NULL;
+    for (int i = 0; i < DLSS_SIZES; ++i) {
+        struct Size *e = &D.sizes[i];
+        if (!e->generation) {
+            if (allow_empty) return e;
+            continue;
+        }
+        if (e == D.last || e == D.swap_size || e == D.fg_size ||
+            __atomic_load_n(&e->last_scene, __ATOMIC_ACQUIRE) == request->scene || !size_idle(e)) continue;
+        if (!candidate || e->used < candidate->used) candidate = e;
+    }
+    return candidate;
+}
+
+// A cold size can wait for older accepted users and actual capacity. An
+// unchanged condition must not repeatedly materialize and roll back siblings.
+#define DLAA_SIZE_NO_PROGRESS_NS UINT64_C(5000000000)
+static int prepare_size(void *context) {
+    DlaaSizeRequest *request = context;
+    DlaaSizeNativePlan plan;
+    request->outcome = dlaa_size_native_plan(request->w, request->h, request->ow, request->oh, &plan);
+    if (request->outcome.state != DLAA_SIZE_NATIVE_READY)
+        return request->outcome.state != DLAA_SIZE_NATIVE_STOPPED;
+
+    int refused = 0, reclaimed = 0;
+    uint64_t progress_at = kern_now_ns();
+    while (!vk_sync_stopping() && !vk_device_is_lost()) {
+        vk_present_retire_temporal_inputs();
+        reclaimed |= size_collect_retired() != 0;
+        struct Size *slot = size_candidate(request, 1);
+        resource_core_budget_readiness(1, &request->observed);
+        int records = refused && (request->outcome.admission == RC_ADMISSION_NO_RECORDS ||
+                                  request->outcome.child.owner_full);
+        int allowed = !refused || reclaimed || (!records &&
+            resource_core_budget_peak_progress(&request->outcome.peak, &request->outcome.before, &request->observed));
+        if (slot && allowed) {
+            struct Size next = {0};
+            request->outcome = dlaa_size_native_create(&plan, &next);
+            reclaimed = 0;
+            if (request->outcome.state == DLAA_SIZE_NATIVE_READY) {
+                if (slot->generation) {
+                    size_mark_retired(slot);
+                    destroy_size(slot);
+                }
+                if (D.preset_dirty) {
+                    for (int i = 0; i < DLSS_SIZES; ++i)
+                        if (D.sizes[i].generation) size_mark_retired(&D.sizes[i]);
+                    D.preset_dirty = 0;
+                }
+                if (++size_generation == 0) rt_fatal("dlaa: size generation overflow");
+                next.generation = size_generation;
+                *slot = next;
+                request->ready = slot;
+                return 1;
+            }
+            if (request->outcome.state != DLAA_SIZE_NATIVE_PENDING)
+                return request->outcome.state != DLAA_SIZE_NATIVE_STOPPED;
+            refused = 1;
+            records = request->outcome.admission == RC_ADMISSION_NO_RECORDS || request->outcome.child.owner_full;
+        }
+        if (refused) {
+            // Keep the prior published generation. A distinct inactive group
+            // that really retires can return all seven of its native records.
+            struct Size *victim = size_candidate(request, 0);
+            if (victim) {
+                size_mark_retired(victim);
+                destroy_size(victim);
+                reclaimed = 1;
+                progress_at = kern_now_ns();
+                continue;
+            }
+        }
+        if (kern_now_ns() - progress_at >= DLAA_SIZE_NO_PROGRESS_NS) {
+            request->failure = !slot ? "no retired size slot" : records ? "seven allocation records unavailable" :
+                               "full native peak unavailable";
+            request->outcome.state = DLAA_SIZE_NATIVE_TERMINAL;
+            request->outcome.vk_result = VK_NOT_READY;
+            return 1;
+        }
+        RcBudgetProgress progress;
+        resource_core_budget_service(1, &request->outcome.peak, &progress);
+        resource_core_budget_wait_since(progress.event, 100);
+    }
+    request->outcome.state = DLAA_SIZE_NATIVE_STOPPED;
+    return 0;
+}
+
+static struct Size *size_for(VkExec *ex, uint32_t w, uint32_t h, uint32_t ow, uint32_t oh) {
+    DlaaSizeRequest request = {.w = w, .h = h, .ow = ow, .oh = oh, .scene = ex->fence};
+    struct Size *e = size_find(&request);
+    if (e) return e;
+    VkSyncProgressResult progress = vk_exec_temporal_prepare(ex, prepare_size, &request);
+    vk_device_lost_check(request.outcome.vk_result, "preparing temporal size images");
+    if (progress == VK_SYNC_PROGRESS_COMPLETE && request.ready) return request.ready;
+    if (request.ready) size_mark_retired(request.ready);
+    if (progress == VK_SYNC_PROGRESS_STOPPED || request.outcome.state == DLAA_SIZE_NATIVE_STOPPED) {
+        vk_exec_cancel_temporal_preparation();
+    } else if (!vk_sync_stopping() && !vk_device_is_lost()) {
+        char diagnostic[240];
+        int domain = -1;
+        uint64_t needed = 0, available = 0;
+        for (unsigned i = 0; i < RC_ADMISSION_MAX_DOMAINS; ++i) {
+            uint64_t peak = request.outcome.peak.amount[i], room = request.observed.available.amount[i];
+            if (peak <= room) continue;
+            domain = (int)i;
+            needed = peak;
+            available = room;
+            break;
+        }
+        snprintf(diagnostic, sizeof diagnostic,
+                 "cannot prepare %ux%u -> %ux%u (%s, park %d, Vulkan %d, budget %d, domain %d needs %llu / has %llu bytes)",
+                 w, h, ow, oh, request.failure ? request.failure : "native preparation failed",
+                 (int)progress, (int)request.outcome.vk_result, (int)request.outcome.admission, domain,
+                 (unsigned long long)needed, (unsigned long long)available);
+        vk_exec_required_temporal_unavailable(ex, diagnostic);
+    }
+    return NULL;
+}
+
+static void size_record_begin(VkExec *ex, struct Size *e) {
+    size_scene_use(ex, e);
+    if (e->initialized) return;
+    VkCommandBuffer cb = ex->cb;
     VkImageMemoryBarrier2 ib[7];
     VkImage im[7] = {e->out, e->mv, e->mask, e->chars[0], e->chars[1], e->dist[0], e->dist[1]};
     for (int i = 0; i < 7; i++)
@@ -812,8 +1768,7 @@ static struct Size *size_for(VkCommandBuffer cb, uint32_t w, uint32_t h, uint32_
     VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 7,
                            .pImageMemoryBarriers = ib};
     vkCmdPipelineBarrier2(cb, &di);
-    e->w = w, e->h = h, e->ow = ow, e->oh = oh;
-    return e;
+    e->initialized = 1;
 }
 
 static void full_barrier(VkCommandBuffer cb) {
@@ -911,10 +1866,45 @@ typedef struct {
     float zmask;
 } MvPush;
 
+static RcAdmissionVector mv_refused;
+static int mv_waiting_capacity;
+
+static void mv_discard(const VkCtx *c) {
+    if (D.mv_pipe) vkDestroyPipeline(c->device, D.mv_pipe, NULL);
+    if (D.mv_layout) vkDestroyPipelineLayout(c->device, D.mv_layout, NULL);
+    if (D.mv_dsl) vkDestroyDescriptorSetLayout(c->device, D.mv_dsl, NULL);
+    if (D.mv_samp) vkDestroySampler(c->device, D.mv_samp, NULL);
+    if (D.camb) resource_core_vma_destroy_buffer(c->vma, D.camb, D.camb_mem);
+    if (D.mvm) resource_core_vma_destroy_buffer(c->vma, D.mvm, D.mvm_mem);
+    D.mv_pipe = VK_NULL_HANDLE;
+    D.mv_layout = VK_NULL_HANDLE;
+    D.mv_dsl = VK_NULL_HANDLE;
+    D.mv_samp = VK_NULL_HANDLE;
+    D.camb = D.mvm = VK_NULL_HANDLE;
+    D.camb_mem = D.mvm_mem = NULL;
+    D.mvm_map = NULL;
+}
+
+void vk_dlaa_motion_shutdown(void) {
+    const VkCtx *c = vk_ctx();
+    if (!c) return;
+    mv_discard(c);
+    mv_waiting_capacity = 0;
+    D.mv_ok = -1;
+}
+
 static int mv_init(void) {
     if (D.mv_ok >= 0) return D.mv_ok;
-    D.mv_ok = 0;
+    if (vk_sync_stopping() || vk_device_is_lost()) return 0;
+    if (mv_waiting_capacity) {
+        RcBudgetReadiness now;
+        resource_core_budget_readiness(1, &now);
+        if (!resource_core_budget_peak_ready(&mv_refused, &now)) return 0;
+    }
     const VkCtx *c = vk_ctx();
+    RcBudgetTicket joint = {0};
+    RcAdmissionVector peak = {0};
+    int peak_known = 0;
     VkDescriptorSetLayoutBinding b[10] = {
         {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
         {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
@@ -940,35 +1930,81 @@ static int mv_init(void) {
     VkShaderModule m = VK_NULL_HANDLE;
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 2 * CAM_SLOT,
                              .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
-    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
-    if (vkCreateDescriptorSetLayout(c->device, &dci, NULL, &D.mv_dsl) != VK_SUCCESS) goto fail;
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+                                  .flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT};
     VkBufferCreateInfo mbi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = MVM_SLOTS * 2 * CAM_BYTES,
                               .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT};
     VmaAllocationCreateInfo mai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
-                                   .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                                   .flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT |
+                                            VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
                                             VMA_ALLOCATION_CREATE_MAPPED_BIT};
+    RcVmaRequest request = {.producer = RC_BUDGET_OTHER, .required = 1};
+    VmaAllocationCreateInfo host, device;
+    RcAdmissionVector dev_peak;
+    VkResult r = resource_core_vma_buffer_peak(&request, &mbi, &mai, &host, &peak);
+    if (r != VK_SUCCESS) goto fail;
+    r = resource_core_vma_buffer_peak(&request, &bi, &ai, &device, &dev_peak);
+    if (r != VK_SUCCESS) goto fail;
+    for (unsigned d = 0; d < RC_ADMISSION_MAX_DOMAINS; d++) {
+        if (dev_peak.amount[d] > UINT64_MAX - peak.amount[d]) {
+            r = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+            goto fail;
+        }
+        peak.amount[d] += dev_peak.amount[d];
+    }
+    peak_known = 1;
+    if (resource_core_budget_reserve(request.producer, request.required, &peak, &joint) != RC_ADMISSION_OK) {
+        r = VK_NOT_READY;
+        goto fail;
+    }
+    request.peak_ticket = &joint;
     VmaAllocationInfo minfo;
-    if (vmaCreateBuffer(c->vma, &mbi, &mai, &D.mvm, &D.mvm_mem, &minfo) != VK_SUCCESS) goto fail;
+    r = resource_core_vma_create_buffer(&request, c->vma, &mbi, &host, &D.mvm, &D.mvm_mem, &minfo, NULL);
+    if (r != VK_SUCCESS) goto fail;
+    if (!minfo.pMappedData) {
+        r = VK_ERROR_MEMORY_MAP_FAILED;
+        goto fail;
+    }
     D.mvm_map = minfo.pMappedData;
+    r = resource_core_vma_create_buffer(&request, c->vma, &bi, &device, &D.camb, &D.camb_mem, NULL, NULL);
+    if (r != VK_SUCCESS) goto fail;
+    r = vkCreateDescriptorSetLayout(c->device, &dci, NULL, &D.mv_dsl);
+    if (r != VK_SUCCESS) goto fail;
     VkPipelineLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
                                      .pSetLayouts = &D.mv_dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pr};
-    if (vkCreatePipelineLayout(c->device, &li, NULL, &D.mv_layout) != VK_SUCCESS ||
-        vkCreateSampler(c->device, &si, NULL, &D.mv_samp) != VK_SUCCESS ||
-        vkCreateShaderModule(c->device, &mi, NULL, &m) != VK_SUCCESS ||
-        vmaCreateBuffer(c->vma, &bi, &ai, &D.camb, &D.camb_mem, NULL) != VK_SUCCESS)
-        goto fail;
+    r = vkCreatePipelineLayout(c->device, &li, NULL, &D.mv_layout);
+    if (r != VK_SUCCESS) goto fail;
+    r = vkCreateSampler(c->device, &si, NULL, &D.mv_samp);
+    if (r != VK_SUCCESS) goto fail;
+    r = vkCreateShaderModule(c->device, &mi, NULL, &m);
+    if (r != VK_SUCCESS) goto fail;
     VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
                                       .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                                                 .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main"},
                                       .layout = D.mv_layout};
-    VkResult r = vkCreateComputePipelines(c->device, VK_NULL_HANDLE, 1, &ci, NULL, &D.mv_pipe);
+    r = vkCreateComputePipelines(c->device, VK_NULL_HANDLE, 1, &ci, NULL, &D.mv_pipe);
     vkDestroyShaderModule(c->device, m, NULL);
-    m = VK_NULL_HANDLE;
     if (r != VK_SUCCESS) goto fail;
+    if (resource_core_budget_cancel(&joint) != RC_ADMISSION_OK)
+        rt_fatal("dlaa: motion buffers lost their joint admission");
+    mv_waiting_capacity = 0;
     return D.mv_ok = 1;
 fail:
-    if (m) vkDestroyShaderModule(c->device, m, NULL);   // made before a later step failed
-    rt_log("dlaa: the motion-vector pass could not be set up: DLAA runs with zero motion");
+    mv_discard(c); // No command can use a motion provider before mv_ok becomes ready.
+    if (joint.token.ledger && resource_core_budget_cancel(&joint) != RC_ADMISSION_OK)
+        rt_fatal("dlaa: motion buffers lost their rollback reservation");
+    vk_device_lost_check(r, "preparing the motion-vector pass");
+    if (r == VK_NOT_READY) {
+        if (!mv_waiting_capacity) rt_log("dlaa: motion-vector buffers await required admission");
+        if (peak_known) {
+            mv_refused = peak;
+            mv_waiting_capacity = 1;
+        }
+    } else {
+        mv_waiting_capacity = 0;
+        D.mv_ok = 0;
+        rt_log("dlaa: the motion-vector pass could not be set up (%d): DLAA runs with zero motion", (int)r);
+    }
     return 0;
 }
 
@@ -1038,14 +2074,13 @@ static double plane_dist(const double P[16], double k) {
 // are not fixed: in Hyrule Field its z row is (-1.00001, -0.200001), near 0.1 and far about 25,000 (the view's units
 // are metres), and the camera before it had far about 1,000. Taken as 0.1 and 1e8 (no far plane), a distance d reads
 // as (f - n) d / (f - d): 1,000 as 1,042, 10,000 as 16,650, and the far plane's neighbourhood without bound. So the
-// planes come from the projection every frame; a projection whose stored 0 is not in front of the camera keeps the last
-// frame's planes.
-static void proj_planes(const double P[16], VkDlaaCamera *c) {
+// planes come from each evaluation's projection.
+static int proj_planes(const double P[16], VkDlaaCamera *c) {
     int minus_w = nvn_depth_minus_w();
     double at0 = plane_dist(P, minus_w ? -1.0 : 0.0), at1 = plane_dist(P, 1.0);   // the distances stored as 0 and 1
     int inverted = !(at0 < at1);   // reversed depth: the near plane is stored as 1
     double n = inverted ? at1 : at0, f = inverted ? at0 : at1;
-    if (!(n > 0) || !isfinite(n)) return;
+    if (!(n > 0) || !isfinite(n)) return 0;
     c->inverted = inverted;
     c->znear = (float)n;
     c->infinite = !(f < VK_DLAA_FAR_INFINITE);
@@ -1063,9 +2098,10 @@ static void proj_planes(const double P[16], VkDlaaCamera *c) {
                "w row %.6g %.6g %.6g %.6g)", c->znear, fz, inverted ? "inverted (1 near)" : "0 near, 1 far",
                minus_w ? "-w..w" : "0..w", P[8], P[9], P[10], P[11], P[12], P[13], P[14], P[15]);
     }
+    return 1;
 }
 
-static void fg_camera(const float *v, const double m[16]) {
+static int fg_camera(const float *v, const double m[16], VkDlaaCamera *c) {
     double P[16], Pi[16], mi[16];
     for (int i = 0; i < 16; i++) P[i] = v[28 + i];
     // The tagged D32 image stores zero to one. Express the projection and both
@@ -1083,8 +2119,7 @@ static void fg_camera(const float *v, const double m[16]) {
             reprojection[4 * i + 2] *= 2.0;
         }
     }
-    if (!inv4(projection, Pi) || !inv4(reprojection, mi)) return;
-    VkDlaaCamera *c = &D.fg_cam;
+    if (!inv4(projection, Pi) || !inv4(reprojection, mi) || !proj_planes(P, c)) return 0;
     fg_store(c->view_to_clip, projection), fg_store(c->clip_to_view, Pi);
     fg_store(c->clip_to_prev_clip, reprojection), fg_store(c->prev_clip_to_clip, mi);
     for (int i = 0; i < 3; i++) {
@@ -1094,9 +2129,6 @@ static void fg_camera(const float *v, const double m[16]) {
     }
     c->fov_y = P[5] != 0 ? 2.0f * (float)atan(1.0 / fabs(P[5])) : 1.0f;
     c->aspect = P[0] != 0 ? (float)fabs(P[5] / P[0]) : 1.777f;
-    if (!(c->znear > 0)) c->znear = 0.1f, c->zfar = VK_DLAA_FAR_INFINITE, c->infinite = 1;   // until a projection gives them
-    proj_planes(P, c);
-    D.fg_cam_ok = 1;
     // NX2NAVI_MOUSE_TRACE=1 (test runs, mouse_direct.c): the camera's direction each frame
     static int trace = -1;
     if (trace < 0) {
@@ -1106,6 +2138,7 @@ static void fg_camera(const float *v, const double m[16]) {
     if (trace)
         rt_log("mousetrace: cam t=%.3f fwd=%.6f,%.6f,%.6f pos=%.3f,%.3f,%.3f", plat_now_ns() / 1e6, c->fwd[0], c->fwd[1],
                c->fwd[2], c->pos[0], c->pos[1], c->pos[2]);
+    return 1;
 }
 
 // Frames without a camera (dlaa_cam_keep, NX2NAVI_DLAA_CAM_KEEP; 1 by default, 0 restores the old handling). Measured in
@@ -1192,18 +2225,21 @@ static void cam_cut(const float *v) {
 // zero and DLSS starts a new history); 2: no camera, but the history is kept (the vectors stay zero, dlaa_cam_keep).
 // bias > 0 with this frame's G-buffer classes (D.ids) also writes e->mask, the bias mask (dlaa_mv.comp); *masked says
 // whether it did.
-static int mv_pass(VkExec *ex, struct Size *e, VkImageView zv, float jx, float jy, float bias, int *masked) {
+enum { MV_PASS_ABORTED = -1 };
+static int mv_pass(VkExec *ex, struct Size *e, VkImageView zv, float jx, float jy, float bias, int *masked,
+                   VkDlaaCamera *camera, int *camera_ok) {
     *masked = 0;
-    VkCommandBuffer cb = ex->cb;
     uint32_t w = e->w, h = e->h;
     static int keep = -1;
     if (keep < 0) keep = rt_knob("DLAA_CAM_KEEP", "1");
     VkDescriptorBufferInfo cam;
+    const int matching_depth = dlaa_camera_depth_matches(&D.depth);
     int view = -1;   // Ocarina: the views[] entry of the camera
-    for (int i = 0; D.cam_size == OCAM_BLOCK && D.cam_addr && i < D.nviews; i++)
+    for (int i = 0; matching_depth && D.cam_size == OCAM_BLOCK && D.cam_addr && i < D.nviews; i++)
         if (D.views[i].addr == D.cam_addr) view = i;
     const float *held = keep && view >= 0 && D.views[view].got ? D.views[view].cam : NULL;
-    int found = mv_init() && D.cam_addr && vk_usnap_find(D.cam_addr, D.cam_size == OCAM_BLOCK ? OCAM_BYTES : D.cam_size, 4, &cam);
+    int found = matching_depth && mv_init() && D.cam_addr &&
+        vk_usnap_find(D.cam_addr, D.cam_size == OCAM_BLOCK ? OCAM_BYTES : D.cam_size, 4, &cam);
     if (!found && held && D.mv_ok == 1) {
         D.cam_at_draw++;
         if (D.gap_logged < 40) {
@@ -1218,7 +2254,7 @@ static int mv_pass(VkExec *ex, struct Size *e, VkImageView zv, float jx, float j
     }
     else if (!found) {
         D.mv_none++;
-        if (D.cam_addr) D.cam_none_snap++;
+        if (matching_depth && D.cam_addr) D.cam_none_snap++;
         else D.cam_none_draw++;
         e->chars_ok = e->dist_ok = 0;
         int kept = 0;
@@ -1253,10 +2289,13 @@ static int mv_pass(VkExec *ex, struct Size *e, VkImageView zv, float jx, float j
             have_m = 1;
         }
     }
-    D.fg_cam_ok = 0;
-    if (cr && have_m && D.cam_size == OCAM_BLOCK) fg_camera(cr, m);
+    if (cr && have_m && D.cam_size == OCAM_BLOCK) *camera_ok = fg_camera(cr, m, camera);
     if (cr && D.cam_size == OCAM_BLOCK) cam_cut(cr);
     int s = D.cam_slot, had_prev = D.cam_prev_ok;
+    VkShieldResolve *shield = NULL;
+    if (had_prev && have_m && D.cam_size == OCAM_BLOCK &&
+        !vk_shield_resolve_prepare(ex, D.cam_addr, D.depth.image, w, h, D.reset, &shield)) return MV_PASS_ABORTED;
+    VkCommandBuffer cb = ex->cb;
     if (D.cam_size == CAM_BLOCK) {   // the whole block, for the per-object motion pass (the deferred engine's only)
         VkBufferCopy bc = {cam.offset, (VkDeviceSize)s * CAM_SLOT, CAM_BLOCK};
         vkCmdCopyBuffer(cb, cam.buffer, D.camb, 1, &bc);
@@ -1282,7 +2321,8 @@ static int mv_pass(VkExec *ex, struct Size *e, VkImageView zv, float jx, float j
     // The class mask needs the G-buffer at the scene size; otherwise bindings 4-7 get the mask images as stand-ins
     // (the shader returns before reading them with bias 0).
     const VkExecTarget *ids = &D.ids;
-    int use = bias > 0 && D.ids_ok && ids->image && ids->width == w && ids->height == h && !ids->is3d;
+    int use = bias > 0 && D.ids_ok && dlaa_target_valid(frame_targets[DLAA_TARGET_IDS]) &&
+        ids->image && ids->width == w && ids->height == h && !ids->is3d;
     VkImageView iv = use ? vk_exec_target_view(ids->img, ids->format, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT,
                                                ids->level, ids->base_layer, 1, 0)
                          : e->mask_view;
@@ -1335,7 +2375,9 @@ static int mv_pass(VkExec *ex, struct Size *e, VkImageView zv, float jx, float j
     vk_mvcheck_camera(cb, e->mv, w, h, jx, jy);   // NX2NAVI_MV_CHECK (test)
     // the characters' own motion over the camera's (vk_exec_draw.c, per-object motion)
     uint64_t c0 = T.on > 0 ? kern_now_ns() : 0;
-    if (D.cam_size == OCAM_BLOCK && vk_shield_resolve(ex, D.cam_addr, D.depth.image, zv, e->mv_view, w, h, D.reset)) full_barrier(cb);
+    if (D.cam_size == OCAM_BLOCK &&
+        vk_shield_resolve_emit(ex, &shield, D.cam_addr, D.depth.image, zv, e->mv_view, w, h, D.reset))
+        full_barrier(cb);
     if (D.cam_size == CAM_BLOCK && vk_mvobj_execute(ex, D.cam_addr, e->mv_view, zv, D.depth.format, w, h)) full_barrier(cb);
     if (T.on > 0) T.cpu_mv += kern_now_ns() - c0;
     times_mark(cb, T_OBJ);
@@ -1524,23 +2566,13 @@ static struct Snap *mask_pass(VkCommandBuffer cb, VkImageView cv, uint32_t w, ui
 }
 
 // ---------------------------------------------------------------- teardown
-// The HUD-less picture's images, a half-made pair too. The device must be idle, or the images not yet used.
+// Release an unused alpha image or one whose graphics and SDK uses have retired.
 static void free_alpha(VkNgxImage *a, VmaAllocation *allocation) {
     VkCtx *c = vk_ctx();
     if (a->view) vkDestroyImageView(c->device, a->view, NULL);
-    if (a->img) vmaDestroyImage(c->vma, a->img, *allocation);
+    if (a->img) resource_core_vma_destroy_image(c->vma, a->img, *allocation);
     *a = (VkNgxImage){0};
     *allocation = NULL;
-}
-
-static void hl_destroy(void) {
-    free_alpha(&D.alpha, &D.alpha_mem);
-    D.hud_target = VK_NULL_HANDLE;
-    const VkCtx *c = vk_ctx();
-    if (D.hl_view) vkDestroyImageView(c->device, D.hl_view, NULL);
-    if (D.hl) vmaDestroyImage(c->vma, D.hl, D.hl_mem);
-    if (D.hl_srgb) vmaDestroyImage(c->vma, D.hl_srgb, D.hl_srgb_mem);
-    D.hl_view = VK_NULL_HANDLE, D.hl = D.hl_srgb = VK_NULL_HANDLE;
 }
 
 // The device is idle here. Release NGX features and parameters before their Vulkan resources, then shut down NGX even
@@ -1597,27 +2629,19 @@ static void fcam_probe(VkCommandBuffer cb, const struct Size *e, uint32_t w, uin
 
 void vk_dlaa_release(void) {
     camera_history_enable(0);
+    vk_dlaa_size_shutdown();
+    vk_dlaa_hud_shutdown();
+    release_post();
 #ifndef _WIN32
     const VkCtx *c = vk_ctx();
     if (!c) return;
-    for (int i = 0; i < 5; i++)
-        if (D.sizes[i].feat) N.release(D.sizes[i].feat), D.sizes[i].feat = NULL;
     if (FG.feat) N.release(FG.feat);   // frame generation's feature and parameters (vk_ngxfg_evaluate), before NGX goes
     if (FG.p) N.destroy_params(FG.p);
     memset(&FG, 0, sizeof FG);
     if (D.params) N.destroy_params(D.params);
     if (N.caps_map) N.destroy_params(N.caps_map);
-    for (int i = 0; i < 5; i++) destroy_size(&D.sizes[i]);
     for (int i = 0; i < SNAPS; i++) destroy_snap(&R.s[i]);
-    hl_destroy();
     for (unsigned i = 0; i < 2; ++i) free_alpha(&D.present_alpha[i], &D.present_alpha_mem[i]);
-    release_post();
-    if (D.mv_pipe) vkDestroyPipeline(c->device, D.mv_pipe, NULL);
-    if (D.mv_layout) vkDestroyPipelineLayout(c->device, D.mv_layout, NULL);
-    if (D.mv_dsl) vkDestroyDescriptorSetLayout(c->device, D.mv_dsl, NULL);
-    if (D.mv_samp) vkDestroySampler(c->device, D.mv_samp, NULL);
-    if (D.camb) vmaDestroyBuffer(c->vma, D.camb, D.camb_mem);
-    if (D.mvm) vmaDestroyBuffer(c->vma, D.mvm, D.mvm_mem);   // mapped for good: the destroy unmaps it
     if (fc_buf) vmaDestroyBuffer(c->vma, fc_buf, fc_mem), fc_buf = VK_NULL_HANDLE, fc_map = NULL;
     if (R.pipe) vkDestroyPipeline(c->device, R.pipe, NULL);
     if (R.layout) vkDestroyPipelineLayout(c->device, R.layout, NULL);
@@ -1627,7 +2651,7 @@ void vk_dlaa_release(void) {
     memset(&R, 0, sizeof R), R.ok = -1, R.knob = -1;
     memset(&T, 0, sizeof T), T.on = -1;
     memset(&F, 0, sizeof F);
-    vk_dlaa_swap_img = NULL, vk_dlaa_swap_view = VK_NULL_HANDLE;
+    vk_dlaa_swap_img = NULL, vk_dlaa_swap_view = VK_NULL_HANDLE, vk_dlaa_swap_output = VK_NULL_HANDLE;
     if (!N.device) return;   // NGX never came up on this device: DLAA off, FSR 3.1, or its init failed
     unsigned left = 0;
     vk_queue_lock();   // NGX may wait for the device itself
@@ -1635,6 +2659,10 @@ void vk_dlaa_release(void) {
     vk_queue_unlock();
     rt_log("dlaa: NGX shut down (%08x, %u devices left)", (unsigned)r, left);
     N.device = NULL, N.caps_map = NULL, N.ngx_up = 0, N.available = 0;
+#else
+    // Window teardown has settled the Streamline tags before the allocator goes away.
+    if (vk_ctx())
+        for (unsigned i = 0; i < 2; ++i) free_alpha(&D.present_alpha[i], &D.present_alpha_mem[i]);
 #endif
 }
 
@@ -1735,18 +2763,24 @@ static void dlaa_draw_locked(VkExec *ex) {
     const VkExecTarget *z = &ex->depth;
     if (!z->image || z->width < DLAA_SCENE_MIN_W || z->format != VK_FORMAT_D32_SFLOAT) return;
     if (!F.zdraws && !F.zother) F.seq0 = vk_exec_submit_seq;
-    if (D.jdepth && z->image != D.jdepth) {
-        F.zother++, F.zother_w = z->width, F.zother_h = z->height;
+    if (D.jdepth && z->image != D.jdepth) F.zother++, F.zother_w = z->width, F.zother_h = z->height;
+    else F.zdraws++;
+    // The prior depth is still useful to jitter and diagnose the draw. Votes
+    // for a current camera belong to the depth this evaluation will read.
+    const VkExecTarget *armed = &D.depth;
+    if (dlaa_targets_armed() && (z->image != armed->image || z->format != armed->format ||
+        z->level != armed->level || z->base_layer != armed->base_layer || z->layers != armed->layers))
         return;
-    }
-    F.zdraws++;
     if (ex->ubo[0][0].size == OCAM_BLOCK && ex->ubo[0][0].addr) {
         F.ocam++;
         if (!ex->color[0].image || !scene_color(ex->color[0].format)) F.ocam_off++, F.ocam_off_fmt = ex->color[0].format;
     } else F.c3_other++, F.c3_size = ex->ubo[0][0].addr ? ex->ubo[0][0].size : 0;
-    if (b->size == CAM_BLOCK && b->addr) D.cam_addr = b->addr, D.cam_size = CAM_BLOCK, D.cam_vp = 0x30;
-    else if (ex->ubo[0][0].size == OCAM_BLOCK && ex->ubo[0][0].addr && ex->color[0].image &&
+    if (b->size == CAM_BLOCK && b->addr) {
+        dlaa_camera_depth_select(z);
+        D.cam_addr = b->addr, D.cam_size = CAM_BLOCK, D.cam_vp = 0x30;
+    } else if (ex->ubo[0][0].size == OCAM_BLOCK && ex->ubo[0][0].addr && ex->color[0].image &&
              scene_color(ex->color[0].format)) {   // Ocarina: the scene context most light-target draws use this frame
+        dlaa_camera_depth_select(z);
         uint64_t a = ex->ubo[0][0].addr;
         int i = 0, best = 0;
         while (i < D.nviews && D.views[i].addr != a) i++;
@@ -1844,7 +2878,9 @@ static void window_line(void) {
 }
 
 // dst: the target DLSS's picture goes to, NULL for the light target itself (DLAA in place).
-static void hudless(VkCommandBuffer cb, VkImage source, VkImage target, uint32_t w, uint32_t h);
+static void hudless(VkExec *ex, VkImage source, VkImage target, const VkTexImage *texture,
+                    struct Size *reconstruction, const VkTextureColorBlitSource *compute_output,
+                    uint32_t w, uint32_t h);
 
 // Another light target than last frame's. The game draws its scene into one of a few pooled targets of the same size
 // and moves to another whenever its pass list changes, in the middle of play with the camera and the scene carrying
@@ -1883,35 +2919,81 @@ static void query_vram(void) {
         __atomic_store_n(&dlss_vram, (int64_t)n, __ATOMIC_RELAXED);
 }
 
-// Frees the sizes other than cur that no evaluation used for SIZE_STALE evaluations: the GPU finished with them long
-// ago (the CPU is never that many presents ahead), so their images and feature go at once.
+// Cache age selects inactive groups for retirement. Their actual replay and
+// presentation users determine when the images and feature can be destroyed.
 static void stale_sizes(const struct Size *cur) {
     if (!idle_free()) return;
     for (int i = 0; i < DLSS_SIZES; i++) {
         struct Size *s = &D.sizes[i];
-        if (s == cur || !s->out || D.evals < s->used + SIZE_STALE) continue;
-        rt_log("dlaa: the DLSS feature at %ux%u -> %ux%u went unused for %d frames: freed", s->w, s->h, s->ow, s->oh,
+        if (s == cur || !s->generation || __atomic_load_n(&s->retired, __ATOMIC_ACQUIRE) ||
+            D.evals < s->used + SIZE_STALE) continue;
+        rt_log("dlaa: size %ux%u -> %ux%u went unused for %d frames and was marked for retirement", s->w, s->h, s->ow, s->oh,
                SIZE_STALE);
-        if (D.last == s) D.last = NULL;
-        free_size(s);
+        size_mark_retired(s);
     }
 }
 
-// Before a feature is made: the features of the other sizes with a larger input go, or all of them (all: a feature was
-// released since the last creation, feat_released); their images stay. The GPU may still be running an evaluation of
-// theirs, so it finishes first, as in free_size.
-static void release_kept(const struct Size *making, int all) {
+typedef struct {
+    uint64_t required_scene;
+    int retired;
+} NgxSrRetirement;
+
+// This runs during the existing recorder park, after older sealed submissions
+// are flushed. Only the final native signal proves every older SDK use retired.
+static int ngx_sr_wait_retirement(void *context) {
+    NgxSrRetirement *retirement = context;
+    uint64_t scene = retirement->required_scene;
+    if (scene > vk_sync_handed_fence()) return 1;   // terminal: no final handoff after flush
+    while (!vk_sync_stopping() && !vk_device_is_lost()) {
+        if (!vk_sync_fence_wait(scene, UINT64_C(100000000))) continue;
+        retirement->retired = 1;
+        return 1;
+    }
+    return 0;
+}
+
+// Keep the established compatibility order between larger inputs, presets and
+// previously freed features. Prove every selected SDK use before releasing any.
+static int release_kept(VkExec *ex, const struct Size *making, int all) {
+    struct Size *release[DLSS_SIZES];
     int n = 0;
+    NgxSrRetirement retirement = {0};
     for (int i = 0; i < DLSS_SIZES; i++) {
         struct Size *s = &D.sizes[i];
-        if (s == making || !s->feat) continue;
+        if (s == making || !s->sr.handle) continue;
         if (!all && (uint64_t)s->w * s->h <= (uint64_t)making->w * making->h) continue;
-        if (!n++) vk_queue_lock(), vk_device_wait_idle(), vk_queue_unlock();
-        N.release(s->feat), s->feat = NULL;
+        uint64_t used = s->sr.scene;
+        if (!used || used >= ex->fence) {
+            vk_exec_required_temporal_unavailable(ex, "an incompatible DLSS SR feature still belongs to the current recording");
+            return 0;
+        }
+        if (used > retirement.required_scene) retirement.required_scene = used;
+        release[n++] = s;
+    }
+    if (!n) return 1;
+    if (retirement.required_scene > vk_sync_fence_done()) {
+        VkSyncProgressResult result = vk_exec_temporal_prepare(ex, ngx_sr_wait_retirement, &retirement);
+        if (result == VK_SYNC_PROGRESS_STOPPED) {
+            vk_exec_cancel_temporal_preparation();
+            return 0;
+        }
+        if (result != VK_SYNC_PROGRESS_COMPLETE || !retirement.retired) {
+            vk_exec_required_temporal_unavailable(ex, "could not prove the last native scene of an incompatible DLSS SR feature");
+            return 0;
+        }
+    }
+    if (vk_sync_stopping() || vk_device_is_lost()) {
+        vk_exec_cancel_temporal_preparation();
+        return 0;
+    }
+    for (int i = 0; i < n; ++i) {
+        struct Size *s = release[i];
+        ngx_sr_release(&s->sr);
         if (D.last == s) D.last = NULL;
     }
-    if (n) rt_log("dlaa: %d DLSS feature(s) released before the one for %ux%u is made (%s); made again when used", n,
-                  making->w, making->h, all ? "after a release" : "larger inputs");
+    rt_log("dlaa: %d DLSS feature(s) released before the one for %ux%u is made (%s); made again when used", n,
+           making->w, making->h, all ? "after a release" : "larger inputs");
+    return 1;
 }
 
 // The scene's last column and row after a jitter to the left or up. The jitter moves the scene's viewport by under half a
@@ -1923,68 +3005,240 @@ static void release_kept(const struct Size *making, int all) {
 // the jitter; with NX2NAVI_DLAA_JITTER=0, and without DLSS or FSR, there was no line. Before DLSS or FSR reads the scene,
 // such a column or row of the light target and of the depth (which the motion vectors are made from) is filled from the
 // one next to it. NX2NAVI_DLAA_EDGE_FILL=0 (test): not filled.
-static void edge_fill(VkCommandBuffer cb, const VkExecTarget *t, const VkExecTarget *z, float jx, float jy) {
+static RcSourceRange dlaa_guest_target(const VkExecTarget *target) {
+    if (!target->tex || !target->img || target->img->image != target->image) return (RcSourceRange){0};
+    return (RcSourceRange){1, target->img->addr, target->tex->L.size};
+}
+
+void vk_dlaa_scene_effects_cancel_unselected(VkDlaaSceneEffects *effects, uint32_t selected) {
+    if (effects)
+        for (unsigned i=0; i<2; i++)
+            if (!(selected & (1u<<i))) resource_effects_image_role_finish(&effects->border[i], 0);
+}
+
+static unsigned dlaa_edge_axes(const VkExecTarget *t, float jx, float jy) {
     static int on = -1;
     if (on < 0) on = rt_knob("DLAA_EDGE_FILL", "1");
-    uint32_t w = t->width, h = t->height;
-    if (!on || w < 2 || h < 2 || (jx >= 0 && jy >= 0)) return;
+    if (!on || t->width < 2 || t->height < 2) return 0;
+    return (jx < 0 ? 1u : 0u) | (jy < 0 ? 2u : 0u);
+}
+
+static uint32_t dlaa_edge_targets(const VkExecTarget *t, const VkExecTarget *z) {
+    return (t->image ? 1u : 0u) | (z->image && z->width == t->width && z->height == t->height ? 2u : 0u);
+}
+
+static VkImageCopy dlaa_edge_copy(const VkExecTarget *g, unsigned role, unsigned axis) {
+    uint32_t w = g->width, h = g->height;
+    VkImageSubresourceLayers plane = {role ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT,
+                                      g->level, g->base_layer, 1};
+    VkOffset3D from = axis ? (VkOffset3D){0, (int32_t)h - 2, 0} : (VkOffset3D){(int32_t)w - 2, 0, 0};
+    VkOffset3D to = axis ? (VkOffset3D){0, (int32_t)h - 1, 0} : (VkOffset3D){(int32_t)w - 1, 0, 0};
+    return (VkImageCopy){plane, from, plane, to, axis ? (VkExtent3D){w, 1, 1} : (VkExtent3D){1, h, 1}};
+}
+
+static uint32_t dlaa_edge_regions(const VkExecTarget *target, unsigned role, unsigned axes, VkImageCopy out[2]) {
+    uint32_t n = 0;
+    for (unsigned i = 0; i < 2; i++)
+        if (axes & (1u << i)) out[n++] = dlaa_edge_copy(target, role, i);
+    return n;
+}
+
+static void dlaa_edge_completed(void *opaque) {
+    VkTextureProjectedTransfer *target = opaque;
+    vk_texture_projected_transfer_cancel(&target);
+}
+
+static void dlaa_edge_canceled(void *opaque, int may_have_executed) {
+    (void)may_have_executed;
+    dlaa_edge_completed(opaque);
+}
+
+static unsigned edge_fill(VkCommandBuffer cb, const VkExecTarget *t, const VkExecTarget *z, float jx, float jy,
+                      VkDlaaSceneEffects *effects) {
+    const unsigned axes = dlaa_edge_axes(t, jx, jy);
+    uint32_t targets = axes ? dlaa_edge_targets(t, z) : 0;
+    // Settle skipped roles before a real copy can bind another claim for the same normalized range.
+    vk_dlaa_scene_effects_cancel_unselected(effects, targets);
+    if (!targets) return 0;
+    const VkExecTarget *scene[2] = {t, z};
+    const VkImageCopy *selected[2] = {0};
+    uint32_t next[2] = {0};
+    for (unsigned i = 0; effects && i < 2; i++) {
+        VkTextureProjectedTransfer *edge = effects->edge[i];
+        if (!(targets & (1u << i)) || !edge) continue;
+        VkImageCopy current[2];
+        uint32_t count;
+        const uint32_t actual = dlaa_edge_regions(scene[i], i, axes, current);
+        const VkImageCopy *retained = vk_texture_projected_self_copy_regions(edge, &count);
+        if (count != actual || vk_texture_projected_transfer_image(edge) != scene[i]->image ||
+            memcmp(retained, current, count * sizeof *retained) || !vk_texture_projected_transfer_begin(edge)) {
+            targets &= ~(1u << i);
+            resource_effects_image_role_finish(&effects->border[i], 0);
+            continue;
+        }
+        selected[i] = retained;
+    }
+    if (!targets) return 0;
     static int told;
     if (!told++) rt_log("dlaa: the scene's last column or row after a jitter to the left or up is filled from the one before it");
-    // the column first, then the row over the whole width, so the corner comes from the filled column
-    for (int pass = 0; pass < 2; pass++) {
-        if (pass ? jy >= 0 : jx >= 0) continue;
-        VkOffset3D from = pass ? (VkOffset3D){0, (int32_t)h - 2, 0} : (VkOffset3D){(int32_t)w - 2, 0, 0};
-        VkOffset3D to = pass ? (VkOffset3D){0, (int32_t)h - 1, 0} : (VkOffset3D){(int32_t)w - 1, 0, 0};
-        VkExtent3D ext = pass ? (VkExtent3D){w, 1, 1} : (VkExtent3D){1, h, 1};
-        for (int i = 0; i < 2; i++) {
-            const VkExecTarget *g = i ? z : t;
-            if (!g->image || g->width != w || g->height != h) continue;
-            VkImageAspectFlags a = i ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
-            VkImageCopy r = {.srcSubresource = {a, g->level, g->base_layer, 1}, .srcOffset = from,
-                             .dstSubresource = {a, g->level, g->base_layer, 1}, .dstOffset = to, .extent = ext};
-            vkCmdCopyImage(cb, g->image, VK_IMAGE_LAYOUT_GENERAL, g->image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    unsigned recorded = 0;
+    // The final row copies the already filled column at its corner. Keep the transfer barrier between axes.
+    for (unsigned axis = 0; axis < 2; axis++) {
+        if (!(axes & (1u << axis))) continue;
+        for (unsigned i = 0; i < 2; i++) {
+            if (!(targets & (1u << i))) continue;
+            const VkExecTarget *g = scene[i];
+            recorded++;
+            if (selected[i]) {
+                vkCmdCopyImage(cb, g->image, VK_IMAGE_LAYOUT_GENERAL, g->image, VK_IMAGE_LAYOUT_GENERAL,
+                               1, &selected[i][next[i]++]);
+                continue;
+            }
+            const VkImageCopy region = dlaa_edge_copy(g, i, axis);
+            RcSourceRange range = effects ? effects->ranges[i] : dlaa_guest_target(g);
+            if (range.size) vk_texture_image_write_prepare(g->image, range.offset, range.size);
+            vkCmdCopyImage(cb, g->image, VK_IMAGE_LAYOUT_GENERAL, g->image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+            if (effects) resource_effects_image_role_finish(&effects->border[i], 1);
+            if (range.size) {
+                resource_image_written((uint64_t)(uintptr_t)g->image, range.offset);
+                if (effects && effects->owners[i].hold.id)
+                    resource_image_owned((uint64_t)(uintptr_t)g->image, range.offset, effects->owners[i].hold);
+                vk_texture_storage_written(g->image, range.offset);
+            }
         }
         full_barrier(cb);
     }
+    // Both retained entries were locked before the actual copies, in color/depth order.
+    for (int i = 1; i >= 0; i--) if (selected[i]) {
+        vk_texture_projected_transfer_written(effects->edge[i]);
+        resource_effects_image_role_finish(&effects->border[i], 1);
+    }
+    for (unsigned i = 0; i < 2; i++) if (selected[i]) {
+        vk_completion_add_owned(vk_exec_recording_fence(), dlaa_edge_completed, dlaa_edge_canceled, effects->edge[i]);
+        effects->edge[i] = NULL;
+    }
+    return recorded;
 }
 
 // Set when the scene the upscaler runs on has another size than the last one; vk_dlaa_resized_take reads it.
 static volatile int32_t size_changed;
 
-static int evaluate(VkExec *ex, const VkExecTarget *dst) {
+// Direct NGX SR has no vetted pre-create internal-peak query. Keep the
+// supported SDK path explicit and leave the seven app images on native admission.
+static int ngx_sr_create_opaque(VkExec *ex, struct Size *e, NgxParam *p,
+                                const VkExecTarget *t, const VkExecTarget *z) {
+    if (e->sr.state != NGX_SR_EMPTY) rt_fatal("dlaa: DLSS SR creation already owned by this size");
+    static int reported;
+    if (!reported) {
+        reported = 1;
+        rt_log("dlaa: direct NGX SR uses opaque SDK allocation compatibility (no proven pre-create capacity bound)");
+    }
+    const uint32_t w = e->w, h = e->h, ow = e->ow, oh = e->oh;
+    p_setu(p, "CreationNodeMask", 1);
+    p_setu(p, "VisibilityNodeMask", 1);
+    p_setu(p, "Width", w);
+    p_setu(p, "Height", h);
+    p_setu(p, "OutWidth", ow);
+    p_setu(p, "OutHeight", oh);
+    p_seti(p, "PerfQualityValue", perf_quality(w, ow));
+    // IsHDR | MVLowRes | AutoExposure: linear scene light, motion vectors at the render size, no exposure texture
+    p_seti(p, "DLSS.Feature.Create.Flags", (1 << 0) | (1 << 1) | (1 << 6));
+    p_seti(p, "DLSS.Enable.Output.Subrects", 0);
+    // The model per mode (NVSDK_NGX_DLSS_Hint_Render_Preset: 1 A ... 11 K, 12 L, 13 M), as NVIDIA recommends for
+    // DLSS 4.5 (310.x): K (transformer) for DLAA, Quality and Balanced, M for Performance, L for Ultra Performance.
+    // M and L cost more on cards without FP8 (RTX 20/30). dlss_preset (D.preset, preset_check) takes one model for
+    // every mode instead.
+    int pk = D.preset ? D.preset : 11, pm = D.preset ? D.preset : 13, pl = D.preset ? D.preset : 12;
+    p_setu(p, "DLSS.Hint.Render.Preset.DLAA", (unsigned)pk);
+    p_setu(p, "DLSS.Hint.Render.Preset.UltraQuality", (unsigned)pk);
+    p_setu(p, "DLSS.Hint.Render.Preset.Quality", (unsigned)pk);
+    p_setu(p, "DLSS.Hint.Render.Preset.Balanced", (unsigned)pk);
+    p_setu(p, "DLSS.Hint.Render.Preset.Performance", (unsigned)pm);
+    p_setu(p, "DLSS.Hint.Render.Preset.UltraPerformance", (unsigned)pl);
+    rec_drain();   // NGX records directly into this actual scene command buffer.
+    if (vk_sync_stopping() || vk_device_is_lost()) {
+        vk_exec_cancel_temporal_preparation();
+        return 0;
+    }
+    ngx_sr_scene_use(ex, e);
+    e->sr.state = NGX_SR_FAILED;
+    uint64_t t0 = perf_mark_begin();
+    NgxResult result = N.create(ex->cb, NGX_FEATURE_SUPERSAMPLING, p, &e->sr.handle);
+    perf_mark_end(PERF_M_NGX, t0, 0);
+    ex->recorded++;    // SDK entry may have emitted commands even on failure.
+    vk_exec_draw_new_cb();
+    if (!NGX_OK(result) || !e->sr.handle) {
+        size_mark_retired(e);
+        return dl_fail("DLSS feature creation", result);
+    }
+    e->sr.state = NGX_SR_OPAQUE_READY;
+    feat_released = 0;
+    D.reset = 1;
+    int q = perf_quality(w, ow), pr = q == 0 ? pm : q == 3 ? pl : pk;
+    rt_log("dlaa: DLSS feature created at %ux%u -> %ux%u, quality value %d, preset %c (scene format %d, depth format "
+           "%d)", w, h, ow, oh, q, 'A' + pr - 1, (int)t->format, (int)z->format);
+    return 1;
+}
+
+static void dlaa_compute_blit_written(const VkTextureColorBlitSource *output, const VkImageBlit *blit) {
+    // Seal the actual guest copy before HUD preparation may hand off a native prefix.
+    resource_effects_emitted();
+    resource_image_written((uint64_t)(uintptr_t)output->image, output->address);
+    vk_texture_storage_blit_written(output, blit);
+}
+
+static int evaluate(VkExec *ex, const VkExecTarget *dst, VkDlaaSceneEffects *effects, int early,
+                    const VkTextureColorBlitSource *compute_output) {
     const VkExecTarget *t = &D.color, *z = &D.depth;
+    if (!dlaa_targets_armed()) return 0;
+    const DlaaTargetOwner *destination = !dst ? frame_targets[DLAA_TARGET_COLOR] : NULL;
     if (!dst) dst = t;
+    // Writing a pending seed needs its own vendor output claim and physical publication.
+    if (destination && destination->seed && vk_texture_alias_target_replacement(destination->seed)) return 0;
     uint32_t w = t->width, h = t->height, ow = dst->width, oh = dst->height;
-    if (D.early) wide_picture(&ow, &oh);
-    if (D.early != D.previous_early) D.reset = 1;
-    D.previous_early = D.early;
+    if (early) wide_picture(&ow, &oh);
+    const int fsr = use_fsr();
+    if (!fsr && !N.ngx_up) return 0;
+    const int replace_preset = D.preset_dirty;
+    struct Size *e = size_for(ex, w, h, ow, oh);
+    if (!e) return 0;
+
+    const int cold_sr = !fsr && e->sr.state == NGX_SR_EMPTY;
+    if (!fsr && !D.params && !NGX_OK(N.alloc_params(&D.params))) return dl_fail("parameter allocation", 0);
+    NgxParam *p = D.params;
+    if (cold_sr && (replace_preset || idle_free() != 2) &&
+        !release_kept(ex, e, replace_preset || feat_released)) return 0;
+    if (!fsr && !cold_sr && e->sr.state != NGX_SR_OPAQUE_READY)
+        rt_fatal("dlaa: DLSS selected an unusable SR feature");
+
     VkCommandBuffer cb = ex->cb;
     vk_exec_barrier(ex);   // what drew the scene is done (no pass is open here)
+    if (cold_sr && !ngx_sr_create_opaque(ex, e, p, t, z)) return 0;
+    D.early = early;
+    if (early) hud_sources.open = NULL;
+    if (early != D.previous_early) D.reset = 1;
+    D.previous_early = early;
+    RESOURCE_IMAGE_SCOPE(image_writes, ex->fence);
     vk_gpu_gap_note(VK_GAP_UPSCALER, (uint64_t)ow * oh);
-    if (D.preset_dirty) {   // another model: features are created with it, so every size gets a new one
-        for (int i = 0; i < DLSS_SIZES; i++)
-            if (D.sizes[i].out) free_size(&D.sizes[i]);
-        D.last = NULL, D.preset_dirty = 0;
-    }
-    struct Size *e = size_for(cb, w, h, ow, oh);
-    if (!e) return dl_fail("work image creation", 0);
+    size_record_begin(ex, e);
     if (e != D.last) {   // another size's history is from another moment
         D.reset = 1, D.why[0]++, e->chars_ok = 0;
         __atomic_store_n(&size_changed, 1, __ATOMIC_RELEASE);
     }
-    // Read once: vk_dlaa_frame runs on the present's thread and can clear fsr_frame while this replay is between the
-    // checks below, which would send the rest of this function to DLSS's path without NGX after all.
-    const int fsr = use_fsr();
-    if (!fsr && !N.ngx_up) return 0;   // neither runs this frame: vk_dlaa_frame turns DLAA off at the next present
-    if (!fsr && !D.params && !NGX_OK(N.alloc_params(&D.params))) return dl_fail("parameter allocation", 0);
-    NgxParam *p = D.params;
+    dlaa_target_record(ex, frame_targets[DLAA_TARGET_COLOR], 0);
+    dlaa_target_record(ex, frame_targets[DLAA_TARGET_DEPTH], 0);
+    if (D.ids_ok && dlaa_target_valid(frame_targets[DLAA_TARGET_IDS]))
+        dlaa_target_record(ex, frame_targets[DLAA_TARGET_IDS], 0);
     VkImageView zv = vk_exec_target_view(z->img, z->format, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_DEPTH_BIT, z->level,
                                          z->base_layer, 1, 0);
     float jx = D.jit_used ? D.ux : 0.0f, jy = D.jit_used ? D.uy : 0.0f;
-    edge_fill(cb, t, z, jx, jy);   // before the motion vectors read the depth
+    ex->recorded += edge_fill(cb, t, z, jx, jy, effects);   // before the motion vectors read the depth
     static int no_mv = -1;
     if (no_mv < 0) no_mv = !rt_knob("DLAA_MV", "1");   // NX2NAVI_DLAA_MV=0: zero motion (test)
-    int masked = 0, mv = no_mv ? 0 : mv_pass(ex, e, zv, jx, jy, char_bias(), &masked);
+    VkDlaaCamera camera = {0};
+    int camera_ok = 0, masked = 0;
+    int mv = no_mv ? 0 : mv_pass(ex, e, zv, jx, jy, char_bias(), &masked, &camera, &camera_ok);
+    if (mv == MV_PASS_ABORTED) return 0;
     if (mv != 1) {
         VkClearColorValue zero = {{0, 0, 0, 0}};
         VkImageSubresourceRange all = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
@@ -2010,48 +3264,13 @@ static int evaluate(VkExec *ex, const VkExecTarget *dst) {
         D.last_eval_ns = now;
         VkFfxImage fc = {t->image, t->format, w, h, 0}, fz = {z->image, z->format, w, h, 0},
                    fm = {e->mv, VK_FORMAT_R16G16_SFLOAT, w, h, 1}, fo = {e->out, VK_FORMAT_R16G16B16A16_SFLOAT, ow, oh, 1};
-        VkFfxCamera fcam;
-        if (!vk_dlaa_ffx_camera(&fcam)) memset(&fcam, 0, sizeof fcam);   // no camera this frame: FSR's fixed values
+        VkFfxCamera fcam = camera_ok ? ffx_camera(&camera) : (VkFfxCamera){0};
         if (!vk_ffx_upscale(cb, &fc, &fz, &fm, &fo, jx, jy, D.reset, dt > 0 && dt < 100 ? (float)dt : 16.67f, &fcam))
             return dl_fail("FSR 3.1", 0);
         static int told;
         if (!told++) rt_log("dlaa: FSR 3.1 at %ux%u -> %ux%u (scene format %d, depth format %d)", w, h, ow, oh,
                             (int)t->format, (int)z->format);
         goto evaluated;
-    }
-    if (!e->feat) {
-        // NX2NAVI_TRACE=perf: the release of the kept features (a device idle wait) and the create, as one mark
-        uint64_t t0 = perf_mark_begin();
-        if (idle_free() != 2) release_kept(e, feat_released);
-        feat_released = 0;
-        p_setu(p, "CreationNodeMask", 1);
-        p_setu(p, "VisibilityNodeMask", 1);
-        p_setu(p, "Width", w);
-        p_setu(p, "Height", h);
-        p_setu(p, "OutWidth", ow);
-        p_setu(p, "OutHeight", oh);
-        p_seti(p, "PerfQualityValue", perf_quality(w, ow));
-        // IsHDR | MVLowRes | AutoExposure: linear scene light, motion vectors at the render size, no exposure texture
-        p_seti(p, "DLSS.Feature.Create.Flags", (1 << 0) | (1 << 1) | (1 << 6));
-        p_seti(p, "DLSS.Enable.Output.Subrects", 0);
-        // The model per mode (NVSDK_NGX_DLSS_Hint_Render_Preset: 1 A ... 11 K, 12 L, 13 M), as NVIDIA recommends for
-        // DLSS 4.5 (310.x): K (transformer) for DLAA, Quality and Balanced, M for Performance, L for Ultra Performance.
-        // M and L cost more on cards without FP8 (RTX 20/30). dlss_preset (D.preset, preset_check) takes one model for
-        // every mode instead.
-        int pk = D.preset ? D.preset : 11, pm = D.preset ? D.preset : 13, pl = D.preset ? D.preset : 12;
-        p_setu(p, "DLSS.Hint.Render.Preset.DLAA", (unsigned)pk);
-        p_setu(p, "DLSS.Hint.Render.Preset.UltraQuality", (unsigned)pk);
-        p_setu(p, "DLSS.Hint.Render.Preset.Quality", (unsigned)pk);
-        p_setu(p, "DLSS.Hint.Render.Preset.Balanced", (unsigned)pk);
-        p_setu(p, "DLSS.Hint.Render.Preset.Performance", (unsigned)pm);
-        p_setu(p, "DLSS.Hint.Render.Preset.UltraPerformance", (unsigned)pl);
-        NgxResult r = N.create(cb, NGX_FEATURE_SUPERSAMPLING, p, &e->feat);
-        perf_mark_end(PERF_M_NGX, t0, 0);
-        if (!NGX_OK(r) || !e->feat) return dl_fail("DLSS feature creation", r);
-        D.reset = 1;
-        int q = perf_quality(w, ow), pr = q == 0 ? pm : q == 3 ? pl : pk;
-        rt_log("dlaa: DLSS feature created at %ux%u -> %ux%u, quality value %d, preset %c (scene format %d, depth format "
-               "%d)", w, h, ow, oh, q, 'A' + pr - 1, (int)t->format, (int)z->format);
     }
     if (D.last_color != t->image) target_changed(t, mv == 1);
     NgxResourceVK rc = res_image(cv, t->image, t->format, w, h, VK_IMAGE_ASPECT_COLOR_BIT, 0);
@@ -2086,9 +3305,19 @@ static int evaluate(VkExec *ex, const VkExecTarget *dst) {
     D.last_eval_ns = now;
     p_setf(p, "FrameTimeDeltaInMsec", dt > 0 && dt < 100 ? (float)dt : 16.67f);
     c0 = timed ? kern_now_ns() : 0;
-    NgxResult r = N.evaluate(cb, e->feat, p, NULL);
+    if (vk_sync_stopping() || vk_device_is_lost()) {
+        vk_exec_cancel_temporal_preparation();
+        return 0;
+    }
+    ngx_sr_scene_use(ex, e);
+    NgxResult r = N.evaluate(cb, e->sr.handle, p, NULL);
     if (timed) T.cpu_ngx += kern_now_ns() - c0;
-    if (!NGX_OK(r)) return dl_fail("DLSS evaluation", r);
+    if (!NGX_OK(r)) {
+        e->sr.state = NGX_SR_FAILED;
+        size_mark_retired(e);
+        vk_exec_draw_new_cb();
+        return dl_fail("DLSS evaluation", r);
+    }
 evaluated:
     if (timed) times_mark(cb, T_DL1);   // through the recorder, after NGX's own commands
     // Frame generation gets the same new start with this frame's inputs (vk_dlaa_fg_inputs): a frame DLSS starts a
@@ -2116,26 +3345,47 @@ evaluated:
     VkImage shown = mvdebug ? e->mv : maskdebug && mk ? mk->mask : maskdebug && masked ? e->mask : e->out;
     D.debug_image = shown != e->out;
     if (D.debug_image) b.srcOffsets[1] = (VkOffset3D){(int32_t)w, (int32_t)h, 1};
+    RcSourceRange output = dlaa_guest_target(dst);
+    // The captured compute destination has no guest attachment descriptor. Prepare it in this scope,
+    // where the actual blit and its ownership notification are recorded.
+    if (compute_output && compute_output->bytes)
+        vk_texture_image_write_prepare(compute_output->image, compute_output->address, compute_output->bytes);
+    else if (output.size) vk_texture_image_write_prepare(dst->image, output.offset, output.size);
     vkCmdBlitImage(cb, shown, VK_IMAGE_LAYOUT_GENERAL, dst->image, VK_IMAGE_LAYOUT_GENERAL, 1, &b,
                    D.early && ow != w ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+    if (compute_output) dlaa_compute_blit_written(compute_output, &b);
+    else if (output.size) {
+        resource_image_written((uint64_t)(uintptr_t)dst->image, output.offset);
+        vk_texture_storage_written(dst->image, output.offset);
+    }
     full_barrier(cb);
-    if (dst != t) vk_dlaa_swap_img = t->img, vk_dlaa_swap_view = e->out_view;   // the scaling draw reads DLSS's picture
+    if (dst != t) {
+        D.swap_size = e;
+        vk_dlaa_swap_img = t->img;
+        vk_dlaa_swap_view = e->out_view;
+        vk_dlaa_swap_output = e->out;   // the scaling draw reads DLSS's picture
+    }
+    ex->recorded += 4;
     // Frame generation needs the tonemapped scene. The early forward resolve takes
     // that copy in vk_dlaa_scene_upscale after the game composites bloom.
     if (!D.early && vk_dlaa_hudless_wanted && (!vk_dlssg_active() || (D.cam_size == OCAM_BLOCK && !D.gbuf))) {
         if (!dst->level && !dst->base_layer)
-            hudless(cb, dst->image, dst->image, dst->width, dst->height);
+            hudless(ex, dst->image, dst->image, dst->img, NULL, compute_output, dst->width, dst->height);
         else
-            hudless(cb, e->out, VK_NULL_HANDLE, ow, oh);
+            hudless(ex, e->out, VK_NULL_HANDLE, NULL, e, NULL, ow, oh);
     }
-    ex->recorded += 4;
     vk_exec_draw_new_cb();   // NGX bound pipelines and descriptor sets of its own: the next draw binds everything again
     D.jdepth = z->image, D.jw = z->width, D.jh = z->height;
+    __atomic_store_n(&hud_sources.forward_pending, D.early && vk_dlaa_hudless_wanted, __ATOMIC_RELEASE);
     // for frame generation at this frame's present (vk_dlaa_fg_inputs)
+    D.fg_cam = camera;
+    D.fg_cam_ok = camera_ok;
     D.fg_depth = (VkFfxImage){z->image, z->format, w, h, 0};
     D.fg_mv = (VkFfxImage){e->mv, VK_FORMAT_R16G16_SFLOAT, w, h, 1};
-    D.fg_depth_view = zv, D.fg_mv_view = e->mv_view;
-    D.fg_jx = jx, D.fg_jy = jy, D.fg_at = D.presents, D.fg_fresh = 1;
+    D.fg_mv_view = e->mv_view;
+    D.fg_jx = jx, D.fg_jy = jy, D.fg_at = D.presents;
+    fg_publish_size(e, z);
+    size_hook_close();
     if (D.jit_used) D.jittered++;
     next_jitter(w, ow);
     if (++D.evals == 1 || D.evals == 300 || D.evals % 3600 == 0)   // 300: one early line with the frames counted
@@ -2155,24 +3405,47 @@ evaluated:
     return 1;
 }
 
-// The HUD-less picture (vk_dlaa_fg_hudless): DLSS's output, which the HUD is then drawn over, through the encode the
-// game's last pass gives its picture (linear to sRGB), as RGBA8 UNORM bytes like the picture the present reads. With
-// HDR (NX2NAVI_HDR = 1) the game's picture stays float and linear up to the present, which encodes it to PQ
-// (vk_hdr_encode): DLSS's output is kept as RGBA16F for the same encode. The game's own HDR (native) encodes inside the
-// game, which this cannot follow: no HUD-less picture there.
+// The composition slot receives a separate R16F output for Streamline. The source is R8 coverage.
 static int alpha_image(VkCommandBuffer cb, VkNgxImage *a, VmaAllocation *allocation, uint32_t w, uint32_t h,
                        VkImageUsageFlags usage, VkFormat format) {
-    if (a->img && (a->w != w || a->h != h)) {
-        vk_queue_lock(), vk_device_wait_idle(), vk_queue_unlock();
-        free_alpha(a, allocation);
+    if (!a->img || a->w != w || a->h != h || a->fmt != format) {
+        const VkCtx *c = vk_ctx();
+        usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        VkImageCreateInfo info = dlaa_image_2d_info(w, h, format, usage);
+        const RcVmaRequest request = {.producer = RC_BUDGET_OTHER};
+        VmaAllocationCreateInfo placement = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        VmaAllocation memory = NULL;
+        VkNgxImage next = {.fmt = format, .w = w, .h = h};
+        VkResult result = resource_core_vma_create_image(&request, c->vma, &info, &placement,
+                                                        &next.img, &memory, NULL, NULL);
+        if (result != VK_SUCCESS) {
+            vk_device_lost_check(result, "preparing the present alpha image");
+            return 0;
+        }
+        VkImageView view = VK_NULL_HANDLE;
+        result = dlaa_image_2d_view(c->device, next.img, format, &view);
+        if (result != VK_SUCCESS || !view) {
+            vk_device_lost_check(result, "creating the present alpha view");
+            free_alpha(&next, &memory);
+            return 0;
+        }
+        next.view = view;
+        if (a->img) {
+            // Slot reuse checks Streamline's receipt when available. Keep the device-idle
+            // compatibility proof for resizing this input on older SDK paths.
+            VkResult idle = vk_device_wait_idle();
+            if (idle != VK_SUCCESS) {
+                vk_device_lost_check(idle, "retiring the present alpha image");
+                free_alpha(&next, &memory);
+                return 0;
+            }
+            free_alpha(a, allocation);
+        }
+        *a = next;
+        *allocation = memory;
     }
-    if (a->img) return 1;
-    a->w = w, a->h = h, a->fmt = format;
-    usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    if (!image2d(w, h, a->fmt, usage, &a->img, allocation, &a->view)) {
-        free_alpha(a, allocation);
-        return 0;
-    }
+    // The clear or blit replaces every pixel. Discard the old contents on this
+    // recording, including when a previous composition was never submitted.
     VkImageMemoryBarrier2 b = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
         .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .dstAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
         .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
@@ -2190,34 +3463,236 @@ static void clear_alpha(VkCommandBuffer cb, VkImage image) {
     full_barrier(cb);
 }
 
-void vk_dlaa_hud_incomplete(void) { __atomic_store_n(&D.alpha_incomplete, 1, __ATOMIC_RELAXED); }
+static void hud_group_drop_target(VkDlaaHudSource *use) {
+    vk_texture_present_release(use->target_owner);
+    use->target_owner = NULL;
+    use->target = VK_NULL_HANDLE;
+}
+
+static void hud_group_collect(void) {
+    for (unsigned i = 0; i < HUD_SOURCE_GROUPS; ++i) {
+        VkDlaaHudSource *use = &hud_sources.groups[i];
+        if (use != hud_sources.open && use != hud_sources.sealed && hud_group_idle(use))
+            hud_group_drop_target(use);
+    }
+}
+
+static void hud_group_destroy(VkDlaaHudSource *use) {
+    hud_group_drop_target(use);
+    const VkCtx *c = vk_ctx();
+    if (use->coverage.view) vkDestroyImageView(c->device, use->coverage.view, NULL);
+    if (use->coverage.img) resource_core_vma_destroy_image(c->vma, use->coverage.img, use->coverage_mem);
+    if (use->images.color.view) vkDestroyImageView(c->device, use->images.color.view, NULL);
+    if (use->images.color.img) resource_core_vma_destroy_image(c->vma, use->images.color.img, use->color_mem);
+    if (use->srgb) resource_core_vma_destroy_image(c->vma, use->srgb, use->srgb_mem);
+    *use = (VkDlaaHudSource){0};
+}
+
+void vk_dlaa_hud_shutdown(void) {
+    if (!vk_ctx()) return;
+    hud_sources.open = hud_sources.sealed = NULL;
+    for (unsigned i = 0; i < HUD_SOURCE_GROUPS; ++i) {
+        VkDlaaHudSource *use = &hud_sources.groups[i];
+        if (!hud_group_idle(use)) rt_fatal("dlaa: HUD source still belongs to replay or composition");
+        hud_group_destroy(use);
+    }
+}
+
+typedef struct {
+    uint32_t w, h;
+    VkFormat format;
+    int coverage;
+    VkDlaaHudSource *ready;
+    VkResult result;
+    RcAdmissionStatus admission;
+    RcAdmissionVector peak;
+} HudSourceRequest;
+
+static int hud_group_matches(const HudSourceRequest *request, const VkDlaaHudSource *use) {
+    const VkNgxImage *color = &use->images.color;
+    return color->img && color->w == request->w && color->h == request->h && color->fmt == request->format &&
+           !!use->coverage.img == request->coverage && !__atomic_load_n(&use->invalid, __ATOMIC_ACQUIRE);
+}
+
+static VkResult hud_group_create(HudSourceRequest *want, VkDlaaHudSource *out) {
+    const VkCtx *c = vk_ctx();
+    const VkImageUsageFlags transfer = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                       VK_IMAGE_USAGE_SAMPLED_BIT;
+    enum { COLOR, COVERAGE, ENCODED, MEMBERS };
+    VkImageCreateInfo images[MEMBERS] = {
+        dlaa_image_2d_info(want->w, want->h, want->format, transfer | VK_IMAGE_USAGE_STORAGE_BIT),
+        dlaa_image_2d_info(want->w, want->h, VK_FORMAT_R8_UNORM, transfer | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT),
+        dlaa_image_2d_info(want->w, want->h, VK_FORMAT_R8G8B8A8_SRGB, transfer),
+    };
+    const int enabled[MEMBERS] = {1, want->coverage, want->format == VK_FORMAT_R8G8B8A8_UNORM};
+    VmaAllocationCreateInfo placement[MEMBERS];
+    const VmaAllocationCreateInfo dedicated = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        .flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT};
+    RcVmaRequest request = {.producer = RC_BUDGET_TEXTURE};
+    want->peak = (RcAdmissionVector){0};
+    for (unsigned i = 0; i < MEMBERS; ++i) {
+        if (!enabled[i]) continue;
+        VkImageFormatProperties properties;
+        VkResult r = vkGetPhysicalDeviceImageFormatProperties(c->phys, images[i].format, images[i].imageType,
+            images[i].tiling, images[i].usage, images[i].flags, &properties);
+        if (r != VK_SUCCESS) return r;
+        if (want->w > properties.maxExtent.width || want->h > properties.maxExtent.height)
+            return VK_ERROR_FORMAT_NOT_SUPPORTED;
+        RcAdmissionVector member;
+        r = resource_core_vma_image_peak(&request, &images[i], &dedicated, &placement[i], &member);
+        if (r != VK_SUCCESS) return r;
+        for (unsigned d = 0; d < RC_ADMISSION_MAX_DOMAINS; ++d) {
+            if (member.amount[d] > UINT64_MAX - want->peak.amount[d]) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+            want->peak.amount[d] += member.amount[d];
+        }
+    }
+    RcBudgetTicket ticket = {0};
+    want->admission = resource_core_budget_reserve(request.producer, 0, &want->peak, &ticket);
+    if (want->admission != RC_ADMISSION_OK) return VK_NOT_READY;
+    request.peak_ticket = &ticket;
+    VkDlaaHudSource next = {0};
+    VkImage *native[MEMBERS] = {&next.images.color.img, &next.coverage.img, &next.srgb};
+    VmaAllocation *memory[MEMBERS] = {&next.color_mem, &next.coverage_mem, &next.srgb_mem};
+    VkImageView *views[MEMBERS] = {&next.images.color.view, &next.coverage.view, NULL};
+    VkResult r = VK_SUCCESS;
+    for (unsigned i = 0; i < MEMBERS; ++i) {
+        if (!enabled[i]) continue;
+        if (vk_sync_stopping() || vk_device_is_lost()) {
+            r = vk_device_is_lost() ? VK_ERROR_DEVICE_LOST : VK_NOT_READY;
+            break;
+        }
+        r = resource_core_vma_create_image(&request, c->vma, &images[i], &placement[i],
+                                          native[i], memory[i], NULL, &want->admission);
+        if (r != VK_SUCCESS) break;
+        if (!*native[i] || !*memory[i]) {
+            r = VK_ERROR_INITIALIZATION_FAILED;
+            break;
+        }
+        if (views[i]) {
+            r = dlaa_image_2d_view(c->device, *native[i], images[i].format, views[i]);
+            if (r != VK_SUCCESS) break;
+        }
+    }
+    if (resource_core_budget_cancel(&ticket) != RC_ADMISSION_OK)
+        rt_fatal("dlaa: HUD source lost its precharged native reservation");
+    if (r != VK_SUCCESS) {
+        hud_group_destroy(&next);
+        return r;
+    }
+    next.images.color.fmt = want->format;
+    next.images.color.w = want->w;
+    next.images.color.h = want->h;
+    if (want->coverage) {
+        next.coverage.fmt = VK_FORMAT_R8_UNORM;
+        next.coverage.w = want->w;
+        next.coverage.h = want->h;
+    }
+    *out = next;
+    return VK_SUCCESS;
+}
+
+static VkDlaaHudSource *hud_group_find(const HudSourceRequest *want) {
+    for (unsigned i = 0; i < HUD_SOURCE_GROUPS; ++i) {
+        VkDlaaHudSource *use = &hud_sources.groups[i];
+        if (use != hud_sources.open && use != hud_sources.sealed && hud_group_idle(use) &&
+            hud_group_matches(want, use)) return use;
+    }
+    return NULL;
+}
+
+static int hud_group_prepare(void *arg) {
+    HudSourceRequest *want = arg;
+    hud_group_collect();
+    VkDlaaHudSource *slot = NULL;
+    for (unsigned i = 0; i < HUD_SOURCE_GROUPS; ++i) {
+        VkDlaaHudSource *use = &hud_sources.groups[i];
+        if (use == hud_sources.open || use == hud_sources.sealed || !hud_group_idle(use)) continue;
+        if (!slot || !use->images.color.img) slot = use;
+        if (!use->images.color.img) break;
+    }
+    if (!slot) {
+        want->result = VK_NOT_READY;
+        return 1;
+    }
+    VkDlaaHudSource next = {0};
+    want->result = hud_group_create(want, &next);
+    if (want->result != VK_SUCCESS && want->result != VK_ERROR_DEVICE_LOST && want->coverage &&
+        !vk_sync_stopping() && !vk_device_is_lost()) {
+        // The alpha-optional fallback is a separately admitted color recipe.
+        want->coverage = 0;
+        want->ready = hud_group_find(want);
+        if (want->ready) {
+            want->result = VK_SUCCESS;
+            return 1;
+        }
+        want->result = hud_group_create(want, &next);
+    }
+    if (want->result == VK_SUCCESS) {
+        hud_group_destroy(slot);
+        *slot = next;
+        want->ready = slot;
+    }
+    return !vk_sync_stopping() && !vk_device_is_lost();
+}
+
+void vk_dlaa_hud_incomplete(void) {
+    VkDlaaHudSource *use = hud_sources.open;
+    if (use) __atomic_store_n(&use->alpha_bad, 1, __ATOMIC_RELEASE);
+}
+
+// Only the exact attachment writes reported for this emitted draw are
+// covered. Storage and transfer reports outside this scope still taint alpha.
+static _Thread_local VkImage hud_coverage_target;
+void vk_dlaa_hud_target_report(const VkExec *ex) {
+    hud_coverage_target = ex && ex->in_pass && ex->hud_alpha_attachment ? ex->color[0].image : VK_NULL_HANDLE;
+}
 
 void vk_dlaa_hud_write(VkImage image) {
-    if (image && image == D.hud_target && D.hl_at == D.presents) vk_dlaa_hud_incomplete();
+    VkDlaaHudSource *use = hud_sources.open;
+    if (use && image && image == use->target && image != hud_coverage_target) vk_dlaa_hud_incomplete();
+}
+
+void vk_dlaa_hud_draw_emitted(const VkExec *ex) {
+    VkDlaaHudSource *use = hud_sources.open;
+    if (!use || !use->coverage.img || !ex->in_pass || ex->hud_alpha_attachment) return;
+    for (uint32_t i = 0; i < ex->pass_ncolor; ++i)
+        if (ex->color[i].image == use->target) vk_dlaa_hud_incomplete();
+}
+
+static const VkExecTarget *hud_attachment_target(const VkDlaaHudSource *use, const VkExecTarget *colors,
+    uint32_t count) {
+    if (!use || !use->target || !use->coverage.view || use->turn != D.presents) return NULL;
+    for (uint32_t i = 0; i < count; ++i) {
+        const VkExecTarget *target = &colors[i];
+        if (target->image == use->target && !target->level && !target->base_layer) return target;
+    }
+    return NULL;
 }
 
 int vk_dlaa_hud_attachment(const VkExec *ex, VkRenderingAttachmentInfo *a) {
-    if (!D.hud_target || D.hl_at != D.presents) return 0;
-    for (uint32_t i = 0; i < ex->pass_ncolor; i++) {
-        const VkExecTarget *t = &ex->color[i];
-        if (t->image != D.hud_target || t->level || t->base_layer) continue;
-        if (ex->pass_ncolor != 1 || ex->pass_layers != 1 || t->samples > 1 ||
-            t->width != D.alpha.w || t->height != D.alpha.h) {
-            vk_dlaa_hud_incomplete();
-            return 0;
-        }
-        *a = (VkRenderingAttachmentInfo){.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-            .imageView = D.alpha.view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
-            .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
-        return 1;
+    VkDlaaHudSource *use = hud_sources.open;
+    const VkExecTarget *t = hud_attachment_target(use, ex->color, ex->pass_ncolor);
+    if (!t) return 0;
+    if (ex->pass_ncolor != 1 || ex->pass_layers != 1 || t->samples > 1 ||
+        t->width != use->coverage.w || t->height != use->coverage.h) {
+        vk_dlaa_hud_incomplete();
+        return 0;
     }
-    return 0;
+    hud_group_record(ex, use);
+    __atomic_store_n(&use->alpha_seen, 1, __ATOMIC_RELEASE);
+    *a = (VkRenderingAttachmentInfo){.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .imageView = use->coverage.view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+    return 1;
 }
 
-VkNgxImage vk_dlaa_present_alpha(VkCommandBuffer cb, VkExtent2D ext, const int rect[4], const int to[4], uint64_t frame, unsigned slot) {
-    // The SDK Vulkan format table recognizes R16F for a single-channel UI tag.
-    if (!D.hud_target || D.hl_at + 1 != frame || D.fg_at != D.hl_at ||
-        __atomic_load_n(&D.alpha_incomplete, __ATOMIC_RELAXED) ||
+void vk_dlaa_present_alpha_unrecorded(unsigned slot) {
+    free_alpha(&D.present_alpha[slot], &D.present_alpha_mem[slot]);
+}
+
+VkNgxImage vk_dlaa_present_alpha(VkCommandBuffer cb, VkExtent2D ext, const int rect[4], const int to[4],
+                                 const VkDlaaHudImages *source, unsigned slot) {
+    if (!source || !source->alpha.img ||
         !alpha_image(cb, &D.present_alpha[slot], &D.present_alpha_mem[slot], ext.width, ext.height,
                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT, VK_FORMAT_R16_SFLOAT))
         return (VkNgxImage){0};
@@ -2227,73 +3702,112 @@ VkNgxImage vk_dlaa_present_alpha(VkCommandBuffer cb, VkExtent2D ext, const int r
         .srcOffsets = {{rect[0], rect[1], 0}, {rect[0] + rect[2], rect[1] + rect[3], 1}},
         .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
         .dstOffsets = {{to[0], to[1], 0}, {to[0] + to[2], to[1] + to[3], 1}}};
-    vkCmdBlitImage(cb, D.alpha.img, VK_IMAGE_LAYOUT_GENERAL, D.present_alpha[slot].img, VK_IMAGE_LAYOUT_GENERAL,
+    vkCmdBlitImage(cb, source->alpha.img, VK_IMAGE_LAYOUT_GENERAL, D.present_alpha[slot].img, VK_IMAGE_LAYOUT_GENERAL,
                    1, &region, VK_FILTER_LINEAR);
     full_barrier(cb);
     return D.present_alpha[slot];
 }
 
 int vk_dlaa_hudless_wanted;
-static void hudless(VkCommandBuffer cb, VkImage source, VkImage target, uint32_t w, uint32_t h) {
-    const VkCtx *c = vk_ctx();
-    int hdr = vk_hdr_wanted() && !vk_hdr_native();
-    D.hud_target = VK_NULL_HANDLE;
-    if (vk_hdr_native()) return;
-    VkFormat fmt = hdr ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
-    if (D.hl && (D.hl_w != w || D.hl_h != h || D.hl_fmt != fmt)) {
-        vk_queue_lock(), vk_device_wait_idle(), vk_queue_unlock();
-        hl_destroy();
+
+static void hud_group_initialize(VkCommandBuffer cb, VkDlaaHudSource *use) {
+    if (use->initialized) return;
+    VkImage images[] = {use->images.color.img, use->srgb, use->coverage.img};
+    VkImageMemoryBarrier2 barriers[sizeof images / sizeof images[0]];
+    uint32_t n = 0;
+    for (unsigned i = 0; i < sizeof images / sizeof images[0]; ++i) {
+        if (!images[i]) continue;
+        barriers[n++] = (VkImageMemoryBarrier2){.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+            .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+            .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = images[i], .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
     }
-    if (!D.hl) {
-        VkImageView v2 = VK_NULL_HANDLE;
-        VkImageUsageFlags u = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-        if ((!hdr && !image2d(w, h, VK_FORMAT_R8G8B8A8_SRGB, u, &D.hl_srgb, &D.hl_srgb_mem, &v2)) ||
-            !image2d(w, h, fmt, u | VK_IMAGE_USAGE_STORAGE_BIT, &D.hl, &D.hl_mem, &D.hl_view)) {
-            if (v2) vkDestroyImageView(c->device, v2, NULL);   // the first image's view, when the second image failed
-            hl_destroy();   // and what of the two images was made
-            rt_log("dlaa: the HUD-less picture's images could not be made: frame generation sees the HUD");
-            vk_dlaa_hudless_wanted = 0;
+    VkDependencyInfo info = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = n,
+                             .pImageMemoryBarriers = barriers};
+    vkCmdPipelineBarrier2(cb, &info);
+    use->initialized = 1;
+}
+
+static void hudless(VkExec *ex, VkImage source, VkImage target, const VkTexImage *texture,
+                    struct Size *reconstruction, const VkTextureColorBlitSource *compute_output,
+                    uint32_t w, uint32_t h) {
+    hud_sources.open = NULL;
+    if (!source || vk_hdr_native()) return;
+    // Hold the actual source before preparation can park the recorder. The
+    // guest source is also the coverage target; the private source is SR output.
+    VkTexturePresentSource *target_owner = NULL;
+    VkFormat target_format = VK_FORMAT_UNDEFINED;
+    if (target) {
+        if (!texture || target != source) return;
+        target_format = texture->format;
+        const DlaaTargetOwner *owner = frame_targets[DLAA_TARGET_COLOR];
+        if (compute_output) {
+            if (compute_output->image != target) return;
+            target_owner = vk_texture_present_retain_held_image(compute_output->hold, target);
+        } else target_owner = owner && texture == &owner->image ? dlaa_present_target(owner, target) :
+            vk_texture_present_retain_image(texture, target);
+        if (!target_owner) return;
+    } else {
+        if (!reconstruction || reconstruction->out != source ||
+            __atomic_load_n(&reconstruction->retired, __ATOMIC_ACQUIRE)) return;
+        size_scene_use(ex, reconstruction);
+    }
+    int hdr = vk_hdr_wanted();
+    HudSourceRequest want = {.w = w, .h = h,
+        .format = hdr ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM,
+        .coverage = target && D.cam_size == OCAM_BLOCK && !D.gbuf && (vk_dlssg_ui_alpha() || vk_ngxfg_on())};
+    want.ready = hud_group_find(&want);
+    if (!want.ready) {
+        VkSyncProgressResult progress = vk_exec_temporal_prepare(ex, hud_group_prepare, &want);
+        vk_device_lost_check(want.result, "HUD source images");
+        if (progress != VK_SYNC_PROGRESS_COMPLETE) {
+            vk_texture_present_release(target_owner);
             return;
         }
-        if (v2) vkDestroyImageView(c->device, v2, NULL);
-        D.hl_w = w, D.hl_h = h, D.hl_fmt = fmt;
-        VkImageMemoryBarrier2 ib[2];
-        VkImage im[2] = {D.hl, D.hl_srgb};
-        int nim = D.hl_srgb ? 2 : 1;
-        for (int i = 0; i < nim; i++)
-            ib[i] = (VkImageMemoryBarrier2){.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-                                            .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-                                            .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-                                            .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
-                                            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-                                            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                                            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = im[i],
-                                            .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
-        VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = (uint32_t)nim,
-                               .pImageMemoryBarriers = ib};
-        vkCmdPipelineBarrier2(cb, &di);
     }
-    VkImageBlit b = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .srcOffsets = {{0, 0, 0}, {(int32_t)w, (int32_t)h, 1}},
-                     .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstOffsets = {{0, 0, 0}, {(int32_t)w, (int32_t)h, 1}}};
-    if (target && D.cam_size == OCAM_BLOCK && !D.gbuf && (vk_dlssg_ui_alpha() || vk_ngxfg_on()) &&
-        alpha_image(cb, &D.alpha, &D.alpha_mem, w, h, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_FORMAT_R8_UNORM)) {
-        D.hud_target = target;
-        __atomic_store_n(&D.alpha_incomplete, 0, __ATOMIC_RELAXED);
-        full_barrier(cb);
-        clear_alpha(cb, D.alpha.img);
-    }
-    vkCmdBlitImage(cb, source, VK_IMAGE_LAYOUT_GENERAL, hdr ? D.hl : D.hl_srgb, VK_IMAGE_LAYOUT_GENERAL, 1, &b,
-                   VK_FILTER_NEAREST);
-    full_barrier(cb);
-    if (hdr) {
-        D.hl_at = D.presents, D.hl_fresh = 1;
+    if (!want.ready) {
+        static unsigned logged;
+        if (logged++ < 8)
+            rt_log("dlaa: HUD source %ux%u unavailable (VkResult %d, admission %d)", w, h, want.result, want.admission);
+        vk_texture_present_release(target_owner);
         return;
     }
-    VkImageCopy cp = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-                      .extent = {w, h, 1}};
-    vkCmdCopyImage(cb, D.hl_srgb, VK_IMAGE_LAYOUT_GENERAL, D.hl, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+    VkDlaaHudSource *use = want.ready;
+    hud_group_drop_target(use);
+    use->target_owner = target_owner;
+    use->target = target;
+    use->target_format = target_format;
+    use->turn = D.presents;
+    if (!++hud_sources.generation) rt_fatal("dlaa: HUD source generation exhausted");
+    use->images.generation = hud_sources.generation;
+    use->images.alpha = (VkNgxImage){0};
+    use->images.frame = 0;
+    use->images.exact = 0;
+    use->alpha_seen = use->alpha_bad = 0;
+    use->last_scene = 0;
+    hud_group_record(ex, use);
+    VkCommandBuffer cb = ex->cb;
+    hud_group_initialize(cb, use);
+    if (use->coverage.img) {
+        full_barrier(cb);
+        clear_alpha(cb, use->coverage.img);
+    }
+    VkImageBlit region = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+        .srcOffsets = {{0, 0, 0}, {(int32_t)w, (int32_t)h, 1}},
+        .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+        .dstOffsets = {{0, 0, 0}, {(int32_t)w, (int32_t)h, 1}}};
+    vkCmdBlitImage(cb, source, VK_IMAGE_LAYOUT_GENERAL, hdr ? use->images.color.img : use->srgb,
+                   VK_IMAGE_LAYOUT_GENERAL, 1, &region, VK_FILTER_NEAREST);
     full_barrier(cb);
-    D.hl_at = D.presents, D.hl_fresh = 1;
+    if (!hdr) {
+        VkImageCopy copy = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+            .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .extent = {w, h, 1}};
+        vkCmdCopyImage(cb, use->srgb, VK_IMAGE_LAYOUT_GENERAL, use->images.color.img, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+        full_barrier(cb);
+    }
+    hud_sources.open = use;
 }
 
 static int scene_color(VkFormat f) {
@@ -2304,13 +3818,18 @@ static int samples_scene(const VkExec *ex, int with_bloom) {
     uint64_t scene = ex->tex[NVN_STAGE_FS][0], bloom = ex->tex[NVN_STAGE_FS][1];
     if (!scene || (with_bloom && !bloom)) return 0;
     vk_texture_lock();
-    int match = vk_texture_by_id_locked(NVN_HANDLE_TEX(scene), NULL, NULL) == D.color.img;
+    const VkTexImage *selected = vk_texture_current_registration_locked(NVN_HANDLE_TEX(scene), NULL, NULL);
+    int match = dlaa_selected_image_matches(selected, D.color.img, frame_targets[DLAA_TARGET_COLOR]);
     if (match && with_bloom) {
-        const VkTexImage *b = vk_texture_by_id_locked(NVN_HANDLE_TEX(bloom), NULL, NULL);
+        const VkTexImage *b = vk_texture_current_registration_locked(NVN_HANDLE_TEX(bloom), NULL, NULL);
         match = b && b->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && b->width < D.color.width && b->height < D.color.height;
     }
     vk_texture_unlock();
     return match;
+}
+
+int vk_dlaa_swap_matches(const VkTexImage *selected) {
+    return vk_dlaa_swap_img && dlaa_selected_image_matches(selected, vk_dlaa_swap_img, frame_targets[DLAA_TARGET_COLOR]);
 }
 
 int vk_dlaa_swap_active(const VkExec *ex) {
@@ -2318,24 +3837,34 @@ int vk_dlaa_swap_active(const VkExec *ex) {
            (D.early ? ex->tonemap_extent.width != 0 : ex->pass_w > vk_dlaa_swap_img->width + 1);
 }
 
-static void blit_scene(VkCommandBuffer cb, VkImage src, uint32_t sw, uint32_t sh, VkImage dst, uint32_t dw, uint32_t dh) {
+static VkImageBlit blit_scene(VkCommandBuffer cb, VkImage src, uint32_t sw, uint32_t sh,
+                              VkImage dst, uint32_t dw, uint32_t dh) {
     VkImageBlit region = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                           .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                           .srcOffsets = {{0, 0, 0}, {(int32_t)sw, (int32_t)sh, 1}},
                           .dstOffsets = {{0, 0, 0}, {(int32_t)dw, (int32_t)dh, 1}}};
     vkCmdBlitImage(cb, src, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_GENERAL, 1, &region,
                    sw == dw && sh == dh ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
+    return region;
+}
+
+static int dlaa_tonemap_targets(const VkExec *ex, const VkExecTarget *color, const VkExecTarget *depth,
+    uint32_t color_count) {
+    return D.composite && vk_dlaa_swap_img && color[0].image == D.composite && D.last &&
+           (D.last->ow != D.color.width || D.last->oh != D.color.height) &&
+           color_count == 1 && depth->image == D.depth.image && post_current(post.frame) &&
+           post.frame->size.width == D.last->ow && post.frame->size.height == D.last->oh &&
+           !ex->pipe.ds.dt && !ex->pipe.ds.dw && !(ex->pipe.color.blend_en & 1) && samples_scene(ex, 1);
 }
 
 int vk_dlaa_tonemap_target(const VkExec *ex) {
-    return D.composite && vk_dlaa_swap_img && ex->color[0].image == D.composite && D.last &&
-           (D.last->ow != D.color.width || D.last->oh != D.color.height) &&
-           ex->pass_ncolor == 1 && ex->depth.image == D.depth.image && post.ready &&
-           !ex->pipe.ds.dt && !ex->pipe.ds.dw && !(ex->pipe.color.blend_en & 1) && samples_scene(ex, 1);
+    return dlaa_tonemap_targets(ex, ex->color, &ex->depth, ex->pass_ncolor);
 }
 
 void vk_dlaa_tonemap_begin(VkExec *ex, VkRenderingAttachmentInfo *color, VkRenderingAttachmentInfo *depth,
                            VkRenderingInfo *ri) {
+    DlaaPostImages *images = post.frame;
+    post_scene_use(ex, images);
     VkRect2D sc = vk_exec_scissor(ex);
     // The viewport can extend beyond the guest target. A clipped or letterboxed
     // composite keeps the guest colours in the portion the draw will not cover.
@@ -2344,17 +3873,18 @@ void vk_dlaa_tonemap_begin(VkExec *ex, VkRenderingAttachmentInfo *color, VkRende
                   ex->vp[0][0] + ex->vp[0][2] >= ex->pass_w && ex->vp[0][1] + ex->vp[0][3] >= ex->pass_h));
     if (!covers) {
         full_barrier(ex->cb);
-        blit_scene(ex->cb, ex->color[0].image, ex->pass_w, ex->pass_h, post.color, post.size.width, post.size.height);
+        blit_scene(ex->cb, ex->color[0].image, ex->pass_w, ex->pass_h, images->member[POST_COLOR].image,
+                   images->size.width, images->size.height);
         full_barrier(ex->cb);
         ex->recorded += 3;
     }
     ex->tonemap_drawn = 0;
     color->loadOp = covers ? VK_ATTACHMENT_LOAD_OP_DONT_CARE : VK_ATTACHMENT_LOAD_OP_LOAD;
-    color->imageView = post.cv;
-    depth->imageView = post.zv;
+    color->imageView = images->member[POST_COLOR].view;
+    depth->imageView = images->member[POST_DEPTH].view;
     depth->loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     depth->storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    ri->renderArea.extent = ex->tonemap_extent = post.size;
+    ri->renderArea.extent = ex->tonemap_extent = images->size;
 }
 
 void vk_dlaa_tonemap_end(VkExec *ex) {
@@ -2362,40 +3892,139 @@ void vk_dlaa_tonemap_end(VkExec *ex) {
     if (!ex->tonemap_drawn) return;
     // Keep the original guest target current for copies and alternate present paths.
     full_barrier(ex->cb);
-    blit_scene(ex->cb, post.color, post.size.width, post.size.height, ex->color[0].image, ex->pass_w, ex->pass_h);
+    const VkExecTarget *target = &ex->color[0];
+    RcSourceRange output = dlaa_guest_target(target);
+    if (output.size) vk_texture_image_write_prepare(target->image, output.offset, output.size);
+    DlaaPostImages *images = post.frame;
+    blit_scene(ex->cb, images->member[POST_COLOR].image, images->size.width, images->size.height,
+               target->image, ex->pass_w, ex->pass_h);
+    if (output.size) {
+        resource_image_written((uint64_t)(uintptr_t)target->image, output.offset);
+        vk_texture_storage_written(target->image, output.offset);
+    }
     full_barrier(ex->cb);
     D.promoted = 1;
     ex->recorded += 3;
 }
 
 // The final encode samples the compute upscaler's output even on frames that skip the HUD pass.
-int vk_dlaa_scene_upscale(VkExec *ex, uint32_t sw, uint32_t sh, const VkTexImage *dst) {
-    if (!dl_active()) return 0;
+static int scene_effects_current(const VkDlaaSceneEffects *effects) {
+    if (!effects || !effects->complete) return 0;
+    const VkExecTarget *targets[2] = {&D.color,&D.depth};
+    for (unsigned i=0;i<2;i++) {
+        const VkExecTarget *t=targets[i];
+        uint64_t address=t->tex?(uint64_t)(uintptr_t)t->tex->mem:0;
+        if (t->image!=effects->images[i] || address!=effects->addresses[i]) return 0;
+    }
+    return 1;
+}
+int vk_dlaa_scene_effects(VkDlaaSceneEffects *out) {
+    if (!out) return 0;
+    *out=(VkDlaaSceneEffects){0};
+    // The caller has finished earlier recording workers before sealing this serial dispatch. Snapshot both
+    // possible edge-fill outputs even if reconstruction is currently inactive; state can become active later.
+    const VkExecTarget targets[2]={D.color,D.depth};
+    for (unsigned i=0;i<2;i++) {
+        const VkExecTarget *t=&targets[i];
+        out->images[i]=t->image;
+        out->addresses[i]=t->tex?(uint64_t)(uintptr_t)t->tex->mem:0;
+        if (t->image && (!out->addresses[i] ||
+            !vk_texture_image_effect(t->image,out->addresses[i],&out->ranges[i],&out->owners[i]))) return 0;
+    }
+    out->complete=1;
+    if (!scene_effects_current(out)) {out->complete=0;return 0;}
+    return 1;
+}
+static int dlaa_edge_mapping(const VkDlaaSceneEffects *scene, unsigned role,
+                             RcRegistryImageWriteExtent **out, uint32_t *count) {
+    RcRegistryImageBinding unused;
+    const RcSourceRange range = scene->ranges[role];
+    vk_texture_image_binding(scene->images[role], range.offset, range.size, &unused, out, count);
+    uint64_t address = range.offset;
+    for (uint32_t i = 0; i < *count; i++) {
+        const RcInterval interval = (*out)[i].interval;
+        if (!interval.mapping || !rc_range_valid(interval.range) || interval.address != address ||
+            interval.range.size > range.size - (address - range.offset)) return 0;
+        address += interval.range.size;
+    }
+    return *count && address - range.offset == range.size;
+}
+
+void vk_dlaa_scene_prepare_edges(VkDlaaSceneEffects *scene, const VkTextureColorBlitSource *primary) {
+    if (!scene->complete || !dl_active() || !D.jit_used || !primary->mapping_count) return;
+    const unsigned axes = dlaa_edge_axes(&D.color, D.ux, D.uy);
+    if (!axes) return;
+    const VkExecTarget *targets[2] = {&D.color, &D.depth};
+    const uint32_t mask = dlaa_edge_targets(&D.color, &D.depth);
+    RcRegistryImageWriteExtent *mapping[2] = {0};
+    uint32_t counts[2] = {0};
+    int disjoint = 1;
+    vk_texture_lock();
+    for (unsigned i = 0; i < 2 && disjoint; i++) {
+        if (!scene->images[i]) continue;
+        disjoint = scene->images[i] != primary->image && dlaa_edge_mapping(scene, i, &mapping[i], &counts[i]);
+        for (uint32_t j = 0; j < counts[i] && disjoint; j++)
+            for (uint32_t k = 0; k < primary->mapping_count && disjoint; k++)
+                disjoint = !rc_range_overlap(mapping[i][j].interval.range, primary->mapping[k].range);
+    }
+    if (scene->images[0] && scene->images[0] == scene->images[1]) disjoint = 0;
+    for (uint32_t i = 0; i < counts[0] && disjoint; i++)
+        for (uint32_t j = 0; j < counts[1] && disjoint; j++)
+            disjoint = !rc_range_overlap(mapping[0][i].interval.range, mapping[1][j].interval.range);
+    for (unsigned i = 0; disjoint && i < 2; i++) {
+        const VkExecTarget *target = targets[i];
+        if (!(mask & (1u << i)) || !target->tex || !target->img) continue;
+        VkImageCopy regions[2];
+        uint32_t n = dlaa_edge_regions(target, i, axes, regions);
+        vk_texture_projected_self_copy_capture(target->tex, target->img, regions, n, &scene->edge[i]);
+    }
+    vk_texture_unlock();
+    free(mapping[0]);
+    free(mapping[1]);
+}
+
+void vk_dlaa_scene_release_edges(VkDlaaSceneEffects *scene) {
+    for (unsigned i = 0; i < 2; i++) vk_texture_projected_transfer_cancel(&scene->edge[i]);
+}
+
+int vk_dlaa_scene_upscale(VkExec *ex, uint32_t sw, uint32_t sh, const VkTexImage *dst,
+                         VkDlaaSceneEffects *effects, const VkTextureColorBlitSource *output) {
+    if (!dl_active() || !output || !output->hold || output->image != dst->image || output->address != dst->addr) return 0;
     vk_exec_hooks_wait();
-    if (!D.armed || D.gbuf || (D.done && !D.early) || sw != D.color.width || sh != D.color.height ||
+    if (!dlaa_targets_armed() || D.gbuf || (D.done && !D.early) || sw != D.color.width || sh != D.color.height ||
         dst->image == D.color.image || dst->width < sw || dst->height < sh)
         return 0;
     vk_exec_hook_turn();
+    // A sealed declaration cannot acquire a newly selected guest output. The caller's ordinary blit still
+    // writes only its captured destination, so it remains valid when optional reconstruction loses this guard.
+    if (effects && !scene_effects_current(effects)) return 0;
     if (D.early) {
         if (!D.composite || D.up) return 0;
+        vk_dlaa_scene_effects_cancel_unselected(effects, 0);
+        DlaaPostImages *images = post.frame;
+        int promoted = D.promoted && post_current(images);
+        if (promoted) post_scene_use(ex, images);
         vk_exec_barrier(ex);
-        VkImage src = D.promoted ? post.color : D.composite;
-        blit_scene(ex->cb, src, D.promoted ? post.size.width : sw, D.promoted ? post.size.height : sh,
-                   dst->image, dst->width, dst->height);
+        VkImage src = promoted ? images->member[POST_COLOR].image : D.composite;
+        uint32_t width = promoted ? images->size.width : sw, height = promoted ? images->size.height : sh;
+        VkImageBlit blit = blit_scene(ex->cb, src, width, height, dst->image, dst->width, dst->height);
+        dlaa_compute_blit_written(output, &blit);
         full_barrier(ex->cb);
-        if (vk_dlaa_hudless_wanted) hudless(ex->cb, dst->image, dst->image, dst->width, dst->height);
-        D.up = 1;
         ex->recorded += 2;
+        if (vk_dlaa_hudless_wanted)
+            hudless(ex, dst->image, dst->image, dst, NULL, output, dst->width, dst->height);
+        __atomic_store_n(&hud_sources.forward_pending, 0, __ATOMIC_RELEASE);
+        D.up = 1;
         D.early_outputs++;
-        if (D.promoted || (sw == dst->width && sh == dst->height)) D.full_size_outputs++;
+        if (promoted || (sw == dst->width && sh == dst->height)) D.full_size_outputs++;
         if (D.early_outputs == 1 || D.early_outputs == 300 || D.early_outputs % 3600 == 0)
             rt_log("dlaa: before bloom on %llu of %llu reconstructed frames; %llu tonemapped at output size; scene %ux%u, tonemap %ux%u, output %ux%u",
                    (unsigned long long)D.early_outputs, (unsigned long long)D.evals, (unsigned long long)D.full_size_outputs, sw, sh,
-                   D.promoted ? post.size.width : sw, D.promoted ? post.size.height : sh, dst->width, dst->height);
+                   width, height, dst->width, dst->height);
         return 1;
     }
     VkExecTarget out = {.image = dst->image, .format = dst->format, .width = dst->width, .height = dst->height, .img = dst};
-    if (!evaluate(ex, &out)) return 0;
+    if (!evaluate(ex, &out, effects, 0, output)) return 0;
     D.ended = D.done = D.up = 1;
     static int told;
     if (!told++) rt_log("dlaa: resolved the scene at its compute upscale (%ux%u -> %ux%u)", sw, sh, dst->width, dst->height);
@@ -2423,149 +4052,300 @@ static int output_target(VkFormat f) { return srgb8(f) || vk_hdr_native_picture(
 
 double wide_dlss_share(void);   // widescreen.c: the DLSS mode's share of the picture (1 DLAA), 0 off
 
-void vk_dlaa_pass(VkExec *ex) {
-    const VkExecTarget *c = &ex->color[0], *z = &ex->depth;
-    if (!dl_active()) return;
+static int dlaa_deferred;   // at least one scene-size G-buffer established the deferred frame shape
+
+typedef enum {
+    DLAA_PASS_NONE, DLAA_PASS_COMPOSITE, DLAA_PASS_GBUFFER, DLAA_PASS_ARM, DLAA_PASS_BLOOM,
+    DLAA_PASS_OUTPUT, DLAA_PASS_NATIVE_OUTPUT, DLAA_PASS_ENCODE, DLAA_PASS_DEFER_WAIT,
+    DLAA_PASS_DEFER_OUTPUT, DLAA_PASS_NEEDS_OUTPUT
+} DlaaPassAction;
+
+typedef struct {
+    const VkExecTarget *color, *depth;
+    uint32_t color_count, width, layers;
+} DlaaPassTargets;
+
+typedef struct {
+    DlaaPassAction action;
+    int second_scene, one_color, wrong_shape;
+} DlaaPassDecision;
+
+// The same exact view, format, shader input and size predicates drive preview and execution.
+// The preview reports the need for an ordered hook without committing this frame's state.
+static DlaaPassDecision dlaa_pass_select(const VkExec *ex, DlaaPassTargets targets, const unsigned output[2]) {
+    const VkExecTarget *c = &targets.color[0], *z = targets.depth;
+    const uint32_t n = targets.color_count;
+    DlaaPassDecision decision = {0};
+    if (!dl_active()) return decision;
     if (D.early) {
-        if (!D.composite && ex->pass_ncolor == 1 && ex->pass_layers == 1 && c->image && c->image != D.color.image &&
+        if (!D.composite && n == 1 && targets.layers == 1 && c->image && c->image != D.color.image &&
             c->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && c->width == D.color.width && c->height == D.color.height &&
             !c->level && !c->base_layer && c->samples <= 1 && z->image == D.depth.image && !ex->pipe.ds.dt &&
-            !ex->pipe.ds.dw && !(ex->pipe.color.blend_en & 1) && samples_scene(ex, 1)) {
-            vk_exec_hook_turn();
-            D.composite = c->image;
-            if (!D.debug_image && (D.last->ow != c->width || D.last->oh != c->height) &&
-                post_images(ex->cb, (VkExtent2D){D.last->ow, D.last->oh})) {
-                vk_dlaa_swap_img = D.color.img;
-                vk_dlaa_swap_view = D.last->out_view;
-            }
-        }
-        return;
+            !ex->pipe.ds.dw && !(ex->pipe.color.blend_en & 1) && samples_scene(ex, 1))
+            decision.action = DLAA_PASS_COMPOSITE;
+        return decision;
     }
-    if (D.done) {   // diagnostics: another scene drawn into a light target in the same present interval
-        if (ex->pass_ncolor == 1 && c->image && scene_color(c->format) && z->image && z->format == VK_FORMAT_D32_SFLOAT &&
-            c->width == D.color.width && c->height == D.color.height && z->width == c->width)
-            F.second++, F.second_img = c->image;
-        return;
+    if (D.done) {
+        decision.second_scene = n == 1 && c->image && scene_color(c->format) && z->image &&
+            z->format == VK_FORMAT_D32_SFLOAT && c->width == D.color.width && c->height == D.color.height &&
+            z->width == c->width;
+        return decision;
     }
-    static int deferred;   // a scene-size G-buffer was seen: the deferred shape
-    unsigned o[2], s[2];
-    res_sizes(o, s);
-    // Ocarina's builds carry no scene or output patch sets, so res_sizes reports placeholders there: the sizes come
-    // from the frame itself (the light target's, and the output pass's).
-    int scene = z->image && z->format == VK_FORMAT_D32_SFLOAT && z->width >= DLAA_SCENE_MIN_W;
-    // The G-buffer: several colour targets with the D32F scene depth. Only the light target drawn after it arms the
-    // frame; at night the game draws into the light target alone with the scene depth before the G-buffer too, and
-    // DLAA then ran at a small pass ahead of the whole scene, which reached the screen jittered.
-    // A pass of that shape smaller than the light target already armed is not one: Ocarina draws a half-size effect
-    // into three targets with a half-size D32F depth after its scene, and taking that for a G-buffer switched every
-    // later frame to the deferred shape, where DLSS's and FSR 3.1's smaller modes never found their output pass.
-    if (ex->pass_ncolor >= 3 && scene && !(D.armed && (z->width < D.color.width || z->height < D.color.height))) {
-        if (!deferred)
-            rt_log("dlaa: a G-buffer pass (%d colour targets, depth %ux%u, target 0 format %d): the deferred frame shape",
-                   ex->pass_ncolor, z->width, z->height, c->image ? (int)c->format : 0);
-        D.gbuf = 1, D.armed = 0, deferred = 1;
-        // target 0 is the object-class buffer (RGBA8, the scene size): the characters' bias mask reads its green. A
-        // smaller pass of the same shape (640x360, seen while loading) does not replace the scene's in the same frame.
-        if (c->image && c->format == VK_FORMAT_R8G8B8A8_UNORM && c->width == z->width && c->height == z->height &&
-            c->samples <= 1 && !c->is3d && (!D.ids_ok || c->width >= D.ids.width))
-            D.ids = *c, D.ids_ok = 1;
-        return;
-    }
-    // the scene depth is D32F; a D16 target of the scene size also serves one composite pass before the transparents.
-    // A smaller pair never takes over an armed one: the camera rune draws a half-size RGBA16F target with a half-size
-    // D32F depth after the lighting (852x480 under a 1704x960 scene), and DLSS ran on that and wrote its picture into
-    // the scene's own light target, which left every object black.
-    if ((D.gbuf || !deferred) && ex->pass_ncolor == 1 && c->image && scene_color(c->format) && scene &&
+    const int armed = dlaa_targets_armed();
+    const int scene = z->image && z->format == VK_FORMAT_D32_SFLOAT && z->width >= DLAA_SCENE_MIN_W;
+    // A half-size effects buffer must not replace the armed light/depth pair.
+    if (n >= 3 && scene && !(armed && (z->width < D.color.width || z->height < D.color.height)))
+        decision.action = DLAA_PASS_GBUFFER;
+    else if ((D.gbuf || !dlaa_deferred) && n == 1 && c->image && scene_color(c->format) && scene &&
         c->width == z->width && c->height == z->height &&
-        (!D.armed || (c->width >= D.color.width && c->height >= D.color.height)) && c->samples <= 1 && !c->is3d) {
-        int first = !D.armed;
-        D.color = *c, D.depth = *z, D.armed = 1;
+        (!armed || (c->width >= D.color.width && c->height >= D.color.height)) && c->samples <= 1 && !c->is3d)
+        decision.action = DLAA_PASS_ARM;
+    if (decision.action || !armed) return decision;
+    if (before_bloom && !dlaa_deferred && !use_fsr() && n == 2 && !z->image &&
+        c->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && targets.color[1].format == c->format &&
+        c->width == targets.color[1].width && c->height == targets.color[1].height &&
+        c->width < D.color.width && c->height < D.color.height && samples_scene(ex, 0)) {
+        decision.action = DLAA_PASS_BLOOM;
+        return decision;
+    }
+    if (!dlaa_deferred) {
+        decision.one_color = n == 1 && c->image && !z->image && c->image != D.color.image && c->samples <= 1 && !c->is3d;
+        if (!decision.one_color) return decision;
+        const double share = wide_dlss_share();
+        const int native = share <= 0 || share >= 1;
+        const int big = D.share_off || native || c->width >= 0.95 * D.color.width / share;
+        const int same = c->width == D.color.width && c->height == D.color.height;
+        const int larger = c->width > D.color.width && c->height > D.color.height;
+        // The output shares the scene aspect ratio. A large square minimap must keep its own content.
+        const int shape = (double)c->width * D.color.height <= 1.03 * (double)c->height * D.color.width &&
+                          (double)c->height * D.color.width <= 1.03 * (double)c->width * D.color.height;
+        decision.wrong_shape = !shape && big && larger;
+        if (shape && big && larger) decision.action = DLAA_PASS_OUTPUT;
+        else if (same && native && scene_color(c->format)) decision.action = DLAA_PASS_NATIVE_OUTPUT;
+        else if (same && output_target(c->format)) decision.action = DLAA_PASS_ENCODE;
+        return decision;
+    }
+    if (!D.ended) {
+        if (targets.width && targets.width * 4 <= D.color.width)
+            decision.action = !output ? DLAA_PASS_NEEDS_OUTPUT :
+                D.color.width >= output[0] ? DLAA_PASS_ENCODE : DLAA_PASS_DEFER_WAIT;
+    } else if (n == 1 && c->image && !z->image && scene_color(c->format) && c->width > D.color.width &&
+        c->samples <= 1 && !c->is3d) {
+        if (!output) decision.action = DLAA_PASS_NEEDS_OUTPUT;
+        else if (c->width == output[0] && c->height == output[1]) decision.action = DLAA_PASS_DEFER_OUTPUT;
+    }
+    return decision;
+}
+
+uint32_t vk_dlaa_graphics_pass_work(const VkExec *ex, const VkExecGraphicsPassShape *shape) {
+    const DlaaPassTargets targets = {shape->color, &shape->depth, shape->pass_ncolor, shape->pass_w, shape->pass_layers};
+    unsigned output[2];
+    const unsigned *size = dlaa_deferred && res_output_size_current(output) ? output : NULL;
+    const DlaaPassAction action = dlaa_pass_select(ex, targets, size).action;
+    uint32_t work = 0;
+    if (action == DLAA_PASS_GBUFFER || action == DLAA_PASS_ARM) work = VK_DLAA_GRAPHICS_PASS_OBSERVE;
+    else if (action) work = VK_DLAA_GRAPHICS_PASS_HOOK;
+    if (dlaa_tonemap_targets(ex, targets.color, targets.depth, targets.color_count)) work |= VK_DLAA_GRAPHICS_PASS_TONEMAP;
+    if (hud_attachment_target(hud_sources.open, targets.color, targets.color_count)) work |= VK_DLAA_GRAPHICS_PASS_HUD;
+    return work;
+}
+
+struct VkDlaaPreparedObserver {
+    RcRegistryPosition read;
+    VkExecTarget color, depth;
+    DlaaTargetOwner *color_owner, *depth_owner;
+    RcBudgetTicket metadata;
+    DlaaPassAction action;
+    int stores_ids;
+};
+
+static int dlaa_pass_stores_ids(DlaaPassAction action, const VkExecTarget *c, const VkExecTarget *z) {
+    return action == DLAA_PASS_GBUFFER && c->image && c->format == VK_FORMAT_R8G8B8A8_UNORM &&
+        c->width == z->width && c->height == z->height && c->samples <= 1 && !c->is3d &&
+        (!D.ids_ok || !dlaa_target_valid(frame_targets[DLAA_TARGET_IDS]) || c->width >= D.ids.width);
+}
+
+static int dlaa_observer_target_same(const VkExecTarget *a, const VkExecTarget *b) {
+    return a->exact_snapshot == b->exact_snapshot && a->tex == b->tex && a->img == b->img &&
+        a->image == b->image && a->format == b->format && a->view_type == b->view_type &&
+        a->aspect == b->aspect && a->level == b->level && a->base_layer == b->base_layer &&
+        a->layers == b->layers && a->width == b->width && a->height == b->height &&
+        a->samples == b->samples && a->is3d == b->is3d && a->bc_backing == b->bc_backing;
+}
+
+static int dlaa_observer_current(const VkExec *ex, DlaaPassTargets targets, const VkDlaaPreparedObserver *prepared) {
+    if (!prepared || ex->fence != prepared->read.scene ||
+        rc_registry_position_compare(prepared->read, vk_exec_resource_position()) ||
+        !dlaa_observer_target_same(&prepared->color, &targets.color[0]) ||
+        !dlaa_observer_target_same(&prepared->depth, targets.depth)) return 0;
+    // G-buffer and scene arm are selected before any output-sized resolve decision.
+    DlaaPassAction action = dlaa_pass_select(ex, targets, NULL).action;
+    return action == prepared->action &&
+        prepared->stores_ids == dlaa_pass_stores_ids(action, &targets.color[0], targets.depth);
+}
+
+int vk_dlaa_prepared_observer_current(const VkExec *ex, const VkExecGraphicsPassShape *shape,
+                                    const VkDlaaPreparedObserver *prepared) {
+    const DlaaPassTargets targets = {shape->color, &shape->depth, shape->pass_ncolor, shape->pass_w, shape->pass_layers};
+    return dlaa_observer_current(ex, targets, prepared);
+}
+
+void vk_dlaa_prepared_observer_cancel(VkDlaaPreparedObserver **in_out) {
+    VkDlaaPreparedObserver *prepared = *in_out;
+    *in_out = NULL;
+    if (!prepared) return;
+    dlaa_target_release(prepared->color_owner);
+    dlaa_target_release(prepared->depth_owner);
+    RcBudgetTicket metadata = prepared->metadata;
+    vk_replay_metadata_free(prepared, &metadata);
+}
+
+int vk_dlaa_prepare_observer(const VkExec *ex, const VkExecGraphicsPassShape *shape,
+                            VkTextureAliasRead *color_seed, VkTextureAliasRead *depth_seed, VkDlaaPreparedObserver **out) {
+    *out = NULL;
+    RcRegistryPosition read = vk_exec_resource_position();
+    if (!read.scene || !read.ordinal || read.scene != ex->fence || shape->in_pass) return 0;
+    const DlaaPassTargets targets = {shape->color, &shape->depth, shape->pass_ncolor, shape->pass_w, shape->pass_layers};
+    const DlaaPassAction action = dlaa_pass_select(ex, targets, NULL).action;
+    if (action != DLAA_PASS_GBUFFER && action != DLAA_PASS_ARM) return 0;
+    const VkExecTarget *c = &shape->color[0], *z = &shape->depth;
+    if (depth_seed && (z->format != VK_FORMAT_D32_SFLOAT || z->aspect != VK_IMAGE_ASPECT_DEPTH_BIT ||
+        z->level || z->base_layer || z->layers != 1 || z->samples != 1)) return 0;
+    const int stores_ids = dlaa_pass_stores_ids(action, c, z);
+
+    RcBudgetTicket metadata = {0};
+    void *storage = NULL;
+    if (vk_replay_metadata_allocate(sizeof(VkDlaaPreparedObserver), 1, RC_BUDGET_TEXTURE, &metadata, &storage) != VK_SUCCESS)
+        return 0;
+    VkDlaaPreparedObserver *prepared = storage;
+    *prepared = (VkDlaaPreparedObserver){.read = read, .color = *c, .depth = *z, .metadata = metadata,
+        .action = action, .stores_ids = stores_ids};
+    if (stores_ids || action == DLAA_PASS_ARM) {
+        prepared->color_owner = dlaa_target_capture(c, color_seed);
+        if (!prepared->color_owner) goto unavailable;
+    }
+    if (action == DLAA_PASS_ARM) {
+        prepared->depth_owner = dlaa_target_capture(z, depth_seed);
+        if (!prepared->depth_owner) goto unavailable;
+    }
+    *out = prepared;
+    return 1;
+
+unavailable:
+    vk_dlaa_prepared_observer_cancel(&prepared);
+    return 0;
+}
+
+static int dlaa_pass_execute(VkExec *ex, VkDlaaPreparedObserver *prepared) {
+    if (!dl_active()) return prepared == NULL;
+    const DlaaPassTargets targets = {ex->color, &ex->depth, ex->pass_ncolor, ex->pass_w, ex->pass_layers};
+    const VkExecTarget *c = &targets.color[0], *z = targets.depth;
+    unsigned out[2], scene[2];
+    const unsigned *size = NULL;
+    if (!prepared && !D.early && !D.done) {
+        // Ocarina takes sizes from this frame. Other supported patch sets have an explicit output size.
+        res_sizes(out, scene);
+        size = out;
+    }
+    if (prepared && !dlaa_observer_current(ex, targets, prepared)) return 0;
+    const DlaaPassDecision decision = dlaa_pass_select(ex, targets, size);
+    const int stores_ids = dlaa_pass_stores_ids(decision.action, c, z);
+    DlaaTargetOwner *color = NULL, *depth = NULL;
+    if (prepared) {
+        color = prepared->color_owner;
+        depth = prepared->depth_owner;
+        prepared->color_owner = NULL;
+        prepared->depth_owner = NULL;
+    }
+    if (decision.second_scene) F.second++, F.second_img = c->image;
+    if (decision.one_color) F.one_n++, F.one_w = c->width, F.one_h = c->height, F.one_fmt = c->format;
+    if (decision.wrong_shape && D.shape_logged < 8)
+        D.shape_logged++, rt_log("dlaa: a %ux%u pass is not the output pass: its shape is not the scene's %ux%u",
+                                 c->width, c->height, D.color.width, D.color.height);
+    switch (decision.action) {
+    case DLAA_PASS_NONE: case DLAA_PASS_NEEDS_OUTPUT:
+        return 1;
+    case DLAA_PASS_COMPOSITE:
+        vk_exec_hook_turn();
+        D.composite = c->image;
+        if (!D.debug_image && (D.last->ow != c->width || D.last->oh != c->height) &&
+            post_images(ex, (VkExtent2D){D.last->ow, D.last->oh})) {
+            D.swap_size = D.last;
+            vk_dlaa_swap_img = D.color.img;
+            vk_dlaa_swap_view = D.last->out_view;
+            vk_dlaa_swap_output = D.last->out;
+        }
+        return 1;
+    case DLAA_PASS_GBUFFER:
+        if (!dlaa_deferred)
+            rt_log("dlaa: a G-buffer pass (%d colour targets, depth %ux%u, target 0 format %d): the deferred frame shape",
+                   targets.color_count, z->width, z->height, c->image ? (int)c->format : 0);
+        D.gbuf = 1;
+        D.armed = 0;
+        dlaa_deferred = 1;
+        // Keep the largest matching object-class buffer for the character bias mask.
+        if (stores_ids) {
+            dlaa_frame_target_set(DLAA_TARGET_IDS, color);
+            D.ids = dlaa_owned_target(c, color);
+            D.ids_ok = 1;
+            dlaa_target_record(ex, color, 1);
+        }
+        return 1;
+    case DLAA_PASS_ARM: {
+        int first = !dlaa_targets_armed();
+        dlaa_frame_target_set(DLAA_TARGET_COLOR, color);
+        dlaa_frame_target_set(DLAA_TARGET_DEPTH, depth);
+        D.color = dlaa_owned_target(c, color);
+        D.depth = dlaa_owned_target(z, depth);
+        D.armed = 1;
+        dlaa_target_record(ex, color, 1);
+        dlaa_target_record(ex, depth, 1);
         static int told;
         if (first && !told++)
             rt_log("dlaa: first scene armed: light target %ux%u format %d, depth %ux%u", c->width, c->height, (int)c->format,
                    z->width, z->height);
-        if (first) mask_snapshot(ex);   // the lit scene, before the transparents (reactive mask)
-        return;
+        if (first) mask_snapshot(ex);
+        return 1;
     }
-    if (!D.armed) return;
-    if (before_bloom && !deferred && !use_fsr() && ex->pass_ncolor == 2 && !z->image &&
-        c->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && ex->color[1].format == c->format &&
-        c->width == ex->color[1].width && c->height == ex->color[1].height &&
-        c->width < D.color.width && c->height < D.color.height && samples_scene(ex, 0)) {
-        // Bloom extraction writes the bright scene to two small float targets.
-        // Earlier low-resolution effects have other inputs or attachments.
+    case DLAA_PASS_BLOOM:
         vk_exec_hook_turn();
-        D.early = 1;
-        D.hl_fresh = 0;
-        if (evaluate(ex, NULL)) D.done = D.ended = 1;
+        if (evaluate(ex, NULL, NULL, 1, NULL)) D.done = D.ended = 1;
         else D.early = 0;
-        return;
+        return 1;
+    case DLAA_PASS_NATIVE_OUTPUT: {
+        static int told;
+        if (!told++)
+            rt_log("dlaa: the pass the HUD is drawn into is at the scene's size (%ux%u, format %d): DLSS writes there",
+                   c->width, c->height, (int)c->format);
+        break;
     }
-    if (!deferred) {   // Ocarina's shape: the output pass ends the scene and runs DLSS
-        int one = ex->pass_ncolor == 1 && c->image && !z->image && c->image != D.color.image && c->samples <= 1 &&
-                  !c->is3d;
-        if (one) F.one_n++, F.one_w = c->width, F.one_h = c->height, F.one_fmt = c->format;
-        // the output pass is the picture's size, the scene over the mode's share: at Ultra Performance (854 wide) a
-        // 960x540 post pass comes first, and DLSS wrote there, which left a 540-line picture stretched to the output
-        // A frame whose scene is not at that share (the first presents before the scale patch takes, a dynamic
-        // resolution step) has no such pass: after a frame that missed DLSS the first pass wider than the scene is
-        // taken for 120 frames (D.share_off, vk_dlaa_frame), so a mismatch costs one frame rather than every frame.
-        double share = wide_dlss_share();
-        int native = share <= 0 || share >= 1;   // no upscaling share: the scene is as large as the picture
-        int big = D.share_off || native || c->width >= 0.95 * D.color.width / share;
-        int same = c->width == D.color.width && c->height == D.color.height;
-        // The output pass has the scene's shape: the game redraws its 2000x2000 area map into an RGBA8 target of its
-        // own on a room change and on the pause menu, one colour target and no depth, larger than the scene both ways.
-        // Taken for the output pass, DLSS wrote the game's picture into the map, and the minimap showed that picture
-        // behind its room shapes until the pause menu drew the map again. A pass whose width over height is more than
-        // 3% from the scene's (sizes round to multiples of 8) is not the output; the ultrawide sets widen the scene
-        // with the picture, so their output pass still matches.
-        int shape = (double)c->width * D.color.height <= 1.03 * (double)c->height * D.color.width &&
-                    (double)c->height * D.color.width <= 1.03 * (double)c->width * D.color.height;
-        if (one && !shape && big && c->width > D.color.width && c->height > D.color.height && D.shape_logged < 8)
-            D.shape_logged++, rt_log("dlaa: a %ux%u pass is not the output pass: its shape is not the scene's %ux%u",
-                                     c->width, c->height, D.color.width, D.color.height);
-        if (one && shape && big && c->width > D.color.width && c->height > D.color.height) {
-            // DLSS runs: the replay workers' draws read the jitter and its end, and list the per-object motion it
-            // takes (vk_exec.c "replay workers"); the G-buffer and the arming above change nothing they read
-            vk_exec_hook_turn();
-            D.ended = D.done = D.up = 1;
-            evaluate(ex, c);
-        } else if (one && same && native && scene_color(c->format)) {
-            // DLAA in gameplay: the pass the HUD is drawn into is also at the scene's size, in the light format, and
-            // the game's upscaler (its stand-in here) has just written the picture there. Waiting for the 8-bit output
-            // pass, as in a frame without it, put DLSS's picture back into the armed light target (the bloom
-            // composite's), which nothing reads after the upscaler took it: the frame showed no DLAA at all. With an
-            // upscaling share the HUD's pass is the larger one above, so a pass of this shape is not it and is ignored
-            // there as before.
-            static int told;
-            if (!told++)
-                rt_log("dlaa: the pass the HUD is drawn into is at the scene's size (%ux%u, format %d): DLSS writes there",
-                       c->width, c->height, (int)c->format);
-            vk_exec_hook_turn();
-            D.ended = D.done = D.up = 1;
-            evaluate(ex, c);
-        } else if (one && same && output_target(c->format)) {
-            vk_exec_hook_turn();
-            D.ended = D.done = 1;
-            evaluate(ex, NULL);
-        }
-        return;
+    case DLAA_PASS_OUTPUT: case DLAA_PASS_ENCODE: case DLAA_PASS_DEFER_WAIT: case DLAA_PASS_DEFER_OUTPUT:
+        break;
     }
-    if (!D.ended) {
-        if (!ex->pass_w || ex->pass_w * 4 > D.color.width) return;
-        vk_exec_hook_turn();
+    vk_exec_hook_turn();
+    if (decision.action == DLAA_PASS_DEFER_WAIT) {
         D.ended = 1;
-        if (D.color.width >= o[0]) D.done = 1, evaluate(ex, NULL);   // DLAA in place; else wait for the scaling pass
-        return;
+        return 1;
     }
-    // the game's scaling pass: one colour target of the output size, no depth
-    if (ex->pass_ncolor == 1 && c->image && !z->image && scene_color(c->format) && c->width > D.color.width &&
-        c->width == o[0] && c->height == o[1] && c->samples <= 1 && !c->is3d) {
-        vk_exec_hook_turn();
+    if (decision.action == DLAA_PASS_ENCODE) {
+        if (evaluate(ex, NULL, NULL, 0, NULL)) D.ended = D.done = 1;
+        return 1;
+    }
+    if (evaluate(ex, c, NULL, 0, NULL)) {
         D.done = D.up = 1;
-        evaluate(ex, c);
+        if (decision.action != DLAA_PASS_DEFER_OUTPUT) D.ended = 1;
     }
+    return 1;
+}
+
+void vk_dlaa_pass(VkExec *ex) {
+    (void)dlaa_pass_execute(ex, NULL);
+}
+
+int vk_dlaa_pass_prepared(VkExec *ex, VkDlaaPreparedObserver **in_out) {
+    if (!*in_out || !dlaa_pass_execute(ex, *in_out)) return 0;
+    vk_dlaa_prepared_observer_cancel(in_out);
+    return 1;
 }
 
 // NX2NAVI_DLSS, read at each present (the menu switches it live): the scene size of the mode (resolution.c) and the
@@ -2632,10 +4412,15 @@ void vk_dlaa_frame(void) {
     static int cfg_known;
     unsigned v = cfg_version();
     __atomic_add_fetch(&D.presents, 1, __ATOMIC_RELAXED);
+    if (D.fg_size && D.presents != D.fg_at + 1) fg_forget_size();
+    size_collect_retired();
     if (cfg_known && v != cfg_seen) setting_presents = SETTING_PRESENTS;
     else if (setting_presents) setting_presents--;
     cfg_seen = v, cfg_known = 1;
-    vk_dlaa_swap_img = NULL, vk_dlaa_swap_view = VK_NULL_HANDLE;
+    D.swap_size = NULL;
+    vk_dlaa_swap_img = NULL, vk_dlaa_swap_view = VK_NULL_HANDLE, vk_dlaa_swap_output = VK_NULL_HANDLE;
+    post_frame_end();
+    dlaa_frame_targets_close();
     D.early = D.promoted = 0, D.composite = VK_NULL_HANDLE;
     dlss_mode();
     preset_check();
@@ -2651,11 +4436,16 @@ void vk_dlaa_frame(void) {
         // either way the next DLAA frame starts a new history from an unjittered frame
         D.reset = 1, D.cam_prev_ok = 0, D.jit_ok = D.jit_used = D.armed = D.done = D.gbuf = D.ended = D.up = 0;
         D.hold = 0;
-        D.fg_fresh = D.hl_fresh = 0;   // frame generation gets nothing made before the switch (fg_current)
+        fg_forget_size();
+        hud_sources.open = hud_sources.sealed = NULL;
         memset(&F, 0, sizeof F);
+        __atomic_store_n(&D.size_hook_open, on && !D.failed, __ATOMIC_RELEASE);
         return;
     }
-    if (!dl_active()) return;
+    if (!dl_active()) {
+        size_hook_close();
+        return;
+    }
     if (D.share_off) D.share_off--;
     if (!D.done && D.armed) D.share_off = 120;   // vk_dlaa_pass: the output pass without the mode's share for a while
     if (!D.done) {
@@ -2687,8 +4477,8 @@ void vk_dlaa_frame(void) {
     else if (D.hold) D.hold--;
     if (!D.done) D.jit_ok = 0;
     D.armed = D.done = D.jit_used = D.gbuf = D.ended = D.up = D.ids_ok = 0;
-    D.cam_addr = 0, D.nviews = 0;
     memset(&F, 0, sizeof F);
+    __atomic_store_n(&D.size_hook_open, 1, __ATOMIC_RELEASE);
 }
 
 // ---------------------------------------------------------------- the game's FXAA (NX2NAVI_FXAA, live)
@@ -2724,7 +4514,7 @@ static uint64_t spirv_hash(const GfxShader *s) {
     return 0;   // table full: no skip
 }
 
-int vk_dlaa_skip_draw(VkExec *ex, const GfxShader *fs) {
+int vk_dlaa_skip_draw_depth(VkImage depth, const GfxShader *fs) {
     static uint64_t frame_read = ~0ull;
     static int fxaa = 1;
     // fxaa = 0 reports once whether it found the game's FXAA draw: the first skip, or a minute of frames (3600) with
@@ -2746,7 +4536,7 @@ int vk_dlaa_skip_draw(VkExec *ex, const GfxShader *fs) {
     int known = 0;
     for (size_t i = 0; i < sizeof FXAA_FS / sizeof FXAA_FS[0]; i++) known |= h == FXAA_FS[i];
     if (!known) return 0;
-    if (!ex->depth.image) {   // the scaling pass, which DLSS replaced
+    if (!depth) {   // the scaling pass, which DLSS replaced
         static int told;
         if (D.up && !told++) rt_log("dlaa: the game's scaling draw left out, DLSS wrote it (fragment shader %016llx)",
                                     (unsigned long long)h);
@@ -2758,6 +4548,8 @@ int vk_dlaa_skip_draw(VkExec *ex, const GfxShader *fs) {
     }
     return !fxaa;
 }
+
+int vk_dlaa_skip_draw(VkExec *ex, const GfxShader *fs) { return vk_dlaa_skip_draw_depth(ex->depth.image, fs); }
 
 
 // ---------------------------------------------------------------- DLSS Frame Generation through NGX (vk_ngxfg)

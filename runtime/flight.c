@@ -318,6 +318,19 @@ static int write_png(const char *path, const uint8_t *rgba, PngBufs *pb) {
 }
 
 // ---------------------------------------------------------------- dump thread
+uint64_t dbg_area_guest(void);
+void dbg_area_pair_result(uint64_t guest, int saved);
+static uint64_t area_retry_guest;
+
+static void area_retry(uint64_t guest) {
+    __atomic_store_n(&area_retry_guest, guest, __ATOMIC_RELEASE);
+}
+
+static int area_retry_take(uint64_t guest) {
+    uint64_t expected = guest;
+    return __atomic_compare_exchange_n(&area_retry_guest, &expected, 0, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
+
 static void dump_main(void *arg) {
     DumpJob *j = arg;
     uint64_t t_start = plat_now_ms();
@@ -328,7 +341,8 @@ static void dump_main(void *arg) {
         free(j->ev), free(j);
         return;
     }
-    write_events(j);   // first: it takes a moment, the thumbnails seconds, and a game closed meanwhile keeps it
+    const int area = !strcmp(j->why, "DBG_TEST area-return");
+    if (!area) write_events(j);   // first: it takes a moment, the thumbnails seconds, and a game closed meanwhile keeps it
     uint8_t *have = calloc((size_t)j->n, 1);
     int n_thumbs = 0;
     if (thumbs_on && have) {
@@ -355,6 +369,13 @@ static void dump_main(void *arg) {
         free(px), free(pb.raw), free(pb.z), free(pb.head);
     }
     char path[PLAT_PATH_MAX + 32];
+    if (area && !n_thumbs) {
+        // The owning present fence can be healthy but not recycled under a slow transition.
+        // Retry this exact retained frame when another actual present gives it progress.
+        area_retry(j->r[0].guest_presents);
+        free(have), free(j);
+        return;
+    }
     snprintf(path, sizeof path, "%s/frames.tsv", j->dir);
     FILE *f = fopen(path, "w");
     if (!f) {
@@ -376,7 +397,9 @@ static void dump_main(void *arg) {
         fprintf(f, "\t%.4f\t%.4f\t%llu", r->step_page, r->step_game, (unsigned long long)r->guest_presents);
         fprintf(f, "\t%d\n", have ? have[i] : 0);
     }
-    fclose(f);
+    int stored = fclose(f) == 0;
+    if (area)
+        dbg_area_pair_result(j->r[0].guest_presents, stored && have && have[0]);
     rt_log("flight: dump %s: %s at frame %llu (%.1f ms), frames %llu-%llu, %d thumbnails, %zu texture events, written "
            "in %llu ms; recorder %.1f us per frame (max %.0f us)", j->dir,
            j->why, (unsigned long long)j->trig_frame, j->trig_interval_us / 1000.0, (unsigned long long)j->r[0].frame,
@@ -403,6 +426,38 @@ static void start_dump(void) {
     snprintf(j->dir, sizeof j->dir, "%s/%04d%02d%02d-%02d%02d%02d-f%llu", base_dir, st.tm_year + 1900, st.tm_mon + 1,
              st.tm_mday, st.tm_hour, st.tm_min, st.tm_sec, (unsigned long long)trig_frame);
     if (!plat_thread_spawn(dump_main, j, "flight dump", 0)) rt_log("flight: cannot start the dump thread"), free(j->ev), free(j);
+}
+
+static void area_pair(uint64_t frame, uint64_t guest) {
+    static uint64_t issued;
+    if (!guest || (issued == guest && !area_retry_take(guest))) return;
+    uint64_t retained = recorded < (uint64_t)ring_n ? recorded : ring_n;
+    // Allow both present fence slots to turn over before attempting the retained thumbnail.
+    for (uint64_t age = 2; age < retained; ++age) {
+        const Rec *r = &ring[(recorded - 1 - age) % (uint64_t)ring_n];
+        if (r->guest_presents != guest) continue;
+        DumpJob *j = calloc(1, sizeof *j + sizeof(Rec));
+        if (!j) return;
+        struct tm now;
+        plat_local_time(&now);
+        j->n = 1;
+        j->trig_frame = r->frame;
+        j->trig_interval_us = r->interval_us;
+        j->why = "DBG_TEST area-return";
+        j->r[0] = *r;
+        snprintf(j->dir, sizeof j->dir, "%s/area-%llu-f%llu", base_dir,
+                 (unsigned long long)guest, (unsigned long long)frame);
+        if (plat_thread_spawn(dump_main, j, "area return picture", 0)) issued = guest;
+        else {
+            area_retry(guest);
+            free(j);
+        }
+        return;
+    }
+    if (retained && ring[(recorded - retained) % (uint64_t)ring_n].guest_presents > guest) {
+        issued = guest;
+        dbg_area_pair_result(guest, 0);
+    }
 }
 
 static void trigger(uint64_t frame, uint64_t interval_ns, const char *why) {
@@ -445,6 +500,7 @@ void flight_frame(uint64_t frame, uint64_t now_ns, uint64_t interval_ns, const u
     }
     frame_step_flight(&r->step_page, &r->step_game, &r->guest_presents);
     recorded++;
+    area_pair(frame, dbg_area_guest());
 
     static int key_was;
     int key = input_flight_key();

@@ -487,6 +487,13 @@ int res_dlss_mode(const char *m) {
     return 1;
 }
 
+int res_output_size_current(unsigned out[2]) {
+    if (!R.decided) return 0;
+    out[0] = R.on ? R.ow : BASE_W;
+    out[1] = R.on ? R.oh : BASE_H;
+    return 1;
+}
+
 void res_sizes(unsigned out[2], unsigned scene[2]) {
     decide();
     out[0] = R.on ? R.ow : BASE_W, out[1] = R.on ? R.oh : BASE_H;

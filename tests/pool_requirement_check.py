@@ -26,6 +26,7 @@ replay = (ROOT / 'runtime/vk_exec.c').read_text()
 (work / 'pool_requirement_constants.h').write_text('// ' + marker + '\n' +
     '\n'.join(re.findall(r'^#define NVN_STAGE_.*$', draw, re.M)) + '\n')
 parts = [function(replay, 'vk_exec_pool_requirement_begin'), function(draw, 'vk_exec_ahead_op'), function(replay, 'ahead_set_rt'),
+         function(replay, 'graphics_opcode'),
          function(replay, 'pool_leader_draw'), function(replay, 'pool_leader_run')]
 (work / 'pool_leader_under_test.h').write_text('// ' + marker + '\n' + '\n\n'.join(parts))
 env = dict(os.environ, PATH=str(CC.parent) + os.pathsep + os.environ.get('PATH', ''))

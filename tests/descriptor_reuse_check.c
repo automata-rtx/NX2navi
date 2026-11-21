@@ -25,16 +25,17 @@ typedef struct { uint32_t bytes, reserved; VkDescSlot data[]; } DescriptorPacket
 typedef uint64_t VkDescriptorSet;
 typedef struct { unsigned local, group, prepared, adopted; } PoolStats;
 typedef struct { PoolStats pool_stats; } DrawCtx;
-typedef struct { DrawCtx *dc; uint64_t fence; } VkExec;
+typedef struct { DrawCtx *dc; uint64_t fence, tex_pool; } VkExec;
 typedef struct { uint64_t fence, generation, set; uint32_t kinds; } VkExecPoolView;
 static DrawCtx context, *dc = &context;
 static VkExecPoolView group_view, local_view;
 static uint32_t vk_pool_kinds_used;
-static struct { VkDescriptorSet set; uint64_t cur_fence, completed_generation; int ready; uint32_t kinds; } PL;
+static struct { VkDescriptorSet set; uint64_t cur_fence, completed_generation, registration_scope, registration_pool; int ready; uint32_t kinds; } PL;
 static struct { uint32_t count; } pool_retry;
 static int pool_mt, shared, in_chunk, waited_ready, locked;
 static unsigned waits, syncs, locks, unlocks, publishes, generation_calls, mutate_generation_at;
 static uint64_t generation;
+static uint64_t vk_texture_registration_scope_token(void) { return 0; }
 static int vk_exec_shared(void) { return shared; }
 static int vk_exec_in_chunk(void) { return in_chunk; }
 static VkExecPoolView *vk_exec_pool_view(void) { return &group_view; }

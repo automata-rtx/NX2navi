@@ -143,7 +143,7 @@ void vk_caps_init(VkCtx *c) {
     // with one setting serve the other. NX2NAVI_ZERO_LOCALS=0 turns it off.
     uint32_t zero_locals = env_u32("NX2NAVI_ZERO_LOCALS", 1);
     // bda: global accesses the translator finds no storage buffer for go through the device address table (vk_gpa.c)
-    gfx_shader_set_host(vk_caps.float64, vk_caps.sbuf_align, told, gather, zero_locals != 0, vk_gpa_wanted_ctx(c));
+    gfx_shader_set_host(vk_caps.float64, vk_caps.sbuf_align, told, gather, zero_locals != 0, vk_gpa_on());
     if (gather) rt_log("vk caps: gather coordinates biased for %u sub-texel bits (NX2NAVI_GATHER_BIAS)", gather);
 
     char dv[32];

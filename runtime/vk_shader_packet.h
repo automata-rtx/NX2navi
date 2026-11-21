@@ -51,6 +51,8 @@ static ShaderPacket *shader_packet_find(ShaderPackets *cache, const VkExec *ex, 
 }
 
 static const GfxShader *shader_for(VkExec *ex, int stage, int *present, int *pending, uint32_t await_ms) {
+    const GfxShader *captured=effect_selected_shader(ex,stage);
+    if (captured) {*present=1;if(pending)*pending=0;return captured;}
     int mode = resource_prep_mode();
     if (!mode || !ex->prog || !ex->prog->serial || (unsigned)stage >= 8 || n_probe_sh || vk_texture_deferred())
         return shader_for_resolve(ex, stage, present, pending, await_ms);

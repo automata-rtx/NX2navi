@@ -358,14 +358,8 @@ static const ShieldDraw *shield_previous(const ShieldFrame *f, const ShieldDraw 
     return found;
 }
 
-static VkDescriptorBufferInfo shield_upload(VkExec *ex, const void *src, uint32_t bytes) {
-    VkDescriptorBufferInfo d = {.range = bytes};
-    memcpy(scratch(ex, bytes, &d.buffer, &d.offset), src, bytes);
-    return d;
-}
-
 static void player_mesh_shutdown(void) {
-    if (player_mesh.buffer) vmaDestroyBuffer(vk_ctx()->vma, player_mesh.buffer, player_mesh.allocation);
+    if (player_mesh.buffer) resource_core_vma_destroy_buffer(vk_ctx()->vma, player_mesh.buffer, player_mesh.allocation);
     for (unsigned i = 0; i < player_mesh.count; ++i) free(player_mesh.entries[i].bytes);
     memset(&player_mesh, 0, sizeof player_mesh);
     for (unsigned f = 0; f < 2; ++f)
@@ -377,10 +371,9 @@ static void player_mesh_shutdown(void) {
     shield_had_scene = 0;
 }
 
-static int motion_geometry_uploaded(unsigned id) {
-    if (!id) return 0;
+static void motion_geometry_promote(unsigned id) {
+    if (!id || player_mesh.entries[id - 1].uploaded) return;
     unsigned i = id - 1;
-    if (player_mesh.entries[i].uploaded) return 1;
     if (!player_mesh.attempted) {
         player_mesh.attempted = 1;
         VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = PLAYER_MESH_BYTES,
@@ -388,199 +381,509 @@ static int motion_geometry_uploaded(unsigned id) {
         VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO,
                                       .requiredFlags = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                                       .flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT};
+        RcVmaRequest request = {.producer = RC_BUDGET_BUFFER};
         VmaAllocationInfo info;
-        if (vmaCreateBuffer(vk_ctx()->vma, &bi, &ai, &player_mesh.buffer, &player_mesh.allocation, &info) == VK_SUCCESS)
+        VkResult result = resource_core_vma_create_buffer(&request, vk_ctx()->vma, &bi, &ai, &player_mesh.buffer,
+                                                           &player_mesh.allocation, &info, NULL);
+        vk_device_lost_check(result, "preparing persistent motion geometry");
+        if (result == VK_SUCCESS) {
             player_mesh.mapped = info.pMappedData;
+            if (!player_mesh.mapped) {
+                resource_core_vma_destroy_buffer(vk_ctx()->vma, player_mesh.buffer, player_mesh.allocation);
+                player_mesh.buffer = VK_NULL_HANDLE;
+                player_mesh.allocation = NULL;
+            }
+        }
     }
-    if (!player_mesh.mapped) return 0;
+    if (!player_mesh.mapped) return;
     unsigned offset = (player_mesh.used + 15u) & ~15u;
     unsigned size = player_mesh.entries[i].size;
-    if (size > PLAYER_MESH_BYTES - offset) return 0;
+    if (size > PLAYER_MESH_BYTES - offset) return;
     memcpy(player_mesh.mapped + offset, player_mesh.entries[i].bytes, size);
     player_mesh.entries[i].offset = offset;
     player_mesh.entries[i].uploaded = 1;
     player_mesh.used = offset + size;
-    return 1;
 }
 
-// Bones and camera constants often serve several shapes. The source packets stay
-// immutable for this resolve and scratch descriptors live in this command buffer.
 typedef struct {
     const void *data;
-    VkDescriptorBufferInfo buffer;
-} PoseUpload;
+    VkDeviceSize offset;
+    uint32_t bytes;
+} ShieldInput;
 
-static int shield_emit(VkExec *ex, ShieldDraw *p, const ShieldDraw *prev, uint32_t w, uint32_t h, PoseUpload uploads[32]) {
+typedef struct {
+    const ShieldDraw *draw;
+    VkPipeState state;
+    VkPipeline pipeline;
+    const VkPipeInfo *info;
+    VkDescriptorSet sets[2];
+    VkBuffer geometry;
+    VkDeviceSize geometry_offset;
+    float screen[4];
+    uint8_t support[SUPPORT_BYTES];
+    ShieldInput inputs[MAX_BINDINGS];
+} ShieldPreparedDraw;
+
+struct VkShieldResolve {
+    VkExec *ex;
+    VkCommandBuffer cb;
+    uint64_t fence, frame;
+    VkDeviceSize alignment, bytes;
+    VkResult result;
+    unsigned count, matched;
+    VkExecGraphicsScratch *scratch;
+    RcBudgetTicket host;
+    int host_retained;
+    ShieldPreparedDraw draws[];
+};
+
+static VkResult graphics_scratch_claim(VkExec *ex, VkExecGraphicsScratch initial, uint32_t base_instance,
+                                      int allow_growth, VkExecGraphicsScratch **out, RcVmaDependency *dependency);
+
+typedef struct {
+    const ShieldDraw *draw, *prev;
+    VkPipeline pipeline;
+    const VkPipeInfo *info;
+} ShieldSelection;
+
+static VkPipeState shield_motion_state(const ShieldDraw *p) {
     VkPipeState state = p->state;
     memset(state.color_fmt, 0, sizeof state.color_fmt);
     state.color_fmt[0] = NVN_FORMAT_RG16F;
     state.chmask.mask = 3;
     state.feedback = state.color.logic_op = 0;
     state.ds.dw = 0;
-    // Match the final visible depth, including holes in the depth-writing silhouette.
     state.ds.df = NVN_DEPTH_FUNC_EQUAL;
-    int pending = 0;
-    const VkPipeInfo *info = NULL;
-    VkPipeline pipe = vk_pipeline_graphics_async(&state, &info, &pending, 0);
-    if (pending || !pipe || !info || info->pool || info->n_bindings > MAX_BINDINGS) return 0;
-    VkDescriptorBufferInfo inputs[MAX_BINDINGS];
-    VkWriteDescriptorSet writes[MAX_BINDINGS];
-    float screen[4] = {(float)w, (float)h, p->viewport.x, p->viewport.y - h};
-    uint8_t support[SUPPORT_BYTES];
-    support_fill(support, p->support[0], p->support[1], p->support[2]);
+    return state;
+}
+
+// Validate every binding before giving a draw a share of the pass scratch.
+static int shield_draw_inputs(const ShieldSelection *selected, ShieldPreparedDraw *draw, uint32_t max_uniform) {
+    const ShieldDraw *p = selected->draw;
+    const VkPipeInfo *info = selected->info;
+    uint32_t set = 0;
     for (uint32_t i = 0; i < info->n_bindings; ++i) {
         const VkPipeBinding *b = info->bindings + i;
-        const void *data;
-        uint32_t bytes;
-        PoseUpload *shared = NULL;
-        if (b->type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || b->count > 1) return 0;
-        if (b->kind == VK_PIPE_SUPPORT) {
-            data = support;
-            bytes = sizeof support;
-        } else if (b->kind != GFX_RES_UBO)
+        ShieldInput input = {0};
+        if (b->type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || b->count > 1 ||
+            (info->n_sets == 2 && (b->set < set || b->set > 1))) return 0;
+        set = b->set;
+        if (b->kind == VK_PIPE_SUPPORT)
+            input = (ShieldInput){.data = draw ? draw->support : NULL, .bytes = sizeof draw->support};
+        else if (b->kind != GFX_RES_UBO || !b->res)
             return 0;
-        else if (nvn_stage_of(b->stage) == NVN_STAGE_FS) {
-            data = screen;
-            bytes = sizeof screen;
-        } else {
+        else if (nvn_stage_of(b->stage) == NVN_STAGE_FS)
+            input = (ShieldInput){.data = draw ? draw->screen : NULL, .bytes = sizeof draw->screen};
+        else {
             int slot = b->res->slot;
             const ShieldDraw *source = p;
             if (slot >= 18) {
                 slot -= 15;
-                source = prev;
+                source = selected->prev;
             }
             if (slot < 0 || slot > 16 || !source->bank[slot].bytes) return 0;
-            ShieldSlice bank = source->bank[slot];
-            data = pose_bank(source, slot);
-            bytes = bank.bytes;
-            if (bytes >= 512) shared = &uploads[b->res->slot];
+            input = (ShieldInput){.data = pose_bank(source, (unsigned)slot), .bytes = source->bank[slot].bytes};
         }
-        if (shared && shared->buffer.range == bytes &&
-            (data == shared->data || !memcmp(data, shared->data, bytes))) {
-            inputs[i] = shared->buffer;
+        if (input.bytes > max_uniform) return 0;
+        if (draw) draw->inputs[i] = input;
+    }
+    return 1;
+}
+
+static int shield_select_draw(ShieldSelection *out, const ShieldDraw *p, const ShieldDraw *prev, uint32_t max_uniform) {
+    VkPipeState state = shield_motion_state(p);
+    int pending = 0;
+    const VkPipeInfo *info = NULL;
+    VkPipeline pipe = vk_pipeline_graphics_async(&state, &info, &pending, 0);
+    if (pending || !pipe || !info || info->pool || info->n_bindings > MAX_BINDINGS || info->n_sets > 2 ||
+        (info->n_bindings && !info->bindings)) return 0;
+    ShieldSelection selected = {.draw = p, .prev = prev, .pipeline = pipe, .info = info};
+    if (!shield_draw_inputs(&selected, NULL, max_uniform)) return 0;
+    *out = selected;
+    return 1;
+}
+
+static int shield_span(VkShieldResolve *plan, uint32_t bytes, VkDeviceSize *offset) {
+    if (!graphics_payload_align(plan->bytes, plan->alignment, offset) || bytes > UINT64_MAX - *offset) return 0;
+    plan->bytes = *offset + bytes;
+    return 1;
+}
+
+static int shield_plan_draw(VkShieldResolve *plan, ShieldPreparedDraw *draw, ShieldInput shared[32]) {
+    for (uint32_t i = 0; i < draw->info->n_bindings; ++i) {
+        const VkPipeBinding *b = draw->info->bindings + i;
+        ShieldInput *input = &draw->inputs[i], *pose = NULL;
+        // The reflected current and previous slots are independent sharing keys.
+        if (b->kind == GFX_RES_UBO && nvn_stage_of(b->stage) != NVN_STAGE_FS && input->bytes >= 512)
+            pose = &shared[b->res->slot];
+        if (pose && pose->bytes == input->bytes &&
+            (pose->data == input->data || !memcmp(pose->data, input->data, input->bytes))) {
+            input->offset = pose->offset;
+            input->data = NULL; // This exact span was already planned.
         } else {
-            inputs[i] = shield_upload(ex, data, bytes);
-            if (shared) *shared = (PoseUpload){data, inputs[i]};
+            if (!shield_span(plan, input->bytes, &input->offset)) return 0;
+            if (pose) *pose = *input;
         }
+    }
+    const ShieldDraw *p = draw->draw;
+    if (p->geometry_id && player_mesh.entries[p->geometry_id - 1].uploaded) {
+        draw->geometry = player_mesh.buffer;
+        draw->geometry_offset = player_mesh.entries[p->geometry_id - 1].offset;
+        return 1;
+    }
+    // Geometry packets already align their index and per-stream slices to 16 bytes.
+    return shield_span(plan, p->geom_size, &draw->geometry_offset);
+}
+
+static int shield_preparation_stopped(void) {
+    return vk_sync_stopping() || vk_device_is_lost() || vk_exec_recording_failed();
+}
+
+static VkResult shield_claim(VkShieldResolve *plan, RcVmaDependency *dependency) {
+    return graphics_scratch_claim(plan->ex, (VkExecGraphicsScratch){
+        .demand = {.bytes = plan->bytes, .alignment = plan->alignment}}, 0, 1, &plan->scratch, dependency);
+}
+
+#define SHIELD_SCRATCH_NO_PROGRESS_NS UINT64_C(5000000000)
+
+typedef struct {
+    uint64_t fence;
+    RcAdmissionVector peak;
+    RcBudgetTicket ticket;
+    RcAdmissionStatus result;
+} ShieldHostPreparation;
+
+static int shield_host_refused(RcAdmissionStatus result) {
+    return result == RC_ADMISSION_REFUSED || result == RC_ADMISSION_NO_RECORDS;
+}
+
+static int shield_host_prepare_parked(void *context) {
+    ShieldHostPreparation *work = context;
+    uint64_t started = kern_now_ns();
+    int retried_ready = 0;
+    while (!shield_preparation_stopped()) {
+        work->result = resource_core_budget_reserve(RC_BUDGET_BUFFER, 1, &work->peak, &work->ticket);
+        if (!shield_host_refused(work->result)) return !shield_preparation_stopped();
+        RcBudgetProgress progress;
+        resource_core_budget_service(1, &work->peak, &progress);
+        RcBudgetReadiness now;
+        resource_core_budget_readiness(1, &now);
+        if (kern_now_ns() - started >= SHIELD_SCRATCH_NO_PROGRESS_NS) return 1;
+        if (resource_core_budget_peak_ready(&work->peak, &now) && !retried_ready) {
+            retried_ready = 1;
+            continue;
+        }
+        uint64_t handed = vk_sync_handed_fence();
+        if (handed >= work->fence) handed = work->fence - 1;
+        if (handed <= vk_sync_fence_done() &&
+            !(progress.reclaim & (RC_BUDGET_RECLAIM_PENDING | RC_BUDGET_RECLAIM_BUSY |
+                                  RC_BUDGET_RECLAIM_DESTROYED))) return 1;
+        resource_core_budget_wait_since(progress.event, 100);
+        retried_ready = 0;
+    }
+    return 0;
+}
+
+static int shield_prepare_parked(void *context) {
+    VkShieldResolve *plan = context;
+    uint64_t started = kern_now_ns();
+    RcVmaDependency dependency = {0};
+    while (!shield_preparation_stopped()) {
+        plan->result = shield_claim(plan, &dependency);
+        if (plan->result != VK_NOT_READY) return !shield_preparation_stopped();
+        uint64_t done = vk_sync_fence_done();
+        RcBudgetReadiness now;
+        resource_core_budget_readiness(1, &now);
+        uint64_t prior = vk_exec_draw_graphics_scratch_prior_useful(plan->ex, plan->bytes, &dependency, &now);
+        if (!prior) prior = vk_exec_draw_scratch_prior_useful(plan->ex, plan->bytes, &dependency, &now);
+        RcBudgetProgress progress;
+        resource_core_budget_service(1, &dependency.peak, &progress);
+        VkDrawScratchWaitContext wait = {.ex = plan->ex, .bytes = plan->bytes};
+        resource_core_budget_readiness(1, &now);
+        if (kern_now_ns() - started >= SHIELD_SCRATCH_NO_PROGRESS_NS) return 1;
+        if (vk_exec_draw_graphics_scratch_spare_ready(&wait) ||
+            resource_core_vma_dependency_ready(&dependency, &now) || vk_sync_fence_done() != done) {
+            dependency = (RcVmaDependency){0};
+            continue;
+        }
+        if (!prior && !(progress.reclaim & (RC_BUDGET_RECLAIM_PENDING | RC_BUDGET_RECLAIM_BUSY |
+                                            RC_BUDGET_RECLAIM_DESTROYED))) return 1;
+        resource_core_budget_wait_since(progress.event, 100);
+        dependency = (RcVmaDependency){0};
+    }
+    return 0;
+}
+
+static uint32_t shield_set_end(const VkPipeInfo *info, uint32_t set, uint32_t first) {
+    uint32_t end = first;
+    while (end < info->n_bindings && (info->n_sets < 2 || info->bindings[end].set == set)) ++end;
+    return end;
+}
+
+static void shield_materialize(VkShieldResolve *plan) {
+    VkExecGraphicsScratch *scratch = plan->scratch;
+    uint8_t *map = scratch ? scratch->slab->chunk.map + scratch->start : NULL;
+    for (unsigned i = 0; i < plan->count; ++i) {
+        ShieldPreparedDraw *draw = &plan->draws[i];
+        for (uint32_t j = 0; j < draw->info->n_bindings; ++j) {
+            const ShieldInput *input = &draw->inputs[j];
+            if (input->data) memcpy(map + input->offset, input->data, input->bytes);
+        }
+        if (!draw->geometry) {
+            memcpy(map + draw->geometry_offset, geometry_bytes(draw->draw), draw->draw->geom_size);
+            draw->geometry = scratch->slab->chunk.buf;
+            draw->geometry_offset += scratch->start;
+        }
+        for (uint32_t set = 0, first = 0; set < 2 && first < draw->info->n_bindings; ++set) {
+            uint32_t end = shield_set_end(draw->info, set, first);
+            if (end > first && !(set ? draw->info->push1 : draw->info->push))
+                draw->sets[set] = alloc_set(plan->ex, set ? draw->info->set_layout1 : draw->info->set_layout);
+            first = end;
+        }
+    }
+}
+
+static void shield_resolve_cancel(VkShieldResolve **resolve) {
+    VkShieldResolve *plan = *resolve;
+    if (!plan) return;
+    *resolve = NULL;
+    RcBudgetTicket host = plan->host;
+    int retained = plan->host_retained;
+    if (retained && resource_core_budget_retire(&host) != RC_ADMISSION_OK)
+        rt_fatal("vk: motion scratch lost its retained host charge");
+    vk_exec_draw_graphics_scratch_finish(&plan->scratch);
+    free(plan);
+    RcAdmissionStatus result = retained ? resource_core_budget_destroyed(&host) : resource_core_budget_cancel(&host);
+    if (result != RC_ADMISSION_OK) rt_fatal("vk: motion scratch lost its host charge");
+}
+
+int vk_shield_resolve_prepare(VkExec *ex, uint64_t camera, VkImage depth, uint32_t w, uint32_t h, int reset,
+                              VkShieldResolve **resolve) {
+    *resolve = NULL;
+    if (shield_preparation_stopped()) {
+        vk_exec_cancel_temporal_preparation();
+        return 0;
+    }
+    if (!motion_owner_enabled()) return 1;
+    uint64_t frame = vk_dlaa_scene_frame();
+    const ShieldFrame *now = &shield_frames[frame & 1], *last = &shield_frames[(frame & 1) ^ 1];
+    if (reset || !shield_had_scene || shield_last_frame + 1 != frame || now->frame != frame ||
+        last->frame != frame - 1 || shield_width != w || shield_height != h) return 1;
+
+    // The temporal hook owns this recording frontier. Earlier capture groups have completed recording.
+    const ShieldDraw *sorted[SHIELD_DRAWS];
+    unsigned n = 0;
+    for (unsigned i = 0; i < now->count; ++i) {
+        const ShieldDraw *p = now->draws + i;
+        if ((now->overflow | last->overflow) & (p->owner.kind == MOTION_PLAYER ? 1u : 2u)) continue;
+        if (p->camera != camera || p->depth != depth) continue;
+        unsigned j = n++;
+        while (j && (sorted[j - 1]->fence > p->fence ||
+                     (sorted[j - 1]->fence == p->fence && sorted[j - 1]->order > p->order))) {
+            sorted[j] = sorted[j - 1];
+            --j;
+        }
+        sorted[j] = p;
+    }
+    uint32_t max_uniform = vk_ctx()->props.limits.maxUniformBufferRange;
+    ShieldSelection selected[SHIELD_DRAWS];
+    unsigned count = 0, matched = 0;
+    for (unsigned i = 0; i < n; ++i) {
+        const ShieldDraw *p = sorted[i], *prev = shield_previous(last, p);
+        if (!prev) continue;
+        ++matched;
+        if (shield_select_draw(&selected[count], p, prev, max_uniform)) ++count;
+    }
+    if (!count) return 1;
+
+    // Reserve the exact pass metadata plus the single malloc-backed graphics grant.
+    // While the native span is pending, the reservation still covers the already allocated plan.
+    size_t plan_bytes = sizeof(VkShieldResolve) + count * sizeof(ShieldPreparedDraw);
+    size_t peak_bytes = plan_bytes + sizeof(VkExecGraphicsScratch);
+    ShieldHostPreparation host = {.fence = ex->fence,
+        .peak.amount = {[RC_BUDGET_RAM] = peak_bytes, [RC_BUDGET_COMMIT] = peak_bytes}};
+    VkSyncProgressResult progress = VK_SYNC_PROGRESS_COMPLETE;
+    host.result = resource_core_budget_reserve(RC_BUDGET_BUFFER, 1, &host.peak, &host.ticket);
+    if (shield_host_refused(host.result)) progress = vk_exec_temporal_prepare(ex, shield_host_prepare_parked, &host);
+    VkShieldResolve *plan = NULL;
+    if (progress == VK_SYNC_PROGRESS_COMPLETE && host.result == RC_ADMISSION_OK && !shield_preparation_stopped())
+        plan = calloc(1, plan_bytes);
+    if (!plan) {
+        if (host.ticket.token.ledger && resource_core_budget_cancel(&host.ticket) != RC_ADMISSION_OK)
+            rt_fatal("vk: motion scratch lost its reserved host charge");
+        if (progress == VK_SYNC_PROGRESS_STOPPED || shield_preparation_stopped())
+            vk_exec_cancel_temporal_preparation();
+        else {
+            char reason[144];
+            snprintf(reason, sizeof reason, "cannot prepare motion scratch metadata (%llu bytes, budget %d, progress %d)",
+                     (unsigned long long)peak_bytes, (int)host.result, (int)progress);
+            vk_exec_required_temporal_unavailable(ex, reason);
+        }
+        return 0;
+    }
+    *resolve = plan;
+    plan->ex = ex;
+    plan->cb = ex->cb;
+    plan->fence = ex->fence;
+    plan->frame = frame;
+    plan->alignment = vk_ctx()->props.limits.minUniformBufferOffsetAlignment;
+    plan->host = host.ticket;
+    plan->count = count;
+    plan->matched = matched;
+    if (plan->alignment < 16) plan->alignment = 16;
+    ShieldInput shared[32] = {0};
+    VkResult result = VK_SUCCESS;
+    for (unsigned i = 0; i < count; ++i) {
+        const ShieldSelection *choice = &selected[i];
+        const ShieldDraw *p = choice->draw;
+        ShieldPreparedDraw *draw = &plan->draws[i];
+        draw->draw = p;
+        draw->state = shield_motion_state(p);
+        draw->pipeline = choice->pipeline;
+        draw->info = choice->info;
+        draw->screen[0] = (float)w, draw->screen[1] = (float)h;
+        draw->screen[2] = p->viewport.x, draw->screen[3] = p->viewport.y - h;
+        support_fill(draw->support, p->support[0], p->support[1], p->support[2]);
+        if (!shield_draw_inputs(choice, draw, max_uniform))
+            rt_fatal("vk: selected motion bindings changed during preparation");
+        if (!shield_plan_draw(plan, draw, shared)) {
+            result = VK_ERROR_OUT_OF_HOST_MEMORY;
+            break;
+        }
+    }
+
+    progress = VK_SYNC_PROGRESS_COMPLETE;
+    if (result == VK_SUCCESS && plan->bytes && !shield_preparation_stopped()) {
+        RcVmaDependency dependency = {0};
+        result = shield_claim(plan, &dependency);
+        if (result == VK_NOT_READY) {
+            progress = vk_exec_temporal_prepare(ex, shield_prepare_parked, plan);
+            if (progress == VK_SYNC_PROGRESS_COMPLETE) result = plan->result;
+        }
+        vk_device_lost_check(result, "preparing selected motion scratch");
+    }
+    if (progress == VK_SYNC_PROGRESS_STOPPED || shield_preparation_stopped()) {
+        shield_resolve_cancel(resolve);
+        vk_exec_cancel_temporal_preparation();
+        return 0;
+    }
+    if (result != VK_SUCCESS || progress != VK_SYNC_PROGRESS_COMPLETE) {
+        char reason[160];
+        snprintf(reason, sizeof reason, "cannot prepare selected motion scratch (%llu bytes, Vulkan %d, progress %d)",
+                 (unsigned long long)plan->bytes, (int)result, (int)progress);
+        shield_resolve_cancel(resolve);
+        vk_exec_required_temporal_unavailable(ex, reason);
+        return 0;
+    }
+
+    size_t actual_bytes = plan_bytes + (plan->scratch ? sizeof *plan->scratch : 0);
+    RcAdmissionVector actual = {.amount = {[RC_BUDGET_RAM] = actual_bytes, [RC_BUDGET_COMMIT] = actual_bytes}};
+    if (!rc_admission_accounted(resource_core_budget_materialize(&plan->host, &actual)))
+        rt_fatal("vk: motion scratch metadata was not charged");
+    plan->host_retained = 1;
+    shield_materialize(plan);
+    // A new optional persistent upload can serve later resolves. This resolve keeps its admitted provider.
+    for (unsigned i = 0; i < plan->count && !shield_preparation_stopped(); ++i)
+        motion_geometry_promote(plan->draws[i].draw->geometry_id);
+    if (shield_preparation_stopped()) {
+        shield_resolve_cancel(resolve);
+        vk_exec_cancel_temporal_preparation();
+        return 0;
+    }
+    return 1;
+}
+
+static void shield_emit(VkExec *ex, const ShieldPreparedDraw *draw, VkBuffer scratch, VkDeviceSize base) {
+    const ShieldDraw *p = draw->draw;
+    const VkPipeInfo *info = draw->info;
+    VkDescriptorBufferInfo inputs[MAX_BINDINGS];
+    VkWriteDescriptorSet writes[MAX_BINDINGS];
+    for (uint32_t i = 0; i < info->n_bindings; ++i) {
+        const VkPipeBinding *b = info->bindings + i;
+        inputs[i] = (VkDescriptorBufferInfo){scratch, base + draw->inputs[i].offset, draw->inputs[i].bytes};
         writes[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                                           .dstBinding = b->binding,
-                                           .descriptorCount = 1,
-                                           .descriptorType = b->type,
-                                           .pBufferInfo = inputs + i};
+                                           .dstBinding = b->binding, .descriptorCount = 1,
+                                           .descriptorType = b->type, .pBufferInfo = inputs + i};
     }
     VkCommandBuffer cb = ex->cb;
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
-    vk_pipeline_set_dynamic(cb, &state);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, draw->pipeline);
+    vk_pipeline_set_dynamic(cb, &draw->state);
     vkCmdSetViewportWithCount(cb, 1, &p->viewport);
     vkCmdSetScissorWithCount(cb, 1, &p->scissor);
     vkCmdSetDepthBias(cb, p->bias[0], p->bias[1], p->bias[2]);
-    for (uint32_t set = 0, first = 0; first < info->n_bindings && set < 2; ++set) {
-        uint32_t end = first;
-        while (end < info->n_bindings && (info->n_sets < 2 || info->bindings[end].set == set))
-            ++end;
+    for (uint32_t set = 0, first = 0; set < 2 && first < info->n_bindings; ++set) {
+        uint32_t end = shield_set_end(info, set, first);
         if (end == first) continue;
         if (set ? info->push1 : info->push)
             rec_push(vk_pipeline_push_fn(), cb, VK_PIPELINE_BIND_POINT_GRAPHICS, info->layout, set, end - first,
                      writes + first);
         else {
-            VkDescriptorSet ds = alloc_set(ex, set ? info->set_layout1 : info->set_layout);
-            for (uint32_t i = first; i < end; ++i)
-                writes[i].dstSet = ds;
+            VkDescriptorSet ds = draw->sets[set];
+            for (uint32_t i = first; i < end; ++i) writes[i].dstSet = ds;
             vkUpdateDescriptorSets(vk_ctx()->device, end - first, writes + first, 0, NULL);
             vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, info->layout, set, 1, &ds, 0, NULL);
         }
         first = end;
     }
-    int uploaded = motion_geometry_uploaded(p->geometry_id);
-    const uint8_t *geometry = geometry_bytes(p);
-    VkDeviceSize mesh_offset = uploaded ? player_mesh.entries[p->geometry_id - 1].offset : 0;
+
     MoVb vb = {0};
     for (unsigned i = 0; i < 17; ++i) {
         vb.b[i] = Z.zbuf;
         vb.sz[i] = ZERO_BYTES;
         if (i == 16) continue;
-        vb.str[i] = state.vstream[i].stride;
+        vb.str[i] = draw->state.vstream[i].stride;
         ShieldSlice v = p->vertex[i];
-        if (v.bytes && uploaded) {
-            vb.b[i] = player_mesh.buffer;
-            vb.o[i] = mesh_offset + v.offset;
-            vb.sz[i] = v.bytes;
-        } else if (v.bytes) {
-            VkDescriptorBufferInfo u = shield_upload(ex, geometry + v.offset, v.bytes);
-            vb.b[i] = u.buffer;
-            vb.o[i] = u.offset;
-            vb.sz[i] = u.range;
-        }
+        if (!v.bytes) continue;
+        vb.b[i] = draw->geometry;
+        vb.o[i] = draw->geometry_offset + v.offset;
+        vb.sz[i] = v.bytes;
     }
     vkCmdBindVertexBuffers2(cb, 0, 17, vb.b, vb.o, vb.sz, vk_pipeline_vertex_input_dynamic() ? NULL : vb.str);
     VkIndexType type = p->draw.itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
-    if (uploaded)
-        vkCmdBindIndexBuffer(cb, player_mesh.buffer, mesh_offset + p->indices.offset, type);
-    else
-        bind_index(ex, geometry + p->indices.offset, p->indices.bytes, type);
+    vkCmdBindIndexBuffer(cb, draw->geometry, draw->geometry_offset + p->indices.offset, type);
+    if (draw->geometry == scratch) ++ex->recorded;
     vkCmdDrawIndexed(cb, p->draw.count, 1, 0, p->draw.base_vertex, 0);
-    return 1;
 }
 
-int vk_shield_resolve(VkExec *ex, uint64_t camera, VkImage depth, VkImageView zv, VkImageView mv, uint32_t w,
-                      uint32_t h, int reset) {
-    if (!motion_owner_enabled()) return 0;
-    uint64_t frame = vk_dlaa_scene_frame();
-    ShieldFrame *now = &shield_frames[frame & 1], *last = &shield_frames[(frame & 1) ^ 1];
-    unsigned written = 0, cross = 0, matched = 0;
-    // The scene hook drains earlier recording groups. Use the original stream order for coplanar ties.
-    if (!reset && shield_had_scene && shield_last_frame + 1 == frame && now->frame == frame &&
-        last->frame == frame - 1 && shield_width == w && shield_height == h) {
-        ShieldDraw *sorted[SHIELD_DRAWS];
-        unsigned n = 0;
-        for (unsigned i = 0; i < now->count; ++i) {
-            ShieldDraw *p = now->draws + i;
-            if ((now->overflow | last->overflow) & (p->owner.kind == MOTION_PLAYER ? 1u : 2u)) continue;
-            if (p->camera != camera || p->depth != depth) continue;
-            unsigned j = n++;
-            while (j && (sorted[j - 1]->fence > p->fence ||
-                         (sorted[j - 1]->fence == p->fence && sorted[j - 1]->order > p->order))) {
-                sorted[j] = sorted[j - 1];
-                --j;
-            }
-            sorted[j] = p;
-        }
-        PoseUpload uploads[32] = {0};
-        for (unsigned i = 0; i < n; ++i) {
-            ShieldDraw *p = sorted[i];
-            const ShieldDraw *q = shield_previous(last, p);
-            if (!q) continue;
-            if (!matched++) {
-                VkRenderingAttachmentInfo color = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-                                                   .imageView = mv,
-                                                   .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
-                                                   .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
-                                                   .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
-                VkRenderingAttachmentInfo z = color;
-                z.imageView = zv;
-                VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
-                                      .renderArea = {{0, 0}, {w, h}},
-                                      .layerCount = 1,
-                                      .colorAttachmentCount = 1,
-                                      .pColorAttachments = &color,
-                                      .pDepthAttachment = &z};
-                vkCmdBeginRendering(ex->cb, &ri);
-            }
-            if (shield_emit(ex, p, q, w, h, uploads)) {
-                ++written;
-                cross += p->fence != ex->fence;
-            }
-        }
-        if (matched) {
-            vkCmdEndRendering(ex->cb);
-            vk_exec_draw_new_cb();
-            ex->dirty = VK_EXEC_DIRTY_ALL;
-            ex->recorded += written + 2;
-        }
+int vk_shield_resolve_emit(VkExec *ex, VkShieldResolve **resolve, uint64_t camera, VkImage depth, VkImageView zv,
+                           VkImageView mv, uint32_t w, uint32_t h, int reset) {
+    if (!motion_owner_enabled()) {
+        shield_resolve_cancel(resolve);
+        return 0;
     }
-    if (shield_trace() && (frame % 15 == 0 || written))
+    VkShieldResolve *plan = *resolve;
+    uint64_t frame = vk_dlaa_scene_frame();
+    unsigned written = plan ? plan->count : 0, cross = 0;
+    if (plan && (plan->ex != ex || plan->cb != ex->cb || plan->fence != ex->fence || plan->frame != frame))
+        rt_fatal("vk: motion scratch escaped its recording frontier");
+    if (written) {
+        VkRenderingAttachmentInfo color = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+                                           .imageView = mv, .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+                                           .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+        VkRenderingAttachmentInfo z = color;
+        z.imageView = zv;
+        VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {w, h}},
+                              .layerCount = 1, .colorAttachmentCount = 1, .pColorAttachments = &color, .pDepthAttachment = &z};
+        VkExecGraphicsScratch *scratch = plan->scratch;
+        VkBuffer buffer = scratch ? scratch->slab->chunk.buf : VK_NULL_HANDLE;
+        VkDeviceSize base = scratch ? scratch->start : 0;
+        if (scratch) scratch->exposed = 1;
+        vkCmdBeginRendering(ex->cb, &ri);
+        for (unsigned i = 0; i < written; ++i) {
+            shield_emit(ex, &plan->draws[i], buffer, base);
+            cross += plan->draws[i].draw->fence != ex->fence;
+        }
+        vkCmdEndRendering(ex->cb);
+        vk_exec_draw_new_cb();
+        ex->dirty = VK_EXEC_DIRTY_ALL;
+        ex->recorded += written + 2;
+    }
+    if (shield_trace() && (frame % 15 == 0 || written)) {
+        const ShieldFrame *now = &shield_frames[frame & 1];
         rt_log("shield resolve: frame %llu captures %u matched %u emitted %u across submissions %u reset %d",
-               (unsigned long long)frame, now->frame == frame ? now->count : 0, matched, written, cross, reset);
+               (unsigned long long)frame, now->frame == frame ? now->count : 0, plan ? plan->matched : 0, written, cross, reset);
+    }
+    shield_resolve_cancel(resolve);
     shield_had_scene = 1;
     shield_last_frame = frame;
     shield_last_camera = camera;

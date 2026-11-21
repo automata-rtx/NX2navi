@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "vk_exec.h"
+#define RESOURCE_IMAGE_SCOPE(name, fence) ((void)(fence))
 
 enum { RESOLVE = 1, IMAGE_CLEAR, ATTACH_CLEAR, FEEDBACK, WRITE, DRAW = 20, W_STENCIL_MASK = 1 };
 typedef struct {
@@ -23,13 +24,29 @@ static void clear_cond_log(const VkExec *ex, const char *name, int index) { (voi
 static void warn_once(int kind, const char *fmt, ...) { (void)fmt; assert(kind == W_STENCIL_MASK); ledger.warnings++; }
 static void resolve_rt(VkExec *ex) { assert(ex == current); event(RESOLVE); }
 int vk_texture_deferred(void) { return deferred; }
+int vk_exec_recording_failed(void) { return 0; }
 void vk_exec_barrier(VkExec *ex) { ex->in_pass = 0; }
-void vk_exec_pass_begin(VkExec *ex) { ex->in_pass = 1; }
+void vk_exec_pass_begin(VkExec *ex) {
+    ex->in_pass = 1;
+    ex->target_binding_mask = ex->depth.img && ex->depth.image == ex->depth.img->image ? 0x100 : 0;
+}
 void vk_exec_feedback_war(VkExec *ex, uint32_t written) {
     assert(ex->in_pass && written == 0x100); event(FEEDBACK);
 }
 void vk_gpu_gap_note(int kind, uint64_t units) { assert(kind == VK_GAP_CLEAR_TARGET && units == 640u * 480u); }
-void vk_texture_gpu_written(const tex_t *tex) { (void)tex; ledger.writes++; event(WRITE); }
+void vk_texture_image_write_prepare(VkImage image, uint64_t addr, uint64_t size) { assert(image && addr && size); }
+void resource_image_written(uint64_t image, uint64_t addr) { (void)image; (void)addr; assert(0); }
+int vk_texture_render_target_written(VkImage image, uint64_t addr) {
+    assert(image == current->depth.image && addr == current->depth.img->addr);
+    ledger.writes++; event(WRITE);
+    return 1;
+}
+void vk_texture_pinned_write_capture(const tex_t *t, VkImage image, VkPinnedTextureWrite *capture) {
+    assert(t && image && !capture->pin);
+}
+void vk_texture_pinned_write_prepare(const VkPinnedTextureWrite *capture) { (void)capture; assert(0); }
+void vk_texture_pinned_write_recorded(const VkPinnedTextureWrite *capture) { (void)capture; assert(0); }
+void vk_texture_pinned_write_release(VkPinnedTextureWrite *capture) { (void)capture; assert(0); }
 static void capture_image(VkCommandBuffer cb, VkImage image, VkImageLayout layout,
                           const VkClearDepthStencilValue *value, uint32_t n, const VkImageSubresourceRange *range) {
     (void)cb; assert(!current->in_pass && image == current->depth.image && layout == VK_IMAGE_LAYOUT_GENERAL && n == 1);
@@ -54,7 +71,10 @@ static Ledger sequence(int split, unsigned kind) {
     ledger = (Ledger){0}; deferred = 0;
     vk_cond_clears_run = vk_cond_clears_skip = vk_cond_depth_run = 0;
     VkExec ex = {.pass_w = 640, .pass_h = 480, .pass_layers = 2, .has_render_cond = 1};
+    VkTexImage image = {.image = (VkImage)(uintptr_t)1, .addr = 0x1000};
+    tex_t texture = {.L.size = 4096};
     ex.depth = (VkExecTarget){.image = (VkImage)(uintptr_t)1, .width = 640, .height = 480,
+        .img = &image, .tex = &texture,
         .aspect = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, .layers = 2, .base_layer = 3, .level = 1};
     current = &ex;
     p_clear_ds clear = {.depth = 2, .depth_mask = 1, .stencil = 0x123, .stencil_mask = 0xff};
@@ -63,7 +83,7 @@ static Ledger sequence(int split, unsigned kind) {
     case 1: ex.has_scissor = 1; ex.scissor = (p_scissor){.x = 7, .y = 9, .w = 20, .h = 30}; break;
     case 2: ex.has_scissor = 1; ex.scissor = (p_scissor){.x = 900, .y = 900, .w = 20, .h = 30}; break;
     case 3: ex.depth.is3d = 1; break;
-    case 4: ex.depth.blocks = 1; break;
+    case 4: ex.depth.blocks = 1; image.image = (VkImage)(uintptr_t)2; break;
     case 5: ex.render_disabled = 1; break;
     case 6: deferred = 1; break;
     case 7: ex.depth.image = VK_NULL_HANDLE; break;
@@ -96,6 +116,7 @@ int main(void) {
             assert(candidate.layers == 2);
         } else if (kind == 1 || kind == 3 || kind == 4 || kind == 11) {
             assert(candidate.attachment_clears == 1 && !candidate.image_clears && candidate.fb_dirty == 0x100);
+            assert(candidate.writes == (kind == 4 ? 0 : 1));
         } else assert(!candidate.image_clears && !candidate.attachment_clears && !candidate.writes);
         if (kind == 1) assert(candidate.rect.offset.x == 7 && candidate.rect.offset.y == 9 &&
                               candidate.rect.extent.width == 20 && candidate.rect.extent.height == 30);

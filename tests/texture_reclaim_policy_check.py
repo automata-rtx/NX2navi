@@ -84,7 +84,7 @@ def run(name, fixture):
 def lifecycle_fixture():
     source = (ROOT/'runtime/vk_texture.c').read_text()
     names = ('PRESENTS', 'VRAM_PRESSURE_DEFAULT', 'PRESSURE_STEP', 'IDLE_ROUNDS',
-             'STALE_FRAMES', 'GPU_STALE_FRAMES', 'GAP_TIMES', 'OVERWRITTEN_KEEP', 'RECLAIM_LOOK', 'EVICT_STEP', 'ROOM_CHECKS')
+             'STALE_FRAMES', 'GPU_STALE_FRAMES', 'GAP_TIMES', 'OVERWRITTEN_KEEP', 'RECLAIM_LOOK', 'EVICT_STEP')
     defines = '\n'.join(re.search(r'^#define '+name+r'\b[^\n]*', source, re.M)[0] for name in names)
     prefix = r"""
 #include <assert.h>
@@ -97,10 +97,12 @@ def lifecycle_fixture():
 static unsigned tex_rate=256, rt_trace;
 typedef struct Tex {
     struct { int mirrored, gpu_owned; } pub;
-    unsigned gpu_dirty, overwritten, retiring, released, back_gap;
+    unsigned gpu_dirty, overwritten, retiring, released, back_gap, pin_owned;
     uint32_t use_round;
     uint64_t bytes, rel_frame, use_frame, ow_frame;
     struct Tex *rel_prev, *rel_next;
+    void *material;
+    uintptr_t alloc;
     unsigned fixture_id, dropped;
 } Tex;
 static Tex *rel_head,*rel_tail,*sweep_at,*reclaim_at,*overwritten_at;
@@ -110,9 +112,7 @@ static uint32_t look_round=1000,submit_epoch;
 static struct { uint32_t cap; Tex **vals; } by_key;
 static struct { uint64_t frames; } gfx_counters;
 static struct { uint64_t checks, inspected, scheduled, pending, ns; } reclaim_stats;
-static uint64_t evict_wait,n_evict,n_evict_bytes,room_level,n_pressure_drops,n_commit_drops,n_cap_drops,n_commit_past;
-static uint32_t room_checks;
-static int64_t room_wanted;
+static uint64_t evict_wait,n_evict,n_evict_bytes,n_pressure_drops,n_commit_drops,n_cap_drops,n_commit_past;
 static int evict_logs,vram_pressure=80,tex_evict=1,commit_evict_on=1,commit_critical;
 static uint64_t commit_deficit, fake_pending, fake_cap, fake_used, fake_budget;
 static int fake_low,fake_held,fake_known=1;
@@ -128,7 +128,6 @@ static const char *cfg_get(const char *n) { (void)n;return NULL; }
 static int rt_knob(const char *n,const char *fallback) { (void)n;return atoi(fallback); }
 static uint64_t vk_sync_fence_done(void) { return sync_done; }
 static uint64_t vk_sync_issued(void) { return sync_issued; }
-static int64_t plat_xchg64(int64_t *p,int64_t n) { int64_t old=*p;*p=n;return old; }
 static int vk_mem_vram_live(uint64_t *u,uint64_t *b) { *u=fake_used;*b=fake_budget;return fake_known; }
 static int vk_mem_vram(uint64_t *u,uint64_t *b,int *exact) { *exact=1;return vk_mem_vram_live(u,b); }
 static void retire_sweep(void) {}
@@ -136,7 +135,14 @@ static int commit_is_low(void) { return fake_low; }
 static int commit_drops_held(void) { return fake_held; }
 static uint64_t released_cap_bytes(void) { return fake_cap; }
 static uint64_t vk_mem_reclaim_pending(void) { return fake_pending; }
-static uint64_t evict_disused(uint64_t want) { disuse_want=want;return 0; }
+static uint64_t evict_disused(uint64_t want,uint32_t domain) { assert(!domain);disuse_want=want;return 0; }
+static struct {uint64_t resident_bytes,retained_bytes,pending_bytes,backend_accounted_bytes;} material_ledger;
+static uint64_t texture_owned_bytes(Tex *e){return e->bytes;}
+static int texture_reclaim_on_heap(uintptr_t allocation,uint32_t domain){return !domain||allocation==domain;}
+static uint64_t content_reclaim(uint64_t want,int live){(void)want;(void)live;return 0;}
+static int content_drop_providers_pressure(uint64_t need,int preserve){(void)need;(void)preserve;return 0;}
+static void resource_core_budget_refresh(void){}
+static void vk_exec_texture_publications_request_reclaim(void){}
 """
     unlink = function(source,'rel_unlink')
     drop = r"""
@@ -156,7 +162,7 @@ static void reset(void) {
     rel_head=rel_tail=sweep_at=reclaim_at=overwritten_at=NULL;reclaim_gpu_phase=reclaim_cpu_seen=0;rel_bytes=total_dropped=disuse_want=0;
     fake_pending=0;fake_low=fake_held=commit_critical=0;commit_deficit=0;fake_cap=UINT64_MAX;
     fake_known=1;fake_used=500*MB;fake_budget=1000*MB;vram_pressure=80;tex_evict=commit_evict_on=1;
-    room_wanted=room_level=room_checks=0;evict_wait=0;sync_done=sync_issued=100;
+    evict_wait=0;sync_done=sync_issued=100;
     gfx_counters.frames=clock_frame;submit_epoch=0;
 }
 static Tex *append(unsigned i,uint64_t bytes,int protected) {
@@ -247,9 +253,18 @@ int main(void) {
     rel_unlink(&textures[512]);assert(overwritten_at==&textures[513]);
     drop_overwritten();assert(textures[600].dropped&&total_dropped==MB&&n_over_drops>0);
     assert(reclaim_stats.inspected<=2*RECLAIM_LOOK);
+    reset();Tex *unrelated=append(1,MB,0),*matching=append(2,MB,0);
+    unrelated->alloc=3;matching->alloc=4;
+    assert(reclaim_released(MB,&count,DROP_VRAM,4)==MB&&matching->dropped&&!unrelated->dropped);
+    // A retained explicit image cannot provide capacity until its actual pin ownership ends.
+    reset();Tex *pinned=append(1,MB,0);pinned->pin_owned=1;append(2,MB,0);
+    assert(reclaim_released(MB,&count,DROP_VRAM)==MB&&!pinned->dropped&&textures[2].dropped);
+    reset();by_key.cap=64;by_key.vals=table;pinned=live(1,0);pinned->pin_owned=1;live(2,0);
+    assert(evict_idle(MB,0,0,DROP_IDLE_VRAM)==MB&&!pinned->dropped&&textures[2].dropped);
     puts("texture reclamation lifecycle: passed");return 0;
 }
 """
+    main = re.sub(r'(reclaim_released|evict_idle)\(([^)]*,DROP_[A-Z_]+)\)', r'\1(\2,0)', main)
     return prefix+defines+'\n'+unlink+drop+functions+main
 
 if __name__ == '__main__':

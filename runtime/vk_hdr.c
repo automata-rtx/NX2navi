@@ -756,7 +756,8 @@ int vk_hdr_track;                 // vk_exec_draw.c calls vk_hdr_draw: set at th
 static volatile int32_t g_active;   // the swapchain is HDR10 (gfx_present.c vk_hdr_set_active)
 static PlatMutex rec_lock = PLAT_MUTEX_INIT;
 // per presented window image: what the last draw copied, and where in the stream (vk_exec_stream_pos)
-static struct { VkImage win, src; VkFormat fmt; uint64_t pos; } recs[4];
+// The texture lock serializes observing, taking, and invalidating the weak native image identity.
+static struct { VkImage win, src; VkFormat fmt; uint64_t pos, addr; } recs[4];
 static int nrecs;
 
 void vk_hdr_set_active(int on) { plat_xchg32(&g_active, on); }
@@ -778,6 +779,7 @@ void vk_hdr_draw(VkExec *ex, const VkPipeInfo *info) {
     uint64_t pos = vk_exec_stream_pos();
     VkImage src = VK_NULL_HANDLE;
     VkFormat fmt = VK_FORMAT_UNDEFINED;
+    uint64_t addr = 0;
     int ntex = 0, slot = -1;
     for (uint32_t i = 0; i < info->n_bindings; i++) {
         const VkPipeBinding *bd = &info->bindings[i];
@@ -785,18 +787,29 @@ void vk_hdr_draw(VkExec *ex, const VkPipeInfo *info) {
         ntex += bd->count ? bd->count : 1;
         if ((bd->res->type & 0x7ff) == 3 && !bd->res->separate) slot = bd->res->slot;   // a plain 2D texture
     }
+    vk_texture_lock();
     if (ntex == 1 && slot >= 0 && slot < 128 && ex->tex[1][slot]) {
         const VkTexImage *s = vk_texture_by_id(NVN_HANDLE_TEX(ex->tex[1][slot]), NULL, NULL);
-        if (s && is_float(s->format) && s->width == t->width && s->height == t->height && s->samples == 1)
-            src = s->image, fmt = s->format;
+        if (s && is_float(s->format) && s->width == t->width && s->height == t->height && s->samples == 1) {
+            src = s->image;
+            fmt = s->format;
+            addr = s->addr;
+        }
     }
     plat_mutex_lock(&rec_lock);
-    for (int i = 0; i < nrecs; i++)
-        if (recs[i].win == t->image && pos >= recs[i].pos) recs[i].src = src, recs[i].fmt = fmt, recs[i].pos = pos;
+    for (int i = 0; i < nrecs; i++) {
+        if (recs[i].win == t->image && pos >= recs[i].pos) {
+            recs[i].src = src;
+            recs[i].fmt = fmt;
+            recs[i].pos = pos;
+            recs[i].addr = addr;
+        }
+    }
     plat_mutex_unlock(&rec_lock);
+    vk_texture_unlock();
 }
 
-void vk_hdr_present_source(const VkTexImage *win, VkImage *image, VkFormat *format) {
+void vk_hdr_present_source_locked(const VkTexImage *win, VkTexImage *source) {
     if (!vk_hdr_wanted() || vk_hdr_native()) return;
     vk_hdr_track = 1;
     plat_mutex_lock(&rec_lock);
@@ -805,14 +818,18 @@ void vk_hdr_present_source(const VkTexImage *win, VkImage *image, VkFormat *form
         if (recs[i].win == win->image) r = i;
     if (r < 0 && nrecs < 4) r = nrecs++, recs[r].win = win->image, recs[r].src = VK_NULL_HANDLE, recs[r].pos = 0;
     // kept until the next draw into the window texture: a present again without a new copy shows the same picture
-    if (r >= 0 && recs[r].src && vk_hdr_active()) *image = recs[r].src, *format = recs[r].fmt;
+    if (r >= 0 && recs[r].src && vk_hdr_active()) {
+        source->image = recs[r].src;
+        source->format = recs[r].fmt;
+        source->addr = recs[r].addr;
+    }
     plat_mutex_unlock(&rec_lock);
     static int logged;
-    if (!logged && *image != win->image) logged = 1, rt_log("hdr: the present reads the game's float picture");
+    if (!logged && source->image != win->image) logged = 1, rt_log("hdr: the present reads the game's float picture");
 }
 
 void vk_hdr_image_gone(VkImage image) {   // a texture image went away: forget it as window or source
-    if (!vk_hdr_track) return;   // no records before the first HDR present (vk_hdr_present_source): no lock per image
+    if (!vk_hdr_track) return;   // no records before the first HDR present: no lock per image
     plat_mutex_lock(&rec_lock);
     for (int i = 0; i < nrecs; i++) {
         if (recs[i].src == image) recs[i].src = VK_NULL_HANDLE;

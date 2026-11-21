@@ -1,47 +1,132 @@
 #version 450
-// The mesh fallback's pass between a draw's task dispatch and its mesh dispatch (vk_mesh_fb.c vk_meshfb_scan,
-// mesh_fb.c): every task workgroup wrote how many mesh workgroups it starts into its payload (word 1). This lists them
-// in task order, so that mesh workgroup g finds its task and its index among that task's in list entry g, and writes
-// the draw's record: how many mesh workgroups to dispatch and how many instances to draw.
-//
-// One thread walks the tasks: the order of the list is the order the primitives are drawn in, which has to be the
-// same in every frame and in the depth and colour passes of one frame.
+// A one-invocation pass writes legal indirect commands before the first guest dispatch.
+// For a task draw a second pass assembles the task payloads in deterministic task order.
 layout(local_size_x = 1) in;
 
 layout(push_constant) uniform Params {
-    uint rec;          // the record's first word in the record buffer
-    uint task_words;   // words of a task workgroup's payload in the task buffer
-    uint fan;          // mesh workgroups a task workgroup starts at most
-    uint slot_words;   // words of a mesh workgroup's output in the mesh buffer
-    uint verts;        // vertices drawn per mesh workgroup
-    uint max_groups;   // workgroups one dispatch may have (maxComputeWorkGroupCount)
+    uint rec;           // first word of the draw's 64-byte record
+    uint capacity;      // first word of the scene's required report
+    uint flags;
+    uint task_words;
+    uint task_fan;      // translator's native task emission bound
+    uint slot_words;
+    uint vertices;
+    uint max_groups;    // maxComputeWorkGroupCount[0]
+    uint phase;         // 0 normalize the outer dispatch, 1 assemble task output
+    uint ordinal_low;
+    uint ordinal_high;
+    uint scene_low;
+    uint scene_high;
 } pc;
 
-// The record: words 0-2 the task dispatch (x written before this pass), 4-6 the mesh dispatch, 8-11 the draw (vertices,
-// instances, first vertex, first instance), 12 the mesh workgroups the tasks asked for, 13 the task workgroups.
+// Record words 0-2 and 4-6 are the task and mesh dispatch arguments. Words 8-11 are the draw
+// arguments, 12-13 are legacy diagnostic counts and 14 is the immutable outer request.
 layout(set = 0, binding = 0) buffer Rec { uint w[]; } rec;
 layout(set = 0, binding = 1) readonly buffer Task { uint w[]; } task;
 layout(set = 0, binding = 2) writeonly buffer List { uint e[]; } list;
-layout(set = 0, binding = 3) readonly buffer Mesh { uint w[]; } mesh;   // read for its size alone
+layout(set = 0, binding = 3) readonly buffer Mesh { uint w[]; } mesh;
 
-void main() {
-    uint asked = rec.w[pc.rec];
-    uint tasks = min(min(asked, uint(task.w.length()) / pc.task_words), 1u << 24);
-    uint room = min(min(uint(mesh.w.length()) / pc.slot_words, uint(list.e.length())), pc.max_groups);
-    uint fan = min(pc.fan, 255u);
-    uint m = 0u, want = 0u;
-    for (uint t = 0u; t < tasks; t++) {
-        uint c = min(task.w[t * pc.task_words + 1u], fan);
-        want += c;
-        for (uint j = 0u; j < c && m < room; j++) list.e[m++] = t | j << 24;
-    }
-    rec.w[pc.rec + 4u] = m;
-    rec.w[pc.rec + 5u] = 1u;
-    rec.w[pc.rec + 6u] = 1u;
-    rec.w[pc.rec + 8u] = pc.verts;
-    rec.w[pc.rec + 9u] = m;
+const uint ARGUMENT_TASK = 1u;
+const uint ARGUMENT_PROBE_PARTIAL = 2u;
+const uint LIMIT_TASK_COUNT = 1u;
+const uint LIMIT_MESH_COUNT = 2u;
+const uint LIMIT_TASK_PACKING = 3u;
+const uint LIMIT_EXPANSION = 4u;
+const uint PACKED_TASKS = 1u << 24;
+const uint PACKED_GROUPS = 1u << 8;
+
+bool probe_partial() {
+    return (pc.flags & ARGUMENT_PROBE_PARTIAL) != 0u;
+}
+
+void capacity_failure(uint limit, uint outer, uint mesh_low, uint mesh_high, uint available, uint detail) {
+    uint at = pc.capacity;
+    if (probe_partial() || rec.w[at + 2u] != 0u) return;
+    // Normalization writes the exact scene cookie. Only the first ordinary capacity failure overwrites the body.
+    rec.w[at + 2u] = limit;
+    rec.w[at + 3u] = outer;
+    rec.w[at + 4u] = mesh_low;
+    rec.w[at + 5u] = mesh_high;
+    rec.w[at + 6u] = available;
+    rec.w[at + 7u] = detail;
+    rec.w[at + 8u] = pc.ordinal_low;
+    rec.w[at + 9u] = pc.ordinal_high;
+}
+
+void set_dispatch(uint word, uint groups) {
+    rec.w[word] = groups;
+    rec.w[word + 1u] = 1u;
+    rec.w[word + 2u] = 1u;
+}
+
+void set_mesh_and_draw(uint groups) {
+    set_dispatch(pc.rec + 4u, groups);
+    rec.w[pc.rec + 8u] = pc.vertices;
+    rec.w[pc.rec + 9u] = groups;
     rec.w[pc.rec + 10u] = 0u;
     rec.w[pc.rec + 11u] = 0u;
-    rec.w[pc.rec + 12u] = want;
-    rec.w[pc.rec + 13u] = asked;
+}
+
+uint mesh_room(bool with_tasks) {
+    uint room = min(uint(mesh.w.length()) / pc.slot_words, pc.max_groups);
+    return with_tasks ? min(room, uint(list.e.length())) : room;
+}
+
+uint initial_groups(uint asked, uint room) {
+    if (asked <= room) return asked;
+    return probe_partial() ? room : 0u;
+}
+
+void normalize(uint asked) {
+    if ((pc.flags & ARGUMENT_TASK) != 0u) {
+        uint room = min(min(uint(task.w.length()) / pc.task_words, PACKED_TASKS), pc.max_groups);
+        if (asked > room) capacity_failure(LIMIT_TASK_COUNT, asked, 0u, 0u, room, 0u);
+        set_dispatch(pc.rec, initial_groups(asked, room));
+        set_mesh_and_draw(0u);
+        rec.w[pc.rec + 12u] = 0u;
+        rec.w[pc.rec + 13u] = asked;
+    } else {
+        uint room = mesh_room(false);
+        if (asked > room) capacity_failure(LIMIT_MESH_COUNT, asked, asked, 0u, room, 0u);
+        set_dispatch(pc.rec, 0u);
+        set_mesh_and_draw(initial_groups(asked, room));
+        rec.w[pc.rec + 12u] = asked;
+        rec.w[pc.rec + 13u] = 0u;
+    }
+}
+
+void assemble(uint asked) {
+    uint tasks = rec.w[pc.rec]; // only the task workgroups actually dispatched produced readable payload
+    uint room = mesh_room(true);
+    uint groups = 0u, largest = 0u;
+    uint wanted_low = 0u, wanted_high = 0u;
+    for (uint t = 0u; t < tasks; t++) {
+        // Native translator clamps the payload count to the number of threads in the producing task.
+        uint wanted = min(task.w[t * pc.task_words + 1u], pc.task_fan);
+        uint sum = wanted_low + wanted;
+        if (sum < wanted_low) wanted_high++;
+        wanted_low = sum;
+        largest = max(largest, wanted);
+        uint packable = min(wanted, PACKED_GROUPS);
+        for (uint j = 0u; j < packable && groups < room; j++) list.e[groups++] = t | (j << 24);
+    }
+    bool packing_overflow = largest > PACKED_GROUPS;
+    bool expansion_overflow = wanted_high != 0u || wanted_low > room;
+    if (packing_overflow)
+        capacity_failure(LIMIT_TASK_PACKING, asked, wanted_low, wanted_high, PACKED_GROUPS, largest);
+    else if (expansion_overflow)
+        capacity_failure(LIMIT_EXPANSION, asked, wanted_low, wanted_high, room, 0u);
+    set_mesh_and_draw((!packing_overflow && !expansion_overflow) || probe_partial() ? groups : 0u);
+    rec.w[pc.rec + 12u] = wanted_high != 0u ? 0xffffffffu : wanted_low;
+}
+
+void main() {
+    uint asked = rec.w[pc.rec + 14u];
+    if (pc.phase == 0u) {
+        rec.w[pc.capacity] = pc.scene_low;
+        rec.w[pc.capacity + 1u] = pc.scene_high;
+        normalize(asked);
+    } else {
+        assemble(asked);
+    }
 }

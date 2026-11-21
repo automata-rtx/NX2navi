@@ -7,9 +7,41 @@
 #ifndef NX2NAVI_REPLAY_WORK_DESCRIPTORS
 #define NX2NAVI_REPLAY_WORK_DESCRIPTORS 0
 #endif
+#ifndef NX2NAVI_REPLAY_WORK_POOL
+#define NX2NAVI_REPLAY_WORK_POOL 0
+#endif
+#ifndef NX2NAVI_REPLAY_WORK_CHAIN
+#define NX2NAVI_REPLAY_WORK_CHAIN 0
+#endif
+
+// These whole-unit regions include front preparation, which has no sampled draw scope. Nested regions partition
+// wall time; residual is the unit's time outside them. They never put a clock around individual pool members.
+#define RWT_REGIONS(X) \
+    X(RESIDUAL, "residual") X(POOL_RESOLVE, "pool-resolve") X(POOL_LOCK, "pool-lock-wait") \
+    X(TEXTURE_LOCK, "texture-lock-wait") X(POOL_WAIT, "pool-publication-wait") \
+    X(POOL_SYNC, "pool-sync") X(POOL_TAKE, "pool-take-set") X(POOL_CURRENT, "pool-current") \
+    X(POOL_ORDER, "pool-order-check") X(POOL_ENTRIES, "pool-sync-entries") \
+    X(POOL_FRONTIER, "pool-frontier") X(POOL_REBUILD, "pool-frontier-rebuild") \
+    X(POOL_INVALIDATE, "pool-authority-invalidation") X(POOL_DUE, "pool-due-members") \
+    X(POOL_CATCH, "pool-catch-up") X(POOL_PUBLISH, "pool-publish") X(POOL_USE, "pool-publication-use") \
+    X(POOL_ORDER_PUBLISH, "pool-order-publish") X(POOL_MANIFEST, "pool-publication-create-release") \
+    X(PUBLICATION_LOCK, "publication-texture-lock-wait") X(PUBLICATION_CREATE, "publication-create-image-walk") \
+    X(PUBLICATION_CANCEL, "publication-release-cancel") X(PUBLICATION_COLLECT, "publication-release-collect") \
+    X(PUBLICATION_USE, "publication-use-nodes") \
+    X(REPLAY_SERVICE, "replay-service") X(COMMAND_WALK, "command-walk") \
+    X(GROUP_FRONT, "group-orchestration") X(CHUNK_BODY, "chunk-command-processing") \
+    X(OP_DRAW, "operation-draw") X(OP_MESH, "operation-mesh") X(OP_COMPUTE, "operation-compute") \
+    X(OP_UPDATE, "operation-update") X(OP_TRANSFER, "operation-transfer") X(OP_STATE, "operation-state") \
+    X(DRAW_PREPARE, "draw-prepare") X(DRAW_BIND, "draw-bind-resources") \
+    X(EFFECT_DECLARE, "effect-declare-and-seal") X(EFFECT_RECORDED, "effect-recorded") \
+    X(EFFECT_RELEASE, "effect-release") X(COORDINATION, "recording-coordination") \
+    X(COMPLETION, "completion-cleanup")
+#define RWT_ENUM(name, text) RWT_REGION_##name,
+enum { RWT_REGIONS(RWT_ENUM) RWT_REGION_COUNT };
+#undef RWT_ENUM
 
 #define RWT_ROLES(X) \
-    X(OWNER, "owner-serial") X(HELP, "owner-help") X(WORKER, "worker")
+    X(OWNER, "owner-serial") X(HELP, "owner-help") X(WORKER, "worker") X(COMPLETION, "completion")
 #define RWT_KINDS(X) \
     X(DRAW, "draw") X(MESH, "mesh") X(COMPUTE, "compute") X(UPDATE, "update")
 #if NX2NAVI_REPLAY_WORK_DESCRIPTORS
@@ -66,7 +98,12 @@ typedef struct {
     uint32_t lost;
 } RwtHistory;
 typedef struct RwtUnit RwtUnit;
-typedef struct { RwtUnit *unit, *previous; unsigned entered; } RwtUnitScope;
+typedef struct { RwtUnit *unit, *previous; uint64_t begin; unsigned entered; } RwtUnitScope;
+typedef struct {
+    RwtUnit *unit;
+    uint64_t begin, children;
+    unsigned region, previous, depth;
+} RwtRegionScope;
 typedef struct RwtDrawScope {
     struct RwtDrawScope *previous;
     RwtUnit *unit;
@@ -75,7 +112,10 @@ typedef struct RwtDrawScope {
 } RwtDrawScope;
 typedef struct { RwtDrawScope *draw; unsigned previous; } RwtStageScope;
 RwtUnitScope gfx_rwt_unit_begin(unsigned role, uint64_t fence, uint64_t replay, uint64_t group, unsigned chunk);
+RwtUnitScope gfx_rwt_completion_begin(uint64_t fence);
 void gfx_rwt_unit_end(RwtUnitScope *scope);
+RwtRegionScope gfx_rwt_region_begin(unsigned region);
+void gfx_rwt_region_end(RwtRegionScope *scope);
 RwtDrawScope gfx_rwt_draw_begin(unsigned kind);
 void gfx_rwt_draw_activate(RwtDrawScope *scope);
 void gfx_rwt_draw_end(RwtDrawScope *scope);
@@ -117,6 +157,27 @@ uint64_t gfx_rwt_replay(void);
 #define RWT_COUNT(key, value) ((void)0)
 #define RWT_HISTORY_LOOKUP(cx, recipe, hit) ((void)0)
 #define RWT_HISTORY_EVICT(cx, recipe) ((void)0)
+#endif
+
+#if NX2NAVI_REPLAY_WORK && NX2NAVI_REPLAY_WORK_POOL
+#define RWT_REGION(name, region) \
+    RwtRegionScope name __attribute__((cleanup(gfx_rwt_region_end))) = gfx_rwt_region_begin(region)
+#define RWT_REGION_END(name) gfx_rwt_region_end(&(name))
+#define RWT_REGION_CALL(region, expression) ({ RWT_REGION(_rwt_region_call, region); (expression); })
+#else
+#define RWT_REGION(name, region) ((void)0)
+#define RWT_REGION_END(name) ((void)0)
+#define RWT_REGION_CALL(region, expression) (expression)
+#endif
+
+#if NX2NAVI_REPLAY_WORK && NX2NAVI_REPLAY_WORK_CHAIN
+#define RWT_CHAIN(name, region) \
+    RwtRegionScope name __attribute__((cleanup(gfx_rwt_region_end))) = gfx_rwt_region_begin(region)
+#define RWT_COMPLETION(name, fence) \
+    RwtUnitScope name __attribute__((cleanup(gfx_rwt_unit_end))) = gfx_rwt_completion_begin(fence)
+#else
+#define RWT_CHAIN(name, region) ((void)0)
+#define RWT_COMPLETION(name, fence) ((void)0)
 #endif
 
 // Extra subdivisions use the existing bounded draw sample. Ordinary profiling keeps its original stage costs.

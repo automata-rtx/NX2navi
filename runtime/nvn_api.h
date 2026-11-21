@@ -113,14 +113,25 @@ static inline const void *nvn_op_payload(const op_hdr *h) { return h + 1; }
 int nvn_handle_live(uint64_t handle);                      // 1 while the handle's copy exists (its control memory was
                                                            // not added again)
 uint64_t nvn_handle_bytes(uint64_t handle);                // bytes of the copy, OP_BEGIN to OP_END; 0 if not live
+uint64_t nvn_submission_handle_bytes(uint64_t handle);     // includes copies still retained by a queued submission
+int nvn_submission_ordered_scratch_max(const uint64_t *handles, int n, uint64_t *bytes);
+
+static inline uint64_t nvn_generated_draw_index_bytes(const p_draw *draw) {
+    if (draw->prim == NVN_DRAW_PRIMITIVE_QUADS && draw->count >= 4)
+        return ((uint64_t)draw->count / 4) * 6 * sizeof(uint32_t);
+    if (draw->prim == NVN_DRAW_PRIMITIVE_LINE_LOOP && draw->count >= 2)
+        return ((uint64_t)draw->count + 1) * sizeof(uint32_t);
+    return 0;
+}
 // Prepared copies, including queued retired handles and submission clones: the OP_BIND_UBO offsets generated at
 // EndRecording. Returned storage has the command copy's lifetime; the caller must already hold its submit/replay
 // lifetime. Returns 0 for unindexed or raw backend-probe handles, whose commands still need walking.
 int nvn_record_uniform_offsets(uint64_t handle, const size_t **offsets, size_t *count);
 // A recording's structural plan contains no resolved GPU objects or captured memory contents. Offsets survive
 // submission cloning; the arrays share the command copy's retirement lifetime. A RUN span has only ordinary state
-// operations and draws. Target, clear, mesh and update boundaries remain explicit for the replay's dynamic rules.
-enum { NVN_PLAN_SERIAL, NVN_PLAN_RUN, NVN_PLAN_TARGET, NVN_PLAN_CLEAR, NVN_PLAN_MESH, NVN_PLAN_UPDATE };
+// operations and draws. Target, clear, mesh, update and generated-index boundaries remain explicit.
+enum { NVN_PLAN_SERIAL, NVN_PLAN_RUN, NVN_PLAN_TARGET, NVN_PLAN_CLEAR, NVN_PLAN_MESH, NVN_PLAN_UPDATE,
+       NVN_PLAN_GENERATED_INDEX };
 typedef struct {
     size_t begin, end;
     uint32_t ops, draws, kind, draw_stride;   // nonzero: only ordinary draw records, each this many bytes
@@ -232,13 +243,19 @@ static inline uint32_t nvn_record_op_class(uint32_t op) {
     case OP_UPDATE_UB: return NVN_PLAN_UPDATE;
     case OP_BEGIN: case OP_VIEWPORTS: case OP_SCISSOR: case OP_DEPTH_RANGE: case OP_STENCIL: case OP_POLY_OFFSET:
     case OP_BLEND_COLOR: case OP_DEPTH_CLAMP: case OP_RASTER_DISCARD: case OP_PRIM_RESTART: case OP_COPY_STRIDE:
-    case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR:
+    case OP_SET_SAMP_POOL: case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR:
     case OP_BIND_VSTREAM: case OP_BIND_VBUF: case OP_BIND_UBO: case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_SAMP:
     case OP_BIND_IMG: case OP_PUSH_CC: case OP_DRAW: case OP_DRAW_IDX: case OP_DRAW_IDX_IND:
     case OP_REPORT_COUNTER: case OP_RESET_COUNTER: case OP_RENDER_ENABLE: case OP_RENDER_COND:
         return NVN_PLAN_RUN;
     default: return NVN_PLAN_SERIAL;
     }
+}
+static inline uint32_t nvn_record_span_class(const op_hdr *h) {
+    if (h->op == OP_DRAW && h->size >= sizeof *h + sizeof(p_draw) &&
+        nvn_generated_draw_index_bytes(nvn_op_payload(h)))
+        return NVN_PLAN_GENERATED_INDEX;
+    return nvn_record_op_class(h->op);
 }
 static inline uint32_t nvn_record_exec_flags(uint32_t op) {
     if (op == NVN_EXEC_STATE) return NVN_EXEC_LINEAR | NVN_EXEC_RUN;
@@ -262,6 +279,18 @@ uint64_t nvn_submit_count(void);                           // QueueSubmitCommand
 // thread that replays them; now = nvn_submit_count().
 void nvn_pins_sweep(uint64_t now, const tex_t *const *keep, int nkeep);
 void nvn_pins_stats(uint64_t *live, uint64_t *freed);      // pins that exist, pins freed so far
+// Native owners are attached only to verified recording pins. The owner is borrowed while the caller
+// keeps the pin (or its own owner lock). Release callbacks run outside pin_lock, including during shutdown.
+const tex_t *nvn_texture_pin_acquire(const tex_t *immutable_descriptor);
+void *nvn_texture_pin_attachment(const tex_t *);
+int nvn_texture_pin_attach(const tex_t *, void *owner, void (*release)(void *));
+int nvn_texture_pin_unattach(const tex_t *, const void *owner);
+const tex_t *nvn_texture_pin_retain_attachment(uint64_t serial, const void *owner);
+void nvn_texture_pin_release(const tex_t *);
+void nvn_texture_pin_attachments_clear(void);
+// Event continuations copy resolved command bytes but also keep the source recording's counted texture pins.
+void *nvn_record_retain_pins(uint64_t handle);
+void nvn_record_release_pins(void *lease);
 const char *nvn_op_name(uint32_t op);                      // "DRAW_IDX", ...; "?" past OP_COUNT_
 // MemoryPoolInvalidateMappedRange: the CPU is about to read pool storage the GPU wrote. Weak no-op in nvn_ext.c; a back
 // end that renders into host-side copies defines it and writes them back.

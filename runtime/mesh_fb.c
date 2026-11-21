@@ -420,16 +420,20 @@ static uint32_t *convert(const uint32_t *w, uint64_t words, const MeshFbInfo *m,
     // ---- pass 2: the module again
     uint32_t head[5] = {w[0], w[1], w[2], 0, 0};
     wb_put(&out, head, 5);
+    // MeshShading implies Shader in the source. The compute stage needs Shader explicitly.
+    INS(&out, OpCapability, CapShader);
     for (size_t i = 0; i < n; i++) {
         const uint32_t *a = w + in[i].at + 1;
         uint32_t op = in[i].op, len = in[i].len;
         if (i == first_decl) wb_put(&out, c.deco.w, c.deco.n);
         if (i == first_fn) wb_put(&out, c.glob.w, c.glob.n);
         if (i >= e0 && i <= e1) continue;   // the old entry function
-        if (op == OpCapability && a[0] == CapMeshShading) continue;
+        if (op == OpCapability && (a[0] == CapMeshShading || a[0] == CapShader)) continue;
         if (op == OpExtension && len >= 6 && !memcmp(a, "SPV_EXT_mesh_shader", 20)) continue;
         if (op == OpExecutionMode && a[1] != ModeLocalSize) continue;
-        if ((op == OpName || op == OpDecorate || op == OpDecorateId || op == OpDecorateString) && id_in(removed, n_removed, a[0])) continue;
+        // Debug names can refer to locals of the removed entry function.
+        if (op == OpName) continue;
+        if ((op == OpDecorate || op == OpDecorateId || op == OpDecorateString) && id_in(removed, n_removed, a[0])) continue;
         if ((op == OpTypePointer && id_in(removed, n_removed, a[0])) || (op == OpVariable && id_in(removed, n_removed, a[1]))) continue;
         if (op == OpEntryPoint) {   // every global variable is its interface (SPIR-V 1.4)
             uint32_t ep[4] = {(uint32_t)((n_gvars + 5) << 16) | OpEntryPoint, ModelGLCompute, entry, 0x6e69616d /* "main" */};

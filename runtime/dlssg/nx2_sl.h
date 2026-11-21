@@ -25,6 +25,56 @@ typedef struct {
     int reset;
 } Nx2SlCamera;
 
+enum { NX2SL_INPUTS_ABI_V1 = 1 };
+enum { NX2SL_INPUT_HUDLESS = 1u << 0, NX2SL_INPUT_UI_ALPHA = 1u << 1 };
+enum { NX2SL_INPUT_NO_LATE_TAGS = 0, NX2SL_INPUT_TIMELINE = 1, NX2SL_INPUT_UNPROVEN = 2 };
+
+// Version 1 has no request flags. A host initializes each input and output prefix.
+typedef struct {
+    uint32_t size, version, flags, reserved;
+    uint64_t frame, generation;
+    VkSwapchainKHR swapchain;
+    VkCommandBuffer cb;
+    const Nx2SlImage *depth, *motion, *hudless, *alpha;
+    const Nx2SlCamera *camera;
+    uint32_t width, height;
+    int32_t rect[4], generated;
+} Nx2SlFrameInputsV1;
+
+typedef struct {
+    uint32_t size, version, flags, reserved;
+    uint64_t ticket, frame, generation;
+    VkSwapchainKHR swapchain;
+    uint32_t sdk_frame, accepted, uncertain;
+} Nx2SlInputReceipt;
+
+typedef struct {
+    uint32_t size, version, flags, reserved;
+    uint64_t ticket;
+    VkSemaphore semaphore;
+    uint64_t value;
+} Nx2SlInputCompletion;
+
+enum { NX2SL_FG_MEMORY_ABI_V1 = 1, NX2SL_FG_ESTIMATE_ROUGH_VRAM = 1u << 0 };
+
+// Input dimensions and formats are native Vulkan values. Optional HUD/alpha formats are VK_FORMAT_UNDEFINED.
+typedef struct {
+    uint32_t size, version, flags, reserved;
+    uint64_t generation;
+    VkSwapchainKHR swapchain;
+    uint32_t backbuffers, generated;
+    uint32_t mvec_width, mvec_height, depth_width, depth_height, color_width, color_height;
+    VkFormat color, depth, motion, hudless, alpha;
+    uint32_t recomposition, queue_mode;
+} Nx2SlFgConfigV1;
+
+typedef struct {
+    uint32_t size, version, flags, reserved;
+    uint64_t vram_bytes;
+    int32_t sdk_result;
+    uint32_t padding;
+} Nx2SlFgEstimateV1;
+
 typedef void (*Nx2SlLog)(const char *line);
 
 #ifdef __cplusplus
@@ -77,6 +127,18 @@ typedef void (*PFN_nx2sl_present_marker)(int after, uint32_t frame);
 typedef uint64_t (*PFN_nx2sl_shown)(void);
 // Queried on the present thread after the present; the SDK owns this timeline semaphore.
 typedef int (*PFN_nx2sl_input_retirement)(VkSemaphore *semaphore, uint64_t *value);
+// These four optional exports are negotiated together. No SDK object pointer crosses the bridge.
+typedef int (*PFN_nx2sl_frame_inputs_v1)(const Nx2SlFrameInputsV1 *, Nx2SlInputReceipt *);
+typedef VkResult (*PFN_nx2sl_present_inputs_v1)(PFN_vkQueuePresentKHR, VkQueue, const VkPresentInfoKHR *,
+                                                const Nx2SlInputReceipt *, Nx2SlInputCompletion *);
+// Positive removal only while the exact receipt is still the next unattempted present.
+typedef int (*PFN_nx2sl_cancel_inputs_v1)(const Nx2SlInputReceipt *);
+// Returns 1 only when the SDK is known shut down or was never initialized.
+typedef int (*PFN_nx2sl_shutdown_checked_v1)(void);
+// Optional independent cold-configuration estimate. The returned bytes are a rough VRAM projection.
+typedef int (*PFN_nx2sl_estimate_fg_v1)(const Nx2SlFgConfigV1 *, Nx2SlFgEstimateV1 *);
+// Take the same typed present's post-present FG execution observation once, without resampling SDK state.
+typedef int (*PFN_nx2sl_fg_observed_v1)(uint64_t frame, const Nx2SlFgConfigV1 *config);
 typedef void (*PFN_nx2sl_shutdown)(void);
 #ifdef __cplusplus
 }

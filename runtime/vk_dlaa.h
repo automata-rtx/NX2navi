@@ -21,9 +21,8 @@ int vk_ngxfg_evaluate(VkCommandBuffer cb, const VkNgxImage *bb, const VkNgxImage
                       const VkNgxImage *real);
 int vk_dlaa_fsr3(void);   // the setting is on and its upscaler is AMD FSR 3.1, which loads
 int vk_dlaa_needs_restart(void);   // the menu's upscaler cannot start in this run
-// Frame generation (vk_fg.cpp): the depth and motion vectors of the frame DLSS or FSR 3.1 last ran on, with its jitter
-// and whether its history reset; 1 once per evaluation (0: none since the last call). The images stay valid until the
-// next frame's scene draws over them, after this present.
+// Frame generation (vk_fg.cpp): obtains the inputs of the selected composition once. The owning receipt retains
+// its native depth image/view and motion generation through the graphics composition submit.
 int vk_dlaa_fg_inputs(VkFfxImage *depth, VkFfxImage *mv, float *jx, float *jy, int *reset);
 // ... their views, and this frame's camera for DLSS Frame Generation (vk_dlssg.c): matrices for row vectors (v * M, the
 // rows stored in order), as Streamline takes them; 0 without a camera that frame.
@@ -39,11 +38,21 @@ typedef struct {
     int infinite, inverted;
 } VkDlaaCamera;
 int vk_dlaa_fg_views(VkImageView *depth, VkImageView *mv);
-// The picture without the HUD at the size of the game's picture, in *fmt: RGBA8 UNORM bytes like it (sRGB-encoded), or
-// RGBA16F linear with HDR on; made at each evaluation while vk_dlaa_hudless_wanted (frame generation sets it); 1 once per
-// evaluation.
+// The reconstruction producer seals an exact frame before vk_dlaa_frame resets its replay state.
 extern int vk_dlaa_hudless_wanted;
-int vk_dlaa_fg_hudless(VkImage *img, VkImageView *view, uint32_t *w, uint32_t *h, VkFormat *fmt);
+typedef struct VkDlaaHudSource VkDlaaHudSource;
+typedef struct {
+    VkNgxImage color, alpha;
+    uint64_t frame, generation;
+    int exact;
+} VkDlaaHudImages;
+void vk_dlaa_hud_frame(uint64_t frame);
+VkDlaaHudSource *vk_dlaa_hud_take(uint64_t frame, const VkTexImage *selected);
+// Requires actual native handoff of the recorded source writes. The returned views remain
+// valid until the caller releases its source or transfers it to the consuming graphics fence.
+const VkDlaaHudImages *vk_dlaa_hud_source_images(const VkDlaaHudSource *source, uint64_t frame);
+void vk_dlaa_hud_source_release(VkDlaaHudSource *source);
+void vk_dlaa_hud_shutdown(void);
 int vk_dlaa_fg_camera(VkDlaaCamera *c);     // ... and its temporal upscaler is AMD FSR 3.1 (NX2NAVI_TAA = fsr3) instead of DLSS
 int vk_dlaa_ffx_camera(VkFfxCamera *c);     // the same camera as FSR takes it (vk_ffx.h); 0 without one that frame
 // vk_device.c: NGX's instance and device extensions join the lists (room for max names); vk_dlaa_init after the
@@ -54,8 +63,9 @@ void vk_dlaa_init(void);
 // vk_device.c destroy_all, once the device is idle and before the allocator and the device go (Linux): releases the NGX
 // features and parameters, frees every image, buffer, pipeline and query pool DLAA made, resets its state for a later
 // device and shuts NGX down for this one. Safe when NGX never came up, when nothing was made, and more than once.
-// Windows: does nothing.
+// Windows: releases the temporal size and post groups; motion resources use the same idle proof on both platforms.
 void vk_dlaa_release(void);
+void vk_dlaa_motion_shutdown(void); // vk_device.c after successful device idle, before allocator teardown.
 // 1 when dlaa is on and NGX came up with DLSS (after vk_dlaa_init): a DLSS mode's smaller scene is scaled up by DLSS.
 int vk_dlaa_available(void);
 // The video memory DLSS reports for its features (NGX's statistics), for the log; -1 while unknown.
@@ -65,19 +75,62 @@ int64_t vk_dlaa_vram(void);
 // frame (vk_dlaa_frame).
 typedef struct VkExec VkExec;
 void vk_dlaa_pass(VkExec *ex);
+int vk_dlaa_swap_matches(const VkTexImage *selected);
+typedef struct VkExecGraphicsPassShape VkExecGraphicsPassShape;
+typedef struct VkDlaaPreparedObserver VkDlaaPreparedObserver;
+// Only an exact G-buffer or scene arm admits a receipt. Recording consumes a successful receipt once.
+int vk_dlaa_prepare_observer(const VkExec *, const VkExecGraphicsPassShape *, VkTextureAliasRead *color_seed,
+                            VkTextureAliasRead *depth_seed, VkDlaaPreparedObserver **);
+int vk_dlaa_prepared_observer_current(const VkExec *, const VkExecGraphicsPassShape *, const VkDlaaPreparedObserver *);
+int vk_dlaa_pass_prepared(VkExec *, VkDlaaPreparedObserver **);
+void vk_dlaa_prepared_observer_cancel(VkDlaaPreparedObserver **);
+enum {
+    VK_DLAA_GRAPHICS_PASS_HOOK = 1 << 0,
+    VK_DLAA_GRAPHICS_PASS_TONEMAP = 1 << 1,
+    VK_DLAA_GRAPHICS_PASS_HUD = 1 << 2,
+    VK_DLAA_GRAPHICS_PASS_OBSERVE = 1 << 3,
+};
+// Read-only classification of selected attachment identities before beginning rendering.
+// Shader texture substitution still uses its actual captured sample provider.
+uint32_t vk_dlaa_graphics_pass_work(const VkExec *, const VkExecGraphicsPassShape *);
+
 int vk_dlaa_hud_attachment(const VkExec *ex, VkRenderingAttachmentInfo *attachment);
 int vk_hud_alpha_pipeline(VkPipeState *s);
 void vk_dlaa_hud_incomplete(void);
 void vk_dlaa_hud_write(VkImage image);
-VkNgxImage vk_dlaa_present_alpha(VkCommandBuffer cb, VkExtent2D ext, const int rect[4], const int to[4], uint64_t frame, unsigned slot);
+void vk_dlaa_hud_draw_emitted(const VkExec *ex);
+void vk_dlaa_hud_target_report(const VkExec *ex);
+// The exact composition and tag were both unissued, after the previous slot retired.
+void vk_dlaa_present_alpha_unrecorded(unsigned slot);
+VkNgxImage vk_dlaa_present_alpha(VkCommandBuffer cb, VkExtent2D ext, const int rect[4], const int to[4],
+                                 const VkDlaaHudImages *source, unsigned slot);
 int vk_dlaa_swap_active(const VkExec *ex);
 int vk_dlaa_tonemap_target(const VkExec *ex);
 void vk_dlaa_tonemap_begin(VkExec *ex, VkRenderingAttachmentInfo *color, VkRenderingAttachmentInfo *depth,
                            VkRenderingInfo *ri);
 void vk_dlaa_tonemap_end(VkExec *ex);
 // The forward scene's compute upscaler. Returns 1 when temporal reconstruction filled its output.
-int vk_dlaa_scene_upscale(VkExec *ex, uint32_t sw, uint32_t sh, const VkTexImage *dst);
+struct VkDlaaSceneEffects;
+int vk_dlaa_scene_upscale(VkExec *ex, uint32_t sw, uint32_t sh, const VkTexImage *dst,
+                         struct VkDlaaSceneEffects *effects, const VkTextureColorBlitSource *output);
 void vk_dlaa_frame(void);
+int vk_dlaa_temporal_hook_needs_recorder(void);
+void vk_dlaa_swap_use(VkExec *ex);
+// Captures the latest evaluation only at its own present boundary. Composition
+// selects it on its thread and moves a consumed use to its native fence slot.
+typedef struct VkDlaaFgSizeUse VkDlaaFgSizeUse;
+VkDlaaFgSizeUse *vk_dlaa_fg_capture(void);
+// Pure description. 1 describes usable inputs, 0 means this frame lacks them, and -1 means its receipt was invalidated.
+int vk_dlaa_fg_describe(const VkDlaaFgSizeUse *, VkFfxImage *depth, VkFfxImage *motion);
+// The same pure check plus native views/camera for the already selected composition.
+int vk_dlaa_fg_compose_peek(VkFfxImage *depth, VkFfxImage *motion, VkImageView *depth_view, VkImageView *motion_view,
+                            VkDlaaCamera *camera, float *jx, float *jy, int *reset);
+void vk_dlaa_fg_discard_current(void);
+void vk_dlaa_fg_compose_select(VkDlaaFgSizeUse *use);
+int vk_dlaa_fg_compose_consumed(const VkDlaaFgSizeUse *use);
+void vk_dlaa_fg_release(VkDlaaFgSizeUse *use);
+// After replay and composition retirement, before destroying the device allocator.
+void vk_dlaa_size_shutdown(void);
 // 1 once, at the present of the first frame whose scene has a new size after a setting changed (vk_dlaa.c).
 int vk_dlaa_resized_take(void);
 // vk_exec_draw.c, each draw before its fixed state is recorded: notes the scene camera block (vk_dlaa_draw), and moves
@@ -95,7 +148,11 @@ void vk_mvprev_draw(VkExec *ex);   // vk_mvprev.c: notes the scene draw's object
 // leaves every binding of the replay to be set again; draws whose camera block is not cam are left out).
 // vk_dlaa_prev_camera: last frame's camera block and this frame's jitter, 0 when there is no history.
 uint64_t vk_dlaa_scene_frame(void);
-int vk_shield_resolve(VkExec *ex, uint64_t camera, VkImage depth, VkImageView zv, VkImageView mv, uint32_t w, uint32_t h, int reset);
+typedef struct VkShieldResolve VkShieldResolve;
+int vk_shield_resolve_prepare(VkExec *ex, uint64_t camera, VkImage depth, uint32_t w, uint32_t h, int reset,
+                              VkShieldResolve **resolve);
+int vk_shield_resolve_emit(VkExec *ex, VkShieldResolve **resolve, uint64_t camera, VkImage depth, VkImageView zv,
+                           VkImageView mv, uint32_t w, uint32_t h, int reset);
 int vk_mvobj_execute(VkExec *ex, uint64_t cam, VkImageView mv, VkImageView depth, VkFormat depth_fmt, uint32_t w,
                      uint32_t h);
 int vk_dlaa_prev_camera(VkDescriptorBufferInfo *out, float jitter[2]);
@@ -109,3 +166,4 @@ void vk_mvcheck_output(VkCommandBuffer cb, VkImage out, uint32_t ow, uint32_t oh
 // vk_exec_draw.c, once a draw's fragment shader is known: 1 skips the draw (the game's FXAA while NX2NAVI_FXAA is 0, its
 // scaling draw when DLSS wrote the scaled picture).
 int vk_dlaa_skip_draw(VkExec *ex, const GfxShader *fs);
+int vk_dlaa_skip_draw_depth(VkImage depth, const GfxShader *fs);

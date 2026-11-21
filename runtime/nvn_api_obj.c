@@ -20,21 +20,35 @@
 #include "platform/platform.h"
 
 // ---------- Descriptor pools
+static uint64_t texture_pool_incarnation;
 // NVNboolean nvnTexturePoolInitialize(NVNtexturePool *tp, const NVNmemoryPool *p, ptrdiff_t offset, int n)
 NVN_API(nvnTexturePoolInitialize) {
-    *(dpool_t *)arg_p(c, 0) = (dpool_t){arg_p(c, 1), (int64_t)arg_x(c, 2), (int32_t)arg_x(c, 3)};
+    uint64_t incarnation = __atomic_add_fetch(&texture_pool_incarnation, 1, __ATOMIC_RELAXED);
+    if (incarnation > (UINT64_MAX >> 21)) rt_fatal("nvn: texture pool identity exhausted");
+    *(dpool_t *)arg_p(c, 0) = (dpool_t){arg_p(c, 1), (int64_t)arg_x(c, 2), (int32_t)arg_x(c, 3), incarnation};
     NVN_LOG("TexturePool n=%d", (int)arg_x(c, 3));
     ret_x(c, 1);
 }
 // void nvnTexturePoolFinalize(NVNtexturePool *tp)
-NVN_API(nvnTexturePoolFinalize) { (void)c; }
+NVN_API(nvnTexturePoolFinalize) {
+    dpool_t *pool = arg_p(c, 0);
+    if (pool && pool->incarnation) {
+        uint64_t incarnation = pool->incarnation;
+        pool->incarnation = 0;
+        gfx_backend()->texture_pool_release(incarnation);
+    }
+}
 // void nvnTexturePoolRegisterTexture(const NVNtexturePool *tp, int id, const NVNtexture *t, const NVNtextureView *v)
 NVN_API(nvnTexturePoolRegisterTexture) {
-    gfx_backend()->texture_register((int)arg_x(c, 1), arg_p(c, 2), arg_p(c, 3));
+    const dpool_t *pool = arg_p(c, 0);
+    int id = (int)arg_x(c, 1);
+    if (!pool || !pool->incarnation || id < 0 || id >= pool->n)
+        rt_fatal("nvn: RegisterTexture slot %d is outside its live texture pool", id);
+    gfx_backend()->texture_register(pool->incarnation, id, arg_p(c, 2), arg_p(c, 3));
 }
 // NVNboolean nvnSamplerPoolInitialize(NVNsamplerPool *sp, const NVNmemoryPool *p, ptrdiff_t offset, int n)
 NVN_API(nvnSamplerPoolInitialize) {
-    *(dpool_t *)arg_p(c, 0) = (dpool_t){arg_p(c, 1), (int64_t)arg_x(c, 2), (int32_t)arg_x(c, 3)};
+    *(dpool_t *)arg_p(c, 0) = (dpool_t){arg_p(c, 1), (int64_t)arg_x(c, 2), (int32_t)arg_x(c, 3), 0};
     NVN_LOG("SamplerPool n=%d", (int)arg_x(c, 3));
     ret_x(c, 1);
 }
@@ -230,8 +244,7 @@ NVN_API(nvnTextureInitialize) {
         if (s->off < 0 || (uint64_t)s->off > room || o->L.size > room - (uint64_t)s->off)
             rt_fatal("nvn: packaged texture data of %#llx bytes at %#llx does not fit its pool (%#llx bytes)",
                      (unsigned long long)o->L.size, (unsigned long long)s->off, (unsigned long long)room);
-        memcpy(o->mem, s->pkg_data, (size_t)o->L.size);
-        nvn_guest_written((uintptr_t)o->mem, o->L.size);
+        gfx_backend()->write_packaged_texture(o, s->pkg_data);
     }
     o->serial = nvn_new_serial();
     live_put(o);

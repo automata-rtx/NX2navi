@@ -39,6 +39,7 @@ extern "C" VkResult vk_fg4_present(const VkPresentInfoKHR *) { return VK_ERROR_F
 extern "C" uint64_t vk_fg4_presents(VkSwapchainKHR) { return 0; }
 extern "C" PFN_vkSetHdrMetadataEXT vk_fg4_hdr_metadata_fn(void) { return nullptr; }
 extern "C" void vk_fg4_frame(VkCommandBuffer, VkSwapchainKHR, VkFormat, VkExtent2D, VkImage, const int *) {}
+extern "C" VkResult vk_fg4_finish_inputs(VkSwapchainKHR) { return VK_ERROR_FEATURE_NOT_PRESENT; }
 extern "C" void vk_fg4_release(void) {}
 #else
 #include <windows.h>
@@ -159,10 +160,10 @@ bool hdr_format(VkFormat f) {
 }
 
 // The swapchain's own presents are done before it is remade or taken down.
-void wait_presents(void) {
+ffxReturnCode_t wait_presents(void) {
     ffxDispatchDescFrameGenerationSwapChainWaitForPresentsVK w = {};
     w.header.type = FFX_API_DISPATCH_DESC_TYPE_FGSWAPCHAIN_WAIT_FOR_PRESENTS_VK;
-    vk_ffx4_api_dispatch(&F.sc, &w.header);
+    return vk_ffx4_api_dispatch(&F.sc, &w.header);
 }
 
 }  // namespace
@@ -418,6 +419,23 @@ extern "C" void vk_fg4_frame(VkCommandBuffer cb, VkSwapchainKHR sc, VkFormat fmt
                "and motion, %llu without the HUD-less picture", (unsigned long long)F.frame, (unsigned long long)F.generated,
                (unsigned long long)F.hudless, (unsigned long long)F.paused, (unsigned long long)F.no_inputs,
                (unsigned long long)F.no_hudless);
+}
+
+extern "C" VkResult vk_fg4_finish_inputs(VkSwapchainKHR sc) {
+    if (vk_device_is_lost()) return VK_ERROR_DEVICE_LOST;
+    if (!F.sc || !sc || sc != F.handle) return VK_ERROR_INITIALIZATION_FAILED;
+    if (F.fg) {
+        ffxConfigureDescFrameGeneration cfg = {};
+        cfg.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
+        cfg.swapChain = (void *)sc;
+        cfg.frameID = F.frame;
+        if (vk_ffx4_api_configure(&F.fg, &cfg.header) != FFX_API_RETURN_OK)
+            return vk_device_is_lost() ? VK_ERROR_DEVICE_LOST : VK_ERROR_INITIALIZATION_FAILED;
+        __atomic_store_n(&F.on, 0, __ATOMIC_RELAXED);
+    }
+    if (wait_presents() != FFX_API_RETURN_OK)
+        return vk_device_is_lost() ? VK_ERROR_DEVICE_LOST : VK_ERROR_INITIALIZATION_FAILED;
+    return vk_device_is_lost() ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
 }
 
 extern "C" void vk_fg4_release(void) {

@@ -3,6 +3,7 @@
 #include "layout.h"
 #include "nvn_api.h"
 #include "platform/platform.h"
+#include "resource_core_budget.h"
 #include <string.h>
 #include <limits.h>
 #include <stdlib.h>
@@ -251,59 +252,112 @@ static void capture_model_buffers(MotionOwnerSnapshot *out) {
     }
 }
 
+typedef struct {
+    MotionOwnerSnapshot snapshot;
+    RcBudgetTicket budget;
+} MotionOwnerAllocation;
+
+static MotionOwnerAllocation *owner_snapshot_allocate(void) {
+    const RcAdmissionVector cost = {{
+        [RC_BUDGET_RAM] = sizeof(MotionOwnerAllocation),
+        [RC_BUDGET_COMMIT] = sizeof(MotionOwnerAllocation),
+    }};
+    RcBudgetTicket ticket = {0};
+    // The capture can still use its normal uniform bytes when optional motion ownership is unavailable.
+    if (resource_core_budget_reserve(RC_BUDGET_SNAPSHOT, 0, &cost, &ticket) != RC_ADMISSION_OK) return NULL;
+    MotionOwnerAllocation *allocation = malloc(sizeof *allocation);
+    if (!allocation) {
+        if (resource_core_budget_cancel(&ticket) != RC_ADMISSION_OK)
+            rt_fatal("equipped motion: snapshot reservation cancellation failed");
+        return NULL;
+    }
+    if (!rc_admission_accounted(resource_core_budget_materialize(&ticket, &cost)))
+        rt_fatal("equipped motion: snapshot capacity settlement failed");
+    allocation->budget = ticket;
+    allocation->snapshot.refs = 1;
+    return allocation;
+}
+
 void motion_owner_release(MotionOwnerSnapshot *snapshot) {
-    if (snapshot && __atomic_sub_fetch(&snapshot->refs, 1, __ATOMIC_ACQ_REL) == 0) free(snapshot);
+    if (!snapshot || __atomic_sub_fetch(&snapshot->refs, 1, __ATOMIC_ACQ_REL)) return;
+    MotionOwnerAllocation *allocation = (MotionOwnerAllocation *)snapshot;
+    RcBudgetTicket ticket = allocation->budget;
+    if (resource_core_budget_retire(&ticket) != RC_ADMISSION_OK)
+        rt_fatal("equipped motion: snapshot capacity retirement failed");
+    free(allocation);
+    if (resource_core_budget_destroyed(&ticket) != RC_ADMISSION_OK)
+        rt_fatal("equipped motion: snapshot capacity destruction failed");
+}
+
+// Invalidation removes the cache reference. Captures keep their independent references.
+static MotionOwnerSnapshot *owner_snapshot_invalidate(void) {
+    MotionOwnerSnapshot *retired = O.published;
+    O.published = NULL;
+    O.valid = 0;
+    return retired;
 }
 
 void motion_owner_shutdown(void) {
     plat_mutex_lock(&owner_lock);
-    motion_owner_release(O.published);
-    O.published = NULL;
-    O.valid = 0;
+    MotionOwnerSnapshot *retired = owner_snapshot_invalidate();
     O.count = O.cached.count = 0;
     plat_mutex_unlock(&owner_lock);
+    motion_owner_release(retired);
 }
 
-// Submissions retain the same immutable identity list until the producer discovers
-// another generation. A queued replay can finish using its original list after a swap.
+static void owner_snapshot_refresh(void) {
+    if (O.valid) return;
+    refresh(O.producer_frame, 1);
+    O.cached.count = 0;
+    capture_model_buffers(&O.cached);
+    if (O.producer_frame % 30 == 0 && rt_knob("SHIELD_TRACE", "0"))
+        rt_log("shield owner: frame %llu models %u bindings %u", (unsigned long long)O.producer_frame, O.count,
+               O.cached.count);
+    qsort(O.cached.bindings, O.cached.count, sizeof *O.cached.bindings, binding_address_order);
+    unsigned kept = 0;
+    for (unsigned i = 0; i < O.cached.count;) {
+        const MotionOwnerBinding *binding = &O.cached.bindings[i];
+        uint64_t end = binding->address + binding->size;
+        unsigned next = i + 1;
+        while (next < O.cached.count && O.cached.bindings[next].address < end) {
+            const MotionOwnerBinding *overlap = &O.cached.bindings[next++];
+            if (end < overlap->address + overlap->size) end = overlap->address + overlap->size;
+        }
+        if (next == i + 1) O.cached.bindings[kept++] = *binding;
+        i = next;
+    }
+    O.cached.count = kept;
+}
+
+static MotionOwnerSnapshot *owner_snapshot_retain(void) {
+    MotionOwnerSnapshot *snapshot = O.published;
+    if (snapshot) __atomic_add_fetch(&snapshot->refs, 1, __ATOMIC_RELAXED);
+    return snapshot;
+}
+
+// A queued replay retains its immutable identity list and budget after the producer swaps generations.
 MotionOwnerSnapshot *motion_owner_acquire(void) {
     if (!motion_owner_enabled()) return NULL;
     plat_mutex_lock(&owner_lock);
-    if (!O.valid) {
-        motion_owner_release(O.published);
-        O.published = NULL;
-        refresh(O.producer_frame, 1);
-        O.cached.count = 0;
-        capture_model_buffers(&O.cached);
-        if (O.producer_frame % 30 == 0 && rt_knob("SHIELD_TRACE", "0"))
-            rt_log("shield owner: frame %llu models %u bindings %u", (unsigned long long)O.producer_frame, O.count,
-                   O.cached.count);
-        qsort(O.cached.bindings, O.cached.count, sizeof *O.cached.bindings, binding_address_order);
-        unsigned kept = 0;
-        for (unsigned i = 0; i < O.cached.count;) {
-            const MotionOwnerBinding *binding = &O.cached.bindings[i];
-            uint64_t end = binding->address + binding->size;
-            unsigned next = i + 1;
-            while (next < O.cached.count && O.cached.bindings[next].address < end) {
-                const MotionOwnerBinding *overlap = &O.cached.bindings[next++];
-                if (end < overlap->address + overlap->size) end = overlap->address + overlap->size;
-            }
-            if (next == i + 1) O.cached.bindings[kept++] = *binding;
-            i = next;
-        }
-        O.cached.count = kept;
-    }
-    if (!O.published && O.cached.count) {
-        O.published = malloc(sizeof *O.published);
-        if (O.published) {
-            O.published->count = O.cached.count;
-            O.published->refs = 1;
-            memcpy(O.published->bindings, O.cached.bindings, O.cached.count * sizeof *O.cached.bindings);
-        }
-    }
-    MotionOwnerSnapshot *snapshot = O.published;
-    if (snapshot) __atomic_add_fetch(&snapshot->refs, 1, __ATOMIC_RELAXED);
+    owner_snapshot_refresh();
+    MotionOwnerSnapshot *snapshot = owner_snapshot_retain();
+    int needs_storage = !snapshot && O.cached.count;
     plat_mutex_unlock(&owner_lock);
+    if (!needs_storage) return snapshot;
+
+    MotionOwnerAllocation *allocation = owner_snapshot_allocate();
+    plat_mutex_lock(&owner_lock);
+    // A producer update or another acquisition may have raced with admission. Publish only the current list.
+    owner_snapshot_refresh();
+    if (allocation && !O.published && O.cached.count) {
+        O.published = &allocation->snapshot;
+        O.published->count = O.cached.count;
+        memcpy(O.published->bindings, O.cached.bindings, O.cached.count * sizeof *O.cached.bindings);
+        allocation = NULL;
+    }
+    snapshot = owner_snapshot_retain();
+    plat_mutex_unlock(&owner_lock);
+    if (allocation) motion_owner_release(&allocation->snapshot);
     return snapshot;
 }
 
@@ -311,21 +365,24 @@ void motion_owner_present(void) {
     if (!motion_owner_enabled()) return;
     plat_mutex_lock(&owner_lock);
     ++O.producer_frame;
-    O.valid = 0;
+    MotionOwnerSnapshot *retired = owner_snapshot_invalidate();
     plat_mutex_unlock(&owner_lock);
+    motion_owner_release(retired);
 }
 
 static void forget(uint64_t buffer, uint64_t address, uint64_t size) {
     if (!motion_owner_enabled()) return;
     plat_mutex_lock(&owner_lock);
+    MotionOwnerSnapshot *retired = NULL;
     for (unsigned i = 0; i < O.cached.count; ++i) {
         MotionOwnerBinding *b = &O.cached.bindings[i];
         if (b->buffer != buffer && !(size && b->address < address + size && address < b->address + b->size)) continue;
         O.cached.count = O.count = 0;
-        O.valid = 0;
+        retired = owner_snapshot_invalidate();
         break;
     }
     plat_mutex_unlock(&owner_lock);
+    motion_owner_release(retired);
 }
 void motion_owner_forget(uint64_t buffer) { forget(buffer, 0, 0); }
 void motion_owner_forget_range(uint64_t address, uint64_t size) {

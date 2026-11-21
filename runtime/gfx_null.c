@@ -37,10 +37,11 @@ const GfxBackend *gfx_backend(void) {
 
 static uint64_t fence;
 
-static int null_pool_init(pool_t *p) { (void)p; return 1; }
+static int null_pool_init(pool_t *p, const pool_t *setup) { (void)p; (void)setup; return 1; }
 static void null_pool_fini(pool_t *p) { (void)p; }
 static int null_pool_map_virtual(pool_t *v, int n, const void *requests) { (void)v, (void)n, (void)requests; return 1; }
-static void null_texture_register(int id, const tex_t *t, const view_t *v) { (void)id, (void)t, (void)v; }
+static void null_texture_register(uint64_t pool, int id, const tex_t *t, const view_t *v) { (void)pool, (void)id, (void)t, (void)v; }
+static void null_texture_pool_release(uint64_t pool) { (void)pool; }
 static void null_sampler_register(int id, const samp_par *s) { (void)id, (void)s; }
 static void null_texture_release(const tex_t *t) { (void)t; }
 static void null_program_release(const prog_t *p) { (void)p; }
@@ -131,6 +132,9 @@ static void null_write_texels(const tex_t *t, const view_t *v, const NVNcopyRegi
     (void)t, (void)v, (void)r, (void)src, (void)row, (void)img;
 }
 
+static void null_write_packaged_texture(const tex_t *t, const void *src) {
+    memcpy(t->mem, src, (size_t)t->L.size);
+}
 static void null_guest_written(uint64_t addr, uint64_t size) { (void)addr, (void)size; }
 static void null_guest_read(uint64_t addr, uint64_t size) { (void)addr, (void)size; }
 static void null_cpu_synced(uint64_t fence) { (void)fence; }
@@ -141,6 +145,7 @@ const GfxBackend gfx_null_backend = {
     .pool_fini = null_pool_fini,
     .pool_map_virtual = null_pool_map_virtual,
     .texture_register = null_texture_register,
+    .texture_pool_release = null_texture_pool_release,
     .sampler_register = null_sampler_register,
     .texture_release = null_texture_release,
     .program_release = null_program_release,
@@ -152,6 +157,7 @@ const GfxBackend gfx_null_backend = {
     .finish = null_finish,
     .read_texels = null_read_texels,
     .write_texels = null_write_texels,
+    .write_packaged_texture = null_write_packaged_texture,
     .guest_written = null_guest_written,
     .guest_read = null_guest_read,
     .cpu_synced = null_cpu_synced,

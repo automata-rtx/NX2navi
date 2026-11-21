@@ -251,6 +251,11 @@ static void save_shot(const tex_t *t, const char *path) {
 // present), box-filtered to 480x270; NX2NAVI_SHOTS=w<lo>-<hi>:<step> takes them by world-clock seconds instead, the first
 // present at or after each step (full size with NX2NAVI_SHOTS_FULL=1), for finding short glitches. Pipeline builds stay asynchronous, so the
 // pictures show what a player sees.
+unsigned dbg_area_request(void);
+unsigned dbg_area_settled_presents(unsigned stage);
+void dbg_area_guest_ready(unsigned stage, uint64_t present);
+int dbg_area_done(void);
+
 static void series_shot(const tex_t *t, uint64_t n) {
     static int parsed;
     static unsigned long long lo, hi, step, next;
@@ -265,14 +270,21 @@ static void series_shot(const tex_t *t, uint64_t n) {
             step = (unsigned long long)(ws * 1e6), next = lo;
         else if (!e || sscanf(e, "%llu-%llu:%llu", &lo, &hi, &step) != 3 || !step) hi = 0;
         dir = cfg_get("NX2NAVI_SHOTS_DIR") ? cfg_get("NX2NAVI_SHOTS_DIR") : ".";
-        if (hi) plat_file_mkdir_p(dir);
+        if (hi || dbg_area_request()) plat_file_mkdir_p(dir);
         parsed = 1;
     }
-    if (world) {   // the first present at or after each step of the world clock
+    static unsigned area_seen, area_saved;
+    static uint64_t area_first_present;
+    unsigned area = dbg_area_request();
+    if (area) {
+        if (area_seen != area) area_seen = area, area_first_present = n;
+        if (area_saved == area || n - area_first_present + 1 < dbg_area_settled_presents(area)) return;
+        plat_file_mkdir_p(dir);
+    } else if (world) {   // the first present at or after each step of the world clock
         int64_t w = frame_step_world_us();
         if (w < 0 || (unsigned long long)w < next || next > hi) return;
         while (next <= (unsigned long long)w) next += step;
-    } else if (n < lo || n > hi || (n - lo) % step) {
+    } else if (!step || n < lo || n > hi || (n - lo) % step) {
         return;
     }
     int fmt = t->d.format;
@@ -299,9 +311,22 @@ static void series_shot(const tex_t *t, uint64_t n) {
             for (int c = 0; c < 4; c++) o[c] = (uint8_t)(sum[bgra && c != 3 ? 2 - c : c] / k);
             o[3] = 255;
         }
+    if (area) {
+        // Post-transition black fades offer no visual evidence. Keep waiting for a nonuniform scene.
+        unsigned lit = 0;
+        for (unsigned iy = 1; iy < 8; ++iy) for (unsigned ix = 1; ix < 8; ++ix) {
+            const uint8_t *p = out + 4ull * ((iy * oh / 8) * (uint64_t)ow + ix * ow / 8);
+            lit += p[0] + p[1] + p[2] >= 30;
+        }
+        if (lit < 16) { free(out); free(px); return; }
+    }
     char path[PLAT_PATH_MAX];
     snprintf(path, sizeof path, "%s/f%05llu.png", dir, (unsigned long long)n);
     rt_write_png(path, out, ow, oh);
+    if (area && plat_file_size(path) > 8) {
+        area_saved = area;
+        dbg_area_guest_ready(area, n);
+    }
     free(out);
     free(px);
 }
@@ -313,7 +338,7 @@ void rt_frame_presented(const tex_t *t, uint64_t n) {
     const RtConfig *cfg = rt_config();
     series_shot(t, n);
     int64_t w = cfg->seconds ? frame_step_world_us() : -1;
-    if (w < 0 || (double)w < cfg->seconds * 1e6) return;
+    if (!dbg_area_done() && (w < 0 || (double)w < cfg->seconds * 1e6)) return;
     if (cfg->shot) save_shot(t, cfg->shot);
     GfxStats g = gfx_stats();
     rt_logf("boot: frames %llu presented (nvn calls %llu, distinct %llu, unimplemented %llu, validation errors %llu, "

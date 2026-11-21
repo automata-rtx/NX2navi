@@ -14,6 +14,7 @@
 extern "C" {
 #include "host.h"
 #include "vk.h"
+#include "resource_core_vma.h"
 #include "platform/platform.h"
 }
 #include "menu_assets.h"
@@ -119,7 +120,7 @@ static int upload_rgba(Art &a, const uint8_t *rgba, uint32_t w, uint32_t h, uint
     // slow to read back)
     uint8_t *chain = (uint8_t *)malloc((size_t)bytes);
     if (!chain) {
-        vmaDestroyBuffer(c->vma, sb, sa);
+        resource_core_vma_destroy_buffer(c->vma, sb, sa);
         return art_free(a), 0;
     }
     memcpy(chain, rgba, (size_t)w * h * 4);
@@ -136,7 +137,7 @@ static int upload_rgba(Art &a, const uint8_t *rgba, uint32_t w, uint32_t h, uint
     free(chain);
     // The batch flushes its own staging buffers. This one is caller-owned and can be noncoherent.
     if (vmaFlushAllocation(c->vma, sa, 0, bytes) != VK_SUCCESS) {
-        vmaDestroyBuffer(c->vma, sb, sa);
+        resource_core_vma_destroy_buffer(c->vma, sb, sa);
         return art_free(a), 0;
     }
     VkCommandBuffer cb = vk_upload_begin();
@@ -163,7 +164,7 @@ static int upload_rgba(Art &a, const uint8_t *rgba, uint32_t w, uint32_t h, uint
     vkCmdPipelineBarrier2(cb, &di);
     vk_upload_end();
     vk_upload_flush(1);
-    vmaDestroyBuffer(c->vma, sb, sa);
+    resource_core_vma_destroy_buffer(c->vma, sb, sa);
     VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     vi.image = a.img;
     vi.viewType = VK_IMAGE_VIEW_TYPE_2D;

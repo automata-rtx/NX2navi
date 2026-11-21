@@ -588,6 +588,118 @@ void dbg_event_start(const char *name) {
 static const char REFUSED[] = "The game refused %s: it is in a cutscene, a conversation or a menu, or Link cannot take part "
                               "now (swimming, in the air). Try again once he stands free.";
 
+enum { AREA_ROUTE_COUNT = 3 };
+typedef struct {
+    char area[64], spawn[64];
+    float xyz[3];
+    unsigned presents;
+} DbgAreaStage;
+static DbgAreaStage area_route[AREA_ROUTE_COUNT];
+
+static int area_identifier(const char *value) {
+    if (!*value) return 0;
+    for (const unsigned char *p = (const unsigned char *)value; *p; ++p)
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') || *p == '_'))
+            return 0;
+    return 1;
+}
+
+static int area_route_parse(const char *spec, const char *end) {
+    char text[768];
+    size_t length = end ? (size_t)(end - spec) : strlen(spec);
+    if (!length || length >= sizeof text) return 0;
+    memcpy(text, spec, length);
+    text[length] = 0;
+    DbgAreaStage stages[AREA_ROUTE_COUNT] = {0};
+    const char *row = text;
+    for (unsigned i = 0; i < AREA_ROUTE_COUNT; ++i) {
+        DbgAreaStage *stage = &stages[i];
+        int used = 0;
+        if (sscanf(row, "%63[^,|],%63[^,|],%f,%f,%f,%3u%n", stage->area, stage->spawn,
+                   &stage->xyz[0], &stage->xyz[1], &stage->xyz[2], &stage->presents, &used) != 6 || !used ||
+            stage->presents < 2 || stage->presents > 16 ||
+            !area_identifier(stage->area)) return 0;
+        if (i == 0) {
+            if (strcmp(stage->spawn, "-")) return 0;
+            stage->spawn[0] = 0;
+        } else if (!area_identifier(stage->spawn)) return 0;
+        for (unsigned axis = 0; axis < 3; ++axis)
+            if (!isfinite(stage->xyz[axis])) return 0;
+        row += used;
+        if (*row != (i + 1 < AREA_ROUTE_COUNT ? '|' : '\0')) return 0;
+        if (*row) ++row;
+    }
+    if (strcmp(stages[0].area, stages[2].area) || !strcmp(stages[0].area, stages[1].area)) return 0;
+    memcpy(area_route, stages, sizeof area_route);
+    return 1;
+}
+
+
+static int area_step, area_stable;
+static unsigned area_request, area_ack;
+static uint64_t area_guest;
+static int area_done;
+
+unsigned dbg_area_request(void) { return __atomic_load_n(&area_request, __ATOMIC_ACQUIRE); }
+unsigned dbg_area_settled_presents(unsigned stage) { return area_route[stage - 1].presents; }
+uint64_t dbg_area_guest(void) { return __atomic_load_n(&area_guest, __ATOMIC_ACQUIRE); }
+int dbg_area_done(void) { return __atomic_load_n(&area_done, __ATOMIC_ACQUIRE); }
+
+void dbg_area_guest_ready(unsigned stage, uint64_t present) {
+    __atomic_store_n(&area_guest, present, __ATOMIC_RELEASE);
+    rt_log("debug: area-return guest stage %u present %llu", stage, (unsigned long long)present);
+}
+
+void dbg_area_pair_result(uint64_t guest, int saved) {
+    if (!guest || dbg_area_guest() != guest) return;
+    if (!saved) {
+        rt_log("debug: area-return incomplete pair for guest present %llu", (unsigned long long)guest);
+        return;
+    }
+    unsigned stage = dbg_area_request();
+    if (stage) __atomic_store_n(&area_ack, stage, __ATOMIC_RELEASE);
+}
+
+static void area_return_tick(uint64_t tick) {
+    if (!area_step || dbg_area_done()) return;
+    unsigned i = (unsigned)area_step - 1;
+    char current[64] = "";
+    float xyz[3];
+    int exact = text_get("Sequence_CurrentBanc", current) && !strcmp(current, area_route[i].area) &&
+                dbg_player_pos(xyz);
+    for (unsigned axis = 0; exact && axis < 3; ++axis)
+        exact = fabsf(xyz[axis] - area_route[i].xyz[axis]) < 2.0f;
+    // Background area preparation and the blackout are not player arrival.
+    if (i && (warp.tries || strcmp(warp.area, area_route[i].area) || strcmp(warp.pos, area_route[i].spawn) ||
+              (warp.state != W_SETTLE && warp.state != W_IDLE))) exact = 0;
+    if (!exact || frame_step_world_us() < 0) {
+        area_stable = 0;
+        return;
+    }
+    if (__atomic_load_n(&area_ack, __ATOMIC_ACQUIRE) == (unsigned)area_step) {
+        if (warp.state == W_SETTLE) {
+            // Let the next normal warp_tick perform its fall check before releasing the existing wait.
+            warp.at = tick + 1;
+            return;
+        }
+        if (warp.state != W_IDLE) return;
+        rt_log("debug: area-return complete stage %d %s %s; native pair for guest present %llu",
+               area_step, current, area_route[i].spawn, (unsigned long long)dbg_area_guest());
+        if (i + 1 == sizeof area_route / sizeof area_route[0]) {
+            __atomic_store_n(&area_done, 1, __ATOMIC_RELEASE);
+            return;
+        }
+        __atomic_store_n(&area_guest, 0, __ATOMIC_RELEASE);
+        dbg_warp(area_route[i+1].area, area_route[i+1].spawn);
+        area_step++;
+        area_stable = 0;
+        return;
+    }
+    if (dbg_area_request() != (unsigned)area_step && ++area_stable >= 2)
+        __atomic_store_n(&area_request, (unsigned)area_step, __ATOMIC_RELEASE);
+}
+
+
 static void warp_tick(Cpu *c, uint64_t tick) {
     if (warp.event[0]) {
         char name[80];
@@ -1012,7 +1124,12 @@ static void test_script(uint64_t tick) {
         unsigned hash = 0, on = 0, size = 4;
         unsigned long long value = 0;
         float f = 0;
-        if (sscanf(colon + 1, "flag %x %u", &hash, &on) == 2) {
+        if (!strncmp(colon + 1, "area-return ", 12)) {
+            if (!area_step) {
+                if (area_route_parse(colon + 13, end)) area_step = 1;
+                else rt_log("debug: invalid area-return route; no warp will be issued");
+            }
+        } else if (sscanf(colon + 1, "flag %x %u", &hash, &on) == 2) {
             dbg_flag_set(hash, (int)on);
         } else if (sscanf(colon + 1, "speed %f", &f) == 1) {
             dbg_speed_set(f);
@@ -1128,6 +1245,7 @@ void dbg_tick(Cpu *c) {
     tick++;
     test_script(tick);
     warp_tick(c, tick);
+    area_return_tick(tick);
     static Req todo[Q_MAX];
     int n;
     plat_mutex_lock(&q_lock);

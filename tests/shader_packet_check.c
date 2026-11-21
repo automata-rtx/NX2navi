@@ -2,6 +2,7 @@
 #include "shader_selection_under_test.h"
 
 struct GfxShader { const uint8_t *control; int stage; GfxShaderAnswers answers; uint32_t mask; };
+static const GfxShader *effect_selected_shader(VkExec *state,int stage){(void)state;(void)stage;return NULL;}
 static struct GfxShader services[256];
 static unsigned services_used, service_calls, shader_locks, texture_locks;
 static unsigned avoided_calls;
@@ -9,14 +10,50 @@ static int mode=1, memo_mode=1, deferred, defer_handle, pending_service, lock_de
 static uint32_t generation=1, service_mask=1u<<2;
 static uint64_t tokens[64];
 static uint8_t types[64], formats[64];
+static VkFormat native_formats[64];
+static unsigned has_views[64];
+static const uint16_t test_views[] = {NVN_FORMAT_R32UI,NVN_FORMAT_R32I,NVN_FORMAT_RG16UI,NVN_FORMAT_RG16I};
+static const uint8_t test_codes[] = {11,12,20,21};
 static int mutate_from, mutate_to, mutate_on_lock;
 static uint8_t control[0xe0], code[64];
 static prog_t programs[4];
 static DrawCtx context;
 static VkExec ex;
 VkExecFrame vk_exec_frame;
-static unsigned route_advanced, primary_draws, motion_draws;
+static unsigned primary_draws, motion_draws;
 static unsigned turns, ended_passes;
+static unsigned preparation_calls;
+static int compat_selected;
+static unsigned direct_issued, indirect_issued, fallback_calls;
+static const VkPipeInfo *const test_compute_info = (const VkPipeInfo *)(uintptr_t)1;
+static const GfxShader *retained_compute;
+static VkExecGraphicsDraw *graphics_current;
+VkPipeline vk_pipeline_compute(const GfxShader *shader, const VkPipeInfo **info) {
+    assert(shader); *info=test_compute_info; return (VkPipeline)(uintptr_t)2;
+}
+static int dispatch_compat_pipeline(VkExec *state,uint32_t opcode,const GfxShader **shader,const VkPipeInfo **info,VkPipeline *pipeline) {
+    (void)state; assert(opcode==OP_DISPATCH || opcode==OP_DISPATCH_IND);
+    if(compat_selected>0){*shader=retained_compute;*info=test_compute_info;*pipeline=(VkPipeline)(uintptr_t)2;}
+    return compat_selected;
+}
+static int native_tensor(const VkExec *state){(void)state;return 1;}
+static void untranslated_dispatch_fallback(VkExec *state){(void)state;fallback_calls++;}
+static int dispatch_storage_standins(VkExec *state,const VkPipeInfo *info,uint32_t opcode,uint64_t address,const VkMemSpan *span) {
+    (void)state; (void)address;assert(info==test_compute_info && !!span==(opcode==OP_DISPATCH_IND));return 1;
+}
+static void dispatch_direct_emit(VkExec *state,const p_dispatch *d,const GfxShader *shader,VkPipeline pipeline,const VkPipeInfo *info,int hint) {
+    (void)state;(void)d;(void)hint;assert(shader && pipeline && info==test_compute_info && !deferred);direct_issued++;
+}
+static void dispatch_indirect_emit(VkExec *state,const p_dispatch_ind *d,const GfxShader *shader,VkPipeline pipeline,const VkPipeInfo *info,VkMemSpan span,int hint) {
+    (void)state;(void)d;(void)hint;(void)span;assert(shader && pipeline && info==test_compute_info && !deferred);indirect_issued++;
+}
+static int graphics_storage_begin(VkExec *state,const VkExecGraphicsDraw *draw){(void)state;(void)draw;return 1;}
+static void graphics_storage_recorded(VkExec *state,const VkExecGraphicsDraw *draw){(void)state;(void)draw;}
+int vk_sync_stopping(void){return 0;}
+volatile int vk_lost;
+VkSyncProgressResult vk_exec_graphics_progress_prepare(VkExec *state,int (*prepare)(void *),void *context) {
+    (void)state; return prepare(context)?VK_SYNC_PROGRESS_COMPLETE:VK_SYNC_PROGRESS_STOPPED;
+}
 static int motion_lock_depth, descriptor_defer, ordered;
 static struct { int failed; uint64_t ns_check; } MO;
 static PlatMutex mo_lock = PLAT_MUTEX_INIT;
@@ -33,6 +70,8 @@ static void mvobj_draw_(VkExec *ex,const p_draw_idx *d,VkBuffer buffer,VkDeviceS
 void rc_vkCmdDrawIndexed(VkCommandBuffer cb,uint32_t count,uint32_t instances,uint32_t first,int32_t vertex,uint32_t base) {
     (void)cb;(void)count;(void)instances;(void)first;(void)vertex;(void)base; primary_draws++;
 }
+static void storage_images_written(VkExec *state){(void)state;}
+static void shield_capture(VkExec *state,const p_draw_idx *draw){(void)state;(void)draw;}
 #include "shader_caller_gates.h"
 
 void rt_log(const char *fmt, ...) { (void)fmt; }
@@ -63,19 +102,33 @@ void plat_mutex_unlock(PlatMutex *m) {
     if(m==&mo_lock) { assert(motion_lock_depth);motion_lock_depth=0;return; }
     assert(m==&shader_lock);
 }
-static void mutate(int slot) { tokens[slot]++; generation++; types[slot]++; formats[slot]++; }
+static void mutate(int slot) { tokens[slot]++; generation++; types[slot]++; formats[slot]=(formats[slot]+1)%4; }
 void vk_texture_lock(void) {
     assert(!lock_depth); lock_depth=1; texture_locks++;
     if (mutate_on_lock) { mutate(mutate_on_lock); mutate_on_lock=0; }
 }
 void vk_texture_unlock(void) { assert(lock_depth); lock_depth=0; }
-static uint8_t type_of_handle(uint64_t h) {
-    assert(lock_depth && h<64);
-    if (h && (int)h==defer_handle) { deferred=1; return 0; }
-    if (h && (int)h==mutate_from) { mutate(mutate_to); mutate_from=0; }
-    return h ? types[h] : 0;
+int vk_texture_metadata_locked(int id, VkTexImage *out, view_t *view, int *has_view) {
+    assert(lock_depth && id > 0 && id < 64);
+    if (id == defer_handle) return -1;
+    if (id == mutate_from) { mutate(mutate_to); mutate_from = 0; }
+    *out = (VkTexImage){.width = types[id], .format = native_formats[id]};
+    *view = (view_t){.set_format = has_views[id], .format = test_views[formats[id]]};
+    *has_view = has_views[id];
+    return 1;
 }
-static uint8_t format_of_handle(uint64_t h) { assert(lock_depth && h<64); return h ? formats[h] : 0; }
+const VkTexImage *vk_texture_current_registration_locked(int id, view_t *view, int *has_view) {
+    (void)view;
+    (void)has_view;
+    assert(lock_depth && id > 0 && id == defer_handle);
+    preparation_calls++;
+    deferred = 1;
+    return NULL;
+}
+static int gfx_type_of(const VkTexImage *image, const view_t *view, int has_view) {
+    assert(!has_view || view->set_format);
+    return (int)image->width;
+}
 VkFormat vk_vertex_format(int fmt,int *type) { if(type)*type=fmt%3; return VK_FORMAT_R32_UINT; }
 static VkFormat target_format(int fmt,int *depth,int *stencil) { (void)depth;(void)stencil;return (VkFormat)fmt; }
 static int format_type(VkFormat fmt) { return (unsigned)fmt%3; }
@@ -109,13 +162,17 @@ static void reset(int stage) {
         programs[i].serial=i+1; programs[i].nstage=1;
         programs[i].sd[0].control=control; programs[i].sd[0].data=(uintptr_t)code;
     }
-    for(unsigned i=0;i<64;i++) tokens[i]=i+100,types[i]=(uint8_t)(i%9+1),formats[i]=(uint8_t)(i%4+1);
+    for(unsigned i=0;i<64;i++) {
+        tokens[i]=i+100;types[i]=(uint8_t)(i%9+1);formats[i]=(uint8_t)(i%4);
+        native_formats[i]=VK_FORMAT_R8G8B8A8_UNORM;has_views[i]=1;
+    }
     ex.dc=&context; ex.prog=&programs[0]; ex.tex[stage][2]=1; ex.img[stage][2]=2;
     mode=memo_mode=1; deferred=defer_handle=pending_service=lock_depth=0;
     mutate_from=mutate_to=mutate_on_lock=n_probe_sh=0;
     service_mask=1u<<2; generation=1;
     services_used=service_calls=shader_locks=answer_calls=texture_locks=resolve_calls=0;
     turns=ended_passes=0; motion_lock_depth=descriptor_defer=ordered=0;
+    preparation_calls=0;
 }
 static const GfxShader *select_ready(VkExec *state,int stage) {
     int present=0,pending=0;
@@ -196,7 +253,7 @@ static void answer_publications(void) {
     assert(answers_for(&ex,0,control,3,&a));
     mutate(1); mutate_from=1; mutate_to=2;
     assert(answers_for(&ex,0,control,3,&a));
-    assert(a.tex_type[1]==types[2] && a.img_type[0]==types[2] && a.img_format[0]==formats[2]);
+    assert(a.tex_type[1]==types[2] && a.img_type[0]==types[2] && a.img_format[0]==test_codes[formats[2]]);
     context.AC[0].ttok[0]=0; mutate_on_lock=1;
     assert(answers_for(&ex,0,control,1,&a));
     assert(context.AC[0].tgen[0]==generation && a.tex_type[0]==types[1]);
@@ -204,6 +261,21 @@ static void answer_publications(void) {
     assert(!answers_for(&ex,0,control,1,&a) && deferred && !context.AC[0].ttok[0]);
     deferred=defer_handle=0; memo_mode=1; mutate(1);
     assert(answers_for(&ex,0,control,1,&a) && a.tex_type[0]==types[1]);
+    deferred=1;context.AC[0].ttok[0]=0;
+    assert(answers_for(&ex,0,control,1,&a) && deferred && a.tex_type[0]==types[1]);
+    deferred=0; // unrelated content state does not make unambiguous descriptor metadata unavailable.
+}
+
+static void metadata_only(void) {
+    reset(NVN_STAGE_CS);
+    defer_handle = 1;
+    uint8_t type = UINT8_MAX, format = UINT8_MAX;
+    vk_texture_lock();
+    assert(!answer_of_handle(1, SHADER_ANSWER_IMAGE, &type, &format, 1));
+    assert(!type && !format && !preparation_calls && !deferred);
+    assert(!answer_of_handle(1, SHADER_ANSWER_IMAGE, &type, &format, 0));
+    assert(preparation_calls == 1 && deferred);
+    vk_texture_unlock();
 }
 
 static unsigned packet_set(uint64_t serial,unsigned stage) {
@@ -230,13 +302,36 @@ static void eviction(void) {
 }
 
 static void caller_routing(void) {
-    reset(NVN_STAGE_CS); route_advanced=0; defer_handle=1;
-    gate_op_dispatch(&ex); assert(deferred && !route_advanced);
-    deferred=0; gate_op_dispatch_ind(&ex); assert(deferred && !route_advanced);
-    deferred=defer_handle=0; gate_op_dispatch(&ex); gate_op_dispatch_ind(&ex); assert(route_advanced==2);
-    reset(NVN_STAGE_MESH); route_advanced=0; defer_handle=1;
-    gate_mfb_draw(&ex); assert(deferred && !route_advanced);
-    deferred=defer_handle=0; gate_mfb_draw(&ex); assert(route_advanced==1);
+    reset(NVN_STAGE_CS);
+    direct_issued=indirect_issued=fallback_calls=0;
+    const p_dispatch direct={.x=1,.y=1,.z=1};
+    const p_dispatch_ind indirect={0};
+    defer_handle=1;
+    gate_op_dispatch(&ex,&direct); assert(deferred && !direct_issued && !fallback_calls);
+    deferred=0; gate_op_dispatch_ind(&ex,&indirect); assert(deferred && !indirect_issued && !fallback_calls);
+    deferred=defer_handle=0;
+    gate_op_dispatch(&ex,&direct); gate_op_dispatch_ind(&ex,&indirect);
+    assert(direct_issued==1 && indirect_issued==1 && !fallback_calls);
+    retained_compute=select_ready(&ex,NVN_STAGE_CS);
+    unsigned calls=resolve_calls;
+    compat_selected=1; defer_handle=1;
+    gate_op_dispatch(&ex,&direct); gate_op_dispatch_ind(&ex,&indirect);
+    assert(direct_issued==2 && indirect_issued==2 && resolve_calls==calls && !deferred);
+    compat_selected=-1;
+    gate_op_dispatch(&ex,&direct); gate_op_dispatch_ind(&ex,&indirect);
+    assert(direct_issued==2 && indirect_issued==2 && resolve_calls==calls && !fallback_calls);
+    compat_selected=0;
+
+    reset(NVN_STAGE_MESH);
+    defer_handle=1;
+    assert(gate_mesh_stages(&ex,0)==VK_EXEC_GRAPHICS_NEEDS_ORDERED && !deferred && !service_calls);
+    assert(gate_mesh_stages(&ex,1)==VK_EXEC_GRAPHICS_UNAVAILABLE && deferred && !service_calls);
+    deferred=defer_handle=0;
+    assert(gate_mesh_stages(&ex,0)==VK_EXEC_GRAPHICS_NEEDS_ORDERED && !deferred && !service_calls);
+    assert(gate_mesh_stages(&ex,1)==VK_EXEC_GRAPHICS_READY && service_calls==1);
+    const GfxShader *mesh=NULL;
+    assert(graphics_stage_select(&ex,&ex.pipe,NVN_STAGE_MESH,0,&mesh)==VK_EXEC_GRAPHICS_READY);
+    assert(mesh && service_calls==1);
     reset(NVN_STAGE_VS); primary_draws=motion_draws=0; vk_exec_frame.draws=0; context.B.st_valid=1;
     p_draw_idx draw={.itype=NVN_INDEX_TYPE_UNSIGNED_SHORT,.count=3,.instances=1}; VkMemSpan span={0};
     defer_handle=1; gate_indexed(&ex,&draw,span);
@@ -249,8 +344,91 @@ static void caller_routing(void) {
     assert(primary_draws==2 && motion_draws==1 && vk_exec_frame.draws==2);
 }
 
-int main(void) {
-    dependencies(); interleaving_and_modes(); incomplete(); answer_publications(); eviction(); caller_routing();
+static void specialization_codes(uint8_t codes[4]) {
+    reset(NVN_STAGE_CS);
+    const VkFormat native[] = {VK_FORMAT_R16G16_SFLOAT,VK_FORMAT_R16G16_UINT,VK_FORMAT_R16G16_SINT,
+                               VK_FORMAT_B10G11R11_UFLOAT_PACK32};
+    const uint8_t expected[] = {0,20,21,11};
+    const GfxShader *previous=NULL;
+    for (unsigned i=0;i<4;i++) {
+        mutate(2);
+        native_formats[2]=native[i];
+        has_views[2]=(i==3);
+        formats[2]=0;
+        const GfxShader *selected=prime(NVN_STAGE_CS);
+        assert(selected!=previous && selected->answers.img_format[2]==expected[i]);
+        assert_hit(&ex,NVN_STAGE_CS,selected);
+        codes[i]=selected->answers.img_format[2];
+        previous=selected;
+    }
+}
+
+static RcNativeImageStore read_module(const char *path,int extended) {
+    FILE *file=fopen(path,"rb");
+    assert(file && !fseek(file,0,SEEK_END));
+    long bytes=ftell(file);
+    assert(bytes>20 && bytes%4==0 && !fseek(file,0,SEEK_SET));
+    size_t words=(size_t)bytes/4;
+    uint32_t *raw=malloc((size_t)bytes);
+    assert(raw && fread(raw,4,words,file)==words && !fclose(file));
+    RcNativeImageStore original={0}, selected={0};
+    assert(rc_native_image_store(raw,words,&original)!=RC_NATIVE_IMAGE_STORE_NONE);
+    uint32_t *with_capability=NULL;
+    assert(spirv_storage_image_extended(raw,words,&with_capability));
+    const uint32_t *native=with_capability?with_capability:raw;
+    size_t native_words=words;
+    if (with_capability) {
+        assert(extended && !memcmp(raw,native,20) && native[5]==((2u<<16)|17) && native[6]==49);
+        assert(!memcmp(raw+5,native+7,(size_t)bytes-20));
+        native_words+=2;
+    }
+    int capability=0;
+    for (size_t i=5;i<native_words;) {
+        size_t len=native[i]>>16;
+        assert(len && len<=native_words-i);
+        if ((native[i]&0xffff)==17 && len==2 && native[i+1]==49) capability++;
+        i+=len;
+    }
+    assert(capability==extended);
+    uint32_t *again=NULL;
+    assert(spirv_storage_image_extended(native,native_words,&again) && !again);
+    assert(rc_native_image_store(native,native_words,&selected)!=RC_NATIVE_IMAGE_STORE_NONE);
+    assert(original.scalar==selected.scalar && original.set==selected.set && original.binding==selected.binding &&
+           original.image_format==selected.image_format && original.reads_storage==selected.reads_storage);
+    free(with_capability);
+    free(raw);
+    return selected;
+}
+
+static void check_native_modules(char **paths) {
+    const RcNativeImageStore f=read_module(paths[0],0), u=read_module(paths[1],1);
+    const RcNativeImageStore s=read_module(paths[2],1), raw=read_module(paths[3],0);
+    assert(f.image_format==0 && f.scalar==RC_NATIVE_IMAGE_FLOAT32 && rc_native_image_store_format(&f,7,1,0));
+    assert(!rc_native_image_store_format(&f,36,1,1) && !rc_native_image_store_format(&f,26,1,1));
+    assert(!rc_native_image_store_format(&f,7,0,1));
+    assert(u.image_format==36 && u.scalar==RC_NATIVE_IMAGE_UINT32 && rc_native_image_store_format(&u,36,0,0));
+    assert(s.image_format==26 && s.scalar==RC_NATIVE_IMAGE_SINT32 && rc_native_image_store_format(&s,26,0,0));
+    assert(!rc_native_image_store_format(&u,26,1,1) && !rc_native_image_store_format(&s,36,1,1));
+    assert(!rc_native_image_store_format(&u,7,1,1) && !rc_native_image_store_format(&s,7,1,1));
+    assert(raw.image_format==33 && rc_native_image_store_format(&raw,33,0,0) && !rc_native_image_store_format(&raw,36,1,1));
+    puts("SM86 native storage: real float, unsigned, signed and explicit uint variants and exact capability/view checks passed");
+}
+
+int main(int argc,char **argv) {
+    if (argc==2 && !strcmp(argv[1],"--format-codes")) {
+        uint8_t codes[4];
+        specialization_codes(codes);
+        printf("[%u,%u,%u,%u]\n",codes[0],codes[1],codes[2],codes[3]);
+        return 0;
+    }
+    if (argc==6 && !strcmp(argv[1],"--modules")) {
+        check_native_modules(argv+2);
+        return 0;
+    }
+    assert(argc==1);
+    uint8_t codes[4];
+    specialization_codes(codes);
+    dependencies(); interleaving_and_modes(); incomplete(); answer_publications(); metadata_only(); eviction(); caller_routing();
     printf("shader_packet_check: %u ready selections avoided the original resolver, answer construction and shared shader lock; all five stages, exact dependencies, copied state, reference/check modes, pending/deferred results, answer publication, dispatch routing and one-primary motion retries passed\n",avoided_calls);
     return 0;
 }

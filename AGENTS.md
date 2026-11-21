@@ -1,52 +1,43 @@
-# NX2navi
+# 2NX2Navi
 
-Static recompilation of *Ocarina of Time* (Switch 2, ARM64) into a native Windows x86-64 exe with a Vulkan renderer. Identify the exact game revision from the selected build's inputs and manifest, not an inherited version label. Current NEXT requirements: [docs/settings-removal-plan.md](docs/settings-removal-plan.md). Architecture, building and launcher docs describe existing behavior and workflows but may be outdated: verify them against code and build evidence. Preserve required correctness semantics; those descriptions do not mandate retaining their implementation.
+Native Windows recompilation of Ocarina of Time with a Vulkan renderer. Follow the user's current scope and decisions. The [maintained plan](docs/settings-removal-plan.md) records approved requirements, current work and evidence; historical documentation and existing code are references, not proof of the best design.
 
-## Game content boundary
+Existing project documentation is likely to contain substantially outdated or incorrect information. Until a document has been rewritten from the ground up and verified against the current implementation, use it only as a lead for investigation, not as a reliable description or basis for technical decisions. Read the relevant code to verify its claims; use build or runtime evidence where code alone cannot establish behavior. Even replacement documentation needs rechecking when the implementation changes. User-approved requirements describe intended behavior, not proof that it is implemented.
 
-The repository's additions are all rights reserved (`LICENSE-ADDITIONS`). It never holds game data: game data lives outside it and every derived file stays in ignored folders.
+## Engineering judgment
 
-- The user's game and key paths are in `config.local.toml` (ignored). Pass the keys file path to tools; the tools read it themselves. Key values stay out of your output, logs, commands and files.
-- Everything extracted or generated goes under `build/` or `generated/`.
-- Every file the code generator emits carries the marker defined as `GENERATED_MARKER` in `tools/check_content.py`.
-- Run `python tools/check_content.py --staged` before proposing a commit. It is the same check CI runs.
+Evaluate changes against the intended player experience and the complete affected system. For NEXT resource work, the objective is less processing and waiting across the connected path to correct GPU work, with reliable pacing and memory use. Reuse, caching, tracking and parallelism are tools, not objectives.
 
-## Reusing code
+Consider downstream benefits and introduced costs together. A locally more expensive check can enable much larger savings elsewhere. Fewer operations, more cache hits or an isolated timing improvement do not establish a system benefit. Equally, every component of an unfinished replacement need not independently improve FPS.
 
-`refs/` holds the pinned checkout the build reads (`tools/fetch_refs.sh` recreates it). Read-only.
+Performance is not an unconditional veto. Useful features may have acceptable costs, and a coherent rework may temporarily regress. Explain the tradeoff, remaining dependencies and how the result will be evaluated against the user's priorities. A cleaner design alone does not demonstrate future gains.
 
-- Copy only MIT, BSD, ISC, zlib or Apache-2.0 code, keep its header, and add a row to `THIRD_PARTY_NOTICES.md`.
-- GPL code is never copied: write our own.
-- `tools/vendor/` stays byte-identical to its source. Extraction compatibility belongs in `tools/extract.py`; other dependency adaptations belong in their responsible wrapper or checked-in patch set applied to an ignored build copy (for example `tools/xlate/patches` through `tools/build_xlate.py`). Do not change pinned source trees in place.
+Preserve required behavior, not existing implementation choices. Stage boundaries, algorithms, dependencies, address models and testing methods may change with evidence. Distinguish user requirements from hypotheses and provisional choices; do not silently promote the latter into permanent constraints. Resolve changes to agreed product requirements with the user, while handling routine choices within authorized scope autonomously.
 
-## Code
+Keep each work packet coherent: identify the connected change, affected consumers, dependencies and completion evidence. The current NEXT phase completes the agreed resource-management replacement across ownership, observation, preparation/admission, binding, reclamation and lifetime before performance optimization. Ordinary CPU-sampled textures are the first migration lane, not the completion boundary for the foundation. Complete the connected consumers and remove the old responsibilities they replace; do not add a shortcut while leaving the old authority underneath. Use correctness checks and fix discovered bugs during this phase. Existing performance captures inform context, but isolated FPS gains do not select or gate foundational work; resume performance optimization after the foundation is integrated.
 
-- Build generated C with the supported GNU-compatible Clang/UCRT toolchain; `cl.exe` cannot compile its GNU extensions. Discover the existing validated compiler, Ninja and matching dependencies through build configuration or manifests rather than assuming `C:\msys64` exists. `tools/build_game.py` supports explicit toolchain, dependency and Ninja paths. Do not mix incompatible objects, headers or libraries; reuse generated objects only when their input/generator/patch identity matches.
-- Reuse validated Python environments/interpreters with the required dependencies. `.venv` (3.12) and `.venv-py314` are historical names, not required locations. Extraction/shader scripts using `compression.zstd` need Python 3.14 or the explicitly supported equivalent; do not recreate environments merely because those directory names are absent.
-- Generated C is never edited by hand: change the generator (`recomp/`).
-- The runtime's own shaders are checked in as source only (`runtime/shaders/`, `tools/make_dlaa_mask.py`,
-  `tools/make_mvobj_fs.py`). `tools/build_shaders.py` builds `runtime/<name>_spv.h` from them, `build_game.py` runs it,
-  git ignores the headers and `check_content.py` refuses them in a commit.
-- Every lifter change passes the differential tests against Unicorn ([docs/building.md](docs/building.md), "Checks"). After changing `recomp/jumptables.py`, `tests\jumptables_check.py` reports 0 disagreements on 1.2.1 and 1.4.3.
-- `recomp/layout.py` alone decides module bases.
-- Graphics bugs: [docs/maxwell.md](docs/maxwell.md) lists the Maxwell behaviour the Vulkan path must match, what goes wrong when it does not, and what our runtime does.
-- Comments explain behavior and rationale in words that stand on their own. Cite our code by file plus function (optional line hint). Relevant technical sources may be cited in design/research documentation; source attribution for copied code belongs in its license header and `THIRD_PARTY_NOTICES.md` row.
+## Evidence and coordination
 
-## Fork releases
+Verify consequential claims against code and observations. Distinguish measured results, inference and expectations. Validate affected behavior with appropriate checks; existing tests and reference implementations are useful but fallible. Investigate disagreements rather than treating either side as automatically correct.
 
-The public name is `2NX2Navi`. Resource-path development uses branch `NEXT` and `VERSION` labels `NEXT - N`, starting at `NEXT - 0`. Increment N for each subsequent candidate iteration; the spaces and hyphen are part of the label. Legacy is the original reference; use the explicitly selected checkpoint in the maintained plan for each comparison. This convention supersedes Beta/WIP numbering for this development line.
+Keep recoverable checkpoints and reproducible build/settings identities. Distinguish experimental results from readiness for the player.
 
-Benchmark with the validated harness and route/save definitions, compact per-frame records, route/camera checks and exact source/build/settings identities. Confirm effective settings and desktop exclusivity; preserve player saves and share compatible immutable inputs/caches safely. Fully warmed acceptance must be established by the startup record; retain partial/cold observations separately without presenting them as warmed comparisons. Compress logs and remove temporary captures/staging artifacts after review. NEXT currently lacks the root workspace's standalone benchmark guide/harness: locate their validated manifests before launching rather than inventing equivalent commands or silently copying unrelated dirty tools.
+Use model capacity efficiently. Previous work used Astra too often for tasks Sol could likely complete, consuming too much of the user's AI allowance. Use Astra 6.2 Medium for high-level planning and coordination, and Astra 6.2 High for decisions that cross systems and are costly to reverse. Delegate every individual task, including research, implementation, debugging, testing and focused review, to Sol 6.2 High. Define the deliverable, relevant context and file ownership. Run independent tasks in parallel when it saves time.
 
-## NEXT governing objective
+Astra owns integration decisions, reviews Sol's evidence and checks compatibility across tasks. Never repeat a delegated investigation. If evidence is missing or conflicting, send Sol a specific follow-up question. Get the user's approval before substituting a model or reasoning effort when the specified one is unavailable.
 
-Make the complete resource-handling chain deliver correct GPU work with substantially less processing and waiting. Reuse is a means, not the objective. Evaluate connected consequences: a 0.01 ms validity check that avoids 0.001 ms locally can still be worthwhile if its result eliminates 0.3 ms downstream. Conversely, fewer operations or more hits do not establish a net benefit. FPS alone neither accepts nor rejects an unfinished architectural replacement.
+For game runs, follow the user's current authorization and settings, use the validated harness/routes where applicable, and coordinate desktop access. Protect player saves and installs. Distinguish warm and cold results; retain inconvenient results rather than filtering them to support a conclusion. Share compatible inputs, use compact/compressed records and clean temporary artifacts after review while retaining useful evidence.
 
-- Design authoritative facts, ownership, invalidation and all relevant consumers together. Change stage boundaries or remove stages where this simplifies the complete path; do not preserve the old sequence by default.
-- Once per coherent implementation packet, and when evidence changes its design, name the connected chain, enabled downstream changes, introduced costs, dependencies and completion evidence. Delegated tasks must fit that contract; routine edits do not require repetitive planning. Distinguish demonstrated effects from hypotheses. Include contention, memory pressure and required-submission timing.
-- Current scope is the ordinary CPU-sampled texture lifecycle through preparation, binding, release, reclamation and reacquisition. Preserve useful correctness contracts, tests and checkpoint recovery; reconsider existing algorithms, including recent NEXT additions.
-- Do not divert to unrelated optimizations or leave this replacement unfinished to polish local wins. Necessary correctness fixes and diagnostics must serve this scope. Replace or abandon an implementation approach if evidence defeats its intended benefits; preserving the objective does not require preserving that approach. State why when changing direction. Update the maintained plan in place; do not accumulate review history.
+## Repository care
 
-## Writing
+Keep keys private and game data out of tracked files. Tools read key files themselves; extracted/game-derived outputs belong in ignored storage. Preserve generated-content marking and run `python tools/check_content.py --staged` before commits. Checker heuristics may be corrected without weakening that boundary.
 
-Code, comments, docs and commit messages are in English. Commit messages are plain sentences without type prefixes.
+Make durable changes reproducible from maintained sources, generators or explicit transformations. Track dependency versions/patches and preserve licenses and attribution. The current copying policy permits MIT, BSD, ISC, zlib and Apache-2.0 code, not GPL code. Reproducibility does not require freezing a dependency or generator indefinitely.
+
+Discover compatible toolchains from configuration/manifests. Reuse build products only with matching relevant inputs. Keep authoritative shader sources; current source-control policy excludes generated shader binaries but permits prepared distribution artifacts. Coordinate changes to shared ABI/layout contracts across their consumers.
+
+## Maintaining guidance
+
+`AGENTS.md` is the sole repository agent instruction file. Keep it concise. Replace superseded guidance in place; put detailed procedures, requirements and evidence in their responsible documents rather than accumulating history here. Revisit constraints when their rationale changes.
+
+The public name is **2NX2Navi**. Current development uses branch `NEXT` and `NEXT - N` versions; comparison checkpoints are specified in the plan. Write code, documentation and plain-sentence commit messages in English.

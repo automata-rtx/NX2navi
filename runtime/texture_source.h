@@ -12,10 +12,42 @@ typedef struct {
     uint64_t mapping, protection, lineage;
     uint32_t generation;
 } TextureSourceStamp;
+typedef enum {
+    TEX_SOURCE_TRACKING_NONE,
+    TEX_SOURCE_TRACKING_INPUT,
+    TEX_SOURCE_TRACKING_CLOCK,
+    TEX_SOURCE_TRACKING_GENERATION,
+    TEX_SOURCE_TRACKING_SNAPSHOT_EPOCH,
+    TEX_SOURCE_TRACKING_SNAPSHOT_UNTRACKED,
+    TEX_SOURCE_TRACKING_SNAPSHOT_LEASE,
+    TEX_SOURCE_TRACKING_MAPPING_BEFORE,
+    TEX_SOURCE_TRACKING_PROTECTION_BEFORE,
+    TEX_SOURCE_TRACKING_MAPPING_AFTER,
+    TEX_SOURCE_TRACKING_PROTECTION_AFTER,
+} TextureSourceTrackingFailure;
+
 typedef struct {
     TextureSourceStamp stamp;
     uint64_t dirty[TEXTURE_SOURCE_MASK_WORDS];
+    TextureSourceTrackingFailure tracking_failure; // The first failed check that prevented a new stamp.
 } TextureSourceObservation;
+
+static inline const char *texture_source_tracking_failure_name(TextureSourceTrackingFailure failure) {
+    static const char *const names[] = {"none", "invalid-input", "clock-unavailable", "generation-unavailable",
+        "snapshot-epoch", "snapshot-untracked", "snapshot-lease", "mapping-before", "protection-before",
+        "mapping-after", "protection-after"};
+    return (unsigned)failure < sizeof names / sizeof names[0] ? names[failure] : "unrecorded";
+}
+
+// A producer-identified freeze followed by a complete write drain. This bridges protection maintenance only;
+// mapping changes, subsequent thaws and generation discontinuities invalidate it without inspecting source bytes.
+typedef struct { uint64_t before, after, mapping, lineage; } TextureSourceFreezeBridge;
+
+static inline int texture_source_freeze_covers(const TextureSourceFreezeBridge *b, uint64_t observed,
+                                               uint64_t protection, uint64_t mapping, uint64_t lineage) {
+    return b->before && b->after > b->before && b->mapping && b->lineage && observed >= b->before &&
+           protection == b->after && mapping == b->mapping && lineage == b->lineage;
+}
 
 static inline int texture_source_stamp_valid(const TextureSourceStamp *s) {
     return s && s->mapping && s->protection && s->lineage && s->generation;

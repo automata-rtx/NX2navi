@@ -13,6 +13,7 @@
 #include "nvn_api.h"
 #include "tex.h"
 #include "vk.h"
+#include "resource_core_vma.h"
 #include "vk_exec.h"
 #include "vk_gpa.h"
 #include "platform/platform.h"
@@ -395,7 +396,7 @@ static int test_import(pool_t *pool) {
     vmaInvalidateAllocation(c->vma, sa, 0, VK_WHOLE_SIZE);
     GCHECK(!memcmp(s, m + 0x30000, 0x4000), "GPU read of CPU-written heap differs");
     vk_gpu_written(a + 0x30000, 0x4000);
-    vmaDestroyBuffer(c->vma, sb, sa);
+    resource_core_vma_destroy_buffer(c->vma, sb, sa);
 
     // generations: written after `since` -> 1, then 0, explicit host write -> 1
     uint32_t g0, g1, g2, g3;
@@ -508,7 +509,7 @@ static int test_table_sync(uint8_t *guest) {
     bad = 0;
 done:
     vk_sync_finish();
-    vmaDestroyBuffer(c->vma, sb, sa);
+    resource_core_vma_destroy_buffer(c->vma, sb, sa);
     vk_pool_fini(&pool);
 #undef TY_CHECK
 #undef TY_SHADOW
@@ -586,7 +587,7 @@ static int test_table_store(uint8_t *guest) {
     bad = 0;
 done:
     vk_sync_finish();
-    vmaDestroyBuffer(c->vma, sb, sa);
+    resource_core_vma_destroy_buffer(c->vma, sb, sa);
     vk_pool_fini(&pool);
 #undef TS_CHECK
 #undef TS_STORE
@@ -658,7 +659,7 @@ static int test_virtual(pool_t *phys, pool_t *virt) {
     vmaInvalidateAllocation(c->vma, ra, 0, VK_WHOLE_SIZE);
     int same = 1;
     for (int i = 0; i < 0x40; i++) same &= r[i] == 0xA5C3A5C3u;
-    vmaDestroyBuffer(c->vma, rb, ra);
+    resource_core_vma_destroy_buffer(c->vma, rb, ra);
     GCHECK(same, "a GPU fill through virtual page 5 is not in physical page 0");
     nvn_mapping_t un = {NULL, 0, 0, 0x10000, 0, 0};
     GCHECK(vk_pool_map_virtual(virt, 1, &un), "MapVirtual unmap");
@@ -736,7 +737,7 @@ static int image_is_color(VkImage image, uint32_t w, uint32_t h, const uint8_t w
     vmaInvalidateAllocation(c->vma, ra, 0, VK_WHOLE_SIZE);
     int same = 1;
     for (size_t i = 0; i < n; i += 4) same &= !memcmp(r + i, want, 4);
-    vmaDestroyBuffer(c->vma, rb, ra);
+    resource_core_vma_destroy_buffer(c->vma, rb, ra);
     return same;
 }
 
@@ -804,7 +805,7 @@ static int detail_level_is(const VkTexImage *img, uint32_t lv, uint32_t ly, uint
     } else {
         for (size_t i = 0; i < n; i += 4) same &= !memcmp(r + i, want, 4);
     }
-    vmaDestroyBuffer(c->vma, rb, ra);
+    resource_core_vma_destroy_buffer(c->vma, rb, ra);
     return same;
 }
 
@@ -1056,7 +1057,7 @@ static void image_bytes(VkImage image, uint32_t w, uint32_t h, uint8_t *out) {
     vk_upload_flush(1);
     vmaInvalidateAllocation(c->vma, ra, 0, VK_WHOLE_SIZE);
     memcpy(out, r, n);
-    vmaDestroyBuffer(c->vma, rb, ra);
+    resource_core_vma_destroy_buffer(c->vma, rb, ra);
 }
 
 static void prepare_texture_entries(void) {

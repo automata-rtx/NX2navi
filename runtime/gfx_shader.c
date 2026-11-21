@@ -81,6 +81,10 @@
 #include "host.h"
 #include "platform/platform.h"
 #include "prp_file.h"
+#include "resource_core_shader_writes.h"
+#include "rc_native_image_store.h"
+#include "resource_core_effects.h"
+#include "resource_core_inventory.h"
 
 #define CONTROL_SIZE 0x880
 #define CODE_SKIP 0x30                                     // graphics code starts after the first 0x30 bytes of the program
@@ -110,7 +114,10 @@ typedef struct UseEnt {                                    // code hash -> use m
     UseMask m;
 } UseEnt;
 
+#include "shader_pool_indices.h"
+
 struct GfxShader {
+    ShaderPoolIndices *pool_indices;
     struct GfxShader *next;
     uint8_t key[32];
     uint8_t iid[32];                                       // input id (see the keys at the top)
@@ -121,6 +128,10 @@ struct GfxShader {
     // Reflection (reflect(), once per shader before it enters the cache)
     int stage;                                             // GFX_STAGE_*
     GfxShaderRes *res[GFX_RES_KINDS];
+    RcEffectProgram *effects;
+    uint32_t guest_writes;
+    uint32_t queried_tex_slots,queried_img_slots;
+    int write_inventory_complete;
     int nres[GFX_RES_KINDS];
     uint32_t in_mask, out_mask;                            // user Locations of Input / Output variables
     GfxShaderIo in[32], out[32];
@@ -131,6 +142,7 @@ struct GfxShader {
     uint8_t carried;                                       // 1 + the previous identity (C.prev) that translated it; 0 the
                                                            // current translator
     uint8_t fresh;                                         // translated in this process (translate_one)
+    uint16_t indirect_image_rmw;                           // 0 untested, 1 refused, otherwise binding + 2
 };
 
 static PlatMutex cache_lock = PLAT_MUTEX_INIT;                  // memory cache
@@ -689,7 +701,39 @@ static GfxShader *mem_find(const uint8_t key[32]) {
 
 static void shader_free(GfxShader *s) {
     for (int k = 0; k < GFX_RES_KINDS; k++) free(s->res[k]);
+    rc_effect_free(s->effects);
+    free(s->pool_indices);
     free(s->spirv), free(s->reflection), free(s);
+}
+
+static int shader_write_covered(void *context, const RcWriteBinding *binding) {
+    const GfxShader *s = context;
+    int kind = binding->kind == RC_INVENTORY_IMAGE ? GFX_RES_IMG : GFX_RES_SSBO;
+    for (int i = 0; i < s->nres[kind]; i++) {
+        const GfxShaderRes *r = &s->res[kind][i];
+        if (!(r->flags & (kind == GFX_RES_IMG ? 4 : 1))) continue;
+        if (binding->kind == RC_INVENTORY_GPA) {
+            if (r->cbuf_slot == 0x40) return 1;
+        } else if (r->set == binding->set && r->binding == binding->binding &&
+                   (uint32_t)(r->count ? r->count : 1) >= binding->count) return 1;
+    }
+    return 0;
+}
+static uint32_t json_slot_mask(const char *,const char *);
+static void shader_effects_compile(GfxShader *s) {
+    s->queried_tex_slots=json_slot_mask(s->reflection,"tex_queried");
+    s->queried_img_slots=json_slot_mask(s->reflection,"img_queried");
+    // The program borrows this final module. Build after runtime shader patches, and release before its words.
+    s->guest_writes = rc_effect_write_class(s->spirv, (size_t)s->words);
+    for (int i = 0; i < s->nres[GFX_RES_SSBO]; i++) if (s->res[GFX_RES_SSBO][i].flags & 1)
+        s->guest_writes |= s->res[GFX_RES_SSBO][i].cbuf_slot == 0x40 ? RC_EFFECT_WRITES_GPA : RC_EFFECT_WRITES_BUFFER;
+    for (int i = 0; i < s->nres[GFX_RES_IMG]; i++) if (s->res[GFX_RES_IMG][i].flags & 4)
+        s->guest_writes |= RC_EFFECT_WRITES_IMAGE;
+    s->write_inventory_complete = rc_write_inventory_covered(s->spirv, (size_t)s->words,
+                                                            shader_write_covered, s);
+    if (!s->write_inventory_complete) s->guest_writes |= RC_EFFECT_WRITES_UNKNOWN;
+    if (s->guest_writes & (RC_EFFECT_WRITES_BUFFER | RC_EFFECT_WRITES_GPA | RC_EFFECT_WRITES_UNKNOWN))
+        s->effects = rc_effect_compile(s->spirv, (size_t)s->words);
 }
 
 static void reflect(GfxShader *s, int patch_txd);
@@ -804,6 +848,7 @@ static GfxShader *disk_load_from(const uint8_t key[32], const uint8_t *iid, int 
     }
     reflect(s, 1);
     if (s->stage == GFX_STAGE_FS) vk_hdr_shader_swap(&s->spirv, &s->words);   // the in-memory copy; the cache keeps its own
+    shader_effects_compile(s);
     return s;
 }
 
@@ -823,6 +868,7 @@ static const GfxShader *own_shader(const uint32_t *spirv, uint64_t words, const 
     memcpy(s->spirv, spirv, words * 4), memcpy(s->reflection, res_json, rn + 1);
     s->words = words, s->reflection_size = rn;
     reflect(s, patch_txd);
+    shader_effects_compile(s);
     return s;
 }
 
@@ -1234,8 +1280,21 @@ static void reflect(GfxShader *s, int patch_txd) {
         json_objects(js, kinds[k], add_res, s, k);
     }
     reflect_spirv(s);
+    // The GPA descriptor itself is read-only; the physical buffers its entries address may be written. Older
+    // reflection omitted that distinction. Recover it from the actual module once, before publishing the shader.
+    int physical_writes = -1;
+    for (int i = 0; i < s->nres[GFX_RES_SSBO]; i++) {
+        GfxShaderRes *r = &s->res[GFX_RES_SSBO][i];
+        if (r->cbuf_slot != 0x40) continue;
+        if (physical_writes < 0) physical_writes = rc_shader_physical_writes(s->spirv, s->words);
+        if (physical_writes) r->flags |= 1;
+        else r->flags &= (uint8_t)~1u;
+    }
     reflect_exact(s);
     if (patch_txd) patch_txd_transpose(s);
+    const GfxShaderRes *resources[GFX_RES_KINDS];
+    for (int i=0;i<GFX_RES_KINDS;++i) resources[i]=s->res[i];
+    s->pool_indices=shader_pool_indices_build(s->spirv,s->words,resources,s->nres);
 }
 
 // ---- use masks (see the cache key at the top)
@@ -2498,6 +2557,81 @@ int gfx_shader_write_code(const GfxShader *s, const char *path) {
 }
 
 int gfx_shader_stage(const GfxShader *s) { return s->stage; }
+
+const RcEffectProgram *gfx_shader_effects(const GfxShader *s) { return s ? s->effects : NULL; }
+uint32_t gfx_shader_guest_writes(const GfxShader *s) { return s ? s->guest_writes : RC_EFFECT_WRITES_UNKNOWN; }
+void gfx_shader_slot_dependencies(const GfxShader *s,uint32_t *textures,uint32_t *images) {
+    *textures=s?s->queried_tex_slots:0;*images=s?s->queried_img_slots:0;
+}
+int gfx_shader_write_inventory_complete(const GfxShader *s) { return s && s->write_inventory_complete; }
+
+int gfx_shader_indirect_image_rmw_binding(const GfxShader *shader) {
+    if (!shader || shader->stage != GFX_STAGE_CS || shader->guest_writes != RC_EFFECT_WRITES_IMAGE ||
+        !shader->write_inventory_complete) return -1;
+    GfxShader *s = (GfxShader *)shader;
+    unsigned cached = __atomic_load_n(&s->indirect_image_rmw, __ATOMIC_ACQUIRE);
+    if (!cached) {
+        plat_mutex_lock(&cache_lock);
+        cached = __atomic_load_n(&s->indirect_image_rmw, __ATOMIC_RELAXED);
+        if (!cached) {
+            RcNativeImageSeedBindings bindings;
+            cached = rc_native_image_seed_rmw_bindings(s->spirv, (size_t)s->words, &bindings) &&
+                     bindings.count == 1 ? (unsigned)bindings.entries[0].binding + 2 : 1;
+            __atomic_store_n(&s->indirect_image_rmw, cached, __ATOMIC_RELEASE);
+        }
+        plat_mutex_unlock(&cache_lock);
+    }
+    return (int)cached - 2;
+}
+
+int gfx_shader_has_pool_index_plan(const GfxShader *s) { return s && s->pool_indices && !s->pool_indices->domain_source; }
+
+int gfx_shader_has_pool_index_domain(const GfxShader *s) { return s && s->pool_indices && s->pool_indices->domain_source; }
+
+int gfx_shader_has_pool_comparison_domain(const GfxShader *s) {
+    return (gfx_shader_pool_sampler_modes(s) & GFX_POOL_SAMPLER_COMPARE) != 0;
+}
+
+unsigned gfx_shader_pool_sampler_modes(const GfxShader *s) {
+    return s && s->pool_indices ? s->pool_indices->sampler_modes : 0;
+}
+
+int gfx_shader_pool_indices(const GfxShader *s, GfxShaderPoolReadWord read, void *context,
+                            GfxShaderPoolIndex *out, uint32_t capacity, uint32_t *count) {
+    return shader_pool_indices_eval(s ? s->pool_indices : NULL,read,context,out,capacity,count);
+}
+
+int gfx_shader_pool_domain_indices(const GfxShader *s, GfxShaderPoolReadDomain read,
+                                   GfxShaderPoolReadWord read_word, void *context,
+                                   GfxShaderPoolIndex *out, uint32_t capacity, uint32_t *count,
+                                   int *comparison_sampler_zero) {
+    return shader_pool_domain_eval(s ? s->pool_indices : NULL, read, read_word, context, out, capacity, count,
+                                   comparison_sampler_zero);
+}
+
+int gfx_shader_pool_inactive(const GfxShader *s, GfxShaderPoolReadWord read, void *context) {
+    return shader_pool_inactive_eval(s ? s->pool_indices : NULL, read, context);
+}
+
+int gfx_shader_pool_inactive_source(const GfxShader *s, const uint32_t *selected, uint64_t words,
+                                    uint32_t set, uint32_t binding_offset) {
+    if (!s || !s->pool_indices || !s->pool_indices->inactive_guard) return 0;
+    uint64_t original_words;
+    const uint32_t *original = gfx_shader_spirv(s, &original_words);
+    return original_words == words && shader_pool_inactive_source(original, selected, words, set, binding_offset);
+}
+
+int gfx_shader_pool_domain_comparison_indices(const GfxShader *s, GfxShaderPoolReadDomain read,
+    GfxShaderPoolReadWord read_word, void *context, GfxShaderPoolIndex *out,
+    uint32_t capacity, uint32_t *count, GfxShaderPoolSamplers *samplers) {
+    return shader_pool_domain_evaluate(s ? s->pool_indices : NULL, read, read_word, context,
+        out, capacity, count, NULL, samplers);
+}
+
+int gfx_shader_pool_comparison_indices(const GfxShader *s, GfxShaderPoolReadWord read, void *context,
+    GfxShaderPoolIndex *out, uint32_t capacity, uint32_t *count, GfxShaderPoolSamplers *samplers) {
+    return shader_pool_indices_evaluate(s ? s->pool_indices : NULL, read, context, out, capacity, count, samplers);
+}
 
 int gfx_shader_resources(const GfxShader *s, int kind, const GfxShaderRes **res) {
     if (kind < 0 || kind >= GFX_RES_KINDS) return 0;

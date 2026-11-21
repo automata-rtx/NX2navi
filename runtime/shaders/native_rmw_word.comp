@@ -1,0 +1,31 @@
+#version 450
+
+// Collect prior snapshot comparisons and actual mesh execution. The final mode owns the one target word.
+layout(local_size_x = 1) in;
+layout(std430, set = 0, binding = 0) readonly buffer Source { uint data[]; } source;
+layout(std430, set = 0, binding = 1) readonly buffer Mirror { uint data[]; } mirror_word;
+layout(std430, set = 0, binding = 2) buffer Status { uint executed; uint conditions; } status;
+layout(std430, set = 0, binding = 3) writeonly buffer Import { uint data[]; } import_word;
+layout(push_constant) uniform Selection {
+    uint mode;
+    uint source_index;
+    uint mirror_index;
+    uint import_index;
+} selection;
+
+void main() {
+    switch (selection.mode) {
+        case 0:
+            if (source.data[selection.source_index] != 0u)
+                atomicOr(status.conditions, 1u);
+            break;
+        case 1:
+            if (source.data[selection.source_index] != mirror_word.data[selection.mirror_index])
+                atomicOr(status.conditions, 2u);
+            break;
+        case 2:
+            if (status.conditions != 0u)
+                import_word.data[selection.import_index] = mirror_word.data[selection.mirror_index];
+            break;
+    }
+}

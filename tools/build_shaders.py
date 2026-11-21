@@ -40,7 +40,12 @@ MESH_TARGET = 'vulkan1.2'   # mesh and task shaders need SPIR-V 1.4 or later
 ASM = '.spvasm'
 ASM_TARGET = 'vulkan1.3'
 # header name -> the script beside this one that assembles it; the script's HEADER is the header's text
-ASSEMBLED = {'dlaa_mask': 'make_dlaa_mask.py', 'mvobj_fs': 'make_mvobj_fs.py'}
+ASSEMBLED = {'dlaa_mask': 'make_dlaa_mask.py', 'mvobj_fs': 'make_mvobj_fs.py',
+             'sample_restore_probe': 'make_sample_restore_probe.py', 'pool_restore_probe': 'make_pool_restore_probe.py',
+             'pool_dispatch_probe': 'make_pool_dispatch_probe.py',
+             'pool_finite_probe': 'make_pool_finite_probe.py',
+             'fallback_probe': 'make_fallback_probe.py',
+             'storage_first_write_probe': 'make_storage_first_write_probe.py'}
 # a file below runtime/ the runtime embeds -> the header of its bytes, below runtime/ too (git ignores it)
 EMBEDDED = {'ui/fonts/Roboto-Medium.ttf': 'ui/roboto_ttf.h',
             'third_party/smaa/AreaTex.bin': 'smaa_area_tex.h', 'third_party/smaa/SearchTex.bin': 'smaa_search_tex.h'}

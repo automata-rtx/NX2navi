@@ -8,20 +8,92 @@ static uint64_t test_mem = 10, test_snap = 20, test_capture = 30, test_drop, tes
 static uint32_t test_textures = 40, test_texture_epoch = 50, test_samplers = 60;
 static int test_td = 1, test_token_ok = 1, test_fail_alloc, test_mutate_ordered;
 static int test_snapshots, test_fail_proof_end, test_deferred;
+static int test_binding_allowed=1;
+static uint64_t test_mapping=1,test_protection=1;
+static uint64_t test_registrations=1;
+static int test_position_open=1;
+static RcRegistryPosition test_position={1,2},test_next_write;
+static unsigned test_binding_checks;
 static unsigned test_allocs, test_fail_at, test_begins, test_executed[VK_BR_MAX_BINDINGS], test_sequence[256], test_nsequence;
 static uint64_t test_counted;
+static int test_shadow, test_shadow_storage;
+static unsigned test_shadow_enrollments;
 static uint64_t test_semantics = 1469598103934665603ull;
 static void semantic_event(uint64_t value) { test_semantics = (test_semantics ^ value) * 1099511628211ull; }
 VkExecFrame vk_exec_frame;
 const VkTexImage *vk_dlaa_swap_img;
 
+// These mocks exercise the prepared consumer's ownership calls. The actual instance transfer, cancellation and
+// split-recording lifetime implementation is exercised by resource_core_scene_check.c.
+struct TextureImagePublication { uint32_t limit; VkImage image[VK_BR_MAX_DESC]; };
+static unsigned test_publication_updates __attribute__((unused)),test_publication_captures __attribute__((unused)),
+    test_publication_commits __attribute__((unused)),test_publication_releases __attribute__((unused));
+#ifdef PREP_TEXTURE_LOCK_TEST
+static int texture_locked;
+#endif
+TextureImagePublication *vk_texture_publication_create(const VkImage *images,size_t n,const TextureImagePublication *prior) {
+    (void)images;(void)n;(void)prior;
+    TextureImagePublication *p=calloc(1,sizeof *p);assert(p);return p;
+}
+TextureImagePublication *vk_texture_publication_create_indexed(uint32_t count) {
+    assert(count&&count<=VK_BR_MAX_DESC);
+    TextureImagePublication *p=vk_texture_publication_create(NULL,0,NULL);p->limit=count;return p;
+}
+void vk_texture_publication_update(TextureImagePublication *p,uint32_t index,VkImage image) {
+#ifdef PREP_TEXTURE_LOCK_TEST
+    assert(texture_locked);
+#endif
+    assert(p&&index<p->limit);p->image[index]=image;test_publication_updates++;
+}
+void vk_texture_publication_capture(TextureImagePublication *p,const TextureImagePublication *source) {
+    assert(p&&!p->limit);test_publication_captures++;
+    if(source)memcpy(p->image,source->image,sizeof p->image);
+}
+void vk_texture_publication_commit_updates(TextureImagePublication *p) {
+    assert(p&&p->limit);test_publication_commits++;
+}
+void vk_texture_publication_release(TextureImagePublication *p) {
+    if(p){test_publication_releases++;free(p);}
+}
+static CbRes *cb_res(VkExec *ex) {assert(ex->dc->res);return ex->dc->res;}
+
 uint64_t vk_mem_gen(void) { return test_mem; }
+int vk_mem_shadow_storage(void) { return test_shadow; }
 uint64_t vk_usnap_gen(void) { return test_snap; }
 uint64_t vk_usnap_capture(void) { return test_capture; }
 uint32_t vk_texture_slots_gen(void) { return test_textures; }
 uint32_t vk_texture_epoch(void) { return test_texture_epoch; }
 uint32_t vk_sampler_gen(void) { return test_samplers; }
 int vk_texture_deferred(void) { return test_deferred; }
+RcRegistryPosition vk_exec_resource_position(void) {return test_position;}
+int rc_registry_position_open(RcRegistry *r,RcRegistryPosition position) {
+    (void)r;return test_position_open && rc_registry_position_valid(position);
+}
+uint64_t vk_texture_registration_publication(void) {return test_registrations;}
+uint64_t mem_mapping_serial(void) {return test_mapping;}
+uint64_t mem_protection_serial(void) {return test_protection;}
+int vk_texture_binding_receipt_locked(int id,VkImage expected,RcRegistryPosition *next) {
+    (void)id;(void)expected;test_binding_checks++;
+    RcRegistryPosition edge=test_next_write;
+    if(rc_registry_position_valid(edge))edge.ordinal--;
+    if(next)*next=edge;
+    return test_binding_allowed && (!rc_registry_position_valid(edge) ||
+           rc_registry_position_compare(test_position,edge)<0);
+}
+int vk_texture_binding_current_locked(int id,VkImage expected) {
+    return vk_texture_binding_receipt_locked(id,expected,NULL);
+}
+
+static unsigned test_selected_texture_checks __attribute__((unused));
+int vk_texture_resolved_receipt_locked(VkTextureReadKey key,VkImage expected,RcRegistryPosition *next) {
+    assert(key.registration);
+    test_selected_texture_checks++;
+    return vk_texture_binding_receipt_locked(key.native_slot,expected,next);
+}
+#ifndef PREP_TEXTURE_LOCK_TEST
+void vk_texture_lock(void) {}
+void vk_texture_unlock(void) {}
+#endif
 int vk_usnap_lease_valid(const VkUsnapLease *lease) {
     return lease->capture && lease->capture == test_capture && (!test_drop || test_drop > test_epoch);
 }
@@ -74,7 +146,11 @@ static int slot_still(uint32_t *gen, uint64_t token, uint64_t handle, uint32_t c
 }
 static void count_use(DrawCtx *cx, int cls, int use, uint64_t n) {
     semantic_event(6); semantic_event(n);
-    (void)cx; assert(cls == VK_MCLS_HOST_CACHED && use == VK_MUSE_UBO); test_counted += n;
+    (void)cx;
+    assert((cls == VK_MCLS_HOST_CACHED && use == VK_MUSE_UBO) ||
+           (test_shadow_storage && use == VK_MUSE_SSBO &&
+            (cls == VK_MCLS_HOST_CACHED || cls == VK_MCLS_DEVICE)));
+    test_counted += n;
 }
 static void *prepared_test_calloc(size_t n, size_t size) {
     test_allocs++;
@@ -109,7 +185,7 @@ static void execute_fake(VkExec *ex, const VkBindRecipeOp *op, PreparedBindings 
         if (op->kind == VK_BR_TEXEL) p->desc[j].view = (VkBufferView)(uintptr_t)99;
         else if (op->kind == VK_BR_TEXTURE) {
             uint64_t handle = prepared_handle(ex, &p->recipe->input[j]);
-            slot->texture = (TexMemo){.valid = 1, .h = handle, .tok = handle + 100,
+            slot->texture = (TexMemo){.authority = test_authority_epoch, .valid = 1, .h = handle, .tok = handle + 100,
                 .ep = test_texture_epoch, .sg = test_samplers, .gen = test_textures,
                 .image = (VkImage)(uintptr_t)8,
                 .out = {(VkSampler)(uintptr_t)2, (VkImageView)(uintptr_t)3, VK_IMAGE_LAYOUT_GENERAL}};
@@ -123,6 +199,13 @@ static void execute_fake(VkExec *ex, const VkBindRecipeOp *op, PreparedBindings 
             memset(&slot->lease, 0, sizeof slot->lease);
             if (test_snapshots) slot->lease.capture = test_capture;
             slot->count = (PbCount){.cls = VK_MCLS_HOST_CACHED, .use = VK_MUSE_UBO, .n = b->size, .has = 1};
+            if (test_shadow_storage && op->kind == VK_BR_SSBO) {
+                slot->count.use = VK_MUSE_SSBO;
+                if (op->binding->binding == 2) slot->count.cls = VK_MCLS_DEVICE;
+                if (test_shadow && slot->count.cls == VK_MCLS_HOST_CACHED) test_shadow_enrollments++;
+                ex->dc->pb_spoiled = 0;
+                prepared_buffer_end(ex, &p->recipe->input[j], slot);
+            }
             p->desc[j].buffer = (VkDescriptorBufferInfo){(VkBuffer)(uintptr_t)1, b->addr, b->size};
             count_use(ex->dc, slot->count.cls, slot->count.use, slot->count.n);
         }
@@ -132,7 +215,15 @@ static void execute_fake(VkExec *ex, const VkBindRecipeOp *op, PreparedBindings 
 static void prepared_support(VkExec *ex, const VkBindRecipeOp *op, PreparedBindings *p, int check) { execute_fake(ex, op, p, check); }
 static void prepared_uniforms(VkExec *ex, const VkBindRecipeOp *op, PreparedBindings *p, int check) { execute_fake(ex, op, p, check); }
 static void prepared_storage(VkExec *ex, const VkBindRecipeOp *op, PreparedBindings *p, int check) { execute_fake(ex, op, p, check); }
-static void prepared_images(VkExec *ex, const VkBindRecipeOp *op, PreparedBindings *p, int check) { execute_fake(ex, op, p, check); }
+#ifdef PREP_TEXTURE_LOCK_TEST
+static PreparedOp test_image_operation;
+#endif
+static void prepared_images(VkExec *ex, const VkBindRecipeOp *op, PreparedBindings *p, int check) {
+#ifdef PREP_TEXTURE_LOCK_TEST
+    if (test_image_operation) { test_image_operation(ex, op, p, check); return; }
+#endif
+    execute_fake(ex, op, p, check);
+}
 static void prepared_texels(VkExec *ex, const VkBindRecipeOp *op, PreparedBindings *p, int check) { execute_fake(ex, op, p, check); }
 
 static DrawCtx *context_new(void) { DrawCtx *cx = calloc(1, sizeof *cx); assert(cx); return cx; }
@@ -217,6 +308,53 @@ static void lifetimes_and_watchers(void) {
     assert(!bind_handles(handles, 128, &bind, watches));
 }
 
+
+static void raw_shadow_part_enrollment(void) {
+    DrawCtx *cx = context_new();
+    VkExec ex = {.dc = cx, .cb = (VkCommandBuffer)(uintptr_t)1, .fence = 7};
+    GfxShaderRes storage[] = {{.cbuf_slot=0,.handle=0x110/4},{.cbuf_slot=0,.handle=0x120/4}};
+    VkPipeBinding bindings[] = {
+        {.binding=1,.stage=GFX_STAGE_VS,.kind=GFX_RES_SSBO,.res=&storage[0],.type=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER},
+        {.binding=2,.stage=GFX_STAGE_VS,.kind=GFX_RES_SSBO,.res=&storage[1],.type=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER},
+    };
+    VkPipeInfo info = {.n_bindings=2,.bindings=bindings,.bind_point=VK_PIPELINE_BIND_POINT_GRAPHICS};
+    VkBindRecipe *recipe = vk_bind_recipe_create(&info, 0);
+    assert(recipe);
+    ex.ssbo[0][0]=(p_bind_buf){.addr=0x1000,.size=256};
+    ex.ssbo[0][1]=(p_bind_buf){.addr=0x2000,.size=256};
+    test_shadow=test_shadow_storage=1;
+    PreparedBindings *p=prepared_instance(&ex,recipe);
+    PreparedGroup *group=&p->set[0].group[VK_BR_GROUP_BUFFER];
+    prepared_resolve(&ex,p,0);
+    assert(test_shadow_enrollments==1 && p->slot[0].shadow_part==ex.cb && !p->slot[1].shadow_part);
+    assert(group->sealed && prepared_group_valid(&ex,group));
+    prepared_resolve(&ex,p,0);
+    assert(test_shadow_enrollments==1); // one registration per part, not per draw
+    dc=cx;vk_exec_draw_new_cb();
+    ex.cb=(VkCommandBuffer)(uintptr_t)2;
+    assert(prepared_instance(&ex,recipe)==p);
+    assert(!prepared_group_valid(&ex,group));
+    assert(!prepared_buffer_valid(&ex,&recipe->input[0],&p->slot[0]));
+    assert(prepared_buffer_valid(&ex,&recipe->input[1],&p->slot[1])); // device fallback stays reusable
+    prepared_resolve(&ex,p,0);
+    assert(test_shadow_enrollments==2 && p->slot[0].shadow_part==ex.cb && prepared_group_valid(&ex,group));
+    prepared_resolve(&ex,p,0);
+    assert(test_shadow_enrollments==2);
+    context_free(cx);
+    test_shadow=0; // choose the import backend in a distinct test context
+    cx=context_new();
+    ex.dc=cx;
+    p=prepared_instance(&ex,recipe);
+    group=&p->set[0].group[VK_BR_GROUP_BUFFER];
+    prepared_resolve(&ex,p,0);
+    assert(!p->slot[0].shadow_part && prepared_group_valid(&ex,group));
+    ex.cb=(VkCommandBuffer)(uintptr_t)3;
+    assert(prepared_buffer_valid(&ex,&recipe->input[0],&p->slot[0]) && prepared_group_valid(&ex,group));
+    context_free(cx);free(recipe);
+    test_shadow_storage=0;
+    puts("prepared raw storage: actual shadow enrollment, aggregate and slot part renewal, device and import reuse passed");
+}
+
 static void ordered_and_partial_sets(void) {
     DrawCtx *cx = context_new();
     VkExec ex = {.dc = cx, .fence = 10};
@@ -283,13 +421,39 @@ static void proofs_and_texture_sealing(void) {
     recipe = vk_bind_recipe_create(&info, 0);
     p = prepared_instance(&ex, recipe), slot = &p->slot[0];
     ex.tex[0][3] = 17;
-    slot->texture = (TexMemo){.valid = 1, .h = 17, .tok = 117, .ep = test_texture_epoch,
+    slot->texture = (TexMemo){.authority = test_authority_epoch, .valid = 1, .h = 17, .tok = 117, .ep = test_texture_epoch,
         .sg = test_samplers, .gen = test_textures, .image = (VkImage)(uintptr_t)8,
         .out = {(VkSampler)(uintptr_t)2, (VkImageView)(uintptr_t)3, VK_IMAGE_LAYOUT_GENERAL}};
     p->desc[0].image = slot->texture.out;
     p->desc[0].w[2] = (uint32_t)VK_IMAGE_LAYOUT_GENERAL;
     stamp = prepared_stamp(&ex, VK_BR_GROUP_TEXTURE); vk_usnap_proof_begin(&proof); prepared_seal(&ex, p, 0, VK_BR_GROUP_TEXTURE, &stamp, &proof);
     assert(p->set[0].group[VK_BR_GROUP_TEXTURE].sealed && prepared_group_valid(&ex, &p->set[0].group[VK_BR_GROUP_TEXTURE]));
+    // All writers can be declared before the first draw. The producer's own read phase must reject an aggregate
+    // even when broad epochs/tokens are unchanged: its writable aliases require ordinary per-source validation.
+    test_next_write=(RcRegistryPosition){1,5};
+    stamp=prepared_stamp(&ex,VK_BR_GROUP_TEXTURE);vk_usnap_proof_begin(&proof);
+    prepared_seal(&ex,p,0,VK_BR_GROUP_TEXTURE,&stamp,&proof);
+    unsigned receipt_checks=test_binding_checks;
+    assert(prepared_group_valid(&ex,&p->set[0].group[VK_BR_GROUP_TEXTURE]));
+    assert(test_binding_checks==receipt_checks);
+    test_position.ordinal=4;
+    assert(!prepared_group_valid(&ex,&p->set[0].group[VK_BR_GROUP_TEXTURE]));
+    assert(!prepared_texture_valid(&ex,&recipe->input[0],slot,&p->desc[0]));
+    test_position.ordinal=8;
+    assert(!prepared_group_valid(&ex,&p->set[0].group[VK_BR_GROUP_TEXTURE]));
+    assert(!prepared_texture_valid(&ex,&recipe->input[0],slot,&p->desc[0]));
+    test_position.ordinal=2;test_next_write=(RcRegistryPosition){0};
+    test_mapping++;
+    assert(!prepared_group_valid(&ex,&p->set[0].group[VK_BR_GROUP_TEXTURE]));test_mapping--;
+    test_protection++;
+    assert(!prepared_group_valid(&ex,&p->set[0].group[VK_BR_GROUP_TEXTURE]));test_protection--;
+    test_binding_allowed=0;assert(!prepared_texture_valid(&ex,&recipe->input[0],slot,&p->desc[0]));test_binding_allowed=1;
+    test_authority_epoch++;
+    assert(!prepared_group_valid(&ex, &p->set[0].group[VK_BR_GROUP_TEXTURE]));
+    assert(!prepared_texture_valid(&ex, &recipe->input[0], slot, &p->desc[0]));
+    test_authority_epoch = 0;
+    assert(!prepared_group_valid(&ex, &p->set[0].group[VK_BR_GROUP_TEXTURE]));
+    test_authority_epoch = slot->texture.authority;
     test_samplers++;
     assert(!prepared_group_valid(&ex, &p->set[0].group[VK_BR_GROUP_TEXTURE]));
     stamp = prepared_stamp(&ex, VK_BR_GROUP_TEXTURE); vk_usnap_proof_begin(&proof); prepared_seal(&ex, p, 0, VK_BR_GROUP_TEXTURE, &stamp, &proof);
@@ -993,6 +1157,7 @@ static void pipeline_variants(void) {
 int main(void) {
     pipeline_variants();
     lifetimes_and_watchers();
+    raw_shadow_part_enrollment();
     ordered_and_partial_sets();
     proofs_and_texture_sealing();
     mixed_set_groups_and_texel_scratch();

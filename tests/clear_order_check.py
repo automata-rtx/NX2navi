@@ -24,7 +24,9 @@ sys.path.insert(0, str(ROOT / 'tools'))
 from check_content import GENERATED_MARKER
 marker = GENERATED_MARKER.decode() if isinstance(GENERATED_MARKER, bytes) else GENERATED_MARKER
 source = (ROOT / 'runtime/vk_exec.c').read_text()
-parts = [function(source, name) for name in ('vk_exec_scissor', 'whole_target', 'clear_attachment', 'clear_ds')]
+parts = [function(source, name) for name in (
+    'vk_exec_scissor', 'resource_target_prepare', 'resource_target_written', 'resource_target_pinned',
+    'whole_target', 'clear_target_prepare', 'clear_target_written', 'clear_attachment', 'clear_ds')]
 (work / 'clear_under_test.h').write_text('// ' + marker + '\n' + '\n\n'.join(parts))
 env = dict(os.environ, PATH=str(CC.parent) + os.pathsep + os.environ.get('PATH', ''))
 exe = work / 'clear_order_check.exe'

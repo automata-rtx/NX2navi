@@ -155,7 +155,7 @@ static void import_offsets(offset_list *list, const size_t *offsets, size_t coun
 
 static uint64_t import_resources(const plan_piece *part, const uint8_t *commands, offset_list *uniform,
                                  offset_list *deferred, offset_list *pinops, offset_list *capture,
-                                 capture_set *captured, span_list *spans) {
+                                 capture_set *captured, span_list *spans, uint64_t *max_scratch) {
     const copy_prefix *pf = part->child;
     const size_t *u = copy_offsets(pf), *d = u + pf->nuniform, *pins = d + pf->ndeferred;
     size_t old_u = uniform->n, old_pin = pinops->n;
@@ -188,6 +188,8 @@ static uint64_t import_resources(const plan_piece *part, const uint8_t *commands
         NvnRecordSpan s = part->spans[i];
         s.begin += part->delta;
         s.end += part->delta;
+        if (s.kind == NVN_PLAN_UPDATE || s.kind == NVN_PLAN_GENERATED_INDEX)
+            ordered_scratch_max((const op_hdr *)(commands + s.begin), max_scratch);
         spans->v[spans->n++] = s;
     }
     return named;

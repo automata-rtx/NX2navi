@@ -13,10 +13,20 @@
 enum { EV_BEGIN, EV_END, EV_DRAW, EV_CONTACT, EV_BARRIER };
 typedef struct { int kind; uint32_t value; uint64_t weight; } Event;
 static struct { Event e[MAX_EVENTS]; unsigned n; } streams[MAX_CB];
-static struct { uint64_t fence; void (*fn)(void *); void *arg; } callbacks[MAX_CALLBACKS];
+typedef struct {
+    uint64_t fence;
+    void (*fn)(void *);
+    void *arg;
+    void (*cancel)(void *, int);
+} QueryCallback;
+static QueryCallback callbacks[MAX_CALLBACKS];
 static unsigned callback_count;
 static int gpu_finished, groups_merged, contact_pending;
 static uint64_t records[4][2];
+#ifdef QUERY_POSITIONED_RESULTS
+enum { RESULT_STRESS_COUNT = 8205 };
+static uint64_t stress_records[RESULT_STRESS_COUNT][2];
+#endif
 static uint64_t gpu_values[16384], gpu_members[16384];
 static uint8_t gpu_available[16384], gpu_begun[16384];
 static unsigned resets[16384];
@@ -46,7 +56,12 @@ void vk_device_lost_poll(void) {}
 void vk_device_lost_check(VkResult value,const char *where) { (void)where; assert(value == VK_SUCCESS); }
 void vk_mem_count(int cls,int use,uint64_t size) { (void)cls; (void)use; (void)size; }
 int vk_mem_resolve(uint64_t addr,uint64_t size,VkMemSpan *out) {
-    if (addr < (uint64_t)(uintptr_t)records || addr + size > (uint64_t)(uintptr_t)(records + 4)) return 0;
+    int mapped=addr >= (uint64_t)(uintptr_t)records && addr + size <= (uint64_t)(uintptr_t)(records + 4);
+#ifdef QUERY_POSITIONED_RESULTS
+    mapped |= addr >= (uint64_t)(uintptr_t)stress_records &&
+        addr + size <= (uint64_t)(uintptr_t)(stress_records + RESULT_STRESS_COUNT);
+#endif
+    if (!mapped) return 0;
     memset(out,0,sizeof *out); return 1;
 }
 int vk_contact_pending(void) { return contact_pending; }
@@ -89,12 +104,101 @@ VKAPI_ATTR VkResult VKAPI_CALL vkGetQueryPoolResults(VkDevice d,VkQueryPool p,ui
     return VK_SUCCESS;
 }
 
+#ifdef QUERY_PREPARED_TRANSFER
+int vk_exec_recording_failed(void) { return 0; }
+VkExecBufferTransfer *vk_exec_effects_buffer_transfer(const VkExec *ex,uint32_t opcode,const void *payload) {
+    (void)ex; (void)opcode; (void)payload; abort();
+}
+static void buffer_transfer_record(VkExec *ex,VkExecBufferTransfer *transfer) {
+    (void)ex; (void)transfer; abort();
+}
+static void copy_buffer_to_image(VkExec *ex,const p_copy_b2t *payload) {
+    (void)ex; (void)payload; abort();
+}
+#endif
+
 #include "query_under_test.h"
 
 void vk_completion_add_result(uint64_t fence,void (*fn)(void *),void *arg) {
     assert(callback_count<MAX_CALLBACKS && !gpu_finished);
-    callbacks[callback_count++]=(__typeof__(callbacks[0])){fence,fn,arg};
+    callbacks[callback_count++]=(QueryCallback){fence,fn,arg};
 }
+
+#ifdef QUERY_NORMALIZED_RESULTS
+struct MemBackingCapture { RcInterval interval; };
+static uint64_t mapping_generation=1;
+static unsigned mapping_pins, guest_writes;
+
+void plat_once(PlatOnce *once, void (*fn)(void *), void *arg) {
+    if (once->state) return;
+    fn(arg);
+    once->state=1;
+}
+
+uint64_t mem_mapping_serial(void) { return mapping_generation; }
+int mem_mapping_range_unchanged(uint64_t address,uint64_t size,uint64_t mapping) {
+    (void)address; (void)size; return mapping==mapping_generation;
+}
+static RcInterval result_extent(uint64_t address,uint64_t size) {
+    uint64_t base=(uint64_t)(uintptr_t)records;
+    if (base <= address && address+size <= base+sizeof records)
+        return (RcInterval){address,mapping_generation,{mapping_generation+1,address-base,size}};
+#ifdef QUERY_POSITIONED_RESULTS
+    base=(uint64_t)(uintptr_t)stress_records;
+    assert(base <= address && address+size <= base+sizeof stress_records);
+    return (RcInterval){address,mapping_generation,{mapping_generation+1,0x1000+address-base,size}};
+#else
+    abort();
+#endif
+}
+RcBackingResult mem_backing_capture(uint64_t address,uint64_t size,MemBackingCapture **capture) {
+    *capture=malloc(sizeof **capture);
+    assert(*capture);
+    (*capture)->interval=result_extent(address,size);
+    return RC_BACKING_OK;
+}
+const RcInterval *mem_backing_intervals(const MemBackingCapture *capture,uint32_t *count) {
+    *count=capture!=NULL;
+    return capture ? &capture->interval : NULL;
+}
+int mem_read_hold(uint64_t address,uint64_t size) {
+    (void)address; (void)size; mapping_pins++; return 1;
+}
+int mem_backing_read_hold(const MemBackingCapture *capture) {
+    return capture && capture->interval.mapping==mapping_generation &&
+        mem_read_hold(capture->interval.address,capture->interval.range.size);
+}
+void mem_read_release(void) { assert(mapping_pins==1); mapping_pins--; }
+void mem_backing_release(MemBackingCapture **capture) { free(*capture); *capture=NULL; }
+void vk_mem_cpu_result_written(uint64_t address,uint64_t size) {
+    (void)address; (void)size; assert(mapping_pins==1); guest_writes++;
+}
+#ifdef QUERY_POSITIONED_RESULTS
+void plat_mutex_lock(PlatMutex *mutex) { assert(!mutex->p); mutex->p=mutex; }
+void plat_mutex_unlock(PlatMutex *mutex) { assert(mutex->p==mutex); mutex->p=NULL; }
+void plat_cond_init(PlatCond *condition) { assert(!condition->p); condition->p=condition; }
+int plat_cond_wait_ns(PlatCond *condition,PlatMutex *mutex,uint64_t ns) {
+    (void)condition; (void)mutex; (void)ns; abort();
+}
+void plat_cond_broadcast(PlatCond *condition) { assert(condition->p==condition); }
+void vk_completion_add_owned(uint64_t fence,void (*fn)(void *),void (*cancel)(void *,int),void *arg) {
+    (void)fence; (void)fn; (void)cancel; (void)arg;
+    abort(); // A detached CPU result has no duplicate command completion callback.
+}
+#else
+void resource_effects_buffer_result_handoff(uint64_t address,uint64_t size,const RcInterval *intervals,uint32_t count) {
+    assert(count==1 && intervals[0].address==address && intervals[0].range.size==size);
+}
+void resource_effects_buffers_commit(void) {}
+#endif
+void vk_completion_add_result_owned(uint64_t fence,void (*fn)(void *),void (*cancel)(void *,int),void *arg) {
+    assert(callback_count<MAX_CALLBACKS && !gpu_finished && cancel);
+    callbacks[callback_count++]=(QueryCallback){fence,fn,arg,cancel};
+}
+static uint64_t counter_address(const CounterWrite *w) { return w->target.address; }
+#else
+static uint64_t counter_address(const CounterWrite *w) { return w->addr; }
+#endif
 
 typedef struct { uint32_t op; int arg; unsigned id; } Op;
 typedef struct {
@@ -109,6 +213,14 @@ typedef struct {
 } Observation;
 
 static void reset_fixture(void) {
+#ifdef QUERY_NORMALIZED_RESULTS
+    assert(!mapping_pins);
+    oq_block_release(oq_block);
+    oq_block=NULL;
+    oq_used=0;
+    guest_writes=0;
+    mapping_generation++;
+#endif
     free(oq_seg); oq_seg=NULL; oq_nseg=oq_capseg=0;
     for(unsigned g=0;g<GS_GROUPS;g++) {
         free(GS[g].s);
@@ -184,6 +296,34 @@ static void op_one(VkExec *ex,const op_hdr *h) {
         const uint32_t *v=payload; execute(ex,(Op){OP_DRAW,(int)v[0],v[1]},0);
     } else op_xfer_impl(ex,h->op,payload);
 }
+static void *resource_declare(VkExec *ex,const op_hdr *h,int leader) {
+    (void)ex; (void)h; (void)leader; return NULL;
+}
+void *vk_exec_effects_enter(void *effect) { assert(!effect); return NULL; }
+void vk_exec_effects_recorded(void *effect,int deferred) { assert(!effect && !deferred); }
+void vk_exec_effects_leave(void *effect) { assert(!effect); }
+void vk_exec_effects_release(void *effect) { assert(!effect); }
+#ifdef QUERY_PREPARED_LEADER
+static VkExecGraphicsResult prepare_ordered_graphics(VkExec *ex,const op_hdr *op,int boundary,
+    RcRegistryPosition *attempted,RcRegistryPosition *replanned,VkExecGraphicsDraw **draw) {
+    assert(op->op==OP_DRAW && !boundary && !attempted->scene && !attempted->ordinal &&
+           !replanned->scene && !replanned->ordinal && !*draw);
+    return ex->render_disabled ? VK_EXEC_GRAPHICS_NOOP : VK_EXEC_GRAPHICS_COMPAT;
+}
+static int graphics_input_finished(VkExec *ex,const op_hdr *op,VkExecGraphicsResult result,
+                                  const VkExecGraphicsDraw *draw) {
+    assert(!draw && (result==VK_EXEC_GRAPHICS_COMPAT ||
+                    (op->op==OP_DRAW && ex->render_disabled && result==VK_EXEC_GRAPHICS_NOOP)));
+    (void)ex; (void)op;
+    return 1;
+}
+static void resource_declare_noop(VkExec *ex) { assert(ex->render_disabled); }
+static void graphics_noop_record(VkExec *ex,const op_hdr *op) {
+    assert(op->op==OP_DRAW && ex->render_disabled);
+}
+VkExecGraphicsDraw *vk_exec_graphics_draw_enter(VkExecGraphicsDraw *draw) { assert(!draw); return NULL; }
+void vk_exec_graphics_draw_cancel(VkExecGraphicsDraw **draw) { assert(draw && !*draw); }
+#endif
 #include "query_leader_under_test.h"
 
 static void group(VkExec *replay,const Op *ops,unsigned n,unsigned cut,int reverse) {
@@ -286,7 +426,7 @@ static Observation run(const Op *ops,unsigned n,unsigned cut,int reverse,int lea
             for(unsigned q=0;q<s->n;q++) { assert(gpu_available[s->q[q]]); r->members|=gpu_members[s->q[q]]; }
         } else {
             assert(callbacks[i].fn==counter_cb); CounterWrite *w=callbacks[i].arg;
-            r->kind=2; r->seq=w->seq; addr=w->addr;
+            r->kind=2; r->seq=w->seq; addr=counter_address(w);
         }
         r->record=record_index(addr);
         callbacks[i].fn(callbacks[i].arg);
@@ -368,6 +508,109 @@ static void conservative_visibility_check(void) {
     }
 }
 
+#ifdef QUERY_NORMALIZED_RESULTS
+#ifdef QUERY_POSITIONED_RESULTS
+static void positioned_counter(VkExec *ex, const p_report_counter *report, uint64_t ordinal) {
+    RcRegistry *r=rc_registry_runtime();
+    RcRegistryPosition position={ex->fence,ordinal};
+    ResourceCommandEffects *effects=resource_effects_create(position);
+    RcSourceRange raw={1,report->addr,sizeof(NVNcounterData)};
+    RcInterval extent=result_extent(report->addr,sizeof(NVNcounterData));
+    RcRegistryStats before=rc_registry_stats(r);
+    resource_effects_add(effects,raw,raw,RC_REGISTRY_BUFFER);
+    assert(resource_effects_add_intervals(effects,&extent,1,&extent,1,RC_REGISTRY_BUFFER)==RC_REGISTRY_OK);
+    assert(rc_registry_declare_through(r,position)==RC_REGISTRY_OK);
+    ResourceCommandEffects *old=resource_effects_enter(effects);
+    report_counter(ex,report);
+    resource_effects_leave(old);
+    resource_effects_recorded(effects,1);
+    resource_effects_release(effects);
+    RcRegistryStats after=rc_registry_stats(r);
+    assert(after.writers==before.writers+2 && after.writer_pending==before.writer_pending+2);
+}
+
+static void many_positioned_results(void) {
+    reset_fixture();
+    RcRegistry *r=rc_registry_runtime();
+    VkExec ex={.cb=(VkCommandBuffer)(uintptr_t)1,.fence=100};
+    for (unsigned i=0;i<RESULT_STRESS_COUNT;) {
+        unsigned begin=i;
+        for (;i<RESULT_STRESS_COUNT && i-begin<MAX_CALLBACKS;i++) {
+            stress_records[i][0]=17;
+            stress_records[i][1]=91;
+            p_report_counter report={.type=NVN_COUNTER_TYPE_TIMESTAMP,.addr=(uint64_t)(uintptr_t)stress_records[i]};
+            positioned_counter(&ex,&report,i-begin+1);
+        }
+        assert(callback_count==i-begin && rc_registry_stats(r).writers==2*callback_count);
+        assert(rc_registry_handoff_through(r,(RcRegistryPosition){ex.fence,callback_count})==RC_REGISTRY_OK);
+        for (unsigned j=0;j<callback_count;j++) {
+            assert(callbacks[j].fence==ex.fence && stress_records[begin+j][0]==17);
+            callbacks[j].fn(callbacks[j].arg);
+            assert(stress_records[begin+j][0]==0 && stress_records[begin+j][1]==19200000);
+        }
+        RcRegistryStats settled=rc_registry_stats(r);
+        assert(!settled.writers && !settled.writer_refusals && !settled.fail_closed && !mapping_pins);
+        callback_count=0;
+        ex.fence++;
+    }
+    assert(guest_writes==RESULT_STRESS_COUNT);
+    assert(rc_registry_stats(r).writer_peak>=2*MAX_CALLBACKS && rc_registry_stats(r).writer_peak<8192);
+    puts("positioned CPU results: 8205 distinct destinations retired across ordered submissions");
+}
+#endif
+
+static void predecessor_results_check(void) {
+    reset_fixture();
+    VkExec ex={.cb=(VkCommandBuffer)(uintptr_t)1,.fence=81};
+    p_report_counter stamp={.type=NVN_COUNTER_TYPE_TIMESTAMP,.addr=(uint64_t)(uintptr_t)records[0]};
+#ifdef QUERY_POSITIONED_RESULTS
+    RcRegistry *r=rc_registry_runtime();
+    positioned_counter(&ex,&stamp,1);
+    assert(rc_registry_handoff_through(r,(RcRegistryPosition){ex.fence,1})==RC_REGISTRY_OK);
+#else
+    report_counter(&ex,&stamp);
+#endif
+    mapping_generation++;
+    records[0][0]=13;
+    records[0][1]=29;
+    uint64_t value=0;
+    assert(counter_word(stamp.addr,&value)==1 && value==13);
+    callbacks[0].fn(callbacks[0].arg);
+    assert(records[0][0]==13 && records[0][1]==29 && !guest_writes);
+#ifdef QUERY_POSITIONED_RESULTS
+    positioned_counter(&ex,&stamp,2);
+    assert(rc_registry_stats(r).writer_pending==2); // Unhanded tail after the older handed prefix.
+#else
+    ex.fence++;
+    report_counter(&ex,&stamp);
+#endif
+    callbacks[1].cancel(callbacks[1].arg,1);
+    assert(records[0][0]==13 && records[0][1]==29 && !guest_writes);
+    assert(counter_word(stamp.addr,&value)==1 && value==13);
+    ex.fence++;
+#ifdef QUERY_POSITIONED_RESULTS
+    assert(!rc_registry_stats(r).writers);
+    positioned_counter(&ex,&stamp,1);
+    assert(rc_registry_handoff_through(r,(RcRegistryPosition){ex.fence,1})==RC_REGISTRY_OK);
+#else
+    report_counter(&ex,&stamp);
+#endif
+    callbacks[2].fn(callbacks[2].arg);
+    assert(records[0][0]==0 && guest_writes==1 && !mapping_pins);
+#ifdef QUERY_POSITIONED_RESULTS
+    assert(!rc_registry_stats(r).writers && !rc_registry_stats(r).fail_closed);
+#endif
+
+    OqSegment *slots[OQ_SEGMENTS_PER_BLOCK];
+    for (unsigned i=0;i<OQ_SEGMENTS_PER_BLOCK;i++) slots[i]=oq_new_segment();
+    assert(!oq_block && slots[0]->block->refs==OQ_SEGMENTS_PER_BLOCK);
+    for (unsigned i=OQ_SEGMENTS_PER_BLOCK-1;i>0;i--) oq_cancel(slots[i],0);
+    assert(slots[0]->block->refs==1);
+    groups_merged=gpu_finished=1;
+    oq_cb(slots[0]);
+}
+#endif
+
 static void equal(const Observation *a,const Observation *b,const char *name,unsigned cut,int reverse) {
     if(memcmp(a,b,sizeof *a)) {
         fprintf(stderr,"Mismatch %s cut %u reverse %d callbacks %u/%u\n",name,cut,reverse,a->n,b->n);
@@ -405,6 +648,13 @@ int main(void) {
     }
     pending_visibility_check();
     conservative_visibility_check();
+#ifdef QUERY_NORMALIZED_RESULTS
+    predecessor_results_check();
+#ifdef QUERY_POSITIONED_RESULTS
+    many_positioned_results();
+#endif
+    puts("query result ownership: replacement bytes, cancellation and shared occlusion slabs passed");
+#endif
     reset_fixture();
     printf("query ordering: %u production-splitter comparisons (%u accepted, %u refused) with ring wrap/batching; overlapping-fence reports, pending/rearmed records and unavailable/busy conservative visibility passed\n",comparisons,leaders_accepted,leaders_refused);
     return 0;

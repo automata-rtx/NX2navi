@@ -158,12 +158,11 @@ static const char *const gp_kind_names[VK_GAP_N] = {
     "write-back input dependency", "write-back output dependency"};
 static VkQueryPool gp_pool, gp_prims;   // gp_prims: mesh primitives generated per pass (with meshShaderQueries)
 static VkQueryPool gp_stats;            // fragment shader invocations per pass
-static int gp_state, gp_phase, gp_capture;   // state 0 not set up, 1 on, -1 off; phase 0 idle, 1 capturing, 2 waiting
+static int gp_state, gp_phase;   // state 0 not set up, 1 on, -1 off; phase 0 idle, 1 capturing, 2 waiting
 static uint32_t gp_n;
-static uint64_t gp_start;
+static uint64_t gp_start, gp_capture, gp_last_capture;
 
 static unsigned long long shader_id(const GfxShader *s);
-uint32_t vk_exec_mesh_counts(const uint32_t **out);   // vk_exec_draw.c
 
 // The hash NX2NAVI_SKIP_SHADERS takes and the frame dump prints: FNV-1a over the shader's SPIR-V.
 static uint64_t gp_shader_hash(const GfxShader *s) {
@@ -180,7 +179,14 @@ static uint64_t gp_shader_hash(const GfxShader *s) {
 
 static int kind_is_pass(const VkPassMark *m) { return m->kind == VK_MARK_PASS; }
 
-int vk_gpu_passes_capturing(void) { return gp_capture; }
+uint64_t vk_gpu_passes_capture_id(void) { return __atomic_load_n(&gp_capture, __ATOMIC_ACQUIRE); }
+
+int vk_gpu_passes_capturing(void) { return vk_gpu_passes_capture_id() != 0; }
+
+void vk_gpu_passes_stop_capture(void) {
+    uint64_t capture = __atomic_exchange_n(&gp_capture, 0, __ATOMIC_ACQ_REL);
+    if (capture) vk_exec_mesh_counts_end(capture);
+}
 
 static void gp_gap_close(uint32_t to) {
     if (gp_gap_from != UINT32_MAX && gp_ngaps < GP_GAPS) gp_gaps[gp_ngaps++] = (GpGap){gp_gap_from, to, gp_gap_kinds};
@@ -188,14 +194,14 @@ static void gp_gap_close(uint32_t to) {
 }
 
 void vk_gpu_gap_note(int kind, uint64_t units) {
-    if (!gp_capture || gp_part == UINT32_MAX || kind < 0 || kind >= VK_GAP_N) return;
+    if (!vk_gpu_passes_capturing() || gp_part == UINT32_MAX || kind < 0 || kind >= VK_GAP_N) return;
     gp_gap_kinds |= 1u << kind;
     gp_kind_n[kind]++, gp_kind_units[kind] += units;
 }
 
 // A shared endpoint keeps consecutive intervals disjoint, including the work before the first barrier.
 void vk_gpu_gap_boundary(VkCommandBuffer cb) {
-    if (!gp_capture || gp_part == UINT32_MAX || gp_in_mark || gp_n >= GP_SLOTS) return;
+    if (!vk_gpu_passes_capturing() || gp_part == UINT32_MAX || gp_in_mark || gp_n >= GP_SLOTS) return;
     uint32_t q = gp_n * 2;
     gp_labels[gp_n++] = (GpLabel){.kind = GP_KIND_PART};
     vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, gp_pool, q);
@@ -206,7 +212,7 @@ void vk_gpu_gap_boundary(VkCommandBuffer cb) {
 void vk_gpu_passes_part(VkCommandBuffer cb, int end) {
     if (!end) {
         gp_part = UINT32_MAX, gp_gap_from = UINT32_MAX, gp_gap_kinds = 0;
-        if (!gp_capture || gp_n >= GP_SLOTS) return;
+        if (!vk_gpu_passes_capturing() || gp_n >= GP_SLOTS) return;
         gp_labels[gp_n] = (GpLabel){.kind = GP_KIND_PART};
         vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, gp_pool, gp_n * 2);
         gp_part = gp_n++;
@@ -222,7 +228,7 @@ void vk_gpu_passes_part(VkCommandBuffer cb, int end) {
 
 static void gp_begin(VkCommandBuffer cb, VkPassMark *m) {
     m->gp = 0;
-    if (!gp_capture || gp_n >= GP_SLOTS) return;
+    if (!vk_gpu_passes_capturing() || gp_n >= GP_SLOTS) return;
     if (gp_part != UINT32_MAX) gp_gap_close(gp_n * 2);   // the gap before this mark ends at its start
     gp_labels[gp_n].used = 0;
     vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, gp_pool, gp_n * 2);
@@ -310,7 +316,7 @@ static int gp_sum_cmp(const void *a, const void *b) {
     return x < y ? 1 : x > y ? -1 : 0;
 }
 
-static void gp_report(uint64_t frame) {
+static void gp_report(uint64_t frame, uint64_t capture) {
     enum { MAX_SUMS = 2048 };
     static GpSum sums[MAX_SUMS];
     VkCtx *c = vk_ctx();
@@ -360,7 +366,8 @@ static void gp_report(uint64_t frame) {
            (unsigned long long)frame, total / GP_FRAMES, read, GP_FRAMES, unread, n);
     {   // the mesh workgroup counts of the indirect mesh draws (vk_exec_draw.c mesh_ring_entry)
         const uint32_t *mc;
-        uint32_t mn = vk_exec_mesh_counts(&mc);
+        uint32_t missing;
+        uint32_t mn = vk_exec_mesh_counts(capture, &mc, &missing);
         uint64_t sum = 0;
         uint32_t top = 0;
         char list[200];
@@ -371,8 +378,9 @@ static void gp_report(uint64_t frame) {
             if (i < 18 && o < 180) o += snprintf(list + o, sizeof list - (size_t)o, " %u", mc[i]);
         }
         list[o] = 0;
-        rt_log("gpu passes:   indirect mesh draws: %.1f per frame, %.0f workgroups per frame, largest %u; first:%s", (double)mn / GP_FRAMES,
-               (double)sum / GP_FRAMES, top, list);
+        rt_log("gpu passes:   indirect mesh draw counts: %.1f samples per frame, %.0f observed workgroups per frame, "
+               "%u observations missing, largest %u; first:%s", (double)mn / GP_FRAMES,
+               (double)sum / GP_FRAMES, missing, top, list);
     }
     gp_report_gaps(tick_ms, parts_ms, parts);
     for (int s = 0; s < n && s < GP_TOP; s++) {
@@ -441,17 +449,22 @@ void vk_gpu_passes_frame(uint64_t frame) {
     }
     if (gp_phase == 0) {
         if (frame % GP_PERIOD) return;
+        if (gp_last_capture == UINT64_MAX) { gp_state = -1; return; }
         vkResetQueryPool(c->device, gp_pool, 0, GP_SLOTS * 2);
         if (gp_prims) vkResetQueryPool(c->device, gp_prims, 0, GP_SLOTS);
         if (gp_stats) vkResetQueryPool(c->device, gp_stats, 0, GP_SLOTS);
         gp_ngaps = 0, gp_gap_from = UINT32_MAX, gp_gap_kinds = 0, gp_part = UINT32_MAX;
         memset(gp_kind_n, 0, sizeof gp_kind_n), memset(gp_kind_units, 0, sizeof gp_kind_units);
-        gp_n = 0, gp_start = frame, gp_capture = 1, gp_phase = 1;
+        gp_n = 0, gp_start = frame, gp_phase = 1;
+        uint64_t capture = ++gp_last_capture;
+        vk_exec_mesh_counts_begin(capture);
+        __atomic_store_n(&gp_capture, capture, __ATOMIC_RELEASE);
     } else if (gp_phase == 1) {
         if (frame < gp_start + GP_FRAMES) return;
-        gp_capture = 0, gp_phase = 2;
+        vk_gpu_passes_stop_capture();
+        gp_phase = 2;
     } else if (frame >= gp_start + GP_FRAMES + GP_LATER) {
-        gp_report(frame);
+        gp_report(frame, gp_last_capture);
         gp_phase = 0;
     }
 }

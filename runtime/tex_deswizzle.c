@@ -104,36 +104,120 @@ static int move(const nvn_texdesc *d, unsigned level, unsigned layer, uint8_t *b
     return 0;
 }
 
-int nvn_texels_box(const nvn_texdesc *d, unsigned level, unsigned layer, uint32_t x, uint32_t y, uint32_t z, uint32_t wb,
-                   uint32_t h, void *storage, void *rows, size_t pitch, int to_linear) {
-    uint8_t *st = storage, *ln = rows;
+typedef struct {
+    uint32_t row_bytes, rows, stride;
+    uint64_t base;
+    unsigned th, td;
+} TexelBoxLayout;
+
+static int texel_box_layout(const nvn_texdesc *d, unsigned level, unsigned layer, uint32_t x, uint32_t y, uint32_t z,
+                            uint32_t wb, uint32_t h, TexelBoxLayout *layout) {
+    *layout = (TexelBoxLayout){0};
     if (nvn_tex_is_linear(d)) {
         if (level || layer || z || d->samples > 1 || (d->target != 0 && d->target != 1 && d->target != 7)) return -1;
         int bw, bh, bpb = nvn_fmt_bpb(d->format, &bw, &bh);
         if (!bpb) return -1;
-        size_t row = (size_t)((d->width + bw - 1) / bw) * bpb;
-        uint32_t nrows = d->target == 0 ? 1 : (d->height + bh - 1) / bh, stride = nvn_tex_linear_stride(d);
-        if (stride < row || x + (size_t)wb > row || y + (uint64_t)h > nrows) return -1;
+        uint64_t row = ((d->width + (uint64_t)bw - 1) / bw) * bpb;
+        layout->rows = d->target == 0 ? 1 : (d->height + (uint64_t)bh - 1) / bh;
+        layout->stride = nvn_tex_linear_stride(d);
+        if (layout->stride < row) return -1;
+        layout->row_bytes = (uint32_t)row;
+    } else {
+        uint32_t slices, bpb;
+        if (nvn_deswizzle_geom(d, level, layer, &layout->row_bytes, &layout->rows, &slices, &layout->base,
+                                &layout->th, &layout->td, &bpb) || z >= slices) return -1;
+    }
+    return x + (uint64_t)wb > layout->row_bytes || y + (uint64_t)h > layout->rows ? -1 : 0;
+}
+
+int nvn_texels_box(const nvn_texdesc *d, unsigned level, unsigned layer, uint32_t x, uint32_t y, uint32_t z, uint32_t wb,
+                   uint32_t h, void *storage, void *rows, size_t pitch, int to_linear) {
+    uint8_t *st = storage, *ln = rows;
+    TexelBoxLayout layout;
+    if (texel_box_layout(d, level, layer, x, y, z, wb, h, &layout)) return -1;
+    if (nvn_tex_is_linear(d)) {
         for (uint32_t r = 0; r < h; r++) {
-            uint8_t *p = st + (size_t)(y + r) * stride + x, *q = ln + r * pitch;
+            uint8_t *p = st + (size_t)(y + r) * layout.stride + x, *q = ln + r * pitch;
             if (to_linear) memcpy(q, p, wb); else memcpy(p, q, wb);
         }
         return 0;
     }
-    uint32_t row_bytes, nrows, slices, bpb; uint64_t base; unsigned th, td;
-    if (nvn_deswizzle_geom(d, level, layer, &row_bytes, &nrows, &slices, &base, &th, &td, &bpb)) return -1;
-    if (x + (uint64_t)wb > row_bytes || y + (uint64_t)h > nrows || z >= slices) return -1;
     for (uint32_t r = 0; r < h; r++) {
         uint8_t *q = ln + r * pitch;
         for (uint32_t i = 0; i < wb;) {
             uint32_t xb = x + i, n = 16 - xb % 16;   // contiguous up to the end of its 16-byte segment
             if (n > wb - i) n = wb - i;
-            uint8_t *p = st + base + nvn_bl_offset(xb, y + r, z, row_bytes, nrows, th, td);
+            uint8_t *p = st + layout.base + nvn_bl_offset(xb, y + r, z, layout.row_bytes, layout.rows, layout.th, layout.td);
             if (to_linear) memcpy(q + i, p, n); else memcpy(p, q + i, n);
             i += n;
         }
     }
     return 0;
+}
+
+typedef struct {
+    NvnTexelStorageRange emit;
+    void *context;
+    uint64_t offset, end;
+} TexelRanges;
+
+static void texel_range(TexelRanges *r, uint64_t offset, uint64_t size) {
+    if (r->end != offset) {
+        if (r->end > r->offset) r->emit(r->context, r->offset, r->end - r->offset);
+        r->offset = offset;
+    }
+    r->end = offset + size;
+}
+
+int nvn_texels_box_ranges(const nvn_texdesc *d, unsigned level, unsigned layer, uint32_t x, uint32_t y, uint32_t z,
+                          uint32_t wb, uint32_t h, NvnTexelStorageRange emit, void *context) {
+    TexelBoxLayout layout;
+    if (texel_box_layout(d, level, layer, x, y, z, wb, h, &layout)) return -1;
+    if (!wb || !h || !emit) return 0;
+    TexelRanges ranges = {.emit = emit, .context = context};
+    if (nvn_tex_is_linear(d)) {
+        for (uint32_t row = 0; row < h; row++)
+            texel_range(&ranges, (uint64_t)(y + row) * layout.stride + x, wb);
+    } else {
+        // Use the actual GOB ordering from the copy address function, including the Switch 2 permutation.
+        uint8_t segment_x[32], segment_y[32];
+        for (uint32_t yy = 0; yy < 8; yy++)
+            for (uint32_t xx = 0; xx < 64; xx += 16) {
+                uint32_t i = gob_off(xx, yy) / 16;
+                segment_x[i] = (uint8_t)xx;
+                segment_y[i] = (uint8_t)yy;
+            }
+        uint32_t block_rows = 8u << layout.th;
+        uint64_t end_x = (uint64_t)x + wb, end_y = (uint64_t)y + h;
+        for (uint64_t by = y / block_rows * block_rows; by < end_y; by += block_rows) {
+            uint64_t first_y = by > (y & ~7u) ? by : (y & ~7u);
+            uint64_t last_y = by + block_rows < end_y ? by + block_rows : end_y;
+            for (uint64_t gx = x & ~63u; gx < end_x; gx += 64)
+                for (uint64_t gy = first_y; gy < last_y; gy += 8) {
+                    uint64_t gob = layout.base + nvn_bl_offset((uint32_t)gx, (uint32_t)gy, z,
+                        layout.row_bytes, layout.rows, layout.th, layout.td);
+                    if (gx >= x && gx + 64 <= end_x && gy >= y && gy + 8 <= end_y) {
+                        texel_range(&ranges, gob, 512);
+                        continue;
+                    }
+                    for (uint32_t i = 0; i < 32; i++) {
+                        uint64_t sy = gy + segment_y[i], sx = gx + segment_x[i];
+                        if (sy < y || sy >= end_y || sx + 16 <= x || sx >= end_x) continue;
+                        uint64_t lo = sx < x ? x : sx, hi = sx + 16 < end_x ? sx + 16 : end_x;
+                        texel_range(&ranges, gob + i * 16 + lo - sx, hi - lo);
+                    }
+                }
+        }
+    }
+    if (ranges.end > ranges.offset) emit(context, ranges.offset, ranges.end - ranges.offset);
+    return 0;
+}
+
+int nvn_texels_slice_ranges(const nvn_texdesc *d, unsigned level, unsigned layer, uint32_t z,
+                            NvnTexelStorageRange emit, void *context) {
+    TexelBoxLayout layout;
+    if (texel_box_layout(d, level, layer, 0, 0, z, 0, 0, &layout)) return -1;
+    return nvn_texels_box_ranges(d, level, layer, 0, 0, z, layout.row_bytes, layout.rows, emit, context);
 }
 
 int nvn_deswizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src, void *dst, size_t dst_pitch) {

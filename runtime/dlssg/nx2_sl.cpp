@@ -12,6 +12,7 @@
 #define NX2SL_BUILD
 #include <windows.h>
 
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -27,6 +28,10 @@
 #include <sl_reflex.h>
 
 #include "nx2_sl.h"
+
+static_assert(sizeof(Nx2SlFrameInputsV1) == 120 && offsetof(Nx2SlFrameInputsV1, frame) == 16);
+static_assert(sizeof(Nx2SlInputReceipt) == 64 && offsetof(Nx2SlInputReceipt, ticket) == 16);
+static_assert(sizeof(Nx2SlInputCompletion) == 40 && offsetof(Nx2SlInputCompletion, ticket) == 16);
 
 namespace {
 
@@ -45,12 +50,30 @@ PFun_slPCLSetMarker *p_marker;
 PFun_slReflexSetOptions *p_reflex;
 PFun_slReflexGetState *p_reflex_state;
 PFun_slReflexSleep *p_sleep;
+std::mutex g_token_slot;
 std::mutex g_reflex_options;  // GetState and SetOptions are not thread safe
 using Clock = std::chrono::steady_clock;
 constexpr unsigned pacingWindow = 300;
 PFN_vkGetInstanceProcAddr p_gipa;
 PFN_vkGetDeviceProcAddr p_gdpa;
 int g_available = -1;
+bool g_initialized;
+Nx2SlInputReceipt g_pending_inputs{};
+uint64_t g_next_ticket;
+
+struct InputSample {
+    VkSemaphore semaphore;
+    uint64_t value;
+    bool checked;
+};
+InputSample g_last_input_sample{};
+InputSample g_last_proof{};
+struct FgExecutionObservation {
+    uint64_t frame;
+    Nx2SlFgConfigV1 config;
+};
+FgExecutionObservation g_fg_prepared{}, g_fg_execution{};
+uint64_t g_sample_generation;
 int g_frames = -1;                   // the frames to generate as last set (0 off), -1 before the first nx2sl_frame
 std::atomic<uint32_t> g_max{0};      // numFramesToGenerateMax as Streamline last reported it, 0 before it did
 uint64_t g_presented;
@@ -77,18 +100,54 @@ void sl_log(sl::LogType type, const char *msg) {
 template <class T> T *proc(const char *name) { return reinterpret_cast<T *>(GetProcAddress(g_mod, name)); }
 
 // The token of frame n. Tokens come from a small ring Streamline reuses, so each call takes its own right before use.
-sl::FrameToken *token(uint32_t frame) {
+sl::FrameToken *token_locked(uint32_t frame) {
     sl::FrameToken *t = nullptr;
-    return frame && p_token(t, &frame) == sl::Result::eOk ? t : nullptr;
+    uint32_t requested = frame;
+    return frame && p_token(t, &requested) == sl::Result::eOk && t && (uint32_t)*t == frame ? t : nullptr;
 }
 
-void mark(sl::PCLMarker marker, sl::FrameToken &t, uint32_t frame) {
+sl::FrameToken *token(uint32_t frame) {
+    std::lock_guard<std::mutex> lock(g_token_slot);
+    return token_locked(frame);
+}
+
+sl::Result tag_frame(uint32_t frame, const sl::ViewportHandle &viewport, const sl::ResourceTag *tags,
+                     uint32_t count, VkCommandBuffer cb, uint32_t *sdk_frame = nullptr) {
+    std::lock_guard<std::mutex> lock(g_token_slot);
+    sl::FrameToken *t = token_locked(frame);
+    if (!t) return sl::Result::eErrorMissingInputParameter;
+    if (sdk_frame) *sdk_frame = (uint32_t)*t;
+    return p_tag(*t, viewport, tags, count, (sl::CommandBuffer *)cb);
+}
+
+template <typename T> bool input_abi(const T *p) {
+    return p && p->size == sizeof(T) && p->version == NX2SL_INPUTS_ABI_V1 && !p->flags && !p->reserved;
+}
+
+bool same_inputs(const Nx2SlInputReceipt &a, const Nx2SlInputReceipt &b) {
+    return a.ticket == b.ticket && a.frame == b.frame && a.sdk_frame == b.sdk_frame &&
+           a.generation == b.generation && a.swapchain == b.swapchain &&
+           a.accepted == b.accepted && a.uncertain == b.uncertain;
+}
+
+InputSample input_sample(const sl::DLSSGState &s) {
+    return {(VkSemaphore)(uintptr_t)s.inputsProcessingCompletionFence,
+            s.lastPresentInputsProcessingCompletionFenceValue, true};
+}
+
+InputSample query_input_sample() {
+    sl::DLSSGState state{};
+    return p_dlssg_state(sl::ViewportHandle(0), state, nullptr) == sl::Result::eOk ? input_sample(state) : InputSample{};
+}
+
+bool mark(sl::PCLMarker marker, sl::FrameToken &t, uint32_t frame) {
     sl::Result r = p_marker(marker, t);
     if (r != sl::Result::eOk) {
         static std::atomic<unsigned> errors{0};
         if (errors.fetch_add(1, std::memory_order_relaxed) < 8)
             say("dlssg: PCL marker %u rejected on frame %u: %s", (unsigned)marker, frame, sl::getResultAsStr(r));
     }
+    return r == sl::Result::eOk;
 }
 
 void matrix(sl::float4x4 &m, const float *v) {
@@ -147,6 +206,7 @@ extern "C" NX2SL_API int nx2sl_init(const wchar_t *dir, Nx2SlLog log) {
     p.renderAPI = sl::RenderAPI::eVulkan;
     sl::Result r = p_init(p, sl::kSDKVersion);
     if (r != sl::Result::eOk) return say("dlssg: slInit failed (%d): DLSS Frame Generation off", (int)r), 0;
+    g_initialized = true;
     say("dlssg: Streamline up");
     return 1;
 }
@@ -256,20 +316,18 @@ extern "C" NX2SL_API void nx2sl_present_rect(const int rect[4]) {
 static Nx2SlImage pendingAlpha{};
 extern "C" NX2SL_API void nx2sl_ui_alpha(const Nx2SlImage *alpha) { pendingAlpha = alpha ? *alpha : Nx2SlImage{}; }
 
-extern "C" NX2SL_API int nx2sl_frame(VkCommandBuffer cb, const Nx2SlImage *depth, const Nx2SlImage *mv,
-                                     const Nx2SlImage *hudless, const Nx2SlCamera *cam, uint32_t out_w, uint32_t out_h,
-                                     int enable, uint32_t frame) {
-    Nx2SlImage alpha = pendingAlpha;
-    pendingAlpha = {};
-    if (g_available != 1) return 0;
-    sl::FrameToken *t = token(frame);
-    if (!t) return 0;
+static int frame_inputs(VkCommandBuffer cb, const Nx2SlImage *depth, const Nx2SlImage *mv,
+                        const Nx2SlImage *hudless, const Nx2SlImage *alpha, const Nx2SlCamera *cam,
+                        uint32_t out_w, uint32_t out_h, int enable, uint32_t frame,
+                        sl::Extent rect, Nx2SlInputReceipt *receipt, bool *configured = nullptr) {
+    if (g_available != 1 || !frame) return 0;
     sl::ViewportHandle vp(0);
     // never more than Streamline allows: one while it has not said
     uint32_t max = g_max.load();
     int n = enable > 0 ? enable : 0;
     if (n > (int)(max ? max : 1)) n = (int)(max ? max : 1);
-    bool recompose = n && depth && mv && cam && hudless && alpha.view;
+    bool recompose = n && depth && mv && cam && hudless && alpha && alpha->image && alpha->view;
+    bool inputs_accepted = false, off_tags_accepted = false;
     if (n && depth && mv && cam) {
         sl::Constants c{};
         matrix(c.cameraViewToClip, cam->view_to_clip);
@@ -291,39 +349,55 @@ extern "C" NX2SL_API int nx2sl_frame(VkCommandBuffer cb, const Nx2SlImage *depth
         c.cameraMotionIncluded = sl::Boolean::eTrue;
         c.motionVectors3D = sl::Boolean::eFalse;
         c.reset = cam->reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
-        sl::Result constantsResult = p_constants(c, *t, vp);
+        sl::Result constantsResult;
+        {
+            std::lock_guard<std::mutex> lock(g_token_slot);
+            sl::FrameToken *t = token_locked(frame);
+            if (!t) return 0;
+            constantsResult = p_constants(c, *t, vp);
+        }
         if (constantsResult != sl::Result::eOk) recompose = false;
         static unsigned constantErrors;
         if (constantsResult != sl::Result::eOk && constantErrors++ < 8)
             say("dlssg: camera constants rejected on frame %u (%d)", frame, (int)constantsResult);
         sl::Resource rd = resource(depth), rm = resource(mv), rh = hudless ? resource(hudless) : sl::Resource{};
         sl::Extent ed{0, 0, depth->width, depth->height}, em{0, 0, mv->width, mv->height};
-        sl::Extent eh = backbufferRect ? backbufferRect : sl::Extent{0, 0, out_w, out_h};
+        sl::Extent eh = rect ? rect : sl::Extent{0, 0, out_w, out_h};
         // Replay can write the next scene between the blit submission and the paced present.
         // Preserve this frame's depth and motion on the blit command buffer while its color matches.
-        sl::Resource ra = recompose ? resource(&alpha) : sl::Resource{};
+        sl::Resource ra = recompose ? resource(alpha) : sl::Resource{};
         sl::ResourceTag tags[5] = {sl::ResourceTag(&rd, sl::kBufferTypeDepth, sl::ResourceLifecycle::eOnlyValidNow, &ed),
                                    sl::ResourceTag(&rm, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eOnlyValidNow, &em),
                                    sl::ResourceTag(hudless ? &rh : nullptr, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent, &eh)};
         unsigned count = 3;   // a null HUD-less tag also clears the previous picture
         tags[count++] = sl::ResourceTag(recompose ? &ra : nullptr, sl::kBufferTypeUIAlpha,
                                         sl::ResourceLifecycle::eValidUntilPresent, &eh);
-        if (backbufferRect)
+        if (rect)
             tags[count++] = sl::ResourceTag(nullptr, sl::kBufferTypeBackbuffer,
-                                             sl::ResourceLifecycle::eValidUntilPresent, &backbufferRect);
-        t = token(frame);
-        sl::Result result = t ? p_tag(*t, vp, tags, count, (sl::CommandBuffer *)cb) : sl::Result::eErrorMissingInputParameter;
+                                             sl::ResourceLifecycle::eValidUntilPresent, &rect);
+        uint32_t mask = (hudless ? NX2SL_INPUT_HUDLESS : 0) | (recompose ? NX2SL_INPUT_UI_ALPHA : 0);
+        uint32_t sdk_frame = 0;
+        sl::Result result = tag_frame(frame, vp, tags, count, cb, &sdk_frame);
+        inputs_accepted = sdk_frame && result == sl::Result::eOk && constantsResult == sl::Result::eOk;
+        if (receipt && sdk_frame) {
+            receipt->sdk_frame = sdk_frame;
+            if (result == sl::Result::eOk) receipt->accepted = mask;
+            else receipt->uncertain = mask;
+        }
         if (result != sl::Result::eOk) recompose = false;
         static unsigned tagErrors;
         if (result != sl::Result::eOk && tagErrors++ < 8)
             say("dlssg: frame %u resource tags rejected (%d)", frame, (int)result);
-    } else if (n) {
-        // The generation mode can remain on for a few presents while scene inputs are missing.
+    } else if (n || receipt) {
+        // Explicitly clear both late inputs for this SDK frame, including typed Off presents.
         sl::ResourceTag absent[] = {
             {nullptr, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent},
             {nullptr, sl::kBufferTypeUIAlpha, sl::ResourceLifecycle::eValidUntilPresent}};
-        p_tag(*t, vp, absent, 2, (sl::CommandBuffer *)cb);
-    }
+        uint32_t sdk_frame = 0;
+        sl::Result result = tag_frame(frame, vp, absent, 2, cb, &sdk_frame);
+        if (!sdk_frame) return 0;
+        off_tags_accepted = result == sl::Result::eOk;
+    } else if (!token(frame)) return 0;
     static bool recomposing = false;
     if (n != g_frames || recompose != recomposing) {
         sl::DLSSGOptions o{};
@@ -345,18 +419,71 @@ extern "C" NX2SL_API int nx2sl_frame(VkCommandBuffer cb, const Nx2SlImage *depth
             g_frames = n;
         }
     }
+    if (configured) *configured = inputs_accepted && enable == n && g_frames == n && recomposing == recompose;
+    if (receipt && !n) return off_tags_accepted && !g_frames;
     return 1;
 }
 
-extern "C" NX2SL_API void nx2sl_present_marker(int after, uint32_t frame) {
+extern "C" NX2SL_API int nx2sl_frame(VkCommandBuffer cb, const Nx2SlImage *depth, const Nx2SlImage *mv,
+                                     const Nx2SlImage *hudless, const Nx2SlCamera *cam, uint32_t out_w, uint32_t out_h,
+                                     int enable, uint32_t frame) {
+    Nx2SlImage alpha = pendingAlpha;
+    pendingAlpha = {};
+    if (g_pending_inputs.ticket) return 0;
+    return frame_inputs(cb, depth, mv, hudless, &alpha, cam, out_w, out_h, enable, frame, backbufferRect, nullptr);
+}
+
+extern "C" NX2SL_API int nx2sl_frame_inputs_v1(const Nx2SlFrameInputsV1 *in, Nx2SlInputReceipt *out) {
+    if (!input_abi(in) || !input_abi(out)) return 0;
+    *out = {sizeof *out, NX2SL_INPUTS_ABI_V1};
+    if (!in->generation || !in->swapchain || !in->cb || g_pending_inputs.ticket || g_next_ticket == UINT64_MAX) return 0;
+    uint32_t frame = (uint32_t)in->frame;
+    *out = {sizeof *out, NX2SL_INPUTS_ABI_V1, 0, 0, 0, in->frame, in->generation, in->swapchain, frame, 0, 0};
+    sl::Extent rect{(uint32_t)in->rect[1], (uint32_t)in->rect[0], (uint32_t)in->rect[2], (uint32_t)in->rect[3]};
+    const Nx2SlImage *hudless = in->hudless && in->hudless->image && in->hudless->view ? in->hudless : nullptr;
+    bool configured = false;
+    g_fg_prepared = {};
+    int okay = frame_inputs(in->cb, in->depth, in->motion, hudless, in->alpha, in->camera,
+                            in->width, in->height, in->generated, frame, rect, out, &configured);
+    if (okay && configured) {
+        auto &config = g_fg_prepared.config;
+        g_fg_prepared.frame = in->frame;
+        config.generation = in->generation;
+        config.swapchain = in->swapchain;
+        config.generated = static_cast<uint32_t>(in->generated);
+        config.mvec_width = in->motion->width;
+        config.mvec_height = in->motion->height;
+        config.depth_width = in->depth->width;
+        config.depth_height = in->depth->height;
+        config.color_width = in->width;
+        config.color_height = in->height;
+        config.motion = in->motion->format;
+        config.depth = in->depth->format;
+        if (out->accepted & NX2SL_INPUT_HUDLESS) config.hudless = hudless->format;
+        if (out->accepted & NX2SL_INPUT_UI_ALPHA) config.alpha = in->alpha->format;
+        config.recomposition = !!(out->accepted & NX2SL_INPUT_UI_ALPHA);
+    }
+    if (out->accepted || out->uncertain) {
+        out->ticket = ++g_next_ticket;
+        g_pending_inputs = *out;
+    }
+    return okay;
+}
+
+static InputSample present_marker(int after, uint32_t frame, bool accepted, bool *marked = nullptr,
+                                  bool *generated = nullptr) {
     if (after) {
         g_input_fence = VK_NULL_HANDLE;
         g_input_value = 0;
     }
-    sl::FrameToken *t = g_available == 1 ? token(frame) : nullptr;
-    if (!t) return;
-    mark(after ? sl::PCLMarker::ePresentEnd : sl::PCLMarker::ePresentStart, *t, frame);
-    if (!after) return;
+    {
+        std::lock_guard<std::mutex> lock(g_token_slot);
+        sl::FrameToken *t = g_available == 1 ? token_locked(frame) : nullptr;
+        if (!t) return {};
+        bool ok = mark(after ? sl::PCLMarker::ePresentEnd : sl::PCLMarker::ePresentStart, *t, frame);
+        if (marked) *marked = ok;
+    }
+    if (!after || !accepted) return {};
     g_presented++;
     // Asked after each present, numFramesActuallyPresented is what that present showed: 2 with one generated frame, 4
     // with three.
@@ -368,8 +495,9 @@ extern "C" NX2SL_API void nx2sl_present_marker(int after, uint32_t frame) {
     if (result != sl::Result::eOk) {
         if (stateErrors++ % pacingWindow == 0)
             say("dlssg: FG state query after present failed: %s", sl::getResultAsStr(result));
-        return;
+        return {};
     }
+    if (generated) *generated = g_frames > 0 && s.status == sl::DLSSGStatus::eOk && s.numFramesActuallyPresented > 1;
     g_input_fence = (VkSemaphore)(uintptr_t)s.inputsProcessingCompletionFence;
     g_input_value = s.lastPresentInputsProcessingCompletionFenceValue;
     uint64_t shown = g_shown.fetch_add(s.numFramesActuallyPresented, std::memory_order_relaxed) + s.numFramesActuallyPresented;
@@ -403,6 +531,140 @@ extern "C" NX2SL_API void nx2sl_present_marker(int after, uint32_t frame) {
         startShown = shown;
         stateErrors = 0;
     }
+    return input_sample(s);
+}
+
+extern "C" NX2SL_API void nx2sl_present_marker(int after, uint32_t frame) {
+    if (!after) g_fg_execution = {};
+    InputSample observed = present_marker(after, frame, true);
+    if (after) {
+        g_last_input_sample = observed;
+        g_sample_generation = 0;
+    }
+}
+
+static bool fresh_input_sample(InputSample before, InputSample after, bool new_generation) {
+    if (!before.checked || !after.checked || !after.semaphore || !after.value) return false;
+    // A fresh swapchain observation may introduce a different timeline. A
+    // reused numeric value on the same observed timeline still cannot retire it.
+    if (g_last_proof.semaphore == after.semaphore && after.value <= g_last_proof.value) return false;
+    if (before.semaphore == after.semaphore) return after.value > before.value;
+    return !before.semaphore || new_generation;
+}
+
+extern "C" NX2SL_API VkResult nx2sl_present_inputs_v1(PFN_vkQueuePresentKHR present, VkQueue queue,
+        const VkPresentInfoKHR *pi, const Nx2SlInputReceipt *receipt, Nx2SlInputCompletion *out) {
+    g_fg_execution = {};
+    if (!input_abi(out)) return VK_ERROR_INITIALIZATION_FAILED;
+    *out = {sizeof *out, NX2SL_INPUTS_ABI_V1, NX2SL_INPUT_UNPROVEN};
+    if (!input_abi(receipt) || g_available != 1 || !present || !pi || !receipt->generation || !receipt->swapchain ||
+        receipt->sdk_frame != (uint32_t)receipt->frame || pi->swapchainCount != 1 || !pi->pSwapchains ||
+        pi->pSwapchains[0] != receipt->swapchain) return VK_ERROR_INITIALIZATION_FAILED;
+    bool late = receipt->accepted || receipt->uncertain;
+    if (late != !!receipt->ticket || (g_pending_inputs.ticket && !same_inputs(*receipt, g_pending_inputs)) ||
+        (late && !g_pending_inputs.ticket)) return VK_ERROR_INITIALIZATION_FAILED;
+    out->ticket = receipt->ticket;
+    if (!late) out->flags = NX2SL_INPUT_NO_LATE_TAGS;
+    bool changed_generation = !g_sample_generation || receipt->generation != g_sample_generation;
+    InputSample before = g_last_input_sample;
+    if (late && (changed_generation || !before.checked)) before = query_input_sample();
+    g_pending_inputs = {}; // After any actual present attempt a null tag cannot prove cancellation.
+    FgExecutionObservation prepared = g_fg_prepared;
+    g_fg_prepared = {};
+    bool started = false, ended = false;
+    present_marker(0, receipt->sdk_frame, false, &started);
+    VkResult result = present(queue, pi);
+    bool accepted = (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) &&
+                    (!pi->pResults || pi->pResults[0] == VK_SUCCESS || pi->pResults[0] == VK_SUBOPTIMAL_KHR);
+    bool generated = false;
+    InputSample observed = present_marker(1, receipt->sdk_frame, accepted, &ended, &generated);
+    if (accepted && started && ended && generated && prepared.frame == receipt->frame &&
+        prepared.config.generation == receipt->generation && prepared.config.swapchain == receipt->swapchain)
+        g_fg_execution = prepared;
+    g_last_input_sample = observed;
+    g_sample_generation = receipt->generation;
+    if (late && accepted && started && ended && fresh_input_sample(before, observed, changed_generation)) {
+        g_last_proof = observed;
+        out->flags = NX2SL_INPUT_TIMELINE;
+        out->semaphore = observed.semaphore;
+        out->value = observed.value;
+    }
+    return result;
+}
+
+extern "C" NX2SL_API int nx2sl_cancel_inputs_v1(const Nx2SlInputReceipt *receipt) {
+    if (!input_abi(receipt) || !receipt->ticket || !same_inputs(*receipt, g_pending_inputs)) return 0;
+    const sl::ResourceTag absent[] = {
+        {nullptr, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent},
+        {nullptr, sl::kBufferTypeUIAlpha, sl::ResourceLifecycle::eValidUntilPresent}};
+    if (tag_frame(receipt->sdk_frame, sl::ViewportHandle(0), absent, 2, VK_NULL_HANDLE) != sl::Result::eOk) return 0;
+    g_pending_inputs = {};
+    g_fg_prepared = {};
+    return 1;
+}
+
+extern "C" NX2SL_API int nx2sl_estimate_fg_v1(const Nx2SlFgConfigV1 *config, Nx2SlFgEstimateV1 *out) {
+    if (!out || out->size != sizeof *out || out->version != NX2SL_FG_MEMORY_ABI_V1 || out->flags ||
+        out->reserved || out->padding) return 0;
+    *out = {sizeof *out, NX2SL_FG_MEMORY_ABI_V1, 0, 0, 0, -1, 0};
+    if (!config || config->size != sizeof *config || config->version != NX2SL_FG_MEMORY_ABI_V1 ||
+        config->flags || config->reserved || !config->generation || !config->swapchain ||
+        !config->backbuffers || !config->generated || !config->color_width || !config->color_height ||
+        !config->mvec_width || !config->mvec_height || config->mvec_width != config->depth_width ||
+        config->mvec_height != config->depth_height || config->color == VK_FORMAT_UNDEFINED ||
+        config->depth == VK_FORMAT_UNDEFINED || config->motion == VK_FORMAT_UNDEFINED ||
+        config->recomposition > 1 || (config->recomposition &&
+        (config->hudless == VK_FORMAT_UNDEFINED || config->alpha == VK_FORMAT_UNDEFINED)) ||
+        config->queue_mode >= static_cast<uint32_t>(sl::DLSSGQueueParallelismMode::eCount) ||
+        g_available != 1 || !p_dlssg_state) return 0;
+    uint32_t max = g_max.load();
+    if (config->generated > (max ? max : 1)) return 0;
+
+    sl::DLSSGOptions options{};
+    options.mode = sl::DLSSGMode::eOn;
+    options.flags = sl::DLSSGFlags::eRequestVRAMEstimate | sl::DLSSGFlags::eRetainResourcesWhenOff;
+    options.numFramesToGenerate = config->generated;
+    options.numBackBuffers = config->backbuffers;
+    options.mvecDepthWidth = config->mvec_width;
+    options.mvecDepthHeight = config->mvec_height;
+    options.colorWidth = config->color_width;
+    options.colorHeight = config->color_height;
+    options.colorBufferFormat = static_cast<uint32_t>(config->color);
+    options.depthBufferFormat = static_cast<uint32_t>(config->depth);
+    options.mvecBufferFormat = static_cast<uint32_t>(config->motion);
+    options.hudLessBufferFormat = static_cast<uint32_t>(config->hudless);
+    options.uiBufferFormat = static_cast<uint32_t>(config->alpha);
+    options.enableUserInterfaceRecomposition = config->recomposition ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+    options.queueParallelismMode = static_cast<sl::DLSSGQueueParallelismMode>(config->queue_mode);
+
+    sl::DLSSGState state{};
+    const sl::Result result = p_dlssg_state(sl::ViewportHandle(0), state, &options);
+    out->sdk_result = static_cast<int32_t>(result);
+    if (result != sl::Result::eOk) return 0;
+    // GetState consumes the SDK's present delta even when called for a cold estimate.
+    if (state.numFramesActuallyPresented)
+        g_shown.fetch_add(state.numFramesActuallyPresented, std::memory_order_relaxed);
+    if (!state.estimatedVRAMUsageInBytes) return 0;
+    out->flags = NX2SL_FG_ESTIMATE_ROUGH_VRAM;
+    out->vram_bytes = state.estimatedVRAMUsageInBytes;
+    return 1;
+}
+
+extern "C" NX2SL_API int nx2sl_fg_observed_v1(uint64_t frame, const Nx2SlFgConfigV1 *config) {
+    if (!config || config->size != sizeof *config || config->version != NX2SL_FG_MEMORY_ABI_V1 ||
+        config->flags || config->reserved || !frame || g_fg_execution.frame != frame || config->queue_mode) return 0;
+    const auto &actual = g_fg_execution.config;
+    // Swapchain shape/count are established by the host's exact generation. Vulkan image tags and applied options
+    // are independently checked here, including configurations the SDK declined after tagging.
+    if (actual.generation != config->generation || actual.swapchain != config->swapchain ||
+        actual.generated != config->generated || actual.recomposition != config->recomposition ||
+        actual.mvec_width != config->mvec_width || actual.mvec_height != config->mvec_height ||
+        actual.depth_width != config->depth_width || actual.depth_height != config->depth_height ||
+        actual.color_width != config->color_width || actual.color_height != config->color_height ||
+        actual.depth != config->depth || actual.motion != config->motion ||
+        actual.hudless != config->hudless || actual.alpha != config->alpha) return 0;
+    g_fg_execution = {};
+    return 1;
 }
 
 extern "C" NX2SL_API uint32_t nx2sl_frames_max(void) { return g_available == 1 ? g_max.load() : 0; }
@@ -420,6 +682,20 @@ extern "C" NX2SL_API int nx2sl_input_retirement(VkSemaphore *semaphore, uint64_t
 
 extern "C" NX2SL_API uint64_t nx2sl_shown(void) { return g_shown.load(std::memory_order_relaxed); }
 
-extern "C" NX2SL_API void nx2sl_shutdown(void) {
-    if (p_shutdown && g_available >= 0) p_shutdown();
+extern "C" NX2SL_API int nx2sl_shutdown_checked_v1(void) {
+    if (!g_initialized) return 1;
+    if (!p_shutdown || p_shutdown() != sl::Result::eOk) return 0;
+    g_initialized = false;
+    g_available = -1;
+    g_pending_inputs = {};
+    g_fg_prepared = {};
+    g_fg_execution = {};
+    g_last_input_sample = {};
+    g_last_proof = {};
+    g_sample_generation = 0;
+    g_input_fence = VK_NULL_HANDLE;
+    g_input_value = 0;
+    return 1;
 }
+
+extern "C" NX2SL_API void nx2sl_shutdown(void) { (void)nx2sl_shutdown_checked_v1(); }

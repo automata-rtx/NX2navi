@@ -466,6 +466,7 @@ void ldr_load(const char *exefs_dir) {
     }
     verify_identity();
     for (int i = 0; i < nmods; i++) seal(&mods[i]);
+    for (int i = 0; i < nmods; i++) mem_backing_publish_module(mods[i].pub.base, mods[i].pub.size);
     for (int i = 0; i < nmods; i++) {
         const Mod *m = &mods[i];
         rt_log("loaded %-8s at %#llx size %#llx: %llu relocations, %u imports", m->pub.name,

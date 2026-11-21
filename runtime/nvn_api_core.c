@@ -107,16 +107,6 @@ static void gva_free(uint64_t lo) {
     plat_mutex_unlock(&pool_lock);
 }
 
-static void index_add(const pool_t *o) {
-    uintptr_t lo = (uintptr_t)o->mem;
-    pidx_ent e = {.lo = lo, .hi = lo + o->size, .base = lo, .gpu = lo, .key = o};
-    plat_mutex_lock(&pool_lock);
-    pidx_remove(&pool_index, o, NULL);   // a pool object initialized again without Finalize
-    int ok = pidx_insert(&pool_index, &e);
-    plat_mutex_unlock(&pool_lock);
-    if (!ok) rt_fatal("nvn: out of memory for the pool index");
-}
-
 static void index_del(const pool_t *o) {
     plat_mutex_lock(&pool_lock);
     pidx_remove(&pool_index, o, NULL);
@@ -165,6 +155,17 @@ static int pool_place(pool_t *o) {
 }
 
 static int pool_gpu_visible(const pool_t *o) { return !(o->flags & NVN_MEMORY_POOL_FLAGS_GPU_NO_ACCESS); }
+
+static void pool_publish(pool_t *o, const pool_t *setup) {
+    uintptr_t lo = (uintptr_t)setup->mem;
+    pidx_ent e = {.lo = lo, .hi = lo + setup->size, .base = lo, .gpu = lo, .key = o};
+    plat_mutex_lock(&pool_lock);
+    pidx_remove(&pool_index, o, NULL);
+    *o = *setup;
+    int ok = !pool_gpu_visible(o) || pidx_insert(&pool_index, &e);
+    plat_mutex_unlock(&pool_lock);
+    if (!ok) rt_fatal("nvn: out of memory for the pool index");
+}
 
 // ---------- Device
 static const int devinfo[] = {   // Tegra X1 values (nnheaders nvn_DeviceConstantsNX.h, measured on SMO)
@@ -294,29 +295,34 @@ NVN_API(nvnMemoryPoolInitialize) {
     NVN_BLOCKING();
     pool_t *o = arg_p(c, 0);
     const pool_builder_t *s = arg_p(c, 1);
-    memset(o, 0, sizeof *o);
-    o->magic = NVN_POOL_MAGIC;
-    o->flags = s->flags;
-    o->mem = o->game_mem = s->mem;
-    o->size = s->size;
-    int ok = pool_place(o);
-    if (ok && !o->mem) {
-        rt_log("nvn: MemoryPoolInitialize: pool without storage, flags %#x size %#llx", o->flags,
-               (unsigned long long)o->size);
+    int replacing = o->magic == NVN_POOL_MAGIC;
+    uint64_t old_address = replacing ? (uintptr_t)o->mem : 0;
+    uint64_t old_size = replacing ? o->size : 0;
+    pool_t setup = {.magic = NVN_POOL_MAGIC, .flags = s->flags, .mem = s->mem, .game_mem = s->mem, .size = s->size};
+    int ok = pool_place(&setup);
+    if (ok && !setup.mem) {
+        rt_log("nvn: MemoryPoolInitialize: pool without storage, flags %#x size %#llx", setup.flags,
+               (unsigned long long)setup.size);
         ok = 0;
     }
-    if (ok && !gfx_backend()->pool_init(o)) {
+    if (ok && !gfx_backend()->pool_init(o, &setup)) {
         rt_log("nvn: MemoryPoolInitialize: the %s back end refused pool %p (flags %#x, size %#llx)", gfx_backend()->name,
-               (void *)o->mem, o->flags, (unsigned long long)o->size);
+               (void *)setup.mem, setup.flags, (unsigned long long)setup.size);
         ok = 0;
     }
-    if (ok && pool_gpu_visible(o)) index_add(o);
-    if (!ok) {
-        if (nvn_gpu_only((uintptr_t)o->mem)) gva_free((uintptr_t)o->mem);
-        o->magic = 0;
+    if (ok) {
+        if (replacing) motion_owner_forget_range(old_address, old_size);
+        pool_publish(o, &setup);
+        if (nvn_gpu_only(old_address)) gva_free(old_address);
+    } else {
+        if (setup.span && nvn_gpu_only((uintptr_t)setup.mem)) gva_free((uintptr_t)setup.mem);
+        if (!replacing) {
+            setup.magic = 0;
+            *o = setup;
+        }
     }
-    NVN_LOG("MemoryPool %p mem %p size %#llx flags %#x storage %p%s", (void *)o, (void *)o->mem,
-            (unsigned long long)o->size, o->flags, (void *)o->game_mem, ok ? "" : " failed");
+    NVN_LOG("MemoryPool %p mem %p size %#llx flags %#x storage %p%s", (void *)o, (void *)setup.mem,
+            (unsigned long long)setup.size, setup.flags, (void *)setup.game_mem, ok ? "" : " failed");
     ret_x(c, ok);
 }
 // void nvnMemoryPoolFinalize(NVNmemoryPool *p)
@@ -423,9 +429,8 @@ NVN_API(nvnMemoryPoolMapVirtual) {
     if (n < 0 || (n && !r)) { rt_log("nvn: MapVirtual with %d requests at %p", n, (const void *)r); ret_x(c, 0); return; }
     for (int i = 0; i < n; i++)
         if (!check_request(v, &r[i], i)) { ret_x(c, 0); return; }
+    if (!gfx_backend()->pool_map_virtual(v, n, r)) { ret_x(c, 0); return; }
     if (n) motion_owner_forget_range((uint64_t)(uintptr_t)v->mem, v->size);
-    if (!gfx_backend()->pool_map_virtual(v, n, r))
-        rt_fatal("nvn: MapVirtual of %d requests failed after validation; virtual pool %p is inconsistent", n, (void *)v);
     NVN_LOG("MapVirtual pool %p, %d requests", (void *)v->mem, n);
     ret_x(c, 1);
 }
@@ -582,16 +587,19 @@ NVN_API(nvnEventInitialize) {
 // void nvnEventFinalize(NVNevent *e)
 NVN_API(nvnEventFinalize) { ((ev_t *)arg_p(c, 0))->magic = 0; }
 // uint32_t nvnEventGetValue(const NVNevent *e)
-NVN_API(nvnEventGetValue) { ret_x(c, *((const ev_t *)arg_p(c, 0))->val); }
+NVN_API(nvnEventGetValue) { ret_x(c, __atomic_load_n(((const ev_t *)arg_p(c, 0))->val, __ATOMIC_ACQUIRE)); }
 // void nvnEventSignal(NVNevent *e, NVNeventSignalMode mode, uint32_t value)
 NVN_API(nvnEventSignal) {
     const ev_t *e = arg_p(c, 0);
     uint32_t v = (uint32_t)arg_x(c, 2);
     int add = (uint32_t)arg_x(c, 1) == NVN_EVENT_SIGNAL_MODE_ADD;
     // before the write: the replay tells a signal that came after a submission's copies from one before them
-    gfx_event_signalling((const void *)e->val, add ? *e->val + v : v);
-    if (add) *e->val += v;
-    else *e->val = v;
+    uint32_t before = add ? __atomic_load_n(e->val, __ATOMIC_ACQUIRE) : 0;
+    gfx_event_signalling((const void *)e->val, add ? before + v : v);
+    // Match the replay's event samples and the completion thread's signal publication.
+    if (add) __atomic_fetch_add(e->val, v, __ATOMIC_RELEASE);
+    else __atomic_store_n(e->val, v, __ATOMIC_RELEASE);
+    nvn_guest_written((uintptr_t)e->val, sizeof *e->val);
 }
 
 // ---------- Queue

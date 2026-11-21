@@ -1,7 +1,8 @@
 // DLSS Frame Generation through NVIDIA Streamline (vk_dlssg.c, nx2navi_dlssg.dll).
 #pragma once
 #include <stdint.h>
-#include <vulkan/vulkan.h>
+#include "dlssg/nx2_sl.h"
+#include "resource_core_admission.h"
 struct RtDispatchHook;
 struct RtDispatchHook *vk_dlssg_update_hook(void);
 void vk_dlssg_render_start(uint64_t frame);
@@ -25,6 +26,52 @@ void vk_dlssg_destroy_swapchain(VkDevice d, VkSwapchainKHR sc);
 VkResult vk_dlssg_get_images(VkDevice d, VkSwapchainKHR sc, uint32_t *n, VkImage *img);
 VkResult vk_dlssg_acquire(VkDevice d, VkSwapchainKHR sc, uint64_t timeout, VkSemaphore sem, uint32_t *idx);
 VkResult vk_dlssg_present(VkQueue q, const VkPresentInfoKHR *pi);
+// Exact bridge capability. Legacy entry points remain callable on version 4.
+int vk_dlssg_has_input_receipts(void);
+// One present-thread tag for the selected swapchain generation and full host frame.
+int vk_dlssg_frame_inputs(VkCommandBuffer cb, VkExtent2D extent, const int rect[4],
+                          const Nx2SlImage *hudless, const Nx2SlImage *alpha, uint64_t frame,
+                          VkSwapchainKHR swapchain, uint64_t generation, Nx2SlInputReceipt *out);
+VkResult vk_dlssg_present_inputs(VkQueue queue, const VkPresentInfoKHR *present,
+                                 const Nx2SlInputReceipt *receipt, Nx2SlInputCompletion *out);
+int vk_dlssg_cancel_inputs(const Nx2SlInputReceipt *receipt);
+
+typedef enum {
+    VK_DLSSG_CONFIG_READY, VK_DLSSG_CONFIG_COMPAT, VK_DLSSG_CONFIG_PENDING,
+    VK_DLSSG_CONFIG_STOPPED, VK_DLSSG_CONFIG_TERMINAL, VK_DLSSG_CONFIG_INVALIDATED, VK_DLSSG_CONFIG_DRAIN_REQUIRED,
+} VkDlssgConfigResult;
+enum { VK_DLSSG_CONFIG_VARIANTS = 3 };
+enum { VK_DLSSG_SCENE_INVALID = -1, VK_DLSSG_SCENE_ABSENT, VK_DLSSG_SCENE_VALID };
+typedef struct {
+    Nx2SlFgConfigV1 key;
+    uint64_t estimate;
+    VkDlssgConfigResult result;
+} VkDlssgConfigChoice;
+typedef struct {
+    VkDlssgConfigChoice choice[VK_DLSSG_CONFIG_VARIANTS];
+    RcAdmissionVector peak;
+    uint64_t frame, use;
+    uint32_t count, generated;
+    int mode, pending, missing_scene;
+} VkDlssgConfigPreparation;
+// Present-thread preview. These calls neither tag nor configure the SDK.
+// ABSENT is a frame with no usable scene. INVALID preserves the exact owner for revalidation.
+uint32_t vk_dlssg_config_next_generated(int scene_inputs);
+VkDlssgConfigResult vk_dlssg_config_preflight_variants(const Nx2SlFgConfigV1 *, uint32_t count,
+    int scene_inputs, uint64_t frame, VkDlssgConfigPreparation *, RcAdmissionVector *);
+void vk_dlssg_config_cancel(VkDlssgConfigPreparation *);
+// READY and COMPAT consume the exact preparation. Other results leave tags/options untouched.
+VkDlssgConfigResult vk_dlssg_frame_inputs_admitted(VkCommandBuffer, VkExtent2D, VkFormat backbuffer_format,
+    uint32_t actual_backbuffers, const int rect[4], const Nx2SlImage *hudless, const Nx2SlImage *alpha,
+    uint64_t frame, VkSwapchainKHR, uint64_t generation, VkDlssgConfigPreparation *, Nx2SlInputReceipt *,
+    uint64_t *memory_use, RcAdmissionVector *peak, int *sdk_tag_ok);
+// A config use is independent of the SDK ticket that retains the tagged images.
+void vk_dlssg_config_abandon(uint64_t use);
+void vk_dlssg_config_presented(uint64_t use, uint64_t frame, VkFence graphics, VkResult result, VkResult image);
+int vk_dlssg_config_drain_eligible(uint64_t *use, VkFence *first_graphics);
+void vk_dlssg_config_progress(VkDevice device, int checked_idle);
+// After all SDK use drains, before device teardown. Success is positive SDK proof.
+int vk_dlssg_release_checked(void);
 // Each present, before its command buffer is submitted.
 void vk_dlssg_frame(VkCommandBuffer cb, VkExtent2D ext, const int rect[4], VkImage hudless, VkImageView hudless_view,
                     VkFormat hudless_format, VkImage alpha, VkImageView alpha_view);

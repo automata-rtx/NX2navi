@@ -10,6 +10,7 @@
 //
 // Every image lives in VK_IMAGE_LAYOUT_GENERAL. Uploads are recorded into the upload batch of vk_memory.c; the replay
 // submits it (vk_upload_flush) before a submission that samples the textures.
+#include <limits.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -28,11 +29,20 @@
 #include "nvn_hmap.h"
 #include "nvn_tex.h"
 #include "tex.h"
+#include "vk_texture_alias_bytes.h"
 #include "vk.h"
 #include "vk_dlaa.h"
 #include "vk_exec.h"
+#include "vk_gpa.h"
 #include "prof.h"
+#include "replay_work_trace.h"
 #include "platform/platform.h"
+#include "resource_core_registry.h"
+#include "resource_texture_source.h"
+#include "resource_image_write.h"
+#include "resource_command_effects.h"
+#include "resource_host_write.h"
+#include "resource_core_vma.h"
 
 typedef struct {
     uint64_t addr;
@@ -46,6 +56,56 @@ typedef struct { uint32_t flags, type, format, w, h, d, levels, layers, samples,
 #include "vk_texture_material.h"
 static TextureMaterialLedger material_ledger;
 
+typedef struct TextureFlat3D {
+    VkTexImage image;
+    VmaAllocation allocation;
+    TextureMaterial *material;
+    uint64_t source_instance;
+    VkImage source;
+    uint64_t revision;
+    uint32_t upload, layer;
+    uint8_t ordered;
+    RcRegistryPosition position;
+    struct TextureFlat3D *next;
+} TextureFlat3D;
+static void flat3d_retire(TextureFlat3D *copy);
+
+// One successful validation shared by the aliases/kinds of this Tex in the same recording operation. Pool
+// members retain their own cross-operation interval; this value never extends a read boundary or certifies bytes.
+typedef struct {
+    RcRegistryHandle handle;
+    RcSourceRange range;
+    RcRegistryPosition position, origin, edge, sealed_through, next_producer;
+    RcRegistryImageBinding representation;
+    uint64_t revision, content_revision, topology_revision, guard, scope, authority, mapping, protection;
+    TextureSourceStamp stamp;
+    VkImage image;
+    uint32_t wgen, writes, provenance, writer_kinds;
+    uint8_t kind;
+} TextureBindingProof;
+
+typedef struct {
+    MemBackingCapture *lease;
+    const RcInterval *intervals;
+    RcInterval *sample_intervals;
+    TextureSourceSpan *sample_spans;
+    RcRegistrySourceAccess *access;
+    TextureSourceAuthority *observed, *next, *copied;
+    uint64_t native_generation;
+    uint32_t count, sample_count;
+} TextureSourceMapping;
+
+enum {
+    SOURCE_REFUSAL_NONE, SOURCE_REFUSAL_ACQUIRE, SOURCE_REFUSAL_EFFECTS, SOURCE_REFUSAL_AUTHORITY,
+    SOURCE_REFUSAL_WATCH, SOURCE_REFUSAL_RACE, SOURCE_REFUSAL_SNAPSHOT_CAPACITY, SOURCE_REFUSAL_SNAPSHOT_MAPPING,
+    SOURCE_REFUSAL_SNAPSHOT_CHANGED, SOURCE_REFUSAL_SNAPSHOT_COMMIT, SOURCE_REFUSAL_SNAPSHOT_MISSING,
+    SOURCE_REFUSAL_RESTORE, SOURCE_REFUSAL_PERMISSION, SOURCE_REFUSAL_UPLOAD
+};
+
+typedef struct TextureRegistration TextureRegistration;
+typedef struct NativeTextureOutput NativeTextureOutput;
+typedef struct RetainedTextureUpload RetainedTextureUpload;
+
 typedef struct Tex {
     VkTexImage pub;               // first: vk_texture_get hands out &pub
     TexKey key;
@@ -53,21 +113,79 @@ typedef struct Tex {
     TexVkFormat f;
     VmaAllocation alloc;          // own memory; NULL when bound into pool memory
     TextureMaterial *material;    // physical owner; alloc/bytes are zero while attached
+    struct Tex *material_prev, *material_next;
     ImgKey material_intent;       // representation requested before content-dependent opacity selection
     TextureSourceStamp source_stamp;
+    RcRegistrySourceAccess source_access;
+    TextureSourceMapping *source_mapping;
+    TextureRegistration *source_registrations;
+    RcRegistryReadObservation source_vector_read;
+    uint8_t source_canonical, source_mapping_pins;
+    uint64_t source_compatibility_generation;
+    uint64_t source_dirty_visit; // deduplicates one bounded source-notification drain across aliases
+    uint64_t schedule_dirty_visit;
+    uint64_t source_registration_visit, schedule_registration_visit;
+    TextureBindingProof binding_proof;
+    TextureBindingProof pool_binding_proof;
+    RcRegistryPosition pool_schedule_edge;
+    RcRegistryWrite image_authority;
+    RcRegistryWrite *image_mapped_holds;
+    uint32_t image_mapped_hold_count;
+    MemBackingCapture *image_host_backing;
+    uint64_t image_host_cutoff;
+    RcInterval *image_device_intervals;
+    uint32_t image_device_count;
+    uint64_t image_device_size;
+    RcInterval *image_private_mapping;
+    uint32_t image_private_mapping_count;
+    RcInterval *alias_full_demand;
+    uint32_t alias_full_count;
+    RcInterval *alias_plane_demand;
+    VkImageSubresourceRange alias_plane_range;
+    uint32_t alias_plane_count;
+    uint8_t alias_fragment_owner, bound_alias_whole, storage_registration_owned;
+    NativeTextureOutput *native_output;
+    RetainedTextureUpload *retained_sample_upload;
+    uint64_t sample_upload_sequence;
+    TextureSourceAuthority source_authority;
+    TextureSourceStamp source_authority_stamp;
+    uint8_t source_blocked;       // Mixed/unknown GPU authority uses the compatibility renderer, never a CPU proof.
+    uint8_t source_refusal, source_refusal_result, source_snapshot_mismatch, source_tracking_failure;
+    RcRegistryPosition source_refusal_position;
     TextureSourceSpan *source_spans;
     uint32_t source_count;
-    uint8_t *source_copy;         // bounded immutable first-use payload; never an additional persistent asset cache
+    uint8_t *source_copy;         // Owned capture, or a borrowed material provider during residency reconstruction.
+    const tex_t *source_recipe;
+    uint8_t source_borrowed, material_restoring;
+    TextureSourceStamp source_copy_stamp;
+    TextureSourceAuthority source_copy_authority;
+    RcRegistryReadVersion material_version; // logical source association to its immutable prepared provider
+    RcRegistryReadVersion source_copy_version; // committed immutable input, not a promise that guest bytes remain current
+    RcRegistryPosition compatibility_position; // Successful compatibility preparation, never advanced by a cache query.
+    RcRegistryBindingReceipt compatibility_receipt; // Prepared compatibility image, not an immutable CPU-content proof.
+    VkImage compatibility_image;
+    uint64_t compatibility_mapping, compatibility_protection;
+    uint32_t compatibility_wgen, compatibility_writes;
+    RcBudgetTicket source_budget;
+    RcBudgetAvailability source_retry;
+    RcAdmissionVector source_retry_peak;
+    uint32_t source_retry_domains, source_retry_submit;
+    uint8_t source_retry_source;
+    uint64_t source_retry_handle, source_retry_revision, source_retry_guard;
+    TextureSourceStamp source_retry_stamp;
     uint64_t source_copy_size;
     uint8_t source_digest[32];
     uint8_t source_digest_valid;
     uint8_t material_prepared;
     uint8_t material_writable;    // explicit writable use keeps this logical association private
+    uint8_t pin_owned, pin_detached; // exact recorded object, with or without a live address projection
+    VkTextureWriteTarget *pending_write; // first COW owns the tentative attachment until recording or cancellation
     uint64_t bytes;               // the size of alloc (0 without own memory), for the released entries' total
     VmaAllocation bound_to;       // the pool memory it is bound into
     uint32_t wgen;                // page generation of the last upload check
     uint64_t upload_mapping, upload_protection; // guest mapping and tracking state when resident mip contents were copied
     uint32_t checked;             // submit_epoch of the last check from a draw binding
+    uint64_t checked_authority;
     uint32_t use_round;           // look_round when a lookup last reached it (touch)
     uint64_t use_frame;           // gfx_counters.frames then
     uint64_t samp_frame;          // gfx_counters.frames when it was made, a marked shader last sampled it, or a lookup
@@ -76,6 +194,10 @@ typedef struct Tex {
     uint64_t retire_takes;        // vk_pool_takes when it was retired
     uint64_t retire_frame;        // gfx_counters.frames when it was retired
     uint64_t retire_due;          // vk_sync_issued once every pool set was taken since (0: not yet); destroyed after it
+    RcRegistryPosition sample_general_inline;
+    uint64_t sample_general_upload, sample_general_revision;
+    uint8_t host_storage_init;
+    void *host_storage_init_part;
     int uploaded, released;
     uint64_t up_retry;            // gfx_counters.frames from which an upload that had no memory is tried again (upload)
     uint64_t uid;                 // names the entry in its bucket's released set (tex_gen_flip); 0 until its first release
@@ -90,10 +212,15 @@ typedef struct Tex {
     uint64_t gpu_fence;           // fence of the submission that made that write (0: not recorded in one)
     uint64_t run_frame;           // mirrored: the frame of the newest GPU write
     uint8_t run;                  // frames in a row up to run_frame with a GPU write, counted up to WB_RUN
+    RcRegistryPosition native_write;
+    uint32_t packed_storage_writes;
     uint64_t wr_fence;            // any entry: newest submission recorded to write its image (render, copy, clear,
                                   // storage binding); ReadTexels waits for it instead of draining the replay queue
+    uint64_t content_revision;    // every recorded image write, including multiple writes in one scene
     uint8_t listed;               // in owned[]
     uint8_t *snap;                // a texture that fills no page: its storage bytes when the GPU write was recorded
+    uint8_t snap_color_texels;    // compare only the meaningful bytes of the defined single color plane
+    struct MirroredColorWrite *mirrored_color_write;
     uint32_t wt_n;                // WriteTexels into the storage since the last upload
     uint64_t chash;               // content_hash of the storage at its last upload (small textures, CHASH_MAX)
     uint8_t chash_ok;             // chash holds it
@@ -127,10 +254,7 @@ typedef struct Tex {
     uint64_t og_frame;            // gfx_counters.frames when it was made
     uint64_t og_drop_frame;       // gfx_counters.frames of the drop og_drop names
     uint64_t og_back_frame;       // gfx_counters.frames when it was last taken back
-    VkTexImage *flat3d;           // sampled as a 3D texture: its one-slice 3D copy (vk_texture_flat3d_locked), else NULL
-    VmaAllocation flat3d_alloc;
-    uint32_t flat3d_up, flat3d_layer;   // n_up and the layer of the copy's last refresh
-    uint64_t flat3d_wr;           // wr_fence then
+    TextureFlat3D *flat3d;        // at most one current immutable derived instance per requested source layer
 } Tex;
 
 // A slot keeps what vk_texture_by_id resolved for it, so a draw binding skips the key lookup and the address chain: the
@@ -148,10 +272,13 @@ typedef struct {
     uint8_t cwant;                // a shader sampled its stand-in (vk_pool_marks_read): slot_resolve makes it at once
     uint64_t khash;               // hash of the descriptor key and view, 0 for CPU-written textures (vk_texture_slot_khash_locked)
     uint64_t absent_mapping, absent_protection; // pool-only absence, bounded by registration/address identity and backing events
+    TextureRegistration *registration;
+    uint64_t pool_owner;
+    int logical_id, free_slot;
     view_t v;
     tex_t t;
 } TexSlot;
-typedef struct { samp_par p; VkSampler s, sp, sc, sd[2]; uint8_t used; } SampSlot;   // s: vk_sampler_for(&p) once looked up; sp:
+typedef struct { samp_par p; VkSampler s, sp, sc, so, sd[2]; uint8_t used; } SampSlot;   // s: vk_sampler_for(&p) once looked up; sp:
                                                                                // its point-sampled form (vk_sampler_point_by_id_locked),
                                                                                // sc its comparing form (vk_sampler_compare_by_id_locked),
                                                                                // sd[n - 1] its form for a texture made without n
@@ -164,7 +291,7 @@ static nvn_hmap by_addr = {.klen = 8};
 static TexSlot *tslots;
 static int ntslots;
 static SampSlot *sslots;
-static int nsslots;
+static int nsslots, sampler_comparison_slots;
 static nvn_hmap samplers = {.klen = sizeof(samp_par)};
 static int nreleased;
 static Tex *rel_head, *rel_tail;   // released entries in release order (sweep_released drops from the head)
@@ -221,7 +348,27 @@ static uint32_t samp_gen = 1;   // bumped whenever a sampler slot is registered:
 static struct {
     uint64_t queries, ready, prepared, deferred, unavailable, fallback, used;
     uint64_t dependency_detach, live_visits, avoided_visits;
+    uint64_t material_used, versioned_used;
 } resource_path;
+static struct {
+    uint64_t calls, absent, direct_gpu, finalized, ordinary, compatibility, same_operation;
+    uint64_t invalid_slot, stale_slot, image_mismatch, not_ready, ordinary_refused, compatibility_refused;
+} binding_path;
+static struct {
+    uint64_t unordered, position, unchecked, stamp, feedback, material, mapping, protection;
+    uint64_t registry, backwards, scope, race;
+} ordinary_path;
+// One first outcome per preparation/revalidation stage. These expose missing compatibility coverage without
+// another range walk; a ready registry begin alone says nothing about committing or later consuming its receipt.
+static struct {
+    uint64_t begins, begin_position, begin_alias_pool, begin_no_source, begin_registration, begin_feedback, begin_serial, begin_registry, begin_ready;
+    uint64_t image_begins, image_ready, image_commit_changed;
+    uint64_t acquired;
+    uint64_t commits, commit_unready, commit_unbracketed, commit_mapping, commit_protection, commit_registry, commit_ready;
+    uint64_t uses, use_empty, use_position, use_epoch, use_identity, use_feedback, use_mapping, use_protection;
+    uint64_t use_scope, use_backwards, use_edge, use_registry, use_ready;
+    uint64_t source_handled, source_unordered;
+} compatibility_path;
 static uint64_t n_checks;    // draw-binding storage checks (make_fresh_snap) since the last perf line
 // tex_gen per storage address (hashed): a slot resolves through the entries at its own address only (slot_resolve), so
 // a slot's resolution stays valid while its address's generation does. NX2navi finalizes and initializes transient
@@ -359,17 +506,37 @@ static void tex_gen_flip(Tex *e, int plain) {
 // the walk that follows refills it on its own, and the head, whose state the pool tests, is a member from before. (The
 // game's 118 registrations a submission cleared the stamps of the groups they joined, and the walk at a submission's
 // start went member by member as before: 11,300 of 11,550 slots.)
-typedef struct { VkSlotGroup pub; int32_t gnext, gprev, tail; uint32_t bucket; } SlotGroup;
+typedef struct {
+    TexKey texture;
+    view_t view;
+    uint64_t size, layer_size;
+    uint64_t pool_owner;
+    uint32_t align, layers, bpb, tile_h, tile_d, pool_flags;
+    uint8_t has_view, finalized, pad[6];
+} GrpKey;
+typedef struct { VkSlotGroup pub; GrpKey key; int32_t gnext, gprev, tail; uint32_t bucket; } SlotGroup;
 static SlotGroup *grp;
 static int ngrp, cgrp, grp_free = -1, ngrp_live;
 static uint64_t n_grouped;               // slots in groups
 static int32_t bucket_ghead[AGEN_N];     // per bucket: its first group (-1: none; set with the lists)
 static int32_t *slot_grp;                // per slot id: its group, -1 none
-typedef struct { uint64_t kh, b; } GrpKey;
 static nvn_hmap grp_by = {.klen = sizeof(GrpKey)};   // -> group + 1
+static uint64_t group_incarnation;
+static void make_key(const tex_t *t, TexKey *k);
+static GrpKey group_key(const TexSlot *s) {
+    GrpKey key={0};
+    make_key(&s->t,&key.texture);
+    if(s->has_view){key.view=s->v;memset(key.view.pad1,0,sizeof key.view.pad1);}
+    key.size=s->t.L.size;key.layer_size=s->t.L.layer_size;
+    key.pool_owner=s->pool_owner;
+    key.align=s->t.L.align;key.layers=s->t.L.layers;key.bpb=s->t.L.bpb;
+    key.tile_h=s->t.L.tileH;key.tile_d=s->t.L.tileD;key.pool_flags=s->t.pool_flags;
+    key.has_view=s->has_view;key.finalized=s->finalized;
+    return key;
+}
 
-static int grp_get(uint64_t kh, uint32_t b) {
-    GrpKey k = {kh, b};
+static int grp_get(uint64_t kh, uint32_t b, const TexSlot *slot) {
+    GrpKey k = group_key(slot);
     void *v = nvn_hm_get(&grp_by, &k);
     if (v) return (int)((intptr_t)v - 1);
     int g;
@@ -386,6 +553,8 @@ static int grp_get(uint64_t kh, uint32_t b) {
     }
     SlotGroup *G = &grp[g];
     memset(G, 0, sizeof *G);
+    if(group_incarnation==UINT64_MAX)rt_fatal("vk: texture group identity exhausted");
+    G->pub.incarnation=++group_incarnation;G->key=k;
     G->pub.kh = kh, G->pub.head = G->tail = -1, G->bucket = b;
     G->gprev = -1, G->gnext = bucket_ghead[b];
     if (G->gnext >= 0) grp[G->gnext].gprev = g;
@@ -397,19 +566,19 @@ static int grp_get(uint64_t kh, uint32_t b) {
 
 static void grp_drop(int g) {
     SlotGroup *G = &grp[g];
-    GrpKey k = {G->pub.kh, G->bucket};
-    nvn_hm_del(&grp_by, &k);
+    nvn_hm_del(&grp_by, &G->key);
     if (G->gprev >= 0) grp[G->gprev].gnext = G->gnext;
     else bucket_ghead[G->bucket] = G->gnext;
     if (G->gnext >= 0) grp[G->gnext].gprev = G->gprev;
     G->pub.kh = 0, G->pub.head = G->tail = -1, G->pub.n = 0, G->pub.stamp = 0;
+    G->pub.incarnation=0;G->pub.association=0;
     G->gnext = grp_free, grp_free = g;
     ngrp_live--;
 }
 
 // Places slot id in bucket b: at the tail of its group when it has a descriptor hash, else at the head of the bucket's
 // own list (the lists exist once a slot was registered: vk_texture_register).
-static void slot_place(int id, uint32_t b, uint64_t kh) {
+static void slot_unplace(int id) {
     if (slot_prev[id] != -2) {   // out of its old list
         int32_t g = slot_grp[id];
         int32_t *head = g >= 0 ? &grp[g].pub.head : &bucket_head[slot_bucket[id]];
@@ -423,9 +592,15 @@ static void slot_place(int id, uint32_t b, uint64_t kh) {
             if (!--grp[g].pub.n) grp_drop(g);
         }
     }
+    slot_prev[id] = -2;
+    slot_next[id] = -1;
+}
+
+static void slot_place(int id, uint32_t b, uint64_t kh) {
+    slot_unplace(id);
     slot_bucket[id] = (uint16_t)b;
     if (kh) {
-        int g = grp_get(kh, b);   // may move grp
+        int g = grp_get(kh, b, &tslots[id]);   // may move grp
         SlotGroup *G = &grp[g];
         slot_grp[id] = g;
         G->pub.n++, n_grouped++;
@@ -442,7 +617,21 @@ static void slot_place(int id, uint32_t b, uint64_t kh) {
     bucket_head[b] = id;
 }
 
+// Finalization changes selector behavior even when descriptor bytes match. Rekey those registrations together;
+// only a subsequently resolved live DIRECT selection can acquire a group association. Existing native descriptor
+// publications keep their independent image lifetime while the old association is invalidated by the address token.
+static void group_finalize_slot(int id) {
+    if (slot_grp && slot_grp[id] >= 0) {
+        slot_place(id, agen_idx((uintptr_t)tslots[id].t.mem), tslots[id].khash);
+    }
+}
 VkSlotGroup *vk_texture_group_locked(int g) { return &grp[g].pub; }
+int vk_texture_group_member_locked(int g, uint64_t incarnation, int id) {
+    if(g<0 || g>=ngrp || !incarnation || grp[g].pub.incarnation!=incarnation ||
+       id<0 || id>=ntslots || !tslots[id].used || slot_grp[id]!=g)return 0;
+    GrpKey key=group_key(&tslots[id]);
+    return !memcmp(&key,&grp[g].key,sizeof key);
+}
 int vk_texture_group_next_locked(int id) { return slot_next[id]; }
 void vk_texture_groups_unstamp_locked(void) {
     for (int g = 0; g < ngrp; g++) grp[g].pub.stamp = 0;
@@ -535,12 +724,15 @@ static int same_but_swizzle(const TexKey *a, const TexKey *b) {
 // formats are left out of the test, as a GPU encoder renders their blocks through a smaller uncompressed view of the
 // same storage. Counted in n_follow_refused.
 static uint64_t n_follow_refused;
-static int follow_size_ok(const Tex *p, const TexKey *k) {
+static int follow_size_matches(const Tex *p, const TexKey *k) {
     int bw1 = 1, bh1 = 1, bw2 = 1, bh2 = 1;
     nvn_fmt_bpb(p->key.d.format, &bw1, &bh1);
     nvn_fmt_bpb(k->d.format, &bw2, &bh2);
     if (bw1 > 1 || bh1 > 1 || bw2 > 1 || bh2 > 1) return 1;
-    if (p->key.d.width == k->d.width && p->key.d.height == k->d.height && p->key.d.depth == k->d.depth) return 1;
+    return p->key.d.width == k->d.width && p->key.d.height == k->d.height && p->key.d.depth == k->d.depth;
+}
+static int follow_size_ok(const Tex *p, const TexKey *k) {
+    if (follow_size_matches(p, k)) return 1;
     if (n_follow_refused++ < 8)
         rt_log("vk: a texture slot at %#llx (%ux%u format %#x) did not follow a %ux%u texture at the same storage: "
                "its own image instead", (unsigned long long)k->addr, k->d.width, k->d.height, k->d.format,
@@ -593,6 +785,22 @@ static VkFormatFeatureFlags features_of(VkFormat f) {
     VkFormatProperties p;
     vkGetPhysicalDeviceFormatProperties(vk_ctx()->phys, f, &p);
     return p.optimalTilingFeatures;
+}
+
+// This proof belongs to the exact native image create recipe. These paths have no format list.
+static int rgba8_linear_view_supported(const VkImageCreateInfo *image) {
+    if (image->format != VK_FORMAT_R8G8B8A8_SRGB || image->imageType != VK_IMAGE_TYPE_2D ||
+        image->tiling != VK_IMAGE_TILING_OPTIMAL || image->pNext ||
+        !(image->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) || !(image->usage & VK_IMAGE_USAGE_SAMPLED_BIT) ||
+        image->samples != VK_SAMPLE_COUNT_1_BIT ||
+        !(features_of(image->format) & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) ||
+        !(features_of(VK_FORMAT_R8G8B8A8_UNORM) & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) return 0;
+    VkImageFormatProperties limits;
+    return vkGetPhysicalDeviceImageFormatProperties(vk_ctx()->phys, image->format, image->imageType,
+        image->tiling, image->usage, image->flags, &limits) == VK_SUCCESS &&
+        (limits.sampleCounts & image->samples) && limits.maxMipLevels >= image->mipLevels &&
+        limits.maxArrayLayers >= image->arrayLayers && limits.maxExtent.width >= image->extent.width &&
+        limits.maxExtent.height >= image->extent.height && limits.maxExtent.depth >= image->extent.depth;
 }
 
 static VkImageAspectFlags aspect_of(const TexVkFormat *f) {
@@ -700,18 +908,300 @@ static int tex_reuse_on(void) {
 
 static void destroy_tex(Tex *e);
 static _Thread_local int tex_deferred;
+static int pool_ctx;                // the texture pool refresh is looking slots up (vk_texture_pool_ctx)
 static void content_image_forget(Tex *e);
 static int content_early_prepare(Tex *e);
 static uint64_t content_release(Tex *e, int reclaim);
-static int content_source_gpu_overlap(const Tex *e);
-static void content_write_begin(Tex *e, int preserve);
-static uint64_t content_reclaim(uint64_t wanted);
+static uint64_t content_retire(TextureMaterial *material);
+static int content_write_begin(Tex *e, int preserve);
+static void compatibility_invalidate(Tex *);
+static uint64_t content_reclaim(uint64_t wanted, int live);
+static uint64_t content_reclaim_in(uint64_t wanted, int live, uint32_t domain);
+static int texture_reclaim_on_heap(VmaAllocation allocation, uint32_t domain) {
+    if (!domain) return 1;
+    RcAdmissionVector cost;
+    return allocation && resource_core_vma_allocation_cost(allocation, &cost) == RC_ADMISSION_OK && cost.amount[domain];
+}
+static uint64_t content_drop_providers_pressure(uint64_t wanted, int preserve_reclaimable);
 static void content_shutdown(void);
+static void content_use(Tex *e);
+static void content_use_image_add(TextureMaterialInstance *instance);
+static void content_use_image_remove(TextureMaterialInstance *instance);
 static void content_source_discard(Tex *e);
+static int content_image_eligible(const Tex *e);
 static int source_spans_init(Tex *e);
+static void source_registration_release(Tex *e);
+static void texture_registration_source_clear(Tex *e);
+static Tex *texture_registration_source(const TexSlot *s);
+static void texture_registration_source_dirty(Tex *e, void (*visit)(int, void *), void *arg);
+static void slot_result_view(const TexSlot *s, const Tex *e, view_t *view, int *has_view);
+static const TexSlot *texture_read_key_slot(VkTextureReadKey key);
+static Tex *texture_read_key_source(const TexSlot *slot, VkImage expected);
+static int source_access_matches(const Tex *e,RcRegistryHandle handle);
 static int source_observe(Tex *e, const TextureSourceStamp *prior, TextureSourceObservation *out);
-static void source_commit(Tex *e, const TextureSourceStamp *stamp);
-static uint64_t texture_owned_bytes(const Tex *e) { return e->material ? e->material->bytes : e->bytes; }
+static void source_commit(Tex *e, const TextureSourceStamp *stamp, int same_contents);
+static void tex_image_prepare(const Tex *e, uint64_t size);
+static int source_permission_at(Tex *e, RcRegistryPosition position, RcRegistryReadObservation *out);
+static int source_permission_current(Tex *e);
+static const RcRegistrySourceAccess *source_access_anchor(const Tex *e) {
+    return e->source_mapping ? e->source_mapping->access : &e->source_access;
+}
+static RcRegistryReadObservation source_latest_read(const Tex *e) {
+    return e->source_mapping ? e->source_vector_read : rc_registry_source_access_permission(&e->source_access);
+}
+static uint64_t texture_owned_bytes(const Tex *e) { return e->material ? e->material->resident.bytes : e->bytes; }
+// A normalized output can outlive its logical texture cache entry. The allocation and
+// writer tickets move together to this record when the entry releases the old image.
+struct NativeTextureOutput {
+    Tex *entry;
+    NativeTextureOutput *next;
+    VkTexImage image;
+    nvn_texdesc descriptor;
+    TexVkFormat format;
+    uint64_t guest_bytes, allocation_bytes;
+    VmaAllocation allocation;
+    RcRegistryWrite *holds;
+    RcInterval *mapping;
+    uint32_t hold_count, mapping_count;
+    RcBackingId backing;
+    int possible;
+    RcBudgetTicket metadata;
+};
+static nvn_hmap alias_fragment_owners = {.klen = sizeof(VkImage)};
+static NativeTextureOutput *detached_output_head, *detached_output_tail;
+static uint64_t native_outputs_detached, native_outputs_destroyed;
+
+static NativeTextureOutput *native_texture_output_create(void) {
+    RcBudgetTicket metadata = {0};
+    void *storage = NULL;
+    if (vk_replay_metadata_allocate(sizeof(NativeTextureOutput), 1, RC_BUDGET_TEXTURE,
+                                    &metadata, &storage) != VK_SUCCESS) return NULL;
+    NativeTextureOutput *owner = storage;
+    owner->metadata = metadata;
+    return owner;
+}
+
+static void native_texture_output_drop(NativeTextureOutput *owner) {
+    if (!owner) return;
+    RcBudgetTicket metadata = owner->metadata;
+    vk_replay_metadata_free(owner, &metadata);
+}
+
+static int native_texture_output_reserve(Tex *e) {
+    if (e->native_output) return 1;
+    if (!e->alloc || e->bound_to || e->pin_owned || e->material || !e->pub.image) return 0;
+    NativeTextureOutput *owner = native_texture_output_create();
+    if (!owner) return 0;
+    owner->entry = e;
+    e->native_output = owner;
+    return 1;
+}
+
+static void native_texture_output_publish(Tex *e) {
+    if (e->alias_fragment_owner) return;
+    if (!e->native_output || nvn_hm_put(&alias_fragment_owners, &e->pub.image, e->native_output))
+        rt_fatal("vk: duplicate or unreserved native texture output");
+    e->alias_fragment_owner = 1;
+}
+
+static void native_texture_output_unpublish(VkImage image, NativeTextureOutput *owner) {
+    if (nvn_hm_get(&alias_fragment_owners, &image) == owner)
+        nvn_hm_del(&alias_fragment_owners, &image);
+}
+
+// A draw or descriptor use retains the placement independently. These operations manage
+// discoverability and lifetime as a current normalized producer, even without any reader.
+static int native_texture_output_transfer(Tex *e) {
+    NativeTextureOutput *owner = e->native_output;
+    if (!owner || (!owner->possible && !e->alias_fragment_owner) || !e->image_mapped_holds) return 0;
+    if (owner->entry != e || !e->alloc || e->bound_to || e->material || e->pin_owned ||
+        !e->image_private_mapping || !e->image_private_mapping_count ||
+        e->image_private_mapping_count != e->image_mapped_hold_count)
+        rt_fatal("vk: invalid independently placed native texture owner");
+    owner->entry = NULL;
+    owner->image = e->pub;
+    owner->descriptor = e->t.d;
+    owner->format = e->f;
+    owner->guest_bytes = e->t.L.size;
+    owner->allocation_bytes = e->bytes;
+    owner->allocation = e->alloc;
+    owner->holds = e->image_mapped_holds;
+    owner->hold_count = e->image_mapped_hold_count;
+    owner->mapping = e->image_private_mapping;
+    owner->mapping_count = e->image_private_mapping_count;
+    // Device image intervals normally come from one physical provider. Require the whole vector
+    // to name that same exact incarnation before using backing reclamation as the retirement proof.
+    const uint64_t backing = owner->mapping[0].range.backing;
+    owner->backing.id = backing;
+    for (uint32_t i = 1; i < owner->mapping_count; ++i)
+        if (owner->mapping[i].range.backing != backing) { owner->backing.id = 0; break; }
+    if (detached_output_tail) detached_output_tail->next = owner;
+    else detached_output_head = owner;
+    detached_output_tail = owner;
+    __atomic_fetch_add(&native_outputs_detached, 1, __ATOMIC_RELEASE);
+    e->alloc = NULL;
+    e->image_private_mapping = NULL;
+    e->image_private_mapping_count = 0;
+    e->image_mapped_holds = NULL;
+    e->image_mapped_hold_count = 0;
+    e->native_output = NULL;
+    e->alias_fragment_owner = 0;
+    return 1;
+}
+
+static void native_texture_output_destroyed(void *unused) {
+    (void)unused;
+    __atomic_fetch_add(&native_outputs_destroyed, 1, __ATOMIC_RELEASE);
+}
+
+static void native_texture_output_retire(NativeTextureOutput *owner) {
+    native_texture_output_unpublish(owner->image.image, owner);
+    free(owner->holds);
+    free(owner->mapping);
+    const int captured = vk_mem_image_held(owner->image.image);
+    vk_exec_image_gone(owner->image.image);
+    vk_defer_image_notify(owner->image.image, owner->allocation, owner->allocation_bytes,
+                          native_texture_output_destroyed, NULL);
+    if (captured) vk_exec_texture_publications_request_reclaim();
+    native_texture_output_drop(owner);
+}
+
+// Recheck a bounded rotating frontier. A positive disposal consumes the exact original
+// normalized holds, without creating a new guest write or unlinking an earlier submitted reader.
+static void native_texture_output_collect(unsigned limit) {
+    NativeTextureOutput *last = detached_output_tail;
+    RcRegistry *registry = rc_registry_runtime();
+    while (limit-- && detached_output_head) {
+        NativeTextureOutput *owner = detached_output_head;
+        detached_output_head = owner->next;
+        if (!detached_output_head) detached_output_tail = NULL;
+        owner->next = NULL;
+        const int stop = owner == last;
+        const uint64_t image = (uint64_t)(uintptr_t)owner->image.image;
+        const RcRegistryResult result = vk_mem_device_backing_reclaimed(&owner->backing) ?
+            rc_registry_native_image_discard_reclaimed(registry, image, owner->backing.id, owner->holds, owner->hold_count) :
+            rc_registry_native_image_discard_superseded(registry, image, owner->holds, owner->hold_count);
+        if (result == RC_REGISTRY_OK) {
+            native_texture_output_retire(owner);
+        } else {
+            if (detached_output_tail) detached_output_tail->next = owner;
+            else detached_output_head = owner;
+            detached_output_tail = owner;
+        }
+        if (stop) break;
+    }
+}
+static nvn_hmap bound_alias_owners = {.klen = sizeof(VkImage)};
+
+static void bound_alias_forget(Tex *e) {
+    if (!e->bound_alias_whole) return;
+    if (nvn_hm_del(&bound_alias_owners, &e->pub.image) != e)
+        rt_fatal("vk: live bound texture owner changed");
+    e->bound_alias_whole = 0;
+}
+
+static void alias_fragment_forget(Tex *e) {
+    free(e->alias_full_demand);
+    e->alias_full_demand = NULL;
+    e->alias_full_count = 0;
+    free(e->alias_plane_demand);
+    e->alias_plane_demand = NULL;
+    e->alias_plane_count = 0;
+    bound_alias_forget(e);
+    if (e->alias_fragment_owner) {
+        if (!e->native_output || nvn_hm_get(&alias_fragment_owners, &e->pub.image) != e->native_output)
+            rt_fatal("vk: native alias fragment owner changed");
+        native_texture_output_unpublish(e->pub.image, e->native_output);
+        e->alias_fragment_owner = 0;
+    }
+    native_texture_output_drop(e->native_output);
+    e->native_output = NULL;
+}
+
+static const RcInterval *image_backing_intervals(const Tex *e, uint32_t *count) {
+    if (e->image_device_count) {
+        *count = e->image_device_count;
+        return e->image_device_intervals;
+    }
+    if (e->image_private_mapping_count) {
+        *count = e->image_private_mapping_count;
+        return e->image_private_mapping;
+    }
+    return mem_backing_intervals(e->image_host_backing, count);
+}
+
+static void image_holds_end(Tex *e) {
+    if (!e->image_mapped_holds) return;
+    RcRegistry *registry = rc_registry_runtime();
+    // A layout-copy may omit padding/levels. This retirement proves that the old owner cannot authorize a
+    // typed binding, and leaves foreign coverage until an adapter proves an exact CPU-visible byte interval.
+    if (rc_registry_image_hold_release_extents(registry, e->image_mapped_holds,
+                                              e->image_mapped_hold_count, 0) != RC_REGISTRY_OK)
+        rc_registry_fail_closed(registry);
+    free(e->image_mapped_holds);
+    e->image_mapped_holds = NULL;
+    e->image_mapped_hold_count = 0;
+}
+
+static void packed_storage_writes_drop(Tex *);
+static void storage_host_init_drop(Tex *);
+static void storage_host_init_capture(Tex *, RcRegistryPosition);
+
+struct RetainedTextureUpload {
+    Tex *entry;
+    VkImage image;
+    uint64_t sequence, revision;
+    uint32_t uploads, references;
+};
+
+static void retained_texture_upload_detach(Tex *entry) {
+    if (entry->retained_sample_upload) {
+        entry->retained_sample_upload->entry = NULL;
+        entry->retained_sample_upload = NULL;
+    }
+    entry->sample_upload_sequence = 0;
+}
+
+static void retained_texture_upload_release(void *opaque) {
+    RetainedTextureUpload *upload = opaque;
+    lock();
+    if (!--upload->references) {
+        if (upload->entry) upload->entry->retained_sample_upload = NULL;
+        free(upload);
+    }
+    unlock();
+}
+
+static void retained_texture_upload_cancel(void *opaque, int may_have_executed) {
+    (void)may_have_executed;
+    retained_texture_upload_release(opaque);
+}
+
+static int image_owner_replaced(Tex *e, VkImage next) {
+    // Range authority can outlive a particular allocation. Revoke its typed association before replacement,
+    // including a detach to NULL, so later Vulkan handle recycling cannot resurrect the old physical identity.
+    if (e->pub.image == next) return 0;
+    retained_texture_upload_detach(e);
+    e->mirrored_color_write = NULL;
+    packed_storage_writes_drop(e);
+    e->sample_general_revision = 0;
+    e->host_storage_init = 0;
+    storage_host_init_drop(e);
+    const int retained = native_texture_output_transfer(e);
+    e->native_write = (RcRegistryPosition){0};
+    if (e->image_authority.id) rc_registry_image_hold_forget(rc_registry_runtime(), e->image_authority);
+    image_holds_end(e);
+    if (e->pub.image) {
+        free(e->image_device_intervals);
+        e->image_device_intervals = NULL;
+        e->image_device_count = 0;
+        alias_fragment_forget(e);
+        free(e->image_private_mapping);
+        e->image_private_mapping = NULL;
+        e->image_private_mapping_count = 0;
+    }
+    return retained;
+}
 
 // Why an entry was destroyed (drop_tex), in the order of drop_names.
 enum { DROP_NONE, DROP_MAX, DROP_CAP, DROP_COMMIT, DROP_VRAM, DROP_IDLE_VRAM, DROP_IDLE_COMMIT, DROP_DISUSE,
@@ -810,20 +1300,101 @@ static nvn_hmap img_reqs = {.klen = sizeof(ImgKey)};   // ImgKey -> VkMemoryRequ
 static uint64_t n_bind_skips;   // since the last perf line
 #define DEDICATED_MIN ((VkDeviceSize)32 << 20)   // create_tex: images this large get memory of their own
 
-static int bind_pool_memory(VkCtx *c, Tex *e, VkImage img, uint64_t guest_size) {
-    VkMemoryRequirements req;
-    vkGetImageMemoryRequirements(c->device, img, &req);
-    if (!nvn_hm_get(&img_reqs, &e->ik)) {
-        VkMemoryRequirements *q = malloc(sizeof *q);
-        if (!q) rt_fatal("vk: out of memory");
-        *q = req;
-        nvn_hm_put(&img_reqs, &e->ik, q);
+static int image_alias_single_color_view(const tex_t *texture, const view_t *view) {
+    VkImageSubresourceRange plane;
+    return texture->d.target == NVN_TEXTURE_TARGET_2D && texture->d.levels == 1 && texture->L.layers == 1 &&
+        vk_texture_alias_attachment_range(texture, view, 0, &plane);
+}
+
+static int image_alias_ordinary_color(const Tex *entry) {
+    const VkTexImage *image = &entry->pub;
+    const nvn_texdesc *desc = &entry->t.d;
+    const VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    VkTextureAliasLayout layout;
+    int block_width, block_height;
+    return image->type == VK_IMAGE_TYPE_2D && image->view_type == VK_IMAGE_VIEW_TYPE_2D &&
+        desc->target == NVN_TEXTURE_TARGET_2D && desc->levels == 1 && entry->t.L.layers == 1 &&
+        image->depth == 1 && image->levels == 1 && image->layers == 1 && image->samples == 1 && image->scale == 1 &&
+        image->aspect == VK_IMAGE_ASPECT_COLOR_BIT && !image->skip && !image->block_views && !image->mirrored &&
+        image->format == entry->f.vk && entry->f.vk == entry->f.ideal && !entry->f.expand_rgb && !entry->f.astc_bw && !entry->f.astc_bc &&
+        (image->usage & usage) == usage && entry->t.L.size && entry->t.L.size <= VK_TEXTURE_ALIAS_MAX_BYTES &&
+        nvn_fmt_bpb(desc->format, &block_width, &block_height) && block_width == 1 && block_height == 1 &&
+        texture_alias_layout(desc, image, &layout);
+}
+
+static VkMemImageAliasPlacement bind_pool_memory(VkCtx *c, Tex *e, const VkImageCreateInfo *create,
+    uint64_t guest_size, VkImage *image, VkResult *native_failure) {
+    const VkMemoryRequirements *cached = nvn_hm_get(&img_reqs, &e->ik);
+    VkMemoryRequirements requirements;
+    if (cached) requirements = *cached;
+    else {
+        *native_failure = vkCreateImage(c->device, create, NULL, image);
+        if (*native_failure != VK_SUCCESS) {
+            *image = VK_NULL_HANDLE;
+            return VK_MEM_IMAGE_ALIAS_FAILED;
+        }
+        vkGetImageMemoryRequirements(c->device, *image, &requirements);
+        VkMemoryRequirements *saved = malloc(sizeof *saved);
+        if (!saved) rt_fatal("vk: out of memory");
+        *saved = requirements;
+        nvn_hm_put(&img_reqs, &e->ik, saved);
     }
-    VkMemSpan sp;
-    if (!pool_fits(c, e, &req, guest_size, &sp)) return 0;
-    if (vmaBindImageMemory2(c->vma, sp.alloc, sp.alloc_offset, img, NULL) != VK_SUCCESS) return 0;
-    e->bound_to = sp.alloc;
-    return 1;
+    VkMemSpan span;
+    if (!pool_fits(c, e, &requirements, guest_size, &span)) {
+        if (cached) n_bind_skips++;
+        return VK_MEM_IMAGE_ALIAS_FAILED;
+    }
+    RcInterval *mapping = NULL;
+    const uint32_t count = vk_mem_device_intervals(&span, e->pub.addr, requirements.size, &mapping);
+    if (!count) return VK_MEM_IMAGE_ALIAS_STALE;
+    VkMemImageAliasPlacement outcome = VK_MEM_IMAGE_ALIAS_DIRECT;
+    if (!*image) {
+        outcome = vk_mem_image_alias_preplacement(e->pub.addr, &requirements, &span, mapping, count);
+        if (outcome == VK_MEM_IMAGE_ALIAS_DIRECT) {
+            *native_failure = vkCreateImage(c->device, create, NULL, image);
+            if (*native_failure != VK_SUCCESS) {
+                *image = VK_NULL_HANDLE;
+                outcome = VK_MEM_IMAGE_ALIAS_FAILED;
+            } else {
+                VkMemoryRequirements actual;
+                vkGetImageMemoryRequirements(c->device, *image, &actual);
+                if (actual.size != requirements.size || actual.alignment != requirements.alignment ||
+                    actual.memoryTypeBits != requirements.memoryTypeBits) outcome = VK_MEM_IMAGE_ALIAS_STALE;
+            }
+        }
+    }
+    if (outcome == VK_MEM_IMAGE_ALIAS_DIRECT)
+        outcome = vk_mem_bind_image_alias(*image, e->pub.addr, &requirements, &span, mapping, count, native_failure);
+    if (outcome == VK_MEM_IMAGE_ALIAS_DIRECT &&
+        !vk_mem_image_alias_current(*image, e->pub.addr, requirements.size, span.alloc, mapping, count))
+        outcome = VK_MEM_IMAGE_ALIAS_STALE;
+    if (outcome == VK_MEM_IMAGE_ALIAS_DIRECT) {
+        e->bound_to = span.alloc;
+        e->image_device_size = requirements.size;
+        e->image_device_intervals = mapping;
+        e->image_device_count = count;
+        return outcome;
+    }
+    if (outcome == VK_MEM_IMAGE_ALIAS_OCCUPIED) {
+        if (requirements.size == guest_size && image_alias_ordinary_color(e)) {
+            // The identical native and guest extents use the originally selected mapping.
+            // Its required contents are acquired only at the actual LOAD or sampled read.
+            e->image_private_mapping = mapping;
+            e->image_private_mapping_count = count;
+            e->pub.preserve_pool_bytes = 1;
+            return VK_MEM_IMAGE_ALIAS_PRIVATE_PRESERVE;
+        }
+        outcome = VK_MEM_IMAGE_ALIAS_FAILED;
+    }
+    free(mapping);
+    if (outcome == VK_MEM_IMAGE_ALIAS_PRIVATE_PRESERVE) {
+        // The selected physical provider is the same one used for the footprint decision.
+        e->image_private_mapping_count = vk_mem_device_intervals(&span, e->pub.addr, guest_size,
+                                                                 &e->image_private_mapping);
+        if (!e->image_private_mapping_count) return VK_MEM_IMAGE_ALIAS_STALE;
+        e->pub.preserve_pool_bytes = 1;
+    }
+    return outcome;
 }
 
 static void img_key_of(const VkImageCreateInfo *ci, ImgKey *k) {
@@ -865,7 +1436,14 @@ static VkDeviceSize image_size(const VkImageCreateInfo *ci) {
 // without stencil, and the stencil of those images must not be whatever the memory held).
 // A reused image (create_tex) was another texture's: the transition waits for every earlier command, which may still
 // read or write it.
+enum { HOST_STORAGE_ZERO = 1, HOST_STORAGE_COW = 2 };
+
 static void init_image(Tex *e, VkCommandBuffer cb) {
+    e->sample_upload_sequence = 0;
+    e->sample_general_revision = 0;
+    e->host_storage_init = 0;
+    storage_host_init_drop(e);
+    e->native_write = (RcRegistryPosition){0};
     if (e->uploaded || e->material) content_image_forget(e);
     e->upload_mapping = 0;
     VkImageMemoryBarrier2 ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
@@ -878,6 +1456,7 @@ static void init_image(Tex *e, VkCommandBuffer cb) {
                                 .image = e->pub.image, .subresourceRange = {e->pub.aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}};
     VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &ib};
     vkCmdPipelineBarrier2(cb, &di);
+    if (e->pub.preserve_pool_bytes) return; // This transition cannot supply logical contents.
     if (e->f.depth || e->f.stencil) {
         VkClearDepthStencilValue zero = {0.0f, 0};
         VkImageSubresourceRange rg = {e->pub.aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
@@ -891,6 +1470,9 @@ static void init_image(Tex *e, VkCommandBuffer cb) {
         VkImageSubresourceRange rg = {e->pub.aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
         vkCmdClearColorImage(cb, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &rg);
         barrier(cb, VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
+        if (!nvn_gpu_only(e->pub.addr) && e->image_host_backing && e->alloc &&
+            (e->pub.usage & VK_IMAGE_USAGE_STORAGE_BIT))
+            e->host_storage_init = HOST_STORAGE_ZERO;
     }
 }
 
@@ -907,6 +1489,20 @@ static int depth_init_inline(void) {
     return on;
 }
 
+static uint64_t sample_general_revision;
+
+static void sample_general_record(Tex *e, RcRegistryPosition inline_position, uint64_t upload) {
+    if (!upload && !rc_registry_position_valid(inline_position)) return;
+    if (!e->host_storage_init &&
+        (e->pub.type != VK_IMAGE_TYPE_2D || e->pub.layers != 1 ||
+         e->pub.samples != 1 || !(e->pub.usage & VK_IMAGE_USAGE_SAMPLED_BIT))) return;
+    if (rc_registry_position_valid(inline_position)) inline_position.ordinal |= 1;
+    e->sample_general_inline = inline_position;
+    e->sample_general_upload = upload;
+    e->sample_general_revision = __atomic_add_fetch(&sample_general_revision, 1, __ATOMIC_RELAXED);
+    if (!e->sample_general_revision) rt_fatal("vk: sampled layout revision exhausted");
+}
+
 // A new entry's first transition. A reused image goes through it at the replay's current position: earlier commands
 // of the part being recorded may still use the image as the texture it was, and the upload batch runs before the part.
 // So does a new depth or stencil image (depth_init_inline).
@@ -917,13 +1513,17 @@ static void init_new(Tex *e) {
         VkCommandBuffer cb = vk_exec_inline_begin(&reopen);
         if (cb) {
             init_image(e, cb);
+            sample_general_record(e, vk_exec_resource_position(), 0);
+            if (e->host_storage_init) storage_host_init_capture(e, vk_exec_resource_position());
             vk_exec_inline_end(reopen);
             if (ds) n_dinit_inline++, n_dinit_inpass += reopen != 0;
             return;
         }
     }
     if (ds) n_dinit_upload++;
-    init_image(e, vk_upload_begin());
+    VkCommandBuffer cb = vk_upload_begin();
+    init_image(e, cb);
+    sample_general_record(e, (RcRegistryPosition){0}, vk_upload_recording_sequence(cb));
     vk_upload_end();
 }
 
@@ -1105,8 +1705,8 @@ static uint32_t detail_skip(const tex_t *t, const TexKey *k, const TexVkFormat *
 // thread keeps ahead (vk_headroom.c). Render targets keep vmaCreateImage and the driver's preference (vma_image).
 // VK_NULL_HANDLE when the image does not take that memory.
 enum { SUBALLOC_MAX = 32 << 20 };
-static VkImage suballoc_image_limit(VkCtx *c, const VkImageCreateInfo *ci, VmaAllocation *alloc,
-                                    VkDeviceSize limit, VmaAllocationCreateFlags flags) {
+static VkImage suballoc_image_try(VkCtx *c, const VkImageCreateInfo *ci, VmaAllocation *alloc,
+                                  VkDeviceSize limit, VmaAllocationCreateFlags flags, int required) {
     VkImage img;
     if (vkCreateImage(c->device, ci, NULL, &img) != VK_SUCCESS) return VK_NULL_HANDLE;
     // an image the driver requires (not only prefers) dedicated memory for keeps it: vma_image
@@ -1116,10 +1716,11 @@ static VkImage suballoc_image_limit(VkCtx *c, const VkImageCreateInfo *ci, VmaAl
     vkGetImageMemoryRequirements2(c->device, &ri, &mr2);
     VkMemoryRequirements mr = mr2.memoryRequirements;
     VmaAllocationCreateInfo ai = {.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, .flags = flags};
+    RcVmaRequest admission = {.producer = RC_BUDGET_TEXTURE, .required = required};
     int ok = !dr.requiresDedicatedAllocation && mr.size <= limit &&
-             vmaAllocateMemory(c->vma, &mr, &ai, alloc, NULL) == VK_SUCCESS;
+             resource_core_vma_allocate_memory(&admission, c->vma, &mr, &ai, alloc, NULL, NULL) == VK_SUCCESS;
     if (ok && vmaBindImageMemory(c->vma, *alloc, img) != VK_SUCCESS) {
-        vmaFreeMemory(c->vma, *alloc);
+        resource_core_vma_free_memory(c->vma, *alloc);
         ok = 0;
     }
     if (!ok) {
@@ -1129,25 +1730,53 @@ static VkImage suballoc_image_limit(VkCtx *c, const VkImageCreateInfo *ci, VmaAl
     return img;
 }
 
+static VkImage suballoc_image_limit(VkCtx *c, const VkImageCreateInfo *ci, VmaAllocation *alloc,
+                                    VkDeviceSize limit, VmaAllocationCreateFlags flags) {
+    return suballoc_image_try(c, ci, alloc, limit, flags, !(flags & VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT));
+}
+
 static VkImage suballoc_image(VkCtx *c, const VkImageCreateInfo *ci, VmaAllocation *alloc) {
     return suballoc_image_limit(c, ci, alloc, SUBALLOC_MAX, 0);
 }
 
 #include "vk_stream_images.h"
+#include "vk_texture_allocation.h"
 
 // An image made with vmaCreateImage. One of DEDICATED_MIN or more gets memory of its own: freed inside one of VMA's
 // 256 MiB blocks it left a hole the driver went on counting, with the rest of the block, against the budget and the
 // system's commit (0.5 to 1.8 GiB of such free space in a session at 5120x2160), until the block emptied; its own
 // memory goes back when it does.
-static VkResult vma_image(VkCtx *c, const VkImageCreateInfo *ci, const ImgKey *ik, VkImage *img, VmaAllocation *alloc) {
+static VkResult vma_image_mode(VkCtx *c, const VkImageCreateInfo *ci, const ImgKey *ik, VkImage *img, VmaAllocation *alloc,
+                               int required, const char *purpose, int *capacity_failure) {
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
     const VkMemoryRequirements *known = nvn_hm_get(&img_reqs, ik);
     if ((known ? known->size : image_size(ci)) >= DEDICATED_MIN) ai.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
-    return vmaCreateImage(c->vma, ci, &ai, img, alloc, NULL);
+    return texture_image_allocate(c, ci, &ai, img, alloc, required, purpose, capacity_failure);
+}
+static VkResult vma_image(VkCtx *c, const VkImageCreateInfo *ci, const ImgKey *ik, VkImage *img, VmaAllocation *alloc) {
+    return vma_image_mode(c, ci, ik, img, alloc, 1, "texture", NULL);
+}
+
+static void texture_image_components(const nvn_texdesc *d, const TexVkFormat *format, VkTexImage *image) {
+    image->alpha_one = format->alpha_one;
+    memcpy(image->chan, format->chan, sizeof image->chan);
+    image->swz[0] = (uint8_t)d->swizzle_r;
+    image->swz[1] = (uint8_t)d->swizzle_g;
+    image->swz[2] = (uint8_t)d->swizzle_b;
+    image->swz[3] = (uint8_t)d->swizzle_a;
+    if (!(image->swz[0] | image->swz[1] | image->swz[2] | image->swz[3])) {
+        image->swz[0] = NVN_TEXTURE_SWIZZLE_R;
+        image->swz[1] = NVN_TEXTURE_SWIZZLE_G;
+        image->swz[2] = NVN_TEXTURE_SWIZZLE_B;
+        image->swz[3] = NVN_TEXTURE_SWIZZLE_A;
+    }
 }
 
 // defer_init: the caller records the image's first transition (init_image or alias_copy).
-static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
+enum { TEX_PRIVATE_STORAGE_OUTPUT = 2, TEX_PRIVATE_MIRRORED_COLOR_TRANSFER = 3 };
+
+static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init, int private_output, int *capacity_failure) {
+    *capacity_failure = 0;
     static volatile int32_t n_unmapped, n_unsupported, n_failed, n_unbound, n_thick;
     VkCtx *c = vk_ctx();
     const nvn_texdesc *d = &t->d;
@@ -1256,10 +1885,16 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
     e->t = *t;
     e->f = f;
     e->pub.addr = k->addr;
+    if (!nvn_gpu_only(k->addr) && t->L.size) {
+        e->image_host_cutoff = mem_mapping_serial();
+        mem_backing_capture(k->addr, t->L.size, &e->image_host_backing);
+    }
     img_key_of(&ci, &e->ik);
     e->material_intent = e->ik;
     VkTexImage *p = &e->pub;
     p->format = f.vk;
+    p->rgba8_linear_view = d->format == NVN_FORMAT_RGBA8_SRGB && d->target == NVN_TEXTURE_TARGET_2D &&
+        rgba8_linear_view_supported(&ci);
     p->type = type;
     p->usage = usage;
     p->aspect = aspect_of(&f);
@@ -1270,47 +1905,52 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
                  : d->target == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY && (flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) ? VK_IMAGE_VIEW_TYPE_CUBE_ARRAY
                  : layers > 1 || d->target == NVN_TEXTURE_TARGET_2D_ARRAY || d->target == NVN_TEXTURE_TARGET_2D_MULTISAMPLE_ARRAY
                      ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
-    p->alpha_one = f.alpha_one;
-    memcpy(p->chan, f.chan, sizeof p->chan);
-    p->swz[0] = (uint8_t)d->swizzle_r, p->swz[1] = (uint8_t)d->swizzle_g;
-    p->swz[2] = (uint8_t)d->swizzle_b, p->swz[3] = (uint8_t)d->swizzle_a;
-    if (!(p->swz[0] | p->swz[1] | p->swz[2] | p->swz[3]))   // descriptors built without nvnTextureBuilderSetDefaults
-        p->swz[0] = NVN_TEXTURE_SWIZZLE_R, p->swz[1] = NVN_TEXTURE_SWIZZLE_G, p->swz[2] = NVN_TEXTURE_SWIZZLE_B,
-        p->swz[3] = NVN_TEXTURE_SWIZZLE_A;
+    texture_image_components(d, &f, p);
     p->mirrored = (uint8_t)tex_mirrored(t);
     p->block_views = (uint8_t)block_views;
     p->fb_usage = (uint8_t)fb_usage;
     p->scale = (uint8_t)scale;
     p->skip = (uint8_t)skip;
+    p->preserve_pool_bytes = private_output == TEX_PRIVATE_STORAGE_OUTPUT;
 
     e->bc1_try = (uint8_t)bc1_try;
-    if (content_early_prepare(e)) return e;
+    if (private_output != TEX_PRIVATE_MIRRORED_COLOR_TRANSFER && content_early_prepare(e)) return e;
     VkImage img = VK_NULL_HANDLE;
-    if (scale == 1 && nvn_gpu_only(k->addr)) {   // storage in a physical or virtual pool: alias the pool memory (section 3.2)
-        const VkMemoryRequirements *q = nvn_hm_get(&img_reqs, &e->ik);
-        VkMemSpan sp;
-        if (q && !pool_fits(c, e, q, L.size, &sp)) {   // it would not bind there (img_reqs)
-            n_bind_skips++;
-            log_limited(&n_unbound, "texture %#llx (%ux%u fmt %#x) cannot alias its pool memory; own memory instead",
-                        (unsigned long long)k->addr, w, h, d->format);
-        } else if (vkCreateImage(c->device, &ci, NULL, &img) == VK_SUCCESS && !bind_pool_memory(c, e, img, L.size)) {
-            vkDestroyImage(c->device, img, NULL);
+    if (!private_output && scale == 1 && nvn_gpu_only(k->addr)) {
+        VkResult native_failure = VK_SUCCESS;
+        VkMemImageAliasPlacement outcome = bind_pool_memory(c, e, &ci, L.size, &img, &native_failure);
+        if (outcome != VK_MEM_IMAGE_ALIAS_DIRECT && img) {
+            // The atomic bind may have succeeded just before its selected mapping became stale.
+            if (outcome == VK_MEM_IMAGE_ALIAS_STALE) vk_defer_image(img, NULL);
+            else vkDestroyImage(c->device, img, NULL);
             img = VK_NULL_HANDLE;
+        }
+        if (native_failure == VK_ERROR_DEVICE_LOST) {
+            vk_device_lost_check(native_failure, "placing a texture in its native pool");
+            *capacity_failure = 1;
+            goto failed;
+        }
+        if (outcome == VK_MEM_IMAGE_ALIAS_STALE) {
+            // No candidate from a later mapping may replace this selected placement.
+            tex_deferred = 1;
+            *capacity_failure = 1;
+            goto failed;
+        }
+        if (outcome == VK_MEM_IMAGE_ALIAS_FAILED)
             log_limited(&n_unbound, "texture %#llx (%ux%u fmt %#x) cannot alias its pool memory; own memory instead",
                         (unsigned long long)k->addr, w, h, d->format);
-        }
     }
     if (!img && tex_mirrored(t) && samples == 1) {
         if (stream_images_enabled() && !nvn_gpu_only(k->addr))
             img = stream_image_take(d, &ci, &e->ik, &e->alloc);
-        if (!img) img = suballoc_image(c, &ci, &e->alloc);
+        if (!img) img = suballoc_image_try(c, &ci, &e->alloc, SUBALLOC_MAX, 0, !pool_ctx);
     }
     int gpu_only = !tex_mirrored(t);
     // an entry split fill is to fill gets a new image: start_at uploads into it in the upload batch (see "split fill")
     int to_fill = gpu_only && split_wants(t, &f) && L.size <= SPLIT_FILL_MAX;
     for (const Tex *p = to_fill ? nvn_hm_get(&by_addr, &k->addr) : NULL; p; p = p->next_at)
         if (alias_has_gpu_content(p)) { to_fill = 0; break; }   // start_at copies that in instead
-    if (!img && gpu_only && !to_fill && tex_reuse_on()) {   // the image of a released entry with these parameters (reuse, above)
+    if (!img && gpu_only && private_output != TEX_PRIVATE_STORAGE_OUTPUT && !to_fill && tex_reuse_on()) {   // the image of a released entry with these parameters (reuse, above)
         // Not one released in this frame or the one before: Ocarina releases its render targets and registers them
         // again every frame, and DLSS's scene target (2560x1440 at a fixed address in Kokiri Forest) lost its image
         // to a moving target of the same size in between, and DLSS its history (vk_dlaa.c evaluate), several times a
@@ -1322,7 +1962,8 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
         uint64_t best = UINT64_MAX, best_kept = UINT64_MAX;
         int n = 0;
         for (Tex *q = nvn_hm_get(&reuse, &e->ik); q && n < 128; q = q->ru_next, n++) {
-            if (q->rel_epoch == submit_epoch || now - q->rel_frame < 2 || q->key.addr == k->addr) continue;
+            if (q->pin_owned || q->rel_epoch == submit_epoch || now - q->rel_frame < 2 || q->key.addr == k->addr) continue;
+            if (q->native_output || vk_mem_image_held(q->pub.image)) continue;
             uint64_t dist = q->key.addr > k->addr ? q->key.addr - k->addr : k->addr - q->key.addr;
             if (q->overwritten) {
                 if (dist < best) best = dist, a = q;
@@ -1332,6 +1973,7 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
         if (a) {
             img = a->pub.image, e->alloc = a->alloc;
             vk_exec_image_gone(img);   // the views and records of the texture it was
+            image_owner_replaced(a, VK_NULL_HANDLE);
             a->pub.image = VK_NULL_HANDLE, a->alloc = NULL;
             drop_tex(a, DROP_REUSED);
             e->reused = 1, e->og_reimg = 1;
@@ -1340,14 +1982,11 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
     }
     if (!img) {
         if (gpu_only) n_reuse_new++;
-        VkResult r = vma_image(c, &ci, &e->ik, &img, &e->alloc);
+        VkResult r = vma_image_mode(c, &ci, &e->ik, &img, &e->alloc, !pool_ctx, "texture", capacity_failure);
         if (r != VK_SUCCESS) {
             log_limited(&n_failed, "image creation failed (%d): nvn fmt %#x %ux%ux%u target %d levels %u layers %u", (int)r,
                         d->format, w, h, depth, d->target, levels, layers);
-            content_source_discard(e);
-            free(e->source_spans);
-            free(e);
-            return NULL;
+            goto failed;
         }
     }
     if (e->alloc) {
@@ -1369,11 +2008,42 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
             log_limited(&n_stale, "new image %#llx had %d cached views of a destroyed image with its handle; dropped",
                         (unsigned long long)(uintptr_t)img, stale);
     }
+    image_owner_replaced(e, img);
     e->pub.image = img;
     e->pub.bound = e->bound_to != NULL;
+    if (e->pub.preserve_pool_bytes) {
+        const char *probe = cfg_get("NX2NAVI_PROBE_CURRENT_IMAGE_ALIAS");
+        if (probe && (!strcmp(probe, "25") || !strcmp(probe, "26"))) {
+            const VkMemoryRequirements *required = nvn_hm_get(&img_reqs, &e->ik);
+            const RcRegistryPosition origin = vk_exec_resource_position();
+            rt_log("vk: alias placement preserved RAW addr %#llx VkImage %p format %u extent %ux%u levels %u layers %u "
+                   "serial %llu alignment %#llx granularity %#llx read %llu/%llu",
+                   (unsigned long long)e->pub.addr, (void *)img, (unsigned)e->pub.format, w, h, levels, layers,
+                   (unsigned long long)e->t.serial, (unsigned long long)(required ? required->alignment : 0),
+                   (unsigned long long)c->props.limits.bufferImageGranularity,
+                   (unsigned long long)origin.scene, (unsigned long long)origin.ordinal);
+        }
+    }
+    // A separately placed Vulkan image can still own logical bytes in a GPU-only guest mapping.
+    // This range is the NVN footprint, independent of the required native allocation size.
+    if (e->alloc && !e->bound_to && !e->pub.mirrored && scale == 1 && nvn_gpu_only(k->addr) &&
+        !e->image_private_mapping_count) {
+        VkMemSpan logical;
+        if (vk_mem_lookup(e->pub.addr, L.size, &logical))
+            e->image_private_mapping_count = vk_mem_device_intervals(&logical, e->pub.addr, L.size,
+                                                                     &e->image_private_mapping);
+    }
 
     if (!defer_init) init_new(e);
     return e;
+failed:
+    content_source_discard(e);
+    source_registration_release(e);
+    free(e->source_spans);
+    mem_backing_release(&e->image_host_backing);
+    free(e->image_private_mapping);
+    free(e);
+    return NULL;
 }
 
 static int owned_lower(uint64_t a) {
@@ -1386,7 +2056,64 @@ static int owned_lower(uint64_t a) {
     return lo;
 }
 
+static void image_alias_possible_written(Tex *e);
+
+static void image_hold_mapped(Tex *e) {
+    uint32_t count;
+    const RcInterval *intervals = image_backing_intervals(e, &count);
+    if (!count || !e->pub.image) return;
+    const uint64_t image = (uint64_t)(uintptr_t)e->pub.image;
+    RcRegistryPosition output = vk_exec_resource_position();
+    if (rc_registry_position_valid(output)) output.ordinal |= 1;
+    RcRegistry *registry = rc_registry_runtime();
+    const int first_write = !e->image_mapped_holds;
+    if (first_write) {
+        RcRegistryWrite *holds = calloc(count, sizeof *holds);
+        RcRegistryResult begun = holds ? rc_registry_image_hold_begin_extents(registry, image, intervals, count, holds)
+                                      : RC_REGISTRY_CAPACITY;
+        if (begun == RC_REGISTRY_OK) {
+            e->image_mapped_holds = holds;
+            e->image_mapped_hold_count = count;
+        } else {
+            free(holds);
+        }
+    }
+    if (e->image_mapped_holds) {
+        resource_image_owned_mapped(image, e->pub.addr, intervals, e->image_mapped_holds, e->image_mapped_hold_count);
+        const int ordered = rc_registry_position_valid(output) && count == e->image_mapped_hold_count &&
+            resource_effects_image_emitted_intervals(image, intervals, e->image_mapped_holds, count, output, first_write);
+        if (!ordered)
+            rc_registry_image_hold_unordered(registry, image, e->image_mapped_holds, e->image_mapped_hold_count);
+        else if (e->image_private_mapping_count && nvn_gpu_only(e->pub.addr) &&
+                 (!e->native_output || !e->native_output->possible))
+            image_alias_possible_written(e);
+    }
+}
+
+static void image_bound_written(Tex *e) {
+    if (!e->bound_to || !e->image_device_count || e->image_mapped_hold_count != e->image_device_count) return;
+    RcRegistryPosition output = e->native_write;
+    if (rc_registry_position_valid(output) && !(output.ordinal & 1)) output.ordinal++;
+    rc_registry_native_image_written(rc_registry_runtime(), (uint64_t)(uintptr_t)e->pub.image,
+                                     e->image_device_intervals, e->image_mapped_holds, e->image_device_count, output);
+}
+
 static void own_add(Tex *e) {
+    image_hold_mapped(e);
+    if (nvn_gpu_only(e->pub.addr)) return;
+    // Keep GPU authority independently of the legacy image search list. This ticket ends at an actual
+    // read-back or image retirement.
+    if (!e->image_authority.id && e->t.L.size) {
+        RcRegistry *r = rc_registry_runtime();
+        rc_registry_hold_begin(r, (RcSourceRange){1, e->pub.addr, e->t.L.size}, RC_REGISTRY_IMAGE,
+                               &e->image_authority);
+    }
+    if (e->image_authority.id) {
+        // Associate the physical image only after an actual GPU write/copy.
+        uint64_t image = (uint64_t)(uintptr_t)e->pub.image;
+        rc_registry_image_hold_bind(rc_registry_runtime(), e->image_authority, image);
+        resource_image_owned(image, e->pub.addr, e->image_authority);
+    }
     if (e->listed) return;
     plat_mutex_lock(&owned_lock);
     if (nowned == cowned) {
@@ -1403,6 +2130,11 @@ static void own_add(Tex *e) {
 }
 
 static void own_remove(Tex *e) {
+    image_holds_end(e);
+    if (e->image_authority.id) {
+        rc_registry_hold_release(rc_registry_runtime(), e->image_authority, 0);
+        e->image_authority = (RcRegistryWrite){0};
+    }
     if (!e->listed) return;
     plat_mutex_lock(&owned_lock);
     for (int i = owned_lower(e->pub.addr); i < nowned && owned[i]->pub.addr == e->pub.addr; i++)
@@ -1480,6 +2212,7 @@ static uint64_t n_pool_checks, n_pool_skips;
 // untracked, one written since, nothing to check; and the snapshot queries its own pass made (NX2NAVI_POOL_PRESNAP).
 static uint64_t n_pool_miss[5], n_presnap_q;
 static void make_fresh_snap(Tex *e);
+static int source_binding_ready(Tex *e);
 
 // reference: unchanged discovery; observe: maintain dependencies with the reference consumer; worklist: only dirty
 // entries reach freshness preparation; integrated: draw bindings also use clean certificates; check: compare with
@@ -1490,6 +2223,155 @@ static uint64_t pool_deps_map;
 static uint64_t pool_deps_protection;
 static uint64_t pool_deps_serial;
 static uint64_t pool_map_cursor, pool_protection_cursor, pool_content_cursor;
+static uint64_t resource_change_cursor;
+static struct {
+    uint64_t observed, blocked, notifications, rebuilds;
+    uint64_t source_capacity, source_stale, source_other, observe_authority, observe_stale, observe_other, raced;
+    uint64_t canonical_eligible, canonical_excluded, canonical_blocked, canonical_ready;
+} resource_bridge;
+static void source_dirty_slot(Tex *e, int id, void (*visit)(int, void *), void *arg) {
+    if (id < 0 || id >= ntslots || id >= VK_POOL_TEX) return;
+    const TexSlot *s = &tslots[id];
+    // A stale association is covered by the descriptor-token history, not by dereferencing its retired Tex.
+    if (s->used && !texture_registration_source(s) && s->cgen == agen[sinfo[id] & 0xffff] && s->ce == e) visit(id, arg);
+}
+
+int vk_texture_source_dirty_slots_locked(uint64_t *cursor, void (*visit)(int, void *), void *arg) {
+    static uint64_t round;
+    RcRegistry *r = rc_registry_runtime();
+    const uint64_t end = rc_registry_change_position(r);
+    if (!cursor || !visit) return 0;
+    if (!rc_registry_authority_epoch(r) || *cursor > end || round == UINT64_MAX) {
+        *cursor = end;
+        return 0;
+    }
+    if (*cursor == end) return 1;
+    ++round;
+    RcRegistryChange changes[128];
+    while (*cursor < end) {
+        uint64_t left = end - *cursor;
+        uint32_t cap = left < 128 ? (uint32_t)left : 128;
+        int overflow = 0;
+        uint32_t n = rc_registry_changes(r, cursor, changes, cap, &overflow);
+        if (overflow || !n) { *cursor = end; return 0; }
+        for (uint32_t i = 0; i < n; ++i) {
+            const RcRegistryChange *change = &changes[i];
+            uint64_t address=change->range.backing==RC_GUEST_COMPATIBILITY_BACKING?change->range.offset:change->association;
+            if (!address) continue;
+            for (Tex *e = nvn_hm_get(&by_addr, &address); e; e = e->next_at) {
+                if (e->pub.addr != address) continue;
+                if (e->source_registrations && e->source_registration_visit != round &&
+                    change->object_serial == e->t.serial && source_access_matches(e, change->handle)) {
+                    e->source_registration_visit = round;
+                    texture_registration_source_dirty(e, visit, arg);
+                }
+                if (e->source_dirty_visit == round) continue;
+                // entry_of can replace the source serial, size or lease before this drain while a pool
+                // member still carries the earlier receipt. Invalidate resolved associations at that start
+                // address too; exact source identity belongs to proof reuse, not retirement filtering.
+                e->source_dirty_visit = round;
+                if (!slot_next || !sinfo) continue;
+                uint32_t b = agen_idx(e->pub.addr);
+                for (int32_t id = bucket_head[b]; id >= 0; id = slot_next[id]) source_dirty_slot(e, id, visit, arg);
+                for (int32_t g = bucket_ghead[b]; g >= 0; g = grp[g].gnext)
+                    for (int32_t id = grp[g].pub.head; id >= 0; id = slot_next[id]) source_dirty_slot(e, id, visit, arg);
+            }
+        }
+    }
+    // An epoch sampled before this drain and after consumer proof publication remains the race bracket. The
+    // cursor deliberately stops at the entry snapshot, leaving concurrently arriving changes for the next drain.
+    return rc_registry_authority_epoch(r) != 0;
+}
+
+// Schedule-only events invalidate binding permission, never uploaded bytes or the freshness worklist.
+int vk_texture_schedule_dirty_slots_locked(uint64_t *cursor, void (*visit)(int, void *), void *arg) {
+    static uint64_t round;
+    RcRegistry *r = rc_registry_runtime();
+    const uint64_t end = rc_registry_schedule_change_position(r);
+    if (!cursor || !visit) return 0;
+    if (!rc_registry_authority_epoch(r) || *cursor > end || round == UINT64_MAX) {
+        *cursor = end; return 0;
+    }
+    if (*cursor == end) return 1;
+    ++round;
+    RcRegistryScheduleChange changes[128];
+    while (*cursor < end) {
+        uint64_t left = end - *cursor;
+        uint32_t cap = left < 128 ? (uint32_t)left : 128;
+        int overflow = 0;
+        uint32_t n = rc_registry_schedule_changes(r, cursor, changes, cap, &overflow);
+        if (overflow || !n) { *cursor = end; return 0; }
+        for (uint32_t i = 0; i < n; ++i) {
+            const RcRegistryScheduleChange *change = &changes[i];
+            uint64_t address=change->range.backing==RC_GUEST_COMPATIBILITY_BACKING?change->range.offset:change->association;
+            if (!address) continue;
+            for (Tex *e = nvn_hm_get(&by_addr, &address); e; e = e->next_at) {
+                if (e->pub.addr != address) continue;
+                if (e->source_registrations && e->schedule_registration_visit != round &&
+                    change->object_serial == e->t.serial && source_access_matches(e, change->handle)) {
+                    e->schedule_registration_visit = round;
+                    texture_registration_source_dirty(e, visit, arg);
+                }
+                if (e->schedule_dirty_visit == round) continue;
+                e->schedule_dirty_visit = round;
+                if (!slot_next || !sinfo) continue;
+                uint32_t b = agen_idx(e->pub.addr);
+                for (int32_t id = bucket_head[b]; id >= 0; id = slot_next[id]) source_dirty_slot(e, id, visit, arg);
+                for (int32_t g = bucket_ghead[b]; g >= 0; g = grp[g].gnext)
+                    for (int32_t id = grp[g].pub.head; id >= 0; id = slot_next[id]) source_dirty_slot(e, id, visit, arg);
+            }
+        }
+    }
+    return rc_registry_authority_epoch(r) != 0;
+}
+
+static int source_access_matches(const Tex *e,RcRegistryHandle handle) {
+    const RcRegistrySourceAccess *access=source_access_anchor(e);
+    uint32_t count=e->source_mapping?e->source_mapping->count:1;
+    for (uint32_t i=0;i<count;i++)
+        if (access[i].owner.handle.id==handle.id && access[i].owner.handle.index==handle.index) return 1;
+    return 0;
+}
+
+static void source_changes_apply(void) {
+    RcRegistry *r = rc_registry_runtime();
+    uint64_t end = rc_registry_change_position(r);
+    if (end == resource_change_cursor) return;
+    // A bounded notification history normally reaches only affected source identities. A consumer that falls
+    // behind explicitly rebuilds its active view; it never treats lost history as evidence of unchanged contents.
+    RcRegistryChange changes[128];
+    int rebuild = end < resource_change_cursor;
+    while (!rebuild && resource_change_cursor < end) {
+        int overflow = 0;
+        uint64_t left = end - resource_change_cursor;
+        uint32_t n = rc_registry_changes(r, &resource_change_cursor, changes,
+                                         left < 128 ? (uint32_t)left : 128, &overflow);
+        if (overflow || !n) { rebuild = 1; break; }
+        for (uint32_t i = 0; i < n; ++i) {
+            resource_bridge.notifications++;
+            RcRegistryChange *change = &changes[i];
+            uint64_t address=change->range.backing==RC_GUEST_COMPATIBILITY_BACKING?change->range.offset:change->association;
+            if (!address) continue;
+            for (Tex *e = nvn_hm_get(&by_addr, &address); e; e = e->next_at) {
+                if (!source_access_matches(e,change->handle) || e->t.serial != change->object_serial ||
+                    source_permission_current(e)) continue;
+                e->checked = 0;
+                e->checked_authority = 0;
+                if (e->pidx) {
+                    PEnt *p = &pent[e->pidx - 1];
+                    p->ok = 0;
+                    if (pool_deps) fresh_deps_mark(pool_deps, p->dep);
+                }
+            }
+        }
+    }
+    if (rebuild) {
+        resource_bridge.rebuilds++;
+        resource_change_cursor = end;
+        for (int i = 0; i < npent; ++i) pent[i].ok = 0, pent[i].e->checked = 0, pent[i].e->checked_authority = 0;
+        if (pool_deps) fresh_deps_mark_all(pool_deps);
+    }
+}
 static struct {
     uint64_t calls, entries, regions, notifications, candidates, certificates, misses, verified, attempts;
     uint64_t reject[5];   // no membership/content, epoch, mapping, observation serial, node state
@@ -1592,6 +2474,8 @@ static void pool_deps_observe(int query) {   // texture lock and exclusive gener
 }
 
 static int pool_deps_certificate(Tex *e) {   // called only at the ordinary binding's existing freshness boundary
+    if ((e->source_canonical || e->source_access.owner.handle.id) &&
+        !source_permission_current(e)) return 0;
     int mode = pool_deps_mode();
     if (mode < 3) return 0;
     PD.attempts++;
@@ -1797,12 +2681,37 @@ static void pool_list(Tex *e) {
 int vk_texture_pool_note_locked(int id, uint32_t *ent) {
     *ent = 0;
     if (id < 0 || id >= ntslots || !tslots[id].used) return 0;
-    if (tslots[id].ce && tslots[id].cgen != agen[sinfo[id] & 0xffff]) vk_texture_by_id_locked(id, NULL, NULL);
-    Tex *e = tslots[id].ce;
+    TexSlot *slot = &tslots[id];
+    Tex *e = texture_registration_source(slot);
+    if (!e) {
+        if (slot->cgen == agen[sinfo[id] & 0xffff]) e = slot->ce;
+        else if (slot->ce) e = (Tex *)vk_texture_by_id_locked(id, NULL, NULL);
+    }
     if (!e) return 0;
+    content_use(e);
     *ent = pool_ref(e);
     // A previously retired entry can return while older descriptor pools still hold its reference.
     if (pref[*ent - 1].refs) pool_list(e);
+    return 1;
+}
+
+// A group association certifies a direct image selected under a stable address generation. Finalized non-CPU
+// descriptors can also retain their own released image: the same selector key follows live aliases first and
+// otherwise keeps that nonsuperseded entry. CPU stale-kept providers retain their separate content checks.
+// The PRef names the selection for activity accounting; native publications retain installed physical images.
+int vk_texture_group_direct_locked(int group, uint64_t incarnation, int id, VkImage expected, uint32_t *entry) {
+    if(entry)*entry=0;
+    if(!entry || !expected || !vk_texture_group_member_locked(group,incarnation,id))return 0;
+    const TexSlot *slot=&tslots[id];
+    if(slot->cgen!=agen[sinfo[id]&0xffff] || !slot->ce)return 0;
+    const Tex *e=slot->ce;
+    if(e->retiring || e->up_retry || e->pub.gone || e->pub.image!=expected ||
+       (from_storage(e) && !e->pub.gpu_owned))return 0;
+    if(e->released && (!slot->finalized || tex_mirrored(&slot->t) || e->superseded ||
+       nvn_hm_get(&by_key,&grp[group].key.texture)!=e))return 0;
+    RcRegistryPosition edge={0};
+    if(vk_texture_binding_receipt_locked(id,expected,&edge)!=VK_TEXTURE_BINDING_DIRECT || edge.scene)return 0;
+    *entry=pool_ref(slot->ce);
     return 1;
 }
 
@@ -1849,6 +2758,7 @@ static void pool_order_candidates(int count) {
 }
 
 int vk_texture_pool_fresh_locked(void) {
+    source_changes_apply();
     int nq = 0, ps = pool_presnap();
     int mode = pool_deps_mode(), indexed = mode && ps && vk_mem_dependency_serial();
     int timing = mode && pool_deps_timing();
@@ -1918,10 +2828,12 @@ int vk_texture_pool_fresh_locked(void) {
             continue;
         }
         if (e->released) continue;
-        if (!e->uploaded || e->checked != submit_epoch) {
+        uint64_t authority = rc_registry_authority_epoch(rc_registry_runtime());
+        if (!e->uploaded || e->checked != submit_epoch || !source_binding_ready(e)) {
             make_fresh_snap(e);
             if (tex_deferred) continue;
             e->checked = submit_epoch;
+            e->checked_authority = authority;
             n_pool_checks++;
         }
         p->since = e->wgen, p->ok = e->uploaded;
@@ -1966,10 +2878,56 @@ int vk_texture_slot_retry_locked(int id) {
 
 static void retire_remove(Tex *e);
 
+static void free_tex(Tex *e, int retained_output) {
+    retained_texture_upload_detach(e);
+    packed_storage_writes_drop(e);
+    storage_host_init_drop(e);
+    if (e->pin_detached) image_holds_end(e);
+    alias_fragment_forget(e);
+    mem_backing_release(&e->image_host_backing);
+    free(e->image_device_intervals);
+    e->image_device_intervals = NULL;
+    e->image_device_count = 0;
+    free(e->image_private_mapping);
+    e->image_private_mapping = NULL;
+    e->image_private_mapping_count = 0;
+    if (e->material) content_release(e, e->reclaim);
+    else if (!retained_output) {
+        if (vk_mem_image_held(e->pub.image)) vk_exec_texture_publications_request_reclaim();
+        if (e->pub.image) vk_exec_image_gone(e->pub.image);
+        vk_defer_image_reclaim(e->pub.image, e->alloc, e->reclaim ? e->bytes : 0);
+    }
+    content_source_discard(e);
+    source_registration_release(e);
+    free(e->source_spans);
+    e->source_spans = NULL;
+    while (e->flat3d) {
+        TextureFlat3D *copy = e->flat3d;
+        e->flat3d = copy->next;
+        flat3d_retire(copy);
+    }
+    free(e->snap);
+    // Replay and DLSS can keep &pub through the recorded part. The storage and record retire with their actual work.
+    e->pub.gone = 1;
+    vk_defer_free(e);
+}
+
+static void pin_owner_release(void *owner) {
+    Tex *e = owner;
+    lock();
+    if (e->pending_write) rt_fatal("vk: texture pin released before its pending write settled");
+    e->pin_owned = 0;
+    if (e->pin_detached) free_tex(e, 0);
+    unlock();
+}
+
 static void destroy_tex(Tex *e) {
+    e->mirrored_color_write = NULL;
+    texture_registration_source_clear(e);
     if (e->retiring) retire_remove(e);
     pool_unlist(e);
     pool_forget(e);
+    const int retained = native_texture_output_transfer(e);
     own_remove(e);
     gwin_remove(e);
     n_site[0]++;
@@ -1984,101 +2942,191 @@ static void destroy_tex(Tex *e) {
             if (p->next_at == e) { p->next_at = e->next_at; break; }
     }
     if (e->released) nreleased--, rel_unlink(e);
-    if (e->material) content_release(e, e->reclaim);
-    else {
-        if (e->pub.image) vk_exec_image_gone(e->pub.image);
-        vk_defer_image_reclaim(e->pub.image, e->alloc, e->reclaim ? e->bytes : 0);
+    if (e->pin_owned) {
+        e->pin_detached = 1;
+        e->next_at = NULL;
+        e->gpu_dirty = 0;
+        e->reclaim = 0;
+        return;
     }
-    content_source_discard(e);
-    free(e->source_spans);
-    e->source_spans = NULL;
-    if (e->flat3d) {   // its 3D copy goes the same way
-        vk_exec_image_gone(e->flat3d->image);
-        vk_defer_image(e->flat3d->image, e->flat3d_alloc);
-        e->flat3d->gone = 1;
-        vk_defer_free(e->flat3d);
-    }
-    free(e->snap);
-    // The record goes once the GPU is past the submission being recorded, as its image: the replay keeps &e->pub as a
-    // render target for the rest of a command buffer (vk_exec.c resolve_target) and DLSS for the frame, and this runs on
-    // whichever thread released the texture. Freed here, a pass that began again read the freed record, cached a view of
-    // the dead image (vk_exec_target_view), and a later image given the same handle drew through it into freed memory.
-    e->pub.gone = 1;
-    vk_defer_free(e);
+    free_tex(e, retained);
 }
 
 // ---- a flat texture sampled as a 3D one
 // Maxwell samples a texture by its own descriptor, whatever the shader's instruction says: a 2D texture under a 3D
 // sample gives its texel at (u, v), and the third coordinate does nothing. Vulkan has no 3D view of a 2D image, so
-// get_view (vk_exec_draw.c) found no view for such a binding and the draw sampled a stand-in. Such a texture now gets a
-// 3D image of one slice with its texels, all of its levels, made in the upload batch and copied again when the texture
-// was uploaded or drawn into since (n_up, wr_fence) or another layer is asked for; a 3D view of that gives the 2D
-// texel for any w. The copy is recorded in the upload batch, which runs before the part that samples it, so a texture
-// the GPU draws every frame is sampled as it was a part or a frame before. Small plain colour textures only:
-// FLAT3D_MAX texels, one sample, not block-compressed (BC rejects 3D on some drivers). NX2NAVI_TEX_FLAT3D=0: the
-// stand-in, as before. Texture lock held; NULL when the texture does not qualify or the image cannot be made.
+// get_view (vk_exec_draw.c) otherwise has no view for such a binding and samples a stand-in.
+// A derived 3D instance contains one source layer at one ordered content version. Copies record on the
+// consuming scene's command buffer after preceding producers, never in an upload submitted before that scene.
 #define FLAT3D_MAX (1024u * 1024u)
 static volatile int32_t n_flat3d;
 
-const VkTexImage *vk_texture_flat3d_locked(const VkTexImage *img, uint32_t layer) {
+static void flat3d_retire(TextureFlat3D *copy) {
+    if (copy->material) {
+        if (texture_material_release(copy->material, 1)) content_retire(copy->material);
+    } else {
+        vk_exec_image_gone(copy->image.image);
+        vk_defer_image(copy->image.image, copy->allocation);
+    }
+    copy->image.gone = 1;
+    vk_defer_free(copy);
+}
+
+static int flat3d_current(const Tex *source, const TextureFlat3D *copy, RcRegistryPosition position, int strict) {
+    if (copy->image.gone || copy->source != source->pub.image || copy->upload != source->n_up) return 0;
+    if (copy->material) {
+        if (!source->material || !source->material->resident.instance ||
+            source->material->resident.instance->value.id != copy->source_instance ||
+            (!rc_registry_position_valid(position) || (copy->position.scene != position.scene &&
+             !rc_registry_position_handed(rc_registry_runtime(), copy->position)))) return 0;
+    }
+    int ordered = source->pub.gpu_owned || source->content_revision || source->material_writable || !from_storage(source);
+    if (!ordered && copy->ordered) return 0;
+    if (ordered) {
+        // Parallel workers can announce later writes before this operation reaches its turn. An ordered copy is
+        // valid only for its consuming operation; pass preparation in that operation can announce its own write.
+        return rc_registry_position_valid(position) && !rc_registry_position_compare(position, copy->position) &&
+            (!strict || (copy->ordered && copy->revision == source->content_revision));
+    }
+    return copy->revision == source->content_revision;
+}
+
+static int flat3d_material_attach(uint64_t source_instance, TextureFlat3D *copy, const VkImageCreateInfo *ci) {
+    TextureMaterial *material = malloc(sizeof *material);
+    if (!material) return 0;
+    ImgKey key;
+    img_key_of(ci, &key);
+    VmaAllocationInfo allocation;
+    vmaGetAllocationInfo(vk_ctx()->vma, copy->allocation, &allocation);
+    if (!texture_material_init(material, &material_ledger, copy->image.image, copy->allocation, &key, allocation.size, 1)) {
+        free(material);
+        return 0;
+    }
+    texture_material_require(rc_lifetime_recovery_set(&material->lifetime, material->id, RC_LIFETIME_RECOVERY_NONE));
+    material->ready = 1;
+    copy->material = material;
+    copy->allocation = 0;
+    copy->source_instance = source_instance;
+    content_use_image_add(material->resident.instance);
+    return 1;
+}
+
+static int flat3d_recipe(const VkTexImage *image, uint32_t layer, VkImageCreateInfo *info) {
     static int on = -1;
     if (on < 0) on = rt_knob("TEX_FLAT3D", "1") == 1;
-    Tex *e = (Tex *)img;   // pub is the first member
-    if (!on || img->gone || !img->image || img->type != VK_IMAGE_TYPE_2D || img->samples > 1 ||
-        img->aspect != VK_IMAGE_ASPECT_COLOR_BIT || img->block_views || format_compressed(img->format) ||
-        (uint64_t)img->width * img->height > FLAT3D_MAX || layer >= img->layers || img->levels > 16)
+    if (!on || !image || image->gone || !image->image || image->type != VK_IMAGE_TYPE_2D || image->samples > 1 ||
+        image->aspect != VK_IMAGE_ASPECT_COLOR_BIT || image->block_views || format_compressed(image->format) ||
+        (uint64_t)image->width * image->height > FLAT3D_MAX || layer >= image->layers ||
+        !image->levels || image->levels > 16) return 0;
+    *info = (VkImageCreateInfo){.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_3D,
+        .format = image->format, .extent = {image->width, image->height, 1}, .mipLevels = image->levels,
+        .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+    return 1;
+}
+
+static void flat3d_record(const VkTexImage *img, TextureFlat3D *copy, const VkImageCreateInfo *ci,
+                          uint32_t layer, VkCommandBuffer cb, RcRegistryPosition position) {
+    VkTexImage *f = &copy->image;
+    f->type = VK_IMAGE_TYPE_3D; f->view_type = VK_IMAGE_VIEW_TYPE_3D; f->depth = f->layers = 1;
+    f->usage = ci->usage; f->bound = f->block_views = f->fb_usage = f->fb_learned = f->gone = 0;
+    VkImageMemoryBarrier2 ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+        .srcStageMask = VK_PIPELINE_STAGE_2_NONE, .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+        .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = f->image, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, 1}};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1,
+                           .pImageMemoryBarriers = &ib};
+    vkCmdPipelineBarrier2(cb, &di);
+    VkImageCopy regions[16];
+    for (uint32_t level = 0; level < img->levels; level++) {
+        regions[level] = (VkImageCopy){.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1},
+            .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1},
+            .extent = {mip(img->width, level), mip(img->height, level), 1}};
+    }
+    barrier(cb, ALL_RW, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    vkCmdCopyImage(cb, img->image, VK_IMAGE_LAYOUT_GENERAL, f->image, VK_IMAGE_LAYOUT_GENERAL,
+                   img->levels, regions);
+    barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
+    copy->source = img->image;
+    copy->layer = layer;
+    copy->position = position;
+    log_limited(&n_flat3d, "texture %#llx layer %u: immutable 3D sampling copy recorded at scene %llu operation %llu",
+        (unsigned long long)img->addr, layer, (unsigned long long)position.scene, (unsigned long long)position.ordinal);
+}
+
+static const VkTexImage *texture_flat3d_prepare(const VkTexImage *img, Tex *e, uint32_t layer,
+                                               VkCommandBuffer ordered_cb, int required) {
+    VkImageCreateInfo ci;
+    if (!flat3d_recipe(img, layer, &ci)) return NULL;
+    // The argument may be an immutable value capture, not the first member of a live Tex.
+    int selected = e != NULL;
+    if (!e) {
+        e = nvn_hm_get(&by_addr, &img->addr);
+        while (e && (e->pub.image != img->image || e->pub.gone)) e = e->next_at;
+    }
+    if (!e) return NULL;
+    int owned = selected && e->material && e->material->ready && e->material->resident.instance;
+    RcRegistryPosition position = vk_exec_resource_position();
+    TextureFlat3D **link = &e->flat3d;
+    while (*link && (*link)->layer != layer) link = &(*link)->next;
+    TextureFlat3D *old = *link;
+    // An earlier compatibility image has no material captures. Create its exact successor at an ordered
+    // copy point rather than changing the ownership contract of descriptors which may already refer to it.
+    if (old && (!owned || old->material) && flat3d_current(e, old, position, ordered_cb || required != 1)) {
+        return &old->image;
+    }
+    if (!ordered_cb || vk_exec_turn_due() || !rc_registry_position_valid(position)) {
+        if (required || ordered_cb) tex_deferred = 1;
         return NULL;
-    VkCtx *c = vk_ctx();
-    VkCommandBuffer cb = VK_NULL_HANDLE;
-    if (!e->flat3d) {
-        VkTexImage *f = malloc(sizeof *f);
-        if (!f) return NULL;
-        *f = *img;
-        VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_3D,
-                                .format = img->format, .extent = {img->width, img->height, 1}, .mipLevels = img->levels,
-                                .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
-                                .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                                .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
-        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
-        if (vmaCreateImage(c->vma, &ci, &ai, &f->image, &e->flat3d_alloc, NULL) != VK_SUCCESS) {
-            free(f);
-            return NULL;
-        }
-        f->type = VK_IMAGE_TYPE_3D, f->view_type = VK_IMAGE_VIEW_TYPE_3D, f->depth = 1, f->layers = 1;
-        f->usage = ci.usage, f->bound = 0, f->block_views = 0, f->fb_usage = 0, f->fb_learned = 0, f->gone = 0;
-        e->flat3d = f;
-        e->flat3d_up = ~0u;
-        cb = vk_upload_begin();
-        VkImageMemoryBarrier2 ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-                                    .srcStageMask = VK_PIPELINE_STAGE_2_NONE, .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
-                                    .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                                    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-                                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = f->image,
-                                    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, 1}};
-        VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1,
-                               .pImageMemoryBarriers = &ib};
-        vkCmdPipelineBarrier2(cb, &di);
-        log_limited(&n_flat3d, "texture %#llx (%ux%u, %u levels, format %d) is sampled as a 3D texture: a one-slice 3D "
-                    "copy of it is made", (unsigned long long)img->addr, img->width, img->height, img->levels,
-                    (int)img->format);
     }
-    if (e->flat3d_up != e->n_up || e->flat3d_wr != e->wr_fence || e->flat3d_layer != layer) {
-        if (!cb) cb = vk_upload_begin();
-        VkImageCopy rg[16];
-        for (uint32_t l = 0; l < img->levels; l++) {
-            uint32_t w = img->width >> l, h = img->height >> l;
-            rg[l] = (VkImageCopy){.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, layer, 1},
-                                  .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, 0, 1},
-                                  .extent = {w ? w : 1, h ? h : 1, 1}};
-        }
-        barrier(cb, ALL_RW, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
-        vkCmdCopyImage(cb, img->image, VK_IMAGE_LAYOUT_GENERAL, e->flat3d->image, VK_IMAGE_LAYOUT_GENERAL, img->levels, rg);
-        barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
-        e->flat3d_up = e->n_up, e->flat3d_wr = e->wr_fence, e->flat3d_layer = layer;
+    TextureFlat3D *copy = calloc(1, sizeof *copy);
+    if (!copy) { if (required) tex_deferred = 1; return NULL; }
+    copy->image = e->pub;
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    if (texture_image_allocate(vk_ctx(), &ci, &ai, &copy->image.image, &copy->allocation,
+                               required, "3D sampling", NULL) != VK_SUCCESS) {
+        free(copy);
+        if (required) tex_deferred = 1;
+        return NULL;
     }
-    if (cb) vk_upload_end();
-    return e->flat3d;
+    if (owned && !flat3d_material_attach(e->material->resident.instance->value.id, copy, &ci)) {
+        resource_core_vma_destroy_image(vk_ctx()->vma, copy->image.image, copy->allocation);
+        free(copy);
+        if (required) tex_deferred = 1;
+        return NULL;
+    }
+    if (copy->material) {
+        const VkImage images[] = {img->image, copy->image.image};
+        vk_texture_use_images(images, 2); // The actual GPU copy owns both physical instances.
+    }
+    flat3d_record(img, copy, &ci, layer, ordered_cb, position);
+    copy->revision = e->content_revision; copy->upload = e->n_up;
+    copy->ordered = e->pub.gpu_owned || e->content_revision || e->material_writable || !from_storage(e);
+    copy->next = old ? old->next : NULL;
+    *link = copy;
+    if (old) flat3d_retire(old);
+    tex_gen_bump(e->key.addr);
+    return &copy->image;
+}
+
+const VkTexImage *vk_texture_flat3d_locked(const VkTexImage *img, uint32_t layer,
+                                          VkCommandBuffer ordered_cb, int required) {
+    return texture_flat3d_prepare(img, NULL, layer, ordered_cb, required);
+}
+
+const VkTexImage *vk_texture_flat3d_selected_locked(const VkTexImage *img, VkTextureReadKey key, uint32_t layer,
+                                                    VkCommandBuffer ordered_cb, int required) {
+    if (!key.canonical || !img) return vk_texture_flat3d_locked(img, layer, ordered_cb, required);
+    const TexSlot *slot = texture_read_key_slot(key);
+    Tex *source = slot ? texture_read_key_source(slot, img->image) : NULL;
+    if (!source) {
+        if (required) tex_deferred = 1;
+        return NULL;
+    }
+    return texture_flat3d_prepare(img, source, layer, ordered_cb, required);
 }
 
 // ---- origins (NX2NAVI_TRACE=perf; a run without it tests the flag and counts the drops, nothing more)
@@ -2203,7 +3251,8 @@ static void drop_tex(Tex *e, int why) {
                  why == DROP_IDLE_COMMIT || why == DROP_IDLE_VRAM;
     flight_ev(e, FLIGHT_TEX_DROP, (uint32_t)why, 0);
     if (why == DROP_COMMIT || why == DROP_IDLE_COMMIT) commit_drop_note(e);
-    if (e->gpu_dirty && why != DROP_OVERWRITTEN && why != DROP_SHUTDOWN) {
+    if (e->gpu_dirty && why != DROP_OVERWRITTEN && why != DROP_SHUTDOWN &&
+        (!e->pin_owned || mem_backing_current(e->image_host_backing))) {
         uint32_t now;
         wb_cfg_init();
         if (storage_rewritten(e, e->gpu_gen, &now) == 1) e->gpu_dirty = 0;
@@ -2462,9 +3511,10 @@ static int comes_back_intact(const Tex *e) { return e->pub.mirrored && !e->pub.g
 static uint32_t look_round = 1;     // submissions whose lookups walked the texture pool
 static uint32_t round_checks;       // slot checks of the submission being recorded (vk_texture_by_id_locked)
 static uint32_t pool_slots;         // registered slots the pool covers (id < VK_POOL_TEX)
-static int pool_ctx;                // the texture pool refresh is looking slots up (vk_texture_pool_ctx)
 static void touch(Tex *e) {
-    if (e->material) texture_material_note_use(e->material, vk_exec_recording_fence(), submit_epoch);
+    content_use(e);
+    if (e->material && e->material->resident.image)
+        texture_material_note_use(e->material, vk_exec_recording_fence(), submit_epoch);
     e->use_round = look_round;
     e->use_frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
     if (!pool_ctx) e->samp_frame = e->use_frame;   // a draw binds it, or the game or the replay reads it otherwise
@@ -2643,7 +3693,7 @@ static uint64_t stale_after(const Tex *e) {
 // the same protected entries; unlink updates it if a game thread takes back or destroys the pointed-to texture.
 #define RECLAIM_LOOK 512
 static struct { uint64_t checks, inspected, scheduled, pending, ns; } reclaim_stats;
-static uint64_t reclaim_released(uint64_t want, uint64_t *count, int why) {
+static uint64_t reclaim_released(uint64_t want, uint64_t *count, int why, uint32_t domain) {
     if (why == DROP_VRAM) reclaim_gpu_phase = 0;
     uint64_t now = frames_now(), freed = 0;
     Tex *recoverable[PRESSURE_STEP], *other[PRESSURE_STEP];
@@ -2653,11 +3703,11 @@ static uint64_t reclaim_released(uint64_t want, uint64_t *count, int why) {
         reclaim_stats.inspected++;
         if (now - e->rel_frame < STALE_FRAMES) { e = NULL; break; }
         Tex *next = e->rel_next;
-        int eligible = texture_owned_bytes(e) && now - e->rel_frame >= stale_after(e) &&
+        int eligible = !e->pin_owned && !e->material && !e->native_output && texture_owned_bytes(e) && now - e->rel_frame >= stale_after(e) &&
                        (e->overwritten || idle(e, now));
         // VRAM pressure has never authorized destroying the only GPU copy of a released texture.
         if (why == DROP_VRAM && !comes_back_intact(e)) eligible = 0;
-        if (eligible) {
+        if (eligible && texture_reclaim_on_heap(e->alloc, domain)) {
             if (comes_back_intact(e) || e->overwritten) {
                 recoverable[nr++] = e;
                 reclaim_cpu_seen = 1;
@@ -2715,28 +3765,14 @@ static void drop_overwritten(void) {
 // under the threshold. The use counts the free space inside VMA's blocks as free (vk_mem_vram_live): a freed texture
 // leaves a hole the driver still counts, and measured that way the evictions went on until nearly every idle texture
 // was gone. The next check waits until the GPU is past the submissions that may still name the images, as their
-// memory goes back to VMA only then (vk_defer_image). A VRAM mirror that did not fit asks for room the same way, below
-// the threshold too (vk_texture_want_room): a pool without its mirror costs far more than a texture uploaded again.
-// Its request stands as the use the mirror fits at (room_level) for ROOM_CHECKS checks or until the use is down there
-// (sweep_pressure): taken as bytes to free at the one check that read it, a request for 205 MiB got the EVICT_STEP
-// textures of that check, 26 MiB, or nothing when the check fell before evict_wait, and was gone.
+// memory goes back to VMA only then (vk_defer_image). The shared budget service may request the same eligible
+// giveback for a particular heap below the ordinary texture pressure threshold.
 #define EVICT_STEP 64
-#define ROOM_CHECKS 64
 static int tex_evict = -1;
 static uint64_t evict_wait;                       // vk_sync_fence_done value the next eviction waits for
 static uint64_t n_evict, n_evict_bytes;           // since the last perf line
 static int evict_logs;
-static volatile int64_t room_wanted;               // bytes refused VRAM mirrors asked for (vk_texture_want_room)
-static uint64_t room_level;                        // tex_lock: the device-local use at which those mirrors fit
-static uint32_t room_checks;                       // tex_lock: checks the request still stands for; 0 = none stands
-
-void vk_texture_want_room(uint64_t bytes) {
-    int64_t cur = __atomic_load_n(&room_wanted, __ATOMIC_RELAXED);   // the largest request since the last check
-    while ((int64_t)bytes > cur && !__atomic_compare_exchange_n(&room_wanted, &cur, (int64_t)bytes, 0, __ATOMIC_RELAXED,
-                                                                 __ATOMIC_RELAXED)) {}
-}
-
-static uint64_t evict_idle(uint64_t want, uint64_t used, uint64_t budget, int why) {   // tex_lock held; returns the bytes freed
+static uint64_t evict_idle(uint64_t want, uint64_t used, uint64_t budget, int why, uint32_t domain) {
     if (vk_sync_fence_done() < evict_wait) return 0;
     Tex *v[EVICT_STEP];
     int nv = 0;
@@ -2748,7 +3784,9 @@ static uint64_t evict_idle(uint64_t want, uint64_t used, uint64_t budget, int wh
         uint32_t i = scan_at++;
         reclaim_stats.inspected++;
         Tex *e = by_key.vals[i];
-        if (!e || e->released || e->retiring || !texture_owned_bytes(e) || !comes_back_intact(e) || !idle(e, now)) continue;
+        if (!e || e->pin_owned || e->material || e->native_output || e->released || e->retiring ||
+            !texture_owned_bytes(e) || !comes_back_intact(e) || !idle(e, now)) continue;
+        if (!texture_reclaim_on_heap(e->alloc, domain)) continue;
         uint32_t age = look_round - e->use_round;
         int at = nv;
         while (at > 0 && look_round - v[at - 1]->use_round < age) at--;
@@ -2943,20 +3981,28 @@ static int disuse_evict_on(void) {
 }
 
 // tex_lock held; returns the bytes retired (freed a few submissions later), counting those still retiring as freed
-static uint64_t evict_disused(uint64_t want) {
+static uint64_t evict_disused(uint64_t want, uint32_t domain) {
     if (!disuse_evict_on()) return 0;
     if (!want || !vk_pool_marks_enabled() || __atomic_load_n(&vk_pool_marks_missed, __ATOMIC_RELAXED) || marks_reads < 2 ||
         marks_live < 2 || vk_sync_fence_done() < evict_wait)
         return 0;
-    if (retiring_bytes >= want) return retiring_bytes;   // what is on its way out covers it
-    want -= retiring_bytes;
+    uint64_t selected = retiring_bytes;
+    if (domain) {
+        selected = 0;
+        for (int i = 0; i < nretiring; i++)
+            if (retiring[i]->retiring && texture_reclaim_on_heap(retiring[i]->alloc, domain)) selected += retiring[i]->bytes;
+    }
+    if (selected >= want) return selected;   // what is on its way out covers it
+    want -= selected;
     Tex *v[EVICT_STEP];
     int nv = 0;
     uint64_t now = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED), disuse = DISUSE_FRAMES;
     for (uint32_t i = 0; i < by_key.cap; i++) {   // the EVICT_STEP least recently sampled candidates, oldest first
         Tex *e = by_key.vals[i];
-        if (!e || e->released || e->retiring || !texture_owned_bytes(e) || !comes_back_intact(e) || now - e->samp_frame < disuse)
+        if (!e || e->pin_owned || e->material || e->released || e->retiring ||
+            !texture_owned_bytes(e) || !comes_back_intact(e) || now - e->samp_frame < disuse)
             continue;
+        if (!texture_reclaim_on_heap(e->alloc, domain)) continue;
         int at = nv;
         while (at > 0 && v[at - 1]->samp_frame > e->samp_frame) at--;
         if (at == EVICT_STEP) continue;
@@ -3012,7 +4058,7 @@ static uint64_t evict_disused(uint64_t want) {
                "images go once the texture pool sets no longer name them, and one sampled again is made again within a "
                "few frames", n, DISUSE_SECONDS, freed / 1048576.0);
     }
-    return retiring_bytes;
+    return selected + freed;
 }
 
 // The registered slots at e's address, for marks_check's line: how many, those of e's own descriptor ("f": finalized),
@@ -3159,9 +4205,6 @@ static void sweep_pressure(void) {   // tex_lock held
         rt_log("vk: textures under VRAM pressure: %s%d%%%s", vram_pressure ? "dropped above " : "off", vram_pressure,
                !vram_pressure ? "" : tex_evict ? ", released ones first, then idle live ones (NX2NAVI_TEX_EVICT=0: released only)"
                                                : ", released ones only (NX2NAVI_TEX_EVICT=0)");
-        if (vram_pressure > 87)
-            rt_log("vk: NX2NAVI_TEX_VRAM_PRESSURE=%d is above the seven eighths of the budget past which a new VRAM "
-                   "mirror is refused: textures make room only once a mirror was refused", vram_pressure);
     }
     retire_sweep();
     if (submit_epoch & 7) return;   // the budget and commit queries every 8 submits
@@ -3169,25 +4212,21 @@ static void sweep_pressure(void) {   // tex_lock held
     reclaim_stats.checks++;
     uint64_t used = 0, budget = 0;
     int exact;
-    uint64_t wanted = tex_evict ? (uint64_t)plat_xchg64(&room_wanted, 0) : 0;
-    int known = vram_pressure && (rel_head || tex_evict || wanted) &&
+    int known = vram_pressure && (rel_head || tex_evict) &&
                 (tex_evict ? vk_mem_vram_live(&used, &budget) : vk_mem_vram(&used, &budget, &exact));
     uint64_t over = 0;
     if (known) {
         uint64_t limit = budget / 100 * (uint64_t)vram_pressure;
         if (used > limit) over = used - limit + budget / 50;
-        if (wanted) {   // the use at which the refused mirror fits; the lowest of the requests that stand
-            uint64_t level = used > wanted ? used - wanted : 0;
-            if (!room_checks || level < room_level) room_level = level;
-            room_checks = ROOM_CHECKS;
-        }
-        if (room_checks && used <= room_level) room_checks = 0;   // made: the pool gets its mirror when it asks again
-        if (room_checks) {
-            room_checks--;
-            if (used - room_level > over) over = used - room_level;
-        }
     }
     int low = commit_is_low();
+    // Raw providers consume host commit, not image heap space. Give back optional host copies before detaching
+    // selected images, then measure actual relief: allocator retention can make freed bytes differ from commit.
+    // Keep cold reconstruction providers when GPU pressure can instead reclaim their image allocations.
+    if (low && content_drop_providers_pressure(commit_deficit, over != 0)) {
+        resource_core_budget_refresh();
+        low = commit_is_low();
+    }
     int held = low && commit_drops_held();   // the commit drops came back (commit_back_note)
     if (rel_head) drop_overwritten();
     uint64_t cap = released_cap_bytes();
@@ -3197,6 +4236,13 @@ static void sweep_pressure(void) {   // tex_lock held
     uint64_t pressure_need = over > commit_need ? over : commit_need;
     uint64_t want = pressure_need > cap_need ? pressure_need : cap_need;
     uint64_t pending = vk_mem_reclaim_pending();
+    // Detached instances can still be held by captured commands/publications before reaching backend deferral.
+    // Include those bytes once, without counting the backend's deferred charge again.
+    uint64_t captured_pending = material_ledger.pending_bytes - material_ledger.backend_accounted_bytes;
+    pending += captured_pending;
+    // Completed descriptor generations can still own detached instances. Ask the next worker-free replay
+    // boundary to invalidate those dormant sets; taking the pool lock here would invert pool -> texture order.
+    if (want && captured_pending) vk_exec_texture_publications_request_reclaim();
     // Pending allocation destruction is not free memory. Allow the collector to finish before deciding another
     // ordinary batch from a fresh sample. Critical pressure can make progress toward the remaining byte deficit.
     if (pending && !commit_critical) {
@@ -3210,8 +4256,8 @@ static void sweep_pressure(void) {   // tex_lock held
     if (want) {
         int why = over ? DROP_VRAM : commit_need ? DROP_COMMIT : DROP_CAP;
         uint64_t *count = why == DROP_VRAM ? &n_pressure_drops : why == DROP_COMMIT ? &n_commit_drops : &n_cap_drops;
-        uint64_t freed = content_reclaim(want);
-        if (freed < want) freed += reclaim_released(want - freed, count, why);
+        uint64_t freed = content_reclaim(want, 0);
+        if (freed < want) freed += reclaim_released(want - freed, count, why, 0);
         // Live eviction cannot satisfy a retained-entry cap. It can satisfy only the outstanding measured pressure,
         // sharing the released batch's credit rather than starting an independent fixed-size eviction round.
         if (commit_evict_on < 0) commit_evict_on = rt_knob("TEX_COMMIT_EVICT", "1") == 1;
@@ -3219,12 +4265,35 @@ static void sweep_pressure(void) {   // tex_lock held
         if (pending) live_need = live_need > pending ? live_need - pending : 0;
         if (tex_evict && freed < live_need) {
             n_commit_past += (uint64_t)(!over && commit_need != 0);
-            freed += evict_idle(live_need - freed, used, budget, over ? DROP_IDLE_VRAM : DROP_IDLE_COMMIT);
-            if (freed < live_need) evict_disused(live_need - freed);
+            freed += content_reclaim(live_need - freed, 1);
+        }
+        if (tex_evict && freed < live_need) {
+            freed += evict_idle(live_need - freed, used, budget, over ? DROP_IDLE_VRAM : DROP_IDLE_COMMIT, 0);
+            if (freed < live_need) evict_disused(live_need - freed, 0);
         }
         reclaim_stats.scheduled += freed;
     }
     reclaim_stats.ns += kern_now_ns() - started;
+}
+
+unsigned vk_texture_reclaim_heap(uint32_t domain, uint64_t bytes) {
+    if (!plat_rmutex_trylock(&tex_lock)) return RC_BUDGET_RECLAIM_BUSY;
+    uint64_t selected = 0;
+    if (vram_pressure > 0 && tex_evict > 0) {
+        selected = content_reclaim_in(bytes, 0, domain);
+        if (selected < bytes) selected += reclaim_released(bytes - selected, &n_pressure_drops, DROP_VRAM, domain);
+        if (selected < bytes) selected += content_reclaim_in(bytes - selected, 1, domain);
+        if (selected < bytes) {
+            RcBudgetSnapshot budget;
+            resource_core_budget_snapshot(&budget);
+            uint64_t total = budget.sample.total.amount[domain], free = budget.sample.free.amount[domain];
+            selected += evict_idle(bytes - selected, total > free ? total - free : 0, total, DROP_IDLE_VRAM, domain);
+        }
+        if (selected < bytes) selected += evict_disused(bytes - selected, domain);
+        reclaim_stats.scheduled += selected;
+    }
+    plat_rmutex_unlock(&tex_lock);
+    return selected ? RC_BUDGET_RECLAIM_PENDING : RC_BUDGET_RECLAIM_NONE;
 }
 
 // ---------------------------------------------------------------- per-frame texture work (vk.h VK_TS_*)
@@ -3424,15 +4493,15 @@ static int astc_arena(void) {
 // Copies the whole storage into the image (every level and layer the image has). An image made without its top levels
 // (texture detail, VkTexImage.skip) has the game's level lv + skip at its level lv: the loops below run over the image's
 // levels and read the storage at the game's.
-// How long an upload whose decode had no memory waits for its next try (upload, up_wait): half a second of frames. A
-// try costs the copy of the texture's blocks into staging memory, so not every frame.
+// Speculative retries of an upload whose decode had no memory are spaced by half a second of frames. A demanded
+// use immediately retries preparation instead of accepting the speculative refusal as unavailable contents.
 #define UP_RETRY_FRAMES 30
 static uint64_t n_up_retry;
 uint64_t vk_texture_upload_retries(void) { return __atomic_load_n(&n_up_retry, __ATOMIC_RELAXED); }
 
-// 1 while a texture that is not uploaded waits for its next try (e->up_retry; 0 for one never tried).
+// 1 while an unuploaded texture's speculative refresh waits (e->up_retry; 0 for one never tried).
 static int up_wait(const Tex *e) {
-    return e->up_retry && __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) < e->up_retry;
+    return pool_ctx && e->up_retry && __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) < e->up_retry;
 }
 
 // ASTC as BC1: e gets an image of the other format, made with the same parameters, in place of its own: BC1 (bc 2) for
@@ -3456,8 +4525,9 @@ static int astc_reformat(Tex *e, VkCommandBuffer cb, int bc) {
     ImgKey nk;
     img_key_of(&ci, &nk);
     VmaAllocation a = NULL;
-    VkImage img = suballoc_image(c, &ci, &a);
-    if (!img && vma_image(c, &ci, &nk, &img, &a) != VK_SUCCESS) {
+    int required = bc == 1 && !pool_ctx; // narrowing keeps valid BC3 contents; widening must preserve alpha
+    VkImage img = suballoc_image_try(c, &ci, &a, SUBALLOC_MAX, 0, required);
+    if (!img && vma_image_mode(c, &ci, &nk, &img, &a, required, "ASTC alpha", NULL) != VK_SUCCESS) {
         log_limited(&n_failed, "ASTC texture %#llx (%ux%u): no %s image could be made", (unsigned long long)e->pub.addr,
                     e->t.d.width, e->t.d.height, bc == 2 ? "BC1" : "BC3");
         return 0;
@@ -3478,6 +4548,7 @@ static int astc_reformat(Tex *e, VkCommandBuffer cb, int bc) {
     e->bytes = own.size;
     if (e->released) rel_bytes += e->bytes;
     if (e->retiring) retiring_bytes += e->bytes;
+    image_owner_replaced(e, img);
     e->pub.image = img, e->alloc = a, e->reused = 0;
     e->pub.format = e->f.vk = ci.format;
     e->f.astc_bc = (uint8_t)bc;
@@ -3510,21 +4581,11 @@ static int astc_copy_opaque(const Tex *e, uint8_t *dst, const uint8_t *src, uint
 
 // The range index contains GPU-authored CPU-addressable images. A page certificate describes guest writes only;
 // it cannot certify a source whose authoritative contents still reside in another image.
-static int content_source_gpu_overlap(const Tex *e) {
-    uint64_t lo = e->pub.addr, size = e->t.L.size;
-    if (!size || size > UINT64_MAX - lo || nvn_gpu_only(lo)) return 1;
-    for (int i = owned_lower(lo > max_owned ? lo - max_owned : 0);
-         i < nowned && owned[i]->pub.addr < lo + size; i++) {
-        const Tex *q = owned[i];
-        if ((q->pub.gpu_owned || q->gpu_dirty || q->material_writable) && q->t.L.size > lo - (q->pub.addr < lo ? q->pub.addr : lo))
-            return 1;
-    }
-    return 0;
-}
-
 // One bounded map of the original padded mip/layer ranges, independent of the resulting Vulkan representation.
 // Unsupported layouts retain the complete-upload path instead of inventing partial coverage.
 static int source_spans_init(Tex *e) {
+    // Physical/virtual pool aliases need backing-incarnation normalization before joining this CPU-source lifecycle.
+    if (e->t.pool_flags & (NVN_MEMORY_POOL_FLAGS_PHYSICAL | NVN_MEMORY_POOL_FLAGS_VIRTUAL)) return 0;
     if (e->material_writable) return 0;
     if (e->source_spans) return e->source_count != 0;
     const tex_t *t = &e->t;
@@ -3561,46 +4622,847 @@ static int source_spans_init(Tex *e) {
     return 1;
 }
 
-static int source_observe(Tex *e, const TextureSourceStamp *prior, TextureSourceObservation *out) {
+static void source_mapping_free(TextureSourceMapping *source) {
+    if (!source) return;
+    RcRegistry *r=rc_registry_runtime();
+    for (uint32_t i=0;source->access && i<source->count;i++)
+        if (source->access[i].owner.id) rc_registry_source_access_release(r,&source->access[i]);
+    mem_backing_release(&source->lease);
+    free(source->sample_intervals);
+    free(source->sample_spans);
+    free(source->access);
+    free(source->observed);
+    free(source->next);
+    free(source->copied);
+    free(source);
+}
+
+static void source_registration_release(Tex *e) {
+    texture_registration_source_clear(e);
+    source_mapping_free(e->source_mapping);
+    e->source_mapping=NULL;
+    e->source_vector_read=(RcRegistryReadObservation){0};
+    e->source_canonical=0;
+    e->source_compatibility_generation = 0;
+    if (e->source_access.owner.id)
+        rc_registry_source_access_release(rc_registry_runtime(), &e->source_access);
+    e->source_access = (RcRegistrySourceAccess){0};
+    e->material_version = (RcRegistryReadVersion){0};
+    e->source_stamp = (TextureSourceStamp){0};
+    e->source_authority_stamp = (TextureSourceStamp){0};
+    e->source_authority = (TextureSourceAuthority){0};
+    e->binding_proof = e->pool_binding_proof = (TextureBindingProof){0};
+    e->compatibility_receipt = (RcRegistryBindingReceipt){0};
+    e->compatibility_position = (RcRegistryPosition){0};
+    e->checked = 0;
+    e->checked_authority = 0;
+    e->source_retry_domains = e->source_retry_submit = 0;
+    e->source_retry_source = 0;
+}
+
+// The legacy preparation receipt covers a complete raw guest range, independently of the layout restrictions
+// on immutable material preparation. A lease alone grants neither readable CPU contents nor a content version.
+static RcRegistryResult source_compatibility_acquire(Tex *e) {
+    if (e->released || nvn_gpu_only(e->pub.addr) ||
+        (e->t.pool_flags & (NVN_MEMORY_POOL_FLAGS_PHYSICAL | NVN_MEMORY_POOL_FLAGS_VIRTUAL)))
+        return RC_REGISTRY_UNSUPPORTED;
+    return rc_registry_source_access_acquire(rc_registry_runtime(), e->t.serial,
+        (RcSourceRange){RC_GUEST_COMPATIBILITY_BACKING, e->pub.addr, e->t.L.size}, &e->source_access);
+}
+
+typedef struct {
+    TextureSourceSpan *spans;
+    uint64_t size;
+    uint32_t count, capacity;
+    RcRegistryResult failed;
+} TextureSampleFootprint;
+
+static void source_footprint_append(void *arg, uint64_t offset, uint64_t size) {
+    TextureSampleFootprint *f = arg;
+    if (f->failed) return;
+    if (offset > f->size || !size || size > f->size - offset) { f->failed = RC_REGISTRY_INVALID; return; }
+    if (f->count) {
+        TextureSourceSpan *prior = &f->spans[f->count - 1];
+        uint64_t end = prior->offset + prior->size;
+        if (offset < end) { f->failed = RC_REGISTRY_INVALID; return; }
+        if (offset == end) { prior->size += size; return; }
+    }
+    if (f->count == f->capacity) {
+        if (f->count == RC_REGISTRY_SOURCE_SPAN_LIMIT) { f->failed = RC_REGISTRY_UNSUPPORTED; return; }
+        uint32_t capacity = f->capacity ? f->capacity * 2 : 16;
+        TextureSourceSpan *spans = realloc(f->spans, (size_t)capacity * sizeof *spans);
+        if (!spans) { f->failed = RC_REGISTRY_CAPACITY; return; }
+        f->spans = spans;
+        f->capacity = capacity;
+    }
+    f->spans[f->count++] = (TextureSourceSpan){offset, size};
+}
+
+static RcRegistryResult source_sample_footprint(const Tex *e, TextureSourceMapping *source) {
+    // The ASTC decode/BC opacity cases can inspect the padded guest allocation. Those recipes keep their
+    // complete-source proof and copy, with native ASTC sharing that conservative contract.
+    VkFormat format = e->f.ideal;
+    if (e->f.astc_bw || (format >= VK_FORMAT_ASTC_4x4_UNORM_BLOCK && format <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK) ||
+        (format >= VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK && format <= VK_FORMAT_ASTC_12x12_SFLOAT_BLOCK)) return RC_REGISTRY_OK;
+    TextureSampleFootprint f = {.size = e->t.L.size};
+    for (uint32_t ly = 0; ly < e->pub.layers && !f.failed; ly++)
+        for (uint32_t lv = 0; lv < e->pub.levels && !f.failed; lv++)
+            if (nvn_texels_slice_ranges(&e->t.d, lv, ly, 0, source_footprint_append, &f))
+                f.failed = RC_REGISTRY_UNSUPPORTED;
+    if (f.failed || !f.count || (f.count == 1 && f.spans[0].size == f.size)) {
+        free(f.spans);
+        // Unsupported geometry can use the complete canonical source contract. A validated footprint whose
+        // metadata cannot be retained must report capacity instead of certifying an incomplete source.
+        return f.failed == RC_REGISTRY_UNSUPPORTED ? RC_REGISTRY_OK : f.failed;
+    }
+    source->sample_spans = f.spans;
+    source->sample_count = f.count;
+    return RC_REGISTRY_OK;
+}
+
+static RcRegistryResult source_mapping_access(Tex *e, TextureSourceMapping *source) {
+    uint32_t count = 0;
+    const RcInterval *all = mem_backing_intervals(source->lease, &count);
+    if (!count) return RC_REGISTRY_STALE;
+    source->access = calloc(count, sizeof *source->access);
+    source->observed = calloc(count, sizeof *source->observed);
+    source->next = calloc(count, sizeof *source->next);
+    source->copied = calloc(count, sizeof *source->copied);
+    if (!source->access || !source->observed || !source->next || !source->copied) return RC_REGISTRY_CAPACITY;
+    RcRegistry *registry = rc_registry_runtime();
+    RcRegistryResult result = RC_REGISTRY_OK;
+    if (!source->sample_count) {
+        source->intervals = all;
+        source->count = count;
+        for (uint32_t i = 0; i < count && result == RC_REGISTRY_OK; i++)
+            result = rc_registry_source_access_acquire_associated(registry, e->t.serial, all[i].range,
+                                                                   e->pub.addr, &source->access[i]);
+        return result;
+    }
+    source->sample_intervals = calloc(count, sizeof *source->sample_intervals);
+    RcSourceRange *slices = malloc((size_t)source->sample_count * sizeof *slices);
+    if (!source->sample_intervals || !slices) { free(slices); return RC_REGISTRY_CAPACITY; }
+    source->intervals = source->sample_intervals;
+    uint64_t cursor = 0;
+    uint32_t start = 0;
+    for (uint32_t i = 0; i < count && result == RC_REGISTRY_OK; i++) {
+        const RcInterval *map = &all[i];
+        uint64_t lo = map->address - e->pub.addr;
+        if (map->address < e->pub.addr || lo != cursor || lo > e->t.L.size ||
+            map->range.size > e->t.L.size - lo || !rc_range_valid(map->range)) {
+            result = RC_REGISTRY_STALE;
+            break;
+        }
+        uint64_t hi = lo + map->range.size;
+        cursor = hi;
+        uint32_t used = 0;
+        for (uint32_t j = start; j < source->sample_count; j++) {
+            TextureSourceSpan span = source->sample_spans[j];
+            uint64_t end = span.offset + span.size;
+            if (end <= lo) { start = j + 1; continue; }
+            if (span.offset >= hi) break;
+            uint64_t clipped_lo = span.offset > lo ? span.offset : lo;
+            uint64_t clipped_end = end < hi ? end : hi;
+            slices[used++] = (RcSourceRange){map->range.backing, map->range.offset + (clipped_lo - lo),
+                                            clipped_end - clipped_lo};
+        }
+        if (!used) continue;
+        uint32_t at = source->count++;
+        source->sample_intervals[at] = *map;
+        result = rc_registry_source_access_acquire_shaped(registry, e->t.serial, map->range, e->pub.addr,
+                                                           slices, used, &source->access[at]);
+    }
+    free(slices);
+    if (result != RC_REGISTRY_OK) return result;
+    return source->count && cursor == e->t.L.size ? RC_REGISTRY_OK : RC_REGISTRY_STALE;
+}
+
+typedef struct {
+    const Tex *entry;
+    RcRegistryPosition read;
+    const char *step;
+    RcInterval retained, opened;
+    RcRegistryHandle retained_source;
+    VkMemCanonicalSourceQualification native;
+    uint64_t start_generation, retained_generation, passed_generation, final_generation;
+    uint32_t retained_count, opened_count, pins;
+    int retained_current, captured, qualification;
+} SampleMappingRefusal;
+
+static _Thread_local SampleMappingRefusal sample_mapping_refusal;
+
+static RcRegistryResult source_mapping_qualify(const MemBackingCapture *lease, uint64_t addr, uint64_t bytes,
+                                               SampleMappingRefusal *note) {
+    if (!note) return vk_mem_canonical_source_qualify(lease, addr, bytes);
+    note->qualification = vk_mem_canonical_source_qualify_report(lease, addr, bytes, &note->native);
+    return note->qualification;
+}
+
+static RcRegistryResult source_mapping_open(Tex *e, SampleMappingRefusal *note) {
+    if (note) note->step = "open-allocation";
+    TextureSourceMapping *source=calloc(1,sizeof *source);
+    if (!source) return RC_REGISTRY_CAPACITY;
+    RcBackingResult captured=mem_backing_capture(e->pub.addr,e->t.L.size,&source->lease);
+    if (note) {
+        note->step = "open-host-capture";
+        note->captured = captured;
+        const RcInterval *parts = mem_backing_intervals(source->lease, &note->opened_count);
+        if (note->opened_count) note->opened = parts[0];
+    }
+    RcRegistryResult result = captured == RC_BACKING_ABSENT ? RC_REGISTRY_UNSUPPORTED : RC_REGISTRY_STALE;
+    if (captured==RC_BACKING_OK) {
+        uint64_t generation = vk_mem_gen();
+        if (note) note->step = "open-provider";
+        result = source_mapping_qualify(source->lease, e->pub.addr, e->t.L.size, note);
+        if (note) note->passed_generation = generation, note->final_generation = vk_mem_gen();
+        if (result != RC_REGISTRY_OK) {
+            resource_bridge.canonical_excluded += result == RC_REGISTRY_UNSUPPORTED;
+            source_mapping_free(source);
+            return result;
+        }
+        source->native_generation = generation;
+        if (!e->source_canonical) {
+            source_registration_release(e);
+            e->source_canonical = 1;
+            resource_bridge.canonical_eligible++;
+        }
+        if (note) note->step = "open-footprint";
+        result = source_sample_footprint(e, source);
+        if (result == RC_REGISTRY_OK) {
+            if (note) note->step = "open-registry-access";
+            result = source_mapping_access(e, source);
+        }
+    } else if (captured==RC_BACKING_CAPACITY) result=RC_REGISTRY_CAPACITY;
+    if (result==RC_REGISTRY_OK) {
+        e->source_mapping=source;
+        return RC_REGISTRY_OK;
+    }
+    source_mapping_free(source);
+    return result;
+}
+
+static int source_mapping_domain_current_report(const Tex *e, SampleMappingRefusal *note) {
+    TextureSourceMapping *mapped = e->source_mapping;
+    if (!mapped) return 0;
+    uint64_t generation = vk_mem_gen();
+    if (mapped->native_generation == generation) return 1;
+    if (note) note->step = "retained-provider";
+    if (source_mapping_qualify(mapped->lease, e->pub.addr, e->t.L.size, note) != RC_REGISTRY_OK) return 0;
+    if (note) note->passed_generation = generation, note->final_generation = vk_mem_gen();
+    // The actual host lease and winning provider matched. Cache only the earlier clock so any
+    // intervening publication still requires revalidation at a later use.
+    mapped->native_generation = generation;
+    return 1;
+}
+
+static int source_mapping_domain_current(const Tex *e) {
+    return source_mapping_domain_current_report(e, NULL);
+}
+
+static int source_mapping_due(const Tex *e) {
+    return !e->source_canonical && e->source_compatibility_generation != vk_mem_gen() && content_image_eligible(e);
+}
+
+static RcRegistryResult source_registration_acquire(Tex *e) {
+    SampleMappingRefusal *note = sample_mapping_refusal.entry == e ? &sample_mapping_refusal : NULL;
+    if (!e->source_canonical) {
+        if (source_mapping_due(e)) {
+            uint64_t generation = vk_mem_gen();
+            RcRegistryResult selected = source_mapping_open(e, note);
+            if (selected != RC_REGISTRY_UNSUPPORTED) return selected;
+            const uint64_t after = vk_mem_gen();
+            if (after != generation) {
+                if (note) note->step = "compatibility-generation", note->passed_generation = generation,
+                    note->final_generation = after;
+                return RC_REGISTRY_STALE;
+            }
+            e->source_compatibility_generation = generation;
+        }
+        if (note) note->step = "compatibility-access";
+        return source_compatibility_acquire(e);
+    }
+    if (e->source_mapping) {
+        const int current = mem_backing_current(e->source_mapping->lease);
+        if (note) note->retained_current = current, note->step = "retained-host";
+        if (current) return source_mapping_domain_current_report(e, note) ? RC_REGISTRY_OK : RC_REGISTRY_STALE;
+        if (e->source_mapping_pins) {
+            if (note) note->step = "retained-stale-pinned";
+            return RC_REGISTRY_STALE;
+        }
+        source_registration_release(e);
+        e->source_canonical=1;
+    }
+    return source_mapping_open(e, note);
+}
+
+static int source_private_sample(const Tex *e) {
+    // The sample's private upload can preserve bytes from before this operation. A mutable or bound image
+    // needs its own ordered native feedback proof, even if its initial source mapping was canonical.
+    return e->pub.mirrored && !e->pub.gpu_owned && !e->pub.gone && !e->gpu_dirty &&
+           !e->bound_to && !e->sfill && !e->material_writable;
+}
+
+static int source_effects_read_allowed(const Tex *e) {
+    if (!e->source_canonical) return vk_exec_effects_read_allowed(e->pub.addr,e->t.L.size);
+    const TextureSourceMapping *source=e->source_mapping;
+    if (!source_mapping_domain_current(e)) return 0;
+    int private_sample = source_private_sample(e);
+    uint32_t span = 0;
+    for (uint32_t i = 0; i < source->count; ++i) {
+        const RcInterval part = source->intervals[i];
+        if (vk_exec_effects_read_allowed_range(part.range, private_sample)) continue;
+        // A private upload with a proved sample footprint does not read the surrounding padding.
+        // Mutable images and representations that inspect the complete source keep the full guard.
+        if (!private_sample || !source->sample_count) return 0;
+        const uint64_t begin = part.address - e->pub.addr, limit = begin + part.range.size;
+        for (; span < source->sample_count; ++span) {
+            const TextureSourceSpan sample = source->sample_spans[span];
+            const uint64_t end = sample.offset + sample.size;
+            if (end <= begin) continue;
+            if (sample.offset >= limit) break;
+            const uint64_t lo = sample.offset > begin ? sample.offset : begin;
+            const uint64_t hi = end < limit ? end : limit;
+            const RcSourceRange bytes = {part.range.backing, part.range.offset + (lo - begin), hi - lo};
+            if (!vk_exec_effects_read_allowed_range(bytes, private_sample)) return 0;
+            if (end > limit) break;
+        }
+    }
+    return 1;
+}
+
+static int source_snapshot_hold(Tex *e) {
+    TextureSourceMapping *mapped=e->source_mapping;
+    if (!mapped) return !e->source_canonical && mem_read_hold(e->key.addr,e->t.L.size);
+    if (!source_mapping_domain_current(e)) return 0;
+    memcpy(mapped->copied,mapped->observed,(size_t)mapped->count*sizeof *mapped->copied);
+    if (!mem_backing_read_hold(mapped->lease)) return 0;
+    e->source_mapping_pins++;
+    return 1;
+}
+
+static void source_snapshot_copy(const Tex *e, uint8_t *copy, size_t size) {
+    const TextureSourceMapping *mapped = e->source_mapping;
+    if (!mapped || !mapped->sample_count) {
+        memcpy(copy, e->t.mem, size);
+        return;
+    }
+    memset(copy, 0, size);
+    for (uint32_t i = 0; i < mapped->sample_count; i++) {
+        TextureSourceSpan span = mapped->sample_spans[i];
+        memcpy(copy + span.offset, e->t.mem + span.offset, (size_t)span.size);
+    }
+}
+
+static int source_snapshot_current(Tex *e,const TextureSourceAuthority *proof) {
+    TextureSourceMapping *mapped=e->source_mapping;
+    RcRegistryPosition position=vk_exec_resource_position();
+    RcRegistry *r=rc_registry_runtime();
+    if (!mapped) return !e->source_canonical && texture_authority_current(r,proof,position);
+    if (!e->source_mapping_pins) return 0; // Compatibility capture cannot certify a newly selected native mapping.
+    e->source_mapping_pins--;
+    return mem_backing_current(mapped->lease) && source_mapping_domain_current(e) &&
+        rc_registry_source_proofs_current(r,mapped->copied,mapped->count,position);
+}
+
+static int source_stamp_equal(const TextureSourceStamp *a, const TextureSourceStamp *b) {
+    return a->mapping == b->mapping && a->protection == b->protection &&
+           a->lineage == b->lineage && a->generation == b->generation;
+}
+
+static void source_note_refusal(Tex *e, int stage, RcRegistryResult result) {
+    if (e->source_refusal) return;
+    e->source_refusal = (uint8_t)stage;
+    e->source_refusal_result = (uint8_t)result;
+    e->source_refusal_position = vk_exec_resource_position();
+}
+
+static int source_observe_prior(Tex *e, const TextureSourceStamp *prior, TextureSourceObservation *out,
+                                const TextureSourceAuthority *capture) {
+    resource_bridge.observed++;
     *out = (TextureSourceObservation){0};
-    if (!source_spans_init(e) || content_source_gpu_overlap(e)) {
+    e->source_blocked = 0;
+    e->source_refusal = SOURCE_REFUSAL_NONE;
+    e->source_refusal_result = RC_REGISTRY_OK;
+    RcRegistry *r = rc_registry_runtime();
+    TextureSourceAuthority prior_authority = {0};
+    int prior_observed = prior && source_stamp_equal(prior,&e->source_authority_stamp);
+    // A host stamp is a write-watch cutoff, not the identity of the registry observation. During copy
+    // verification the fresh authority belongs to the captured bytes even if older material has the same stamp.
+    int prior_committed = !capture && prior && source_stamp_equal(prior,&e->source_stamp);
+    if (capture) prior_authority = *capture;
+    else if (prior_committed) prior_authority = rc_registry_source_access_content(source_access_anchor(e));
+    else if (prior_observed) prior_authority = e->source_authority;
+    e->source_authority = (TextureSourceAuthority){0};
+    e->source_authority_stamp = (TextureSourceStamp){0};
+    if (e->released || !source_spans_init(e)) {
         texture_source_all_dirty(out, e->source_count);
         return TEX_SOURCE_UNKNOWN;
     }
-    return vk_mem_observe_subresources(e->pub.addr, e->t.L.size, prior, submit_epoch,
-                                      e->source_spans, e->source_count, out);
+    SampleMappingRefusal *mapping_note = NULL;
+    if (rt_knob("GRAPHICS_PREP_TRACE", "0") && rc_registry_position_valid(vk_exec_resource_position())) {
+        mapping_note = &sample_mapping_refusal;
+        *mapping_note = (SampleMappingRefusal){.entry = e, .read = vk_exec_resource_position(),
+            .start_generation = vk_mem_gen(), .retained_current = -1, .captured = -1, .qualification = -1,
+            .pins = e->source_mapping_pins};
+        const TextureSourceMapping *retained = e->source_mapping;
+        if (retained) {
+            const RcInterval *parts = mem_backing_intervals(retained->lease, &mapping_note->retained_count);
+            if (mapping_note->retained_count) mapping_note->retained = parts[0];
+            if (retained->count) mapping_note->retained_source = retained->access[0].owner.handle;
+            mapping_note->retained_generation = retained->native_generation;
+        }
+    }
+    RcRegistryResult acquired = source_registration_acquire(e);
+    if (mapping_note && acquired != RC_REGISTRY_STALE) mapping_note->entry = NULL;
+    if (acquired==RC_REGISTRY_OK && !source_effects_read_allowed(e)) {
+        source_note_refusal(e, SOURCE_REFUSAL_EFFECTS, RC_REGISTRY_BLOCKED);
+        e->source_blocked = 1;
+        resource_bridge.blocked++;
+        resource_bridge.canonical_blocked += e->source_canonical;
+        texture_source_all_dirty(out, e->source_count);
+        return TEX_SOURCE_UNKNOWN;
+    }
+    TextureSourceAuthority authority = {0};
+    TextureSourceMapping *mapped=e->source_mapping;
+    uint64_t scope=submit_epoch?submit_epoch:1;
+    RcRegistryPosition position=vk_exec_resource_position();
+    RcRegistryResult observed = acquired;
+    if (acquired==RC_REGISTRY_OK) {
+        if (mapped) {
+            observed=rc_registry_source_access_observe_extents(r,mapped->access,mapped->count,scope,position,mapped->next);
+            authority=mapped->next[0];
+        } else observed=rc_registry_source_access_observe(r,&e->source_access,scope,position,&authority);
+    }
+    if (acquired != RC_REGISTRY_OK || observed != RC_REGISTRY_OK) {
+        source_note_refusal(e, acquired != RC_REGISTRY_OK ? SOURCE_REFUSAL_ACQUIRE : SOURCE_REFUSAL_AUTHORITY, observed);
+        if (acquired == RC_REGISTRY_CAPACITY) resource_bridge.source_capacity++;
+        else if (acquired == RC_REGISTRY_STALE) resource_bridge.source_stale++;
+        else if (acquired != RC_REGISTRY_OK) resource_bridge.source_other++;
+        else if (observed == RC_REGISTRY_BLOCKED) resource_bridge.observe_authority++;
+        else if (observed == RC_REGISTRY_STALE) resource_bridge.observe_stale++;
+        else resource_bridge.observe_other++;
+        e->source_blocked = 1;
+        resource_bridge.blocked++;
+        resource_bridge.canonical_blocked += e->source_canonical;
+        texture_source_all_dirty(out, e->source_count);
+        return TEX_SOURCE_UNKNOWN;
+    }
+    // A new clean observation cannot bless an older CPU certificate after a GPU writer has intervened. Some
+    // direct GPU stores never set Windows CPU write-watch bits; their registry revision is the only dirty evidence.
+    if (prior && !texture_authority_same(&prior_authority, &authority)) prior = NULL;
+    for (uint32_t i=1;mapped && prior && i<mapped->count;i++) {
+        TextureSourceAuthority previous = capture ? mapped->copied[i] :
+            prior_committed ? rc_registry_source_access_content(&mapped->access[i]) : mapped->observed[i];
+        if (!texture_authority_same(&previous, &mapped->next[i])) prior = NULL;
+    }
+    int state = vk_mem_observe_subresources(e->pub.addr, e->t.L.size, prior, submit_epoch,
+                                            e->source_spans, e->source_count, out);
+    int current=mapped?mem_backing_current(mapped->lease) && source_mapping_domain_current(e) &&
+        rc_registry_source_proofs_current(r,mapped->next,mapped->count,position):texture_authority_current(r,&authority,position);
+    if (!current) {
+        source_note_refusal(e, SOURCE_REFUSAL_RACE, RC_REGISTRY_STALE);
+        resource_bridge.raced++;
+        e->source_blocked = 1;
+        resource_bridge.blocked++;
+        resource_bridge.canonical_blocked += e->source_canonical;
+        *out = (TextureSourceObservation){0};
+        texture_source_all_dirty(out, e->source_count);
+        return TEX_SOURCE_UNKNOWN;
+    }
+    // The registry covers registrations and all reported writers. Memory observation is still required for guest
+    // stores that do not call a notification hook. Neither proof alone certifies current contents.
+    if (mapped) {
+        TextureSourceAuthority *previous=mapped->observed;
+        mapped->observed=mapped->next;mapped->next=previous;
+    }
+    e->source_authority = authority;
+    e->source_authority_stamp = out->stamp;
+    if (!texture_source_stamp_valid(&out->stamp)) {
+        e->source_tracking_failure = out->tracking_failure;
+        source_note_refusal(e, SOURCE_REFUSAL_WATCH, RC_REGISTRY_UNSUPPORTED);
+    }
+    return state;
 }
 
-static void source_commit(Tex *e, const TextureSourceStamp *stamp) {
+static int source_observe(Tex *e, const TextureSourceStamp *prior, TextureSourceObservation *out) {
+    return source_observe_prior(e, prior, out, NULL);
+}
+
+static int source_snapshot_verify(Tex *e, const TextureSourceStamp *before, const TextureSourceAuthority *proof) {
+    enum { HOST_DIRTY = 1, SOURCE_MOVED = 2, MAPPING_CHANGED = 4, PROTECTION_CHANGED = 8,
+           LINEAGE_CHANGED = 16, PROVIDER_CHANGED = 32 };
+    TextureSourceObservation after;
+    int state = source_observe_prior(e, before, &after, proof);
+    // Release the pinned backing regardless of the post-copy outcome. The old proof must still cover
+    // every actual source extent at this read; a new observation cannot certify bytes after a real write.
+    int current = source_snapshot_current(e, proof);
+    unsigned mismatch = 0;
+    if (state != TEX_SOURCE_CLEAN) mismatch |= HOST_DIRTY;
+    if (!current) mismatch |= SOURCE_MOVED;
+    // The host serials may advance for other addresses. Retain the pre-copy cutoff after checking the
+    // actual source range, including protection changes that would prevent publication under that cutoff.
+    if (!mem_mapping_range_unchanged(e->pub.addr, e->t.L.size, before->mapping)) mismatch |= MAPPING_CHANGED;
+    if (!mem_protection_range_unchanged(e->pub.addr, e->t.L.size, before->protection)) mismatch |= PROTECTION_CHANGED;
+    if (after.stamp.lineage != before->lineage) mismatch |= LINEAGE_CHANGED;
+    if (!content_image_eligible(e)) mismatch |= PROVIDER_CHANGED;
+    e->source_snapshot_mismatch = (uint8_t)mismatch;
+    return !mismatch;
+}
+
+static int source_permission_at(Tex *e, RcRegistryPosition position, RcRegistryReadObservation *out) {
+    if (e->source_canonical) {
+        TextureSourceMapping *mapped=e->source_mapping;
+        if (!mapped || !mem_backing_current(mapped->lease) ||
+            rc_registry_source_access_read_extents(rc_registry_runtime(),mapped->access,mapped->count,submit_epoch,
+                                                 position,&e->source_vector_read)!=RC_REGISTRY_OK) return 0;
+        if (out) *out=e->source_vector_read;
+        return 1;
+    }
+    return rc_registry_source_access_read(rc_registry_runtime(), &e->source_access, submit_epoch,
+                                          position, out) == RC_REGISTRY_OK;
+}
+static int source_permission_current(Tex *e) {
+    if (e->source_canonical) {
+        RcRegistryPosition position=vk_exec_resource_position();
+        if (rc_registry_position_valid(position)) return source_permission_at(e,position,NULL);
+        TextureSourceMapping *mapped=e->source_mapping;
+        return mapped && mem_backing_current(mapped->lease) &&
+            rc_registry_source_access_current_extents(rc_registry_runtime(),mapped->access,mapped->count,submit_epoch,position);
+    }
+    return rc_registry_source_access_current(rc_registry_runtime(), &e->source_access, submit_epoch,
+                                             vk_exec_resource_position());
+}
+
+static const Tex *texture_source_entry_locked(int id) {
+    if (id < 0 || id >= ntslots || !tslots[id].used) return NULL;
+    const TexSlot *slot = &tslots[id];
+    const Tex *current = texture_registration_source(slot);
+    if (current) return current;
+    const Tex *e = slot->cgen == agen[sinfo[id] & 0xffff] ? slot->ce : NULL;
+    if (!e || e->t.serial != slot->t.serial) {
+        TexKey key;
+        make_key(&slot->t, &key);
+        e = nvn_hm_get(&by_key, &key);
+        if (!e || e->t.serial != slot->t.serial) return NULL;
+    }
+    return e->source_canonical ? e : NULL;
+}
+
+static void texture_source_report_locked(int logical) {
+    const Tex *e = texture_source_entry_locked(vk_texture_pool_slot_locked(vk_exec_texture_pool(), logical));
+    if (!e) return;
+    static const char *const stages[] = {"unclassified", "mapping acquisition", "operation effects", "registry authority",
+        "host write tracking", "observation race", "snapshot capacity", "snapshot mapping", "snapshot changed",
+        "snapshot commit", "no snapshot", "required restoration", "binding permission", "upload unavailable"};
+    const TextureSourceMapping *mapping = e->source_mapping;
+    RcRegistryPosition position = vk_exec_resource_position();
+    rt_log("vk: refused canonical source stage %s result %u; guest %#llx+%#llx object %llu "
+           "format %#x target %d %ux%u levels %u layers %u stride %u; backing intervals %u "
+           "recording %llu/%llu; uploaded %u retry %llu held image %#llx",
+           stages[e->source_refusal], e->source_refusal_result, (unsigned long long)e->pub.addr,
+           (unsigned long long)e->t.L.size, (unsigned long long)e->t.serial, e->t.d.format, e->t.d.target,
+           e->t.d.width, e->t.d.height, e->pub.levels, e->pub.layers,
+           nvn_tex_is_linear(&e->t.d) ? nvn_tex_linear_stride(&e->t.d) : 0,
+           mapping ? mapping->count : 0, (unsigned long long)position.scene, (unsigned long long)position.ordinal,
+           e->uploaded, (unsigned long long)e->up_retry, (unsigned long long)e->pub.image);
+    if (e->source_refusal == SOURCE_REFUSAL_SNAPSHOT_CHANGED)
+        rt_log("vk: snapshot verification mismatch bits %#x (host/authority/mapping/protection/lineage/provider)",
+               e->source_snapshot_mismatch);
+    if (!mapping) return;
+    RcRegistryPosition query = e->source_refusal == SOURCE_REFUSAL_EFFECTS ? (RcRegistryPosition){0} : position;
+    for (uint32_t i = 0; i < mapping->count; i++) {
+        const RcInterval *interval = &mapping->intervals[i];
+        RcRegistryReadBlocker blocker;
+        if (!rc_registry_diagnose_read_blocker(rc_registry_runtime(), interval->range, query, &blocker)) continue;
+        const RcRegistryDiagnosticSample *s = &blocker.sample;
+        rt_log("vk: refused source current blocker %s command guard %u origin %p at %llu/%llu, mapping %llu "
+               "guest %#llx backing %llu:%#llx+%#llx, writer %llu/%u range %llu:%#llx+%#llx producer %llu/%llu "
+               "submit %llu image %#llx guest %#llx mapping %llu flags %#x",
+               rc_registry_diagnostic_name(blocker.reason), blocker.guard_reason, (void *)blocker.writer_origin,
+               (unsigned long long)blocker.origin_position.scene, (unsigned long long)blocker.origin_position.ordinal,
+               (unsigned long long)interval->mapping, (unsigned long long)interval->address,
+               (unsigned long long)interval->range.backing, (unsigned long long)interval->range.offset,
+               (unsigned long long)interval->range.size, (unsigned long long)s->writer.id, s->writer.index,
+               (unsigned long long)s->range.backing, (unsigned long long)s->range.offset, (unsigned long long)s->range.size,
+               (unsigned long long)s->position.scene, (unsigned long long)s->position.ordinal,
+               (unsigned long long)s->submission, (unsigned long long)s->writer_image,
+               (unsigned long long)blocker.writer_address, (unsigned long long)blocker.writer_mapping, s->flags);
+        if (blocker.guard_reason == RC_REGISTRY_GUARD_GPA_PROJECTION)
+            vk_gpa_report_write_blocker(s->writer, interval->range);
+        return;
+    }
+    rt_log("vk: refused source has no current overlapping registry blocker");
+}
+
+static void source_commit(Tex *e, const TextureSourceStamp *stamp, int same_contents) {
     TextureSourceStamp saved = *stamp;
     stamp = &saved;
+    TextureSourceAuthority authority = e->source_authority;
+    TextureSourceMapping *mapped=e->source_mapping;
+    const TextureSourceAuthority *proofs=mapped?mapped->observed:&authority;
+    int paired = source_stamp_equal(stamp, &e->source_authority_stamp);
+    if (e->source_copy && source_stamp_equal(stamp, &e->source_copy_stamp)) {
+        authority = e->source_copy_authority;
+        if (mapped) proofs=mapped->copied;
+        paired = 1;
+    }
+    int retained = same_contents && texture_source_stamp_valid(&e->source_stamp);
     e->source_stamp = (TextureSourceStamp){0};
-    if (!texture_source_stamp_valid(stamp) || content_source_gpu_overlap(e) ||
+    if (!texture_source_stamp_valid(stamp) || !paired ||
         !mem_mapping_range_unchanged(e->pub.addr, e->t.L.size, stamp->mapping) ||
         !mem_protection_range_unchanged(e->pub.addr, e->t.L.size, stamp->protection)) return;
+    // Native cutoff validation precedes the service commit. That commit owns the distinction between unchanged
+    // copied bytes and current read permission; retaining a cutoff alone never authorizes another consumer.
+    int changed;
+    if (e->source_canonical && (!mapped || !mem_backing_current(mapped->lease))) return;
+    RcRegistryResult committed=mapped?rc_registry_source_access_commit_extents(rc_registry_runtime(),mapped->access,
+        proofs,mapped->count,retained,&changed):rc_registry_source_access_commit(rc_registry_runtime(),&e->source_access,
+        &authority,retained,&changed);
+    if (committed!=RC_REGISTRY_OK) return;
     e->source_stamp = *stamp;
+    if (changed) e->material_version = (RcRegistryReadVersion){0};
+    e->binding_proof = e->pool_binding_proof = (TextureBindingProof){0};
     e->wgen = stamp->generation;
 }
 
 #include "vk_texture_content.h"
+#include "vk_texture_uses.h"
+#include "vk_recording_part.h"
+
+VkRecordingPartDisposition *vk_recording_part_disposition_capture(uint64_t fence) {
+    if (!fence || fence != vk_exec_recording_fence()) return NULL;
+    lock();
+    // An otherwise empty batch carries the queue's existing exact part leaf. No texture use is added.
+    TextureUseBatch *batch = texture_use_active(fence, 1);
+    VkRecordingPartDisposition *part = batch ? texture_use_part_retain(batch) : NULL;
+    unlock();
+    return part;
+}
+
+int vk_recording_part_disposition_handed(const VkRecordingPartDisposition *part) {
+    return part && __atomic_load_n(&part->handover, __ATOMIC_ACQUIRE) == TEXTURE_BATCH_HANDED;
+}
+
+void vk_recording_part_disposition_release(VkRecordingPartDisposition *part) {
+    texture_use_part_release(part);
+}
+
+typedef struct PackedStorageWrite {
+    Tex *owner;
+    VkImage image;
+    TextureUsePartDisposition *part;
+    RcRegistryPosition output;
+    uint64_t frame;
+} PackedStorageWrite;
+
+enum { PACKED_STORAGE_WRITE_LIMIT = 1024 };
+static PackedStorageWrite packed_storage_writes[PACKED_STORAGE_WRITE_LIMIT];
+static uint32_t packed_storage_count;
+static uint64_t packed_storage_collect_frame;
+static uint64_t packed_storage_suspend_frame;
+static int packed_storage_suspended;
+
+static void packed_storage_write_drop(uint32_t index) {
+    const PackedStorageWrite write = packed_storage_writes[index];
+    write.owner->packed_storage_writes--;
+    texture_use_part_release(write.part);
+    packed_storage_writes[index] = packed_storage_writes[--packed_storage_count];
+}
+
+static void packed_storage_writes_drop(Tex *entry) {
+    for (uint32_t i = 0; entry->packed_storage_writes && i < packed_storage_count;) {
+        if (packed_storage_writes[i].owner == entry) packed_storage_write_drop(i);
+        else ++i;
+    }
+}
+
+static int packed_storage_format(VkFormat format) {
+    return format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 || format == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
+}
+
+static void packed_storage_collect(uint64_t frame) {
+    packed_storage_collect_frame = frame;
+    if (packed_storage_suspended && frame - packed_storage_suspend_frame > 1)
+        packed_storage_suspended = 0;
+    for (uint32_t i = 0; i < packed_storage_count;) {
+        const PackedStorageWrite *write = &packed_storage_writes[i];
+        const uint32_t state = __atomic_load_n(&write->part->handover, __ATOMIC_ACQUIRE);
+        const TextureUseBatch *active = state == TEXTURE_BATCH_RECORDING ?
+            texture_use_active(write->output.scene, 0) : NULL;
+        if (frame - write->frame > 1 || state == TEXTURE_BATCH_ABANDONED ||
+            (state == TEXTURE_BATCH_RECORDING && (!active || active->part != write->part))) {
+            packed_storage_write_drop(i);
+        } else {
+            ++i;
+        }
+    }
+}
+
+static void packed_storage_write_add(Tex *entry, RcRegistryPosition output, uint64_t frame) {
+    if (packed_storage_collect_frame != frame || packed_storage_count == PACKED_STORAGE_WRITE_LIMIT)
+        packed_storage_collect(frame);
+    if (packed_storage_suspended) return;
+    TextureUseBatch *active = texture_use_active(output.scene, 0);
+    for (uint32_t i = 0; entry->packed_storage_writes && active && i < packed_storage_count; ++i) {
+        const PackedStorageWrite *write = &packed_storage_writes[i];
+        if (write->owner == entry && write->part == active->part &&
+            !rc_registry_position_compare(write->output, output)) return;
+    }
+    if (packed_storage_count == PACKED_STORAGE_WRITE_LIMIT) {
+        // A missing write can change the winner across siblings. Suspend the whole short history.
+        while (packed_storage_count) packed_storage_write_drop(packed_storage_count - 1);
+        packed_storage_suspended = 1;
+        packed_storage_suspend_frame = frame;
+        return;
+    }
+    if (!active) active = texture_use_active(output.scene, 1);
+    packed_storage_writes[packed_storage_count++] = (PackedStorageWrite){
+        .owner = entry, .image = entry->pub.image, .part = texture_use_part_retain(active),
+        .output = output, .frame = frame};
+    entry->packed_storage_writes++;
+}
+
+static int packed_storage_entry_live(const Tex *entry) {
+    return entry && !entry->released && !entry->retiring && !entry->superseded && !entry->overwritten &&
+        !entry->pub.gone && entry->pub.image && packed_storage_format(entry->pub.format);
+}
+
+static void packed_storage_owner_issued_locked(Tex *entry, VkImage image, RcRegistryPosition output) {
+    if (!packed_storage_entry_live(entry) || !image || image != entry->pub.image ||
+        !rc_registry_position_valid(output) || (output.ordinal & 1) || output.scene != vk_exec_recording_fence() ||
+        rc_registry_position_compare(output, vk_exec_resource_position()) || vk_exec_recording_failed()) return;
+    output.ordinal |= 1;
+    packed_storage_write_add(entry, output, __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED));
+}
+
+void vk_texture_packed_storage_issued(VkImage image, uint64_t address) {
+    if (!image || vk_exec_recording_failed()) return;
+    lock();
+    for (Tex *entry = nvn_hm_get(&by_addr, &address); entry; entry = entry->next_at) {
+        if (entry->pub.image != image || !packed_storage_entry_live(entry)) continue;
+        packed_storage_owner_issued_locked(entry, image, vk_exec_resource_position());
+        break;
+    }
+    unlock();
+}
+
+int vk_texture_packed_storage_rank_available_locked(void) {
+    const uint64_t frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+    if (packed_storage_collect_frame != frame) packed_storage_collect(frame);
+    return !packed_storage_suspended;
+}
+
+static int image_alias_guest_mapping_current(uint64_t, uint64_t, const RcInterval *, uint32_t);
+
+static int packed_storage_mapping_current(const Tex *entry) {
+    if (entry->image_device_count || entry->image_private_mapping_count) {
+        uint32_t count;
+        const RcInterval *mapping = image_backing_intervals(entry, &count);
+        return image_alias_guest_mapping_current(entry->pub.addr, entry->t.L.size, mapping, count);
+    }
+    return entry->image_host_backing && mem_backing_current(entry->image_host_backing);
+}
+
+RcRegistryPosition vk_texture_packed_storage_output_locked(const VkTexImage *image, RcRegistryPosition cut) {
+    RcRegistryPosition output = {0};
+    if (!image || !image->image || image->gone || !packed_storage_format(image->format) ||
+        !rc_registry_position_valid(cut)) return output;
+    const Tex *entry = (const Tex *)image;
+    if (!entry->packed_storage_writes || !packed_storage_entry_live(entry) ||
+        !vk_texture_packed_storage_rank_available_locked()) return output;
+    const TextureUseBatch *active = cut.scene == vk_exec_recording_fence() ? texture_use_active(cut.scene, 0) : NULL;
+    for (uint32_t i = 0; i < packed_storage_count; ++i) {
+        const PackedStorageWrite *write = &packed_storage_writes[i];
+        if (write->owner != entry || write->image != image->image) continue;
+        if (rc_registry_position_compare(write->output, cut) > 0 ||
+            rc_registry_position_compare(write->output, output) <= 0) continue;
+        const uint32_t state = __atomic_load_n(&write->part->handover, __ATOMIC_ACQUIRE);
+        if (state == TEXTURE_BATCH_HANDED ||
+            (state == TEXTURE_BATCH_RECORDING && active && active->part == write->part))
+            output = write->output;
+    }
+    return rc_registry_position_valid(output) && packed_storage_mapping_current(entry) ? output : (RcRegistryPosition){0};
+}
+
+static void storage_host_init_drop(Tex *entry) {
+    texture_use_part_release(entry->host_storage_init_part);
+    entry->host_storage_init_part = NULL;
+}
+
+static void storage_host_init_capture(Tex *entry, RcRegistryPosition position) {
+    if (!rc_registry_position_valid(position)) return;
+    TextureUseBatch *part = texture_use_active(position.scene, 1);
+    if (part) entry->host_storage_init_part = texture_use_part_retain(part);
+}
+#include "vk_texture_pool_names.h"
+#include "vk_texture_registrations.h"
+
+static int source_upload_retain_current(Tex *e) {
+    // Restoration borrowed the exact previously selected material. Its source is deliberately historical.
+    if (e->source_borrowed) return 1;
+    TextureSourceMapping *mapped = e->source_mapping;
+    RcRegistryPosition position = vk_exec_resource_position();
+    return mapped && !rc_registry_position_compare(e->source_copy_authority.ordered.position, position) &&
+        mem_backing_current(mapped->lease) && source_mapping_domain_current(e) &&
+        rc_registry_source_proofs_current(rc_registry_runtime(), mapped->copied, mapped->count, position);
+}
+
+static int source_upload_prepare(Tex *e, const TextureSourceObservation *observed, TextureSourceObservation *observation) {
+    // Creation can stage a convenience capture before the consuming operation. A current upload needs a
+    // capture at its own authorized position; an older private payload cannot certify today's bytes.
+    if (e->source_canonical && e->source_copy && !source_upload_retain_current(e))
+        content_source_discard(e);
+    int retry_capture = 0;
+    if (observed && e->source_canonical && !e->source_copy && e->source_refusal) {
+        retry_capture = e->source_refusal_result == RC_REGISTRY_STALE &&
+            (e->source_refusal == SOURCE_REFUSAL_SNAPSHOT_MAPPING ||
+             e->source_refusal == SOURCE_REFUSAL_SNAPSHOT_CHANGED ||
+             e->source_refusal == SOURCE_REFUSAL_SNAPSHOT_COMMIT ||
+             e->source_refusal == SOURCE_REFUSAL_RACE);
+        // This operation already attempted canonical preparation. Keep a real writer, policy or capacity
+        // refusal attached to it rather than replacing the evidence with an unpaired late observation.
+        if (!retry_capture) { e->source_blocked = 1; return 0; }
+    }
+    if (observed) *observation = *observed;
+    else if (!e->source_copy) source_observe(e, NULL, observation);
+    // Optional preparation may have advanced the scratch observation without retaining a source capture.
+    // Re-observe before this upload reads any bytes; a later observation must never certify an earlier copy.
+    if (!e->source_copy && observed &&
+        (retry_capture || !source_stamp_equal(&observation->stamp, &e->source_authority_stamp)))
+        source_observe(e, NULL, observation);
+    // A newly available or revalidated source gets one required capture attempt at the same read position.
+    // Only its owned bytes can cross the upload boundary.
+    if (e->source_canonical && !e->source_copy && !e->source_blocked &&
+        texture_source_stamp_valid(&observation->stamp)) {
+        if (vk_exec_turn_due()) { tex_deferred = 1; return 0; }
+        if (content_early_prepare(e) || tex_deferred) return 0;
+    }
+    if (e->source_canonical && !e->source_copy) {
+        source_note_refusal(e, SOURCE_REFUSAL_SNAPSHOT_MISSING, RC_REGISTRY_UNSUPPORTED);
+        e->source_blocked=1;
+        return 0;
+    }
+    return 1;
+}
 
 static void upload(Tex *e, const VkDirtyPages *dirty, int tracked, const TextureSourceObservation *observed) {
     if (e->material && vk_exec_turn_due()) { tex_deferred = 1; return; }
     TextureSourceObservation observation = {0};
-    if (observed) observation = *observed;
-    else source_observe(e, NULL, &observation);
+    if (!source_upload_prepare(e, observed, &observation)) return;
     int snapshot = e->source_copy != NULL;
-    TextureSourceStamp cutoff = snapshot ? e->source_stamp : observation.stamp;
+    TextureSourceStamp cutoff = snapshot ? e->source_copy_stamp : observation.stamp;
     uint8_t material_digest[32];
     int material_ready = snapshot && e->source_digest_valid;
     if (material_ready) memcpy(material_digest, e->source_digest, sizeof material_digest);
     // Earlier draws keep the old immutable version, even if this is its only current logical association.
-    content_write_begin(e, !snapshot);
+    if (!content_write_begin(e, !snapshot)) return;
+    e->sample_upload_sequence = 0;
+    uint64_t sample_upload_sequence = 0;
     content_image_forget(e);
     static volatile int32_t n_bad, n_undecoded, n_split;
     int source_complete = 1;
     int no_mem = 0;   // a part's ASTC decode had no memory: the texture is uploaded again later
-    tex_t source = e->t;
+    tex_t source = e->source_recipe ? *e->source_recipe : e->t;
     if (snapshot) source.mem = e->source_copy;
     const tex_t *t = &source;
     const nvn_texdesc *d = &t->d;
@@ -3713,7 +5575,7 @@ static void upload(Tex *e, const VkDirtyPages *dirty, int tracked, const Texture
             prior_protection = observation.stamp.protection;
         }
     }
-    if (!partial && can_retain && !check && dirty && dirty->hi > dirty->lo && prior_map) {
+    if (!snapshot && !partial && can_retain && !check && dirty && dirty->hi > dirty->lo && prior_map) {
         uint32_t keep = 0;
         uint64_t included = 0, packed = 0;
         for (k = 0; k < n; k++) {
@@ -3739,9 +5601,9 @@ static void upload(Tex *e, const VkDirtyPages *dirty, int tracked, const Texture
             partial = 1;
         }
     }
-    // A CPU decode or copy stages at most UPLOAD_PART bytes per staging buffer (a region larger than that alone) and
-    // records one copy per buffer; every part stays in the same upload batch, submitted as before. The GPU decoder
-    // takes the raw blocks of every region from one buffer.
+    // A CPU decode or copy stages at most UPLOAD_PART bytes per staging buffer (a larger region alone), recording
+    // one copy per buffer. Each completed part may checkpoint the upload batch; queue order preserves its barriers.
+    // The GPU decoder takes the raw blocks of every region from one buffer.
     for (uint32_t k0 = 0, k1; k0 < n; k0 = k1) {
         VkDeviceSize base = gdsw ? 0 : rg[k0].bufferOffset;
         k1 = agpu ? n : k0 + 1;
@@ -3757,6 +5619,7 @@ static void upload(Tex *e, const VkDirtyPages *dirty, int tracked, const Texture
         }
         if (k0) parts++;
         VkCommandBuffer cb = vk_upload_begin();
+        sample_upload_sequence = vk_upload_recording_sequence(cb);
         // The part stages in a range of the staging arena (vk_staging_at, its offset added to the regions below), or in
         // a buffer of its own at offset 0 when larger than an arena range; the GPU decoder takes one with
         // NX2NAVI_ASTC_ARENA=0 or in the check mode (astc_arena).
@@ -3900,7 +5763,7 @@ static void upload(Tex *e, const VkDirtyPages *dirty, int tracked, const Texture
             vmaInvalidateAllocation(vk_ctx()->vma, ralloc, 0, VK_WHOLE_SIZE);
             astc_check(e, raw_copy, ar, (int)n, rmap);
         }
-        vmaDestroyBuffer(vk_ctx()->vma, rbuf, ralloc);
+        resource_core_vma_destroy_buffer(vk_ctx()->vma, rbuf, ralloc);
     }
     free(raw_copy);
     free(ar);
@@ -3947,13 +5810,639 @@ static void upload(Tex *e, const VkDirtyPages *dirty, int tracked, const Texture
         e->up_retry = 0;
     }
     if (e->uploaded && !no_mem && source_complete) {
-        source_commit(e, &cutoff);
+        if (checked > 0) e->sample_upload_sequence = sample_upload_sequence;
+        source_commit(e, &cutoff, 0);
         if (material_ready) content_image_publish(e, material_digest, t->L.size);
     }
     content_source_discard(e);
     perf_end(PERF_TEX, p0);
     vk_texstat_time(VK_TS_UPLOAD, u0);
     vk_texstat_add(VK_TS_UPLOAD, 0, src_bytes);
+}
+
+static void content_upload_reconstructed(Tex *e) {
+    upload(e, NULL, 0, NULL);
+}
+
+static uint32_t content_recovery_domains(const Tex *e) {
+    uint32_t domains = (1u << RC_BUDGET_RAM) | (1u << RC_BUDGET_COMMIT);
+    const VkMemoryRequirements *requirements = nvn_hm_get(&img_reqs, &e->ik);
+    const VkPhysicalDeviceMemoryProperties *memory = &vk_ctx()->mem_props;
+    for (uint32_t i = 0; i < memory->memoryTypeCount; i++)
+        if (!requirements || (requirements->memoryTypeBits & (1u << i))) {
+            uint32_t heap = memory->memoryTypes[i].heapIndex;
+            if (heap < RC_BUDGET_GPU_HEAPS) domains |= 1u << (RC_BUDGET_GPU_FIRST + heap);
+        }
+    return domains;
+}
+
+typedef struct {
+    VkBufferImageCopy *regions;
+    uint8_t *scratch;
+    TextureMaterial *material;
+    MaterialSource *provider;
+    RcBudgetTicket ticket;
+    RcAdmissionVector retry_peak;
+    uint32_t count;
+    VkDeviceSize bytes;
+    size_t workspace;
+} TextureRecoveryCopy;
+
+// The first prepared upload consumes one ordinary CPU-copy span. Other recipes keep their current drawable
+// image until the corresponding conversion and segmented staging producers have an admitted transaction.
+static int recovery_copy_layout(const Tex *e, TextureRecoveryCopy *copy) {
+    const nvn_texdesc *d = &e->t.d;
+    int bw, bh;
+    int bpb = nvn_fmt_bpb(d->format, &bw, &bh);
+    if (!bpb || e->f.astc_bw || e->pub.skip || e->pub.type != VK_IMAGE_TYPE_2D) return 0;
+    uint32_t levels = e->pub.levels, layers = e->pub.layers;
+    if (nvn_tex_is_linear(d)) levels = layers = 1;
+    if (!levels || !layers || layers > UINT32_MAX / levels) return 0;
+    copy->count = levels * layers;
+    VkDeviceSize end = 0;
+    size_t scratch = 0;
+    uint32_t k = 0;
+    for (uint32_t lv = 0; lv < levels; lv++) {
+        uint32_t w = mip(d->width, lv), h = mip(d->height, lv);
+        uint64_t columns = ((uint64_t)w + bw - 1) / bw, rows = ((uint64_t)h + bh - 1) / bh;
+        uint64_t row_bytes = columns * bpb;
+        if (!row_bytes || rows > UPLOAD_PART / row_bytes) return 0;
+        uint64_t raw = row_bytes * rows;
+        uint64_t output = e->f.expand_rgb ? raw / 3 * 4 : raw;
+        if (output > UPLOAD_PART - end) return 0;
+        if (e->f.expand_rgb && raw > scratch) scratch = (size_t)raw;
+        for (uint32_t ly = 0; ly < layers; ly++) {
+            if (output > UPLOAD_PART - end) return 0;
+            if (copy->regions) copy->regions[k] = (VkBufferImageCopy){.bufferOffset = end,
+                .bufferRowLength = (uint32_t)(columns * bw), .bufferImageHeight = (uint32_t)(rows * bh),
+                .imageSubresource = {e->pub.aspect, lv, ly, 1}, .imageExtent = {w, h, 1}};
+            end += (output + 15) & ~15ull;
+            k++;
+        }
+    }
+    if (!end || end > UPLOAD_PART || copy->count > (SIZE_MAX - scratch) / sizeof *copy->regions) return 0;
+    copy->bytes = end;
+    copy->workspace = copy->count * sizeof *copy->regions + scratch;
+    return 1;
+}
+
+static int recovery_copy_fill(const Tex *e, const TextureRecoveryCopy *copy, uint8_t *stage) {
+    int bw, bh;
+    const nvn_texdesc *d = &e->t.d;
+    int bpb = nvn_fmt_bpb(d->format, &bw, &bh);
+    for (uint32_t i = 0; i < copy->count; i++) {
+        const VkBufferImageCopy *r = &copy->regions[i];
+        uint32_t row = r->bufferRowLength / (uint32_t)bw * (uint32_t)bpb;
+        uint8_t *dest = stage + r->bufferOffset;
+        if (nvn_deswizzle(d, r->imageSubresource.mipLevel, r->imageSubresource.baseArrayLayer,
+                          e->source_copy, e->f.expand_rgb ? copy->scratch : dest, row)) return 0;
+        if (e->f.expand_rgb) expand_rgb(d->format, copy->scratch, dest, (size_t)r->imageExtent.width * r->imageExtent.height);
+    }
+    return 1;
+}
+
+static int content_recover_prepare(Tex *e, TextureRecoveryCopy *copy, VkPreparedStaging *stage,
+                                   VkImage *image, VmaAllocation *allocation) {
+    const ImgKey *k = &e->ik;
+    VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = k->flags,
+        .imageType = (VkImageType)k->type, .format = (VkFormat)k->format, .extent = {k->w, k->h, k->d},
+        .mipLevels = k->levels, .arrayLayers = k->layers, .samples = (VkSampleCountFlagBits)k->samples,
+        .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = k->usage, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+    RcVmaRequest request = {.producer = RC_BUDGET_TEXTURE};
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    VmaAllocationCreateInfo placement;
+    RcAdmissionVector peak, staging;
+    if (resource_core_vma_image_peak(&request, &ci, &ai, &placement, &peak) != VK_SUCCESS ||
+        vk_staging_prepare_plan(copy->bytes, stage, &staging) != VK_SUCCESS) return 0;
+    RcAdmissionVector work = {{0}};
+    work.amount[RC_BUDGET_RAM] = work.amount[RC_BUDGET_COMMIT] = copy->workspace + sizeof *copy->provider +
+        sizeof(TextureMaterial) + sizeof(TextureMaterialInstance);
+    for (uint32_t d = 0; d < RC_ADMISSION_MAX_DOMAINS; d++) {
+        if (staging.amount[d] > UINT64_MAX - peak.amount[d]) return 0;
+        peak.amount[d] += staging.amount[d];
+        if (work.amount[d] > UINT64_MAX - peak.amount[d]) return 0;
+        peak.amount[d] += work.amount[d];
+    }
+    copy->retry_peak = peak;
+    // A refused optional promotion discards its temporary source. A later promotion must cover that new capture too.
+    for (uint32_t d = RC_BUDGET_RAM; d <= RC_BUDGET_COMMIT; d++) {
+        if (e->source_copy_size > UINT64_MAX - copy->retry_peak.amount[d]) return 0;
+        copy->retry_peak.amount[d] += e->source_copy_size;
+    }
+    if (resource_core_budget_reserve(RC_BUDGET_TEXTURE, 0, &peak, &copy->ticket) != RC_ADMISSION_OK) return 0;
+    request.peak_ticket = &copy->ticket;
+    VkCtx *c = vk_ctx();
+    copy->regions = malloc(copy->workspace);
+    copy->provider = malloc(sizeof *copy->provider);
+    copy->material = malloc(sizeof *copy->material);
+    if (!copy->regions || !copy->provider || !copy->material) return 0;
+    copy->scratch = (uint8_t *)(copy->regions + copy->count);
+    return recovery_copy_layout(e, copy) && vk_staging_prepare_allocate(stage, &copy->ticket, 0) == VK_SUCCESS &&
+        recovery_copy_fill(e, copy, stage->map) &&
+        resource_core_vma_create_image(&request, c->vma, &ci, &placement, image, allocation, NULL, NULL) == VK_SUCCESS;
+}
+
+static void content_recover_finish(TextureRecoveryCopy *copy, VkPreparedStaging *stage) {
+    free(copy->regions);
+    free(copy->provider);
+    vk_staging_prepare_cancel(stage);
+    if (copy->ticket.token.ledger && resource_core_budget_cancel(&copy->ticket) != RC_ADMISSION_OK)
+        rt_fatal("vk: material recovery lost its preparation reservation");
+}
+
+static VkImageCreateInfo write_target_image_info(const VkTextureWriteTarget *);
+static VkResult write_target_create(VkTextureWriteTarget *, const VkImageCreateInfo *, const VmaAllocationCreateInfo *,
+                                    const RcVmaRequest *, RcAdmissionStatus *);
+static void write_target_release_allocation(VkTextureWriteTarget *);
+static VkTextureRestore *write_target_seed(const VkTextureWriteTarget *);
+static void write_target_seed_recorded(VkTextureWriteTarget *);
+static VkImage write_target_allocation(const VkTextureWriteTarget *);
+
+struct VkTextureRestore {
+    TextureMaterial *material;
+    MaterialSource *source;
+    TextureMaterialUse use;
+    VkTextureWriteTarget *write_target;
+    VkTexImage picture;
+    TextureRecoveryCopy copy;
+    VkPreparedStaging stage;
+    VkImage image;
+    VmaAllocation allocation;
+    VkDeviceSize staging_bytes, seed_offset;
+    RcAdmissionVector cached_stage_peak, cached_stage_reuse;
+    int staging_missing, cached_stage_can_reuse;
+    uint64_t sample_registration;
+    int sample_native;
+    RcRegistryPosition sample_read;
+    TextureSourceStamp sample_stamp;
+    int sample_logical;
+};
+static uint64_t ordered_restorations;
+
+int vk_texture_restore_probe_evict(const tex_t *t) {
+    lock();
+    TexKey key;
+    make_key(t, &key);
+    Tex *e = nvn_hm_get(&by_key, &key);
+    int evicted = e && e->t.serial == t->serial && e->source_canonical && e->material && e->material->provider &&
+        content_residency_reclaimable(e->material, 1) && content_detach_residency(e->material);
+    unlock();
+    return evicted;
+}
+
+uint64_t vk_texture_restore_probe_count(void) {
+    lock();
+    uint64_t count = ordered_restorations;
+    unlock();
+    return count;
+}
+
+static Tex restore_recipe(const MaterialSource *source, const ImgKey *key) {
+    return (Tex){.t = source->recipe, .pub = source->representation, .f = source->format, .ik = *key,
+                 .source_copy = source->bytes};
+}
+
+static int restore_plan_locked(Tex *e, uint64_t serial, TextureRecoveryCopy *copy, TextureSourceStamp *stamp) {
+    TextureMaterial *m = e ? e->material : NULL;
+    MaterialSource *p = m ? m->provider : NULL;
+    if (!p || !m->ready || m->retired || m->resident.image || !rc_input_exact(&m->input) || e->pub.image ||
+        e->released || e->t.serial != serial || !e->source_canonical || !content_image_eligible(e)) return 0;
+    Tex recipe = restore_recipe(p, &m->key);
+    TextureSourceObservation observation;
+    *copy = (TextureRecoveryCopy){0};
+    if (!recovery_copy_layout(&recipe, copy) || source_observe(e, &e->source_stamp, &observation) != TEX_SOURCE_CLEAN)
+        return 0;
+    *stamp = observation.stamp;
+    return 1;
+}
+
+static VkTextureRestore *restore_take_plan_locked(Tex *e, const TextureRecoveryCopy *copy, const TextureSourceStamp *stamp) {
+    TextureMaterial *m = e->material;
+    MaterialSource *p = m->provider;
+    VkTextureRestore *restore = calloc(1, sizeof *restore);
+    if (!restore || p->restore_refs == UINT32_MAX) rt_fatal("vk: texture restoration receipt capacity exhausted");
+    texture_material_acquire(m, 0);
+    p->restore_refs++;
+    restore->source = p;
+    restore->material = m;
+    restore->copy = *copy;
+    restore->picture = p->representation;
+    restore->picture.addr = (uintptr_t)e->t.mem;
+    restore->sample_stamp = *stamp;
+    return restore;
+}
+
+static VkTextureRestore *restore_capture_locked(Tex *e, uint64_t serial) {
+    TextureRecoveryCopy copy;
+    TextureSourceStamp stamp;
+    return restore_plan_locked(e, serial, &copy, &stamp) ? restore_take_plan_locked(e, &copy, &stamp) : NULL;
+}
+
+VkTextureRestore *vk_texture_restore_capture(const tex_t *t, VkTexImage *shape) {
+    if (!t || !t->mem) return NULL;
+    lock();
+    TexKey key;
+    make_key(t, &key);
+    VkTextureRestore *restore = restore_capture_locked(nvn_hm_get(&by_key, &key), t->serial);
+    if (restore) *shape = restore->picture;
+    unlock();
+    return restore;
+}
+
+void vk_texture_restore_pair_write_target(VkTextureRestore *restore, VkTextureWriteTarget *target) {
+    if (restore->write_target || !vk_texture_write_target_needs_allocation(target))
+        rt_fatal("vk: paired texture restore requires a fresh private destination");
+    restore->write_target = target;
+}
+
+static int restore_peak_add(RcAdmissionVector *total, const RcAdmissionVector *add) {
+    for (uint32_t i = 0; i < RC_ADMISSION_MAX_DOMAINS; ++i) {
+        if (add->amount[i] > UINT64_MAX - total->amount[i]) return 0;
+        total->amount[i] += add->amount[i];
+    }
+    return 1;
+}
+
+static VkResult restore_copy_workspace(VkTextureRestore *restore) {
+    TextureRecoveryCopy *copy = &restore->copy;
+    copy->regions = malloc(copy->workspace);
+    if (!copy->regions) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    copy->scratch = (uint8_t *)(copy->regions + copy->count);
+    Tex recipe = restore_recipe(restore->source, &restore->material->key);
+    return recovery_copy_layout(&recipe, copy) ? VK_SUCCESS : VK_ERROR_FORMAT_NOT_SUPPORTED;
+}
+
+static int restore_fill_stage(const VkTextureRestore *restore, uint8_t *map) {
+    Tex recipe = restore_recipe(restore->source, &restore->material->key);
+    return recovery_copy_fill(&recipe, &restore->copy, map);
+}
+
+static void restore_attempt_cancel(VkTextureRestore *restore) {
+    if (restore->image) resource_core_vma_destroy_image(vk_ctx()->vma, restore->image, restore->allocation);
+    restore->image = VK_NULL_HANDLE;
+    restore->allocation = NULL;
+    free(restore->copy.regions);
+    restore->copy.regions = NULL;
+    restore->copy.scratch = NULL;
+    vk_staging_prepare_cancel(&restore->stage);
+    if (restore->copy.ticket.token.ledger && resource_core_budget_cancel(&restore->copy.ticket) != RC_ADMISSION_OK)
+        rt_fatal("vk: exact texture restore lost its capacity reservation");
+}
+
+VkResult vk_texture_restore_prepare(VkTextureRestore *restore, RcVmaDependency *dependency) {
+    *dependency = (RcVmaDependency){0};
+    restore->staging_missing = 0;
+    lock();
+    int resident = restore->material->resident.image != VK_NULL_HANDLE;
+    if (resident && !restore->use.instance && texture_material_use_begin(restore->material, &restore->use) != RC_LIFETIME_OK)
+        rt_fatal("vk: exact texture restore could not retain another producer's native image");
+    unlock();
+    VkTextureWriteTarget *target = restore->write_target;
+    VkTextureRestore *seed = target ? write_target_seed(target) : NULL;
+    int needs_source = !restore->use.instance;
+    if (!needs_source && !seed) return target ? vk_texture_write_target_allocate(target, dependency) : VK_SUCCESS;
+    const ImgKey *key = &restore->material->key;
+    VkImageCreateInfo image_info = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = key->flags,
+        .imageType = (VkImageType)key->type, .format = (VkFormat)key->format, .extent = {key->w,key->h,key->d},
+        .mipLevels = key->levels, .arrayLayers = key->layers, .samples = (VkSampleCountFlagBits)key->samples,
+        .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = key->usage, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+    RcVmaRequest request = {.producer = RC_BUDGET_TEXTURE, .required = 1, .dependency = dependency};
+    VmaAllocationCreateInfo settings = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE}, placement;
+    RcAdmissionVector image_peak = {{0}}, stage_peak;
+    VkResult result;
+    if (needs_source) {
+        result = resource_core_vma_image_peak(&request, &image_info, &settings, &placement, &image_peak);
+        if (result != VK_SUCCESS) return result;
+    }
+    VkImageCreateInfo target_info;
+    VmaAllocationCreateInfo target_placement;
+    if (target) {
+        target_info = write_target_image_info(target);
+        RcVmaRequest companion = request;
+        RcVmaDependency target_dependency;
+        if (needs_source) companion.dependency = &target_dependency;
+        RcAdmissionVector target_peak;
+        result = resource_core_vma_image_peak(&companion, &target_info, &settings, &target_placement, &target_peak);
+        if (result != VK_SUCCESS) return result;
+        if (!restore_peak_add(&image_peak, &target_peak)) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        if (needs_source)
+            dependency->can_reuse = dependency->can_reuse && target_dependency.can_reuse &&
+                                    restore_peak_add(&dependency->reuse, &target_dependency.reuse);
+    }
+    resource_core_budget_readiness(1, &dependency->before);
+    TextureRecoveryCopy *copy = &restore->copy;
+    // Each recipe has aligned copy offsets. Pack both retained payloads in one staging acquisition.
+    restore->seed_offset = needs_source ? copy->bytes : 0;
+    restore->staging_bytes = restore->seed_offset + (seed ? seed->copy.bytes : 0);
+    result = vk_staging_prepare_plan(restore->staging_bytes, &restore->stage, &stage_peak);
+    if (result != VK_SUCCESS) return result == VK_NOT_READY ? VK_ERROR_INITIALIZATION_FAILED : result;
+    restore->staging_missing = !restore->stage.buffer;
+
+    RcAdmissionVector work = {{0}};
+    if (needs_source) work.amount[RC_BUDGET_RAM] = copy->workspace + sizeof(TextureMaterialInstance);
+    if (seed) work.amount[RC_BUDGET_RAM] += seed->copy.workspace;
+    work.amount[RC_BUDGET_COMMIT] = work.amount[RC_BUDGET_RAM];
+    restore->cached_stage_reuse = dependency->reuse;
+    restore->cached_stage_can_reuse = dependency->can_reuse && restore_peak_add(&restore->cached_stage_reuse, &work);
+    dependency->reuse = restore->cached_stage_reuse;
+    dependency->can_reuse = restore->cached_stage_can_reuse && restore_peak_add(&dependency->reuse, &stage_peak);
+    restore->cached_stage_peak = image_peak;
+    if (!restore_peak_add(&restore->cached_stage_peak, &work)) {
+        result = VK_ERROR_OUT_OF_HOST_MEMORY;
+        goto failed;
+    }
+    dependency->peak = restore->cached_stage_peak;
+    if (!restore_peak_add(&dependency->peak, &stage_peak)) {
+        result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        goto failed;
+    }
+    dependency->selected = 1;
+    int reuse_only = 0;
+    RcAdmissionStatus admitted = resource_core_budget_reserve(RC_BUDGET_TEXTURE, 1, &dependency->peak, &copy->ticket);
+    if (admitted == RC_ADMISSION_REFUSED && dependency->can_reuse) {
+        admitted = resource_core_budget_reserve(RC_BUDGET_TEXTURE, 1, &dependency->reuse, &copy->ticket);
+        if (admitted == RC_ADMISSION_OK) {
+            reuse_only = 1;
+            if (needs_source) placement.flags |= VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT;
+            if (target) target_placement.flags |= VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT;
+        } else dependency->reuse_unattempted = 1;
+    }
+    if (admitted != RC_ADMISSION_OK) {
+        result = admitted == RC_ADMISSION_REFUSED || admitted == RC_ADMISSION_NO_RECORDS ?
+            VK_NOT_READY : VK_ERROR_INITIALIZATION_FAILED;
+        goto failed;
+    }
+    if (needs_source && (result = restore_copy_workspace(restore)) != VK_SUCCESS) goto failed;
+    if (seed && (result = restore_copy_workspace(seed)) != VK_SUCCESS) goto failed;
+    // Try the default-pool images before making staging. A failed image must not mistake rollback of a
+    // staging allocation made by this same attempt for a newer compatible native giveback.
+    RcVmaDependency native = {0};
+    RcAdmissionStatus allocation_status = RC_ADMISSION_OK;
+    request.peak_ticket = &copy->ticket;
+    request.dependency = &native;
+    if (needs_source)
+        result = resource_core_vma_create_image(&request, vk_ctx()->vma, &image_info, &placement,
+                                                &restore->image, &restore->allocation, NULL, target ? &allocation_status : NULL);
+    else result = VK_SUCCESS;
+    if (target && result == VK_SUCCESS)
+        result = write_target_create(target, &target_info, &target_placement, &request, &allocation_status);
+    if (result != VK_SUCCESS && native.selected) {
+        dependency->owner_full = native.owner_full;
+        dependency->memory_type = native.memory_type;
+        dependency->released = native.released;
+        if (target) {
+            if (native.owner_full) {
+                dependency->owner_full = needs_source ? 2 : 1;
+                restore->staging_missing = 0;
+            }
+        } else {
+            dependency->reuse = native.reuse;
+            dependency->can_reuse = native.can_reuse && restore_peak_add(&dependency->reuse, &work) &&
+                restore_peak_add(&dependency->reuse, &stage_peak);
+        }
+    }
+    if (result != VK_SUCCESS) {
+        // The full incremental peak is still unavailable. A non-growing miss proves no compatible slot
+        // was available for this request; a genuinely new compatible release or growth grant can retry it.
+        if (target && allocation_status == RC_ADMISSION_NO_RECORDS && !native.owner_full) {
+            // The ledger could not partition the compound ticket. Canceling it alone is not evidence to retry.
+            dependency->selected = 0;
+            result = VK_ERROR_TOO_MANY_OBJECTS;
+        } else if (reuse_only && result == VK_ERROR_OUT_OF_DEVICE_MEMORY) result = VK_NOT_READY;
+        goto failed;
+    }
+    result = vk_staging_prepare_allocate(&restore->stage, &copy->ticket, 1);
+    if (result != VK_SUCCESS) {
+        // Releasing our own image during rollback is not new evidence about the stage that failed.
+        dependency->can_reuse = 0;
+        goto failed;
+    }
+    if ((!needs_source || restore_fill_stage(restore, restore->stage.map)) &&
+        (!seed || restore_fill_stage(seed, restore->stage.map + restore->seed_offset))) return VK_SUCCESS;
+    result = VK_ERROR_FORMAT_NOT_SUPPORTED;
+failed:
+    if (seed) restore_attempt_cancel(seed);
+    if (target) {
+        int rolled_back_image = restore->image || write_target_allocation(target);
+        write_target_release_allocation(target);
+        restore_attempt_cancel(restore);
+        if (rolled_back_image && dependency->selected) {
+            // Our own failed attempt just returned capacity. Start looking for progress after that return.
+            resource_core_vma_dependency_rebase(dependency, 1);
+        }
+    } else restore_attempt_cancel(restore);
+    return result;
+}
+
+int vk_texture_restore_spare_ready(void *arg) {
+    VkTextureRestore *restore = arg;
+    lock();
+    int has_residency = restore->material->resident.image != VK_NULL_HANDLE;
+    unlock();
+    if (has_residency && !restore->use.instance) return 1;
+    if (!restore->staging_missing || !vk_staging_prepare_available(restore->staging_bytes)) return 0;
+    RcBudgetReadiness now;
+    resource_core_budget_readiness(1, &now);
+    return resource_core_budget_peak_ready(&restore->cached_stage_peak, &now) ||
+           (restore->cached_stage_can_reuse && resource_core_budget_peak_ready(&restore->cached_stage_reuse, &now));
+}
+
+uint64_t vk_texture_restore_upload_supplier(const VkTextureRestore *restore, uint64_t after) {
+    return restore->staging_missing ? vk_staging_prepare_supplier(restore->staging_bytes, after) : 0;
+}
+
+static void restore_record_copy(const VkTextureRestore *restore, VkImage image, VkCommandBuffer command,
+                                VkBuffer staging, VkDeviceSize offset) {
+    Tex recipe = restore_recipe(restore->source, &restore->material->key);
+    recipe.pub.image = image;
+    init_image(&recipe, command);
+    barrier(command, ALL_RW, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    TextureRecoveryCopy copy = restore->copy;
+    for (uint32_t i = 0; i < copy.count; i++) copy.regions[i].bufferOffset += offset;
+    vkCmdCopyBufferToImage(command, staging, image, VK_IMAGE_LAYOUT_GENERAL, copy.count, copy.regions);
+    barrier(command, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
+}
+
+const VkTexImage *vk_texture_restore_publish(VkTextureRestore *restore) {
+    lock();
+    TextureMaterial *m = restore->material;
+    VkTextureWriteTarget *target = restore->write_target;
+    VkTextureRestore *seed = target ? write_target_seed(target) : NULL;
+    int install = !restore->use.instance && !m->resident.image;
+    if (install) {
+        VmaAllocationInfo allocation;
+        vmaGetAllocationInfo(vk_ctx()->vma, restore->allocation, &allocation);
+        if (!texture_material_install_residency(m, restore->image, restore->allocation, allocation.size).image) {
+            unlock();
+            return NULL;
+        }
+    }
+    uint64_t upload = 0;
+    if (install || seed) {
+        VkCommandBuffer command = vk_upload_begin();
+        upload = vk_upload_recording_sequence(command);
+        VkBuffer staging = vk_staging_prepare_record(command, &restore->stage);
+        if (install) restore_record_copy(restore, restore->image, command, staging, 0);
+        if (seed) {
+            restore_record_copy(seed, write_target_allocation(target), command, staging, restore->seed_offset);
+            write_target_seed_recorded(target);
+            restore_attempt_cancel(seed);
+        }
+        vk_upload_end();
+    }
+    if (install) {
+        texture_material_set_upload(m, upload);
+        content_use_image_add(m->resident.instance);
+        restore->image = VK_NULL_HANDLE;
+        restore->allocation = NULL;
+        material_stats.restored++;
+        material_stats.restored_bytes += restore->source->size;
+        ordered_restorations++;
+    }
+    if (!restore->use.instance && texture_material_use_begin(m, &restore->use) != RC_LIFETIME_OK)
+        rt_fatal("vk: exact texture restore could not retain its native image");
+    restore->picture.image = restore->use.instance->value.image;
+    texture_material_note_use(m, vk_exec_recording_fence(), submit_epoch);
+    unlock();
+    restore_attempt_cancel(restore);
+    return &restore->picture;
+}
+
+void vk_texture_restore_use(const VkTextureRestore *restore) {
+    lock();
+    TextureUseBatch *batch = texture_use_active(vk_exec_recording_fence(), 1);
+    if (!batch || !restore->use.instance) rt_fatal("vk: restored texture used outside its recording");
+    texture_use_insert(&batch->head, batch->buckets, restore->use.instance, NULL);
+    unlock();
+}
+
+void vk_texture_restore_cancel(VkTextureRestore *restore) {
+    if (!restore) return;
+    restore_attempt_cancel(restore);
+    lock();
+    TextureMaterialInstance *instance = restore->use.instance;
+    if (instance) {
+        texture_material_require(texture_material_use_cancel(&restore->use));
+        content_defer_instance(instance);
+    }
+    TextureMaterial *m = restore->material;
+    assert(restore->source->restore_refs);
+    restore->source->restore_refs--;
+    int retire = texture_material_release(m, 0);
+    if (!m->refs && !m->resident.image && m->cached) content_unpin(m->index_slot - 1, 0);
+    else if (retire) content_retire(m);
+    unlock();
+    free(restore);
+}
+
+// Promote only after a private image, staging span and converted bytes exist. Neither a pressure refusal
+// nor a conversion failure can take a drawable compatibility image away or enter required upload staging.
+static void content_recover(Tex *e, const TextureSourceObservation *observed) {
+    (void)observed;
+    assert(!e->material && !e->source_copy && e->uploaded);
+    TextureRecoveryCopy copy = {0};
+    if (!recovery_copy_layout(e, &copy)) { e->source_retry_domains = 0; return; }
+    RcBudgetAvailability before;
+    resource_core_budget_availability(&before);
+    TextureSourceStamp prior_stamp = e->source_stamp;
+    uint8_t prior_digest[32];
+    memcpy(prior_digest, e->source_digest, sizeof prior_digest);
+    uint8_t prior_digest_valid = e->source_digest_valid;
+    material_recovery.starts++;
+    material_recovery.bytes += e->t.L.size;
+    if (content_early_prepare_policy(e, MATERIAL_PREPARE_OPTIONAL)) { e->source_retry_domains = 0; return; }
+    if (!e->source_copy) return;
+    VkPreparedStaging stage = {0};
+    VkImage image = VK_NULL_HANDLE;
+    VmaAllocation allocation = NULL;
+    int planned = content_recover_prepare(e, &copy, &stage, &image, &allocation);
+    VmaAllocationInfo own;
+    if (planned) vmaGetAllocationInfo(vk_ctx()->vma, allocation, &own);
+    if (!planned || !texture_material_init(copy.material, &material_ledger, image, allocation, &e->ik, own.size, 1)) {
+        if (image) resource_core_vma_destroy_image(vk_ctx()->vma, image, allocation);
+        free(copy.material);
+        content_recover_finish(&copy, &stage);
+        content_source_discard(e);
+        e->source_stamp = prior_stamp;
+        memcpy(e->source_digest, prior_digest, sizeof prior_digest);
+        e->source_digest_valid = prior_digest_valid;
+        if (copy.retry_peak.amount[RC_BUDGET_RAM]) content_recovery_wait_peak(e, &copy.retry_peak, &before);
+        else content_recovery_wait(e, content_recovery_domains(e) | (1u << RC_BUDGET_STAGING));
+        return;
+    }
+    VkImage prior_image = e->pub.image;
+    VmaAllocation prior_allocation = e->alloc;
+    uint64_t prior_bytes = e->bytes;
+    uint64_t prior_retry = e->up_retry;
+    uint8_t prior_reused = e->reused, prior_reusable = e->reusable;
+    e->pub.image = image; e->alloc = allocation; e->bytes = own.size;
+    e->uploaded = e->reused = e->reusable = 0;
+    e->up_retry = 0;
+    VkCommandBuffer cb = vk_upload_begin();
+    VkBuffer buffer = vk_staging_prepare_record(cb, &stage);
+    init_image(e, cb);
+    tex_image_prepare(e, e->t.L.size);
+    barrier(cb, ALL_RW, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    vkCmdCopyBufferToImage(cb, buffer, image, VK_IMAGE_LAYOUT_GENERAL, copy.count, copy.regions);
+    barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
+    vk_upload_end();
+    e->uploaded = 1;
+    source_commit(e, &e->source_copy_stamp, 0);
+    if (e->source_digest_valid) {
+        uint8_t digest[32];
+        memcpy(digest, e->source_digest, sizeof digest);
+        content_image_publish_prepared(e, digest, e->t.L.size, &copy.material, &copy.provider);
+    }
+    content_recover_finish(&copy, &stage);
+    content_source_discard(e);
+    if (e->uploaded && !e->up_retry && e->material && e->material->provider) {
+        e->pub.image = prior_image;
+        image_owner_replaced(e, image);
+        e->pub.image = image;
+        vk_exec_image_gone(prior_image);
+        vk_defer_image(prior_image, prior_allocation);
+        tex_gen_bump(e->key.addr);
+        e->source_retry_domains = 0;
+        return;
+    }
+    assert(copy.material && !e->material);
+    if (!texture_material_release(copy.material, 1)) rt_fatal("vk: unpublished material retained an unexpected owner");
+    content_retire(copy.material);
+    e->pub.image = prior_image; e->alloc = prior_allocation; e->bytes = prior_bytes;
+    e->reused = prior_reused; e->reusable = prior_reusable; e->up_retry = prior_retry;
+    e->source_stamp = prior_stamp;
+    memcpy(e->source_digest, prior_digest, sizeof prior_digest);
+    e->source_digest_valid = prior_digest_valid;
+    content_recovery_wait_peak(e, &copy.retry_peak, &before);
+}
+
+// Residency is optional for a logical material. Current uses establish current source contents before selecting a
+// representation; released descriptors reconstruct their exact provider and never read guest storage again.
+static int content_require_resident(Tex *e) {
+    if (e->pub.image || !e->material) return e->pub.image != VK_NULL_HANDLE;
+    TextureMaterial *m = e->material;
+    if (e->released) {
+        if (m->resident.image) {
+            image_owner_replaced(e, m->resident.image);
+            e->pub.image = m->resident.image;
+            e->uploaded = 1; e->up_retry = 0; e->material_prepared = 1;
+            texture_material_note_use(m, vk_exec_recording_fence(), submit_epoch);
+            tex_gen_bump(e->key.addr);
+            return 1;
+        }
+        return content_restore(e, m, NULL);
+    }
+    if (up_wait(e)) { tex_deferred = 1; return 0; }
+    if (vk_exec_turn_due()) { tex_deferred = 1; return 0; }
+    if (content_early_prepare(e)) return e->pub.image != VK_NULL_HANDLE;
+    if (tex_deferred) return 0;
+    if (e->source_canonical && !e->source_copy) { e->source_blocked=1; return 0; }
+    // A changed current source needs a private representation. Preserve the new candidate's digest across the
+    // association detach so upload can publish the captured version after conversion succeeds.
+    uint8_t captured = e->source_digest_valid;
+    if (!content_write_begin(e, 0)) return 0;
+    if (e->source_copy) e->source_digest_valid = captured;
+    return e->pub.image != VK_NULL_HANDLE;
 }
 
 // Whether e's storage fills no 4 KiB page of its own, so the write tracking can only see writes to pages it shares.
@@ -3967,6 +6456,27 @@ enum { SNAP_MAX = 4096 };
 static int wb_exact = -1;
 static volatile int32_t n_kept;
 
+typedef struct {
+    const uint8_t *before, *current;
+    uint64_t size;
+    int different;
+} MirroredColorComparison;
+
+static void compare_mirrored_color_range(void *opaque, uint64_t offset, uint64_t bytes) {
+    MirroredColorComparison *comparison = opaque;
+    if (!comparison->different)
+        comparison->different = offset > comparison->size || bytes > comparison->size - offset ||
+            memcmp(comparison->before + offset, comparison->current + offset, bytes) != 0;
+}
+
+static int mirrored_color_storage_changed(const Tex *entry) {
+    if (!mem_backing_read_hold(entry->image_host_backing)) return 1;
+    MirroredColorComparison comparison = {entry->snap, (const uint8_t *)(uintptr_t)entry->pub.addr, entry->t.L.size, 0};
+    const int valid = nvn_texels_slice_ranges(&entry->t.d, 0, 0, 0, compare_mirrored_color_range, &comparison) == 0;
+    mem_read_release();
+    return !valid || comparison.different;
+}
+
 // vk_mem_changed over the pages wholly inside e's storage (all of its pages when it fills none): a neighbour that shares
 // the first or last page does not count as a write to e. A texture that fills no page shares all of its pages, so
 // there a page write counts only when e's own bytes differ from the copy taken at the GPU write. NX2navi's Purah Pad
@@ -3978,7 +6488,9 @@ static int storage_rewritten(const Tex *e, uint32_t since, uint32_t *now) {
     uint64_t lo = (e->pub.addr + 0xfff) & ~0xfffull, hi = (e->pub.addr + e->t.L.size) & ~0xfffull;
     if (hi <= lo) lo = e->pub.addr, hi = e->pub.addr + e->t.L.size;
     int ch = vk_mem_changed(lo, hi - lo, since, now);
-    if (ch != 1 || !since || !e->snap || memcmp(e->snap, (const void *)(uintptr_t)e->pub.addr, e->t.L.size)) return ch == 1;
+    if (ch != 1 || !since || !e->snap) return ch == 1;
+    if (e->snap_color_texels ? mirrored_color_storage_changed(e) :
+        memcmp(e->snap, (const void *)(uintptr_t)e->pub.addr, e->t.L.size) != 0) return 1;
     log_limited(&n_kept, "write-back of %#llx kept: fmt %#x %ux%u, %llu bytes; a neighbour wrote its page",
                 (unsigned long long)e->pub.addr, e->t.d.format, e->t.d.width, e->t.d.height,
                 (unsigned long long)e->t.L.size);
@@ -4003,14 +6515,21 @@ static int same_content(const Tex *e) {
 // one split fill fills (from_storage), while it is not released: the game may be unmapping a released one's storage,
 // and nothing keeps a slot from resolving to it as the stale rule does for a CPU-written one (slot_resolve).
 static int make_fresh_source(Tex *e) {
-    if (!source_spans_init(e) || content_source_gpu_overlap(e)) return 0;
+    if (!source_spans_init(e)) return 0;
     if (!e->uploaded && up_wait(e)) return 1;
     TextureSourceObservation observed;
     int changed = source_observe(e, e->uploaded ? &e->source_stamp : NULL, &observed);
+    // UNKNOWN can mean untracked CPU bytes; foreign/pending GPU authority is a different route. Keep it out of
+    // this CPU-owned lifecycle and let the existing ordered mixed-resource renderer resolve it. No immutable
+    // material/source certificate may be published from that compatibility preparation.
+    if (e->source_blocked) return e->source_canonical;
     n_checks++;
     e->last_ch = changed;
     if (e->uploaded && changed == TEX_SOURCE_CLEAN) {
-        source_commit(e, &observed.stamp);
+        source_commit(e, &observed.stamp, 1);
+        if (e->material) content_version(e, e->material);
+        else if (!e->source_canonical && content_recovery_due(e) && content_image_eligible(e) && !vk_exec_turn_due())
+            content_recover(e, &observed);
         return 1;
     }
     // An image replacement belongs at this operation's stream position, after earlier workers captured theirs.
@@ -4023,22 +6542,117 @@ static int make_fresh_source(Tex *e) {
     return 1;
 }
 
+// Keep the outcome of actual compatibility preparation across consumers, bounded by its next producer. This
+// receipt cannot publish a material version: earlier mixed authority still belongs to the compatibility renderer.
+typedef struct {
+    RcRegistryBindingObservation observation;
+    uint64_t mapping, protection;
+    int valid;
+} CompatibilityPreparation;
+static void compatibility_invalidate(Tex *e) {
+    e->compatibility_receipt = (RcRegistryBindingReceipt){0};
+    e->compatibility_position = (RcRegistryPosition){0};
+}
+static CompatibilityPreparation compatibility_begin(Tex *e) {
+    CompatibilityPreparation p = {0};
+    compatibility_path.begins++;
+    RcRegistryPosition position = vk_exec_resource_position();
+    if (!rc_registry_position_valid(position)) { compatibility_path.begin_position++; return p; }
+    if (e->t.pool_flags & (NVN_MEMORY_POOL_FLAGS_PHYSICAL | NVN_MEMORY_POOL_FLAGS_VIRTUAL)) {
+        compatibility_path.begin_alias_pool++; return p;
+    }
+    if (e->released || nvn_gpu_only(e->pub.addr) || !e->t.serial ||
+        !rc_range_valid((RcSourceRange){1, e->pub.addr, e->t.L.size})) {
+        compatibility_path.begin_no_source++; return p;
+    }
+    if (!vk_exec_effects_read_allowed(e->pub.addr, e->t.L.size)) { compatibility_path.begin_feedback++; return p; }
+    int had_lease = e->source_access.owner.id != 0;
+    if (source_compatibility_acquire(e) != RC_REGISTRY_OK) { compatibility_path.begin_registration++; return p; }
+    compatibility_path.acquired += !had_lease;
+    p.mapping = mem_mapping_serial();
+    p.protection = mem_protection_serial();
+    if (!p.mapping || !p.protection) { compatibility_path.begin_serial++; return p; }
+    if (e->image_authority.id && e->pub.image) {
+        compatibility_path.image_begins++;
+        p.valid = rc_registry_binding_begin_image(rc_registry_runtime(), e->source_access.owner.handle,
+            submit_epoch, position, (RcRegistryImageBinding){(uint64_t)(uintptr_t)e->pub.image,
+                e->image_authority}, &p.observation) == RC_REGISTRY_OK;
+        compatibility_path.image_ready += p.valid;
+    } else {
+        p.valid = rc_registry_binding_begin(rc_registry_runtime(), e->source_access.owner.handle,
+            submit_epoch, position, &p.observation) == RC_REGISTRY_OK;
+    }
+    if (p.valid) compatibility_path.begin_ready++;
+    else compatibility_path.begin_registry++;
+    return p;
+}
+static void compatibility_commit(Tex *e, const CompatibilityPreparation *p) {
+    compatibility_path.commits++;
+    if (tex_deferred || !e->uploaded || e->up_retry || !e->pub.image) { compatibility_path.commit_unready++; return; }
+    e->compatibility_position = vk_exec_resource_position();
+    if (!p->valid) { compatibility_path.commit_unbracketed++; return; }
+    const RcRegistryImageBinding *image = &p->observation.image_binding;
+    if (image->image && (image->image != (uint64_t)(uintptr_t)e->pub.image ||
+        image->hold.id != e->image_authority.id || image->hold.index != e->image_authority.index)) {
+        // Freshness preparation may replace the physical image. Its result cannot borrow the old image's proof.
+        compatibility_path.image_commit_changed++; return;
+    }
+    if (!mem_mapping_range_unchanged(e->pub.addr, e->t.L.size, p->mapping)) {
+        compatibility_path.commit_mapping++; return;
+    }
+    if (!mem_protection_range_unchanged(e->pub.addr, e->t.L.size, p->protection)) {
+        compatibility_path.commit_protection++; return;
+    }
+    RcRegistryBindingReceipt receipt;
+    if (rc_registry_binding_commit(rc_registry_runtime(), &p->observation, &receipt) != RC_REGISTRY_OK) {
+        compatibility_path.commit_registry++; return;
+    }
+    e->compatibility_receipt = receipt;
+    e->compatibility_image = e->pub.image;
+    e->compatibility_mapping = p->mapping;
+    e->compatibility_protection = p->protection;
+    e->compatibility_wgen = e->wgen;
+    e->compatibility_writes = e->wt_n;
+    compatibility_path.commit_ready++;
+}
+
 static void make_fresh(Tex *e) {
+    if (e->material && !e->pub.image && !content_require_resident(e)) return;
     if (!from_storage(e) || e->pub.gpu_owned || (e->sfill && e->released)) return;
-    if (make_fresh_source(e)) return;
+    e->compatibility_position = (RcRegistryPosition){0};
+    e->compatibility_receipt = (RcRegistryBindingReceipt){0};
+    if (make_fresh_source(e)) {
+        compatibility_path.source_handled++;
+        compatibility_path.source_unordered += !rc_registry_position_valid(rc_registry_source_access_content(source_access_anchor(e)).ordered.position);
+        if (!tex_deferred && e->uploaded && !e->up_retry) e->compatibility_position = vk_exec_resource_position();
+        return;
+    }
     if (!e->uploaded && up_wait(e)) return;
+    CompatibilityPreparation prepared = compatibility_begin(e);
     uint32_t now;
     int ch = vk_mem_changed(e->pub.addr, e->t.L.size, e->uploaded ? e->wgen : 0, &now);
     e->last_ch = ch;
     if (!e->uploaded || (ch && !same_content(e))) upload(e, NULL, ch >= 0, NULL);
-    if (!tex_deferred && e->uploaded && !e->up_retry) e->wgen = now;
+    if (!tex_deferred && e->uploaded && !e->up_retry) {
+        e->wgen = now;
+        compatibility_commit(e, &prepared);
+    }
 }
 
 // Draw lookups reuse this submission's memory observation. Late guest writes remain visible to the next one.
 static void make_fresh_snap(Tex *e) {
+    if (e->material && !e->pub.image && !content_require_resident(e)) return;
     if (!from_storage(e) || e->pub.gpu_owned || (e->sfill && e->released)) return;
-    if (make_fresh_source(e)) return;
+    e->compatibility_position = (RcRegistryPosition){0};
+    e->compatibility_receipt = (RcRegistryBindingReceipt){0};
+    if (make_fresh_source(e)) {
+        compatibility_path.source_handled++;
+        compatibility_path.source_unordered += !rc_registry_position_valid(rc_registry_source_access_content(source_access_anchor(e)).ordered.position);
+        if (!tex_deferred && e->uploaded && !e->up_retry) e->compatibility_position = vk_exec_resource_position();
+        return;
+    }
     if (!e->uploaded && up_wait(e)) return;
+    CompatibilityPreparation prepared = compatibility_begin(e);
     uint32_t now;
     n_checks++;
     VkDirtyPages dirty = {0};
@@ -4046,7 +6660,10 @@ static void make_fresh_snap(Tex *e) {
     int ch = vk_mem_changed_snap(e->pub.addr, e->t.L.size, e->uploaded ? e->wgen : 0, submit_epoch, &now, range);
     e->last_ch = ch;
     if (!e->uploaded || (ch && !same_content(e))) upload(e, range, ch >= 0, NULL);
-    if (!tex_deferred && e->uploaded && !e->up_retry) e->wgen = now;
+    if (!tex_deferred && e->uploaded && !e->up_retry) {
+        e->wgen = now;
+        compatibility_commit(e, &prepared);
+    }
 }
 
 // ---------------------------------------------------------------- aliases (NX2NAVI_TEX_ALIAS)
@@ -4090,17 +6707,48 @@ static int alias_has_gpu_content(const Tex *src) {
     return src->gpu_dirty && !storage_rewritten(src, src->gpu_gen, &now);
 }
 
+typedef struct {
+    VkBuffer buffer;
+    VmaAllocation allocation;
+    VkMemoryImageHold *source, *destination;
+} AliasTransferScratch;
+
+static AliasTransferScratch *alias_transfer_scratch_prepare(VkDeviceSize size) {
+    AliasTransferScratch *scratch = calloc(1, sizeof *scratch);
+    if (!scratch) return NULL;
+    const RcVmaRequest request = {.producer = RC_BUDGET_TEXTURE, .required = 1};
+    const VkBufferCreateInfo info = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size,
+        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    const VmaAllocationCreateInfo placement = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    VkResult result = resource_core_vma_create_buffer(&request, vk_ctx()->vma, &info, &placement,
+                                                      &scratch->buffer, &scratch->allocation, NULL, NULL);
+    if (result == VK_SUCCESS) return scratch;
+    if (result == VK_ERROR_DEVICE_LOST) vk_device_lost_check(result, "allocating texture alias transfer scratch");
+    free(scratch);
+    return NULL;
+}
+
+static void alias_transfer_scratch_drop(void *arg) {
+    AliasTransferScratch *scratch = arg;
+    resource_core_vma_destroy_buffer(vk_ctx()->vma, scratch->buffer, scratch->allocation);
+    if (scratch->source) vk_mem_image_release(scratch->source);
+    if (scratch->destination) vk_mem_image_release(scratch->destination);
+    free(scratch);
+}
+
+static void alias_transfer_scratch_cancel(void *arg, int may_have_executed) {
+    (void)may_have_executed; // VkSync keeps uncertain native users until completion or proven idle.
+    alias_transfer_scratch_drop(arg);
+}
+
 // Maxwell reads the same bytes through both descriptors: src's content goes into the new image e at the replay's
 // current position, before any later command of the submission uses e. Through a buffer, since bound images share
 // their memory and image copies may not overlap; e leaves UNDEFINED between the two halves, so its first transition
 // cannot clobber src's bytes before they are read. 0 when no replay is recording (e is then not initialised yet).
 static int alias_copy(Tex *e, const Tex *src) {
-    e->material_writable = 1;
-    content_write_begin(e, 0);
-    content_image_forget(e);
-    int reopen;
-    VkCommandBuffer cb = vk_exec_inline_begin(&reopen);
-    if (!cb) return 0;
+    const uint64_t fence = vk_exec_recording_fence();
+    if (!fence || vk_exec_recording_failed() || vk_sync_stopping() || vk_device_is_lost()) return 0;
     int bw, bh, bpb = img_block(e, &bw, &bh);
     uint32_t levels = e->pub.levels < src->pub.levels ? e->pub.levels : src->pub.levels;
     uint32_t layers = e->pub.layers < src->pub.layers ? e->pub.layers : src->pub.layers, n = levels * layers, k = 0;
@@ -4120,12 +6768,23 @@ static int alias_copy(Tex *e, const Tex *src) {
                                         .imageExtent = {w, h, z}};
             total += ((VkDeviceSize)(w + bw - 1) / bw * ((h + bh - 1) / bh) * z * bpb + 15) & ~15ull;
         }
-    VkBuffer buf = vk_exec_inline_buffer(total);
-    if (!buf) {
+    AliasTransferScratch *scratch = alias_transfer_scratch_prepare(total);
+    if (!scratch) {
         free(rg);
-        vk_exec_inline_end(reopen);
         return 0;
     }
+
+    texture_registration_source_clear(e);
+    e->material_writable = 1;
+    if (!content_write_begin(e, 0)) goto unissued;
+    if (!src->pub.image || !e->pub.image) goto unissued;
+    scratch->source = vk_mem_image_hold(src->pub.image);
+    scratch->destination = vk_mem_image_hold(e->pub.image);
+    content_image_forget(e);
+    int reopen;
+    VkCommandBuffer cb = vk_exec_inline_begin(&reopen);
+    if (!cb || vk_exec_recording_failed() || vk_sync_stopping() || vk_device_is_lost()) goto unissued;
+    VkBuffer buf = scratch->buffer;
     barrier(cb, ALL_RW, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
     vkCmdCopyImageToBuffer(cb, src->pub.image, VK_IMAGE_LAYOUT_GENERAL, buf, n, rg);
     VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
@@ -4149,9 +6808,17 @@ static int alias_copy(Tex *e, const Tex *src) {
     }
     vkCmdCopyBufferToImage(cb, buf, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, n, rg);
     barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
+    if (resource_core_vma_retire(scratch->allocation) != RC_ADMISSION_OK)
+        rt_fatal("vk: alias transfer scratch lost its native allocation owner");
+    vk_completion_add_owned(fence, alias_transfer_scratch_drop, alias_transfer_scratch_cancel, scratch);
     vk_exec_inline_end(reopen);
     free(rg);
     return 1;
+
+unissued:
+    alias_transfer_scratch_drop(scratch);
+    free(rg);
+    return 0;
 }
 
 // Descriptors whose image creation failed (VRAM exhausted, an unsupported format): not tried again for 2 s, so a
@@ -4252,7 +6919,13 @@ static int depth_alias_log(void) {   // NX2NAVI_DEPTH_ALIAS_LOG=1: start_at logs
 static void start_at(Tex *e, const TexKey *k, int taken_back) {
     // Early adoption excludes every existing same-address alias. Its immutable contents are already prepared.
     if (!taken_back && e->material_prepared) return;
-    if (e->material) content_write_begin(e, 0);
+    if (e->pub.preserve_pool_bytes) {
+        // Ordinary LOAD/sample acquire their ordered source explicitly. A same-address
+        // compatibility copy is not authority to initialize this independent image.
+        if (!taken_back && tex_alias) init_new(e);
+        return;
+    }
+    if (e->material && !content_write_begin(e, 0)) return;
     if (taken_back || !e->source_copy) content_image_forget(e);
     e->upload_mapping = 0;
     int alias = 0;
@@ -4329,6 +7002,9 @@ static void start_at(Tex *e, const TexKey *k, int taken_back) {
                    : e->reused || taken_back ? "cleared at the replay's position (reused)"
                    : depth_init_inline() ? "cleared at the replay's position" : "cleared in the upload batch");
     }
+    // This exact placement can still supply unchanged slices after newer aliases. Only a
+    // qualified read or LOAD may compose newer overlapping contents into its replacement.
+    if (taken_back && e->native_output) return;
     if (taken_back && !newer && !e->pub.mirrored) {   // its image still holds its content
         n_alias_kept++;
         return;
@@ -4406,6 +7082,11 @@ void vk_texture_deferred_stats(uint64_t out[3]) {
     for (int i = 0; i < 3; i++) out[i] = __atomic_exchange_n(&n_deferred[i], 0, __ATOMIC_RELAXED);
 }
 int vk_texture_deferred(void) { return tex_deferred; }
+int vk_texture_defer_until_turn(void) {
+    if (!vk_exec_turn_due()) return 0;
+    tex_deferred = 1;
+    return 1;
+}
 int vk_texture_deferred_take(void) {
     int d = tex_deferred;
     tex_deferred = 0;
@@ -4426,10 +7107,50 @@ static int lookup_quiet(const Tex *e, const TexKey *k) {
     return create_held(k);
 }
 
-static Tex *entry_of(const tex_t *t) {
+// Rejoining the live set is independent of the bytes chosen to initialize a writable incarnation.
+static void texture_resume_use(Tex *e) {
+    compatibility_invalidate(e);
+    flight_ev(e, FLIGHT_TEX_TAKEBACK, 0, 0);
+    e->samp_frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+    uint64_t gap = e->samp_frame - e->rel_frame;
+    if (gap > e->back_gap) e->back_gap = gap > UINT32_MAX ? UINT32_MAX : (uint32_t)gap;
+    if (e->material) texture_material_set_live(e->material, 1);
+    e->released = 0;
+    nreleased--;
+    rel_unlink(e);
+    n_site[2]++;
+    tex_gen_flip(e, e->superseded || e->overwritten);
+    e->overwritten = 0;
+    e->og_backs++;
+    e->og_back_frame = e->samp_frame;
+}
+
+static void texture_rebind_object(Tex *e, const tex_t *t) {
+    if (e->t.serial != t->serial || e->t.L.size != t->L.size) {
+        // A cached image can outlive the guest object using this address. Its old source lease cannot keep
+        // that association current or certify a payload for the replacement object.
+        // Other aliases may retain the old registry lease, so releasing ours need not emit a retirement.
+        // The actual source-identity change must invalidate descriptor receipts independently.
+        tex_gen_bump(e->key.addr);
+        content_source_discard(e);
+        source_registration_release(e);
+        free(e->source_spans);
+        e->source_spans = NULL;
+        e->source_count = 0;
+    }
+    e->t = *t;
+}
+
+static Tex *entry_of_mode(const tex_t *t, int private_output, uint32_t *installed_generation) {
+    int installed = 0;
     TexKey k;
     make_key(t, &k);
     Tex *e = nvn_hm_get(&by_key, &k);
+    if (e && e->pin_owned && e->t.serial != t->serial) {
+        if (vk_exec_turn_due()) { tex_deferred = 1; return NULL; }
+        drop_tex(e, DROP_REPLACED);
+        e = NULL;
+    }
     if ((!e || e->retiring || e->released) && vk_exec_turn_due() && !lookup_quiet(e, &k)) {
         __atomic_add_fetch(&n_deferred[!e ? 0 : e->retiring ? 1 : 2], 1, __ATOMIC_RELAXED);
         tex_deferred = 1;
@@ -4446,28 +7167,29 @@ static Tex *entry_of(const tex_t *t) {
             tex_alias = cfg_bool("NX2NAVI_TEX_ALIAS");
             rt_log("vk: texture aliases: %s", tex_alias ? "a new image takes the live image's content" : "a new image starts empty");
         }
-        if (!(e = create_tex(t, &k, tex_alias))) return create_failed(&k), NULL;
+        int capacity_failure;
+        if (!(e = create_tex(t, &k, tex_alias && !private_output, private_output, &capacity_failure))) {
+            // Speculative refusal must not suppress a later required allocation behind the native-failure hold.
+            if (!capacity_failure) create_failed(&k);
+            return NULL;
+        }
         origin_made(e);
         perf_count(PERF_CNT_TEX_NEW);
-        start_at(e, &k, 0);
+        if (!private_output) start_at(e, &k, 0);
         flight_ev(e, FLIGHT_TEX_NEW, e->og_start, 0);
         e->next_at = nvn_hm_get(&by_addr, &k.addr);
         nvn_hm_put(&by_addr, &k.addr, e);
         nvn_hm_put(&by_key, &k, e);
         n_site[1]++;
         tex_gen_bump(k.addr);
+        installed = 1;
         vk_texstat_time(VK_TS_CREATE, c0);
         e->samp_frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);   // new: not disused before it is drawn
     }
     if (e->released) {
-        flight_ev(e, FLIGHT_TEX_TAKEBACK, 0, 0);
-        e->samp_frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);   // in use again, as a new one
-        uint64_t gap = e->samp_frame - e->rel_frame;
-        if (gap > e->back_gap) e->back_gap = gap > UINT32_MAX ? UINT32_MAX : (uint32_t)gap;
-        if (e->material) texture_material_set_live(e->material, 1);
-        e->released = 0, nreleased--, rel_unlink(e), n_site[2]++, tex_gen_flip(e, e->superseded || e->overwritten);
-        e->overwritten = 0;
-        e->og_backs++, e->og_back_frame = e->samp_frame;
+        // Dormant storage can change within the same submit. A prior receipt cannot bypass its first refresh.
+        texture_resume_use(e);
+        installed = 1;
         if (e->superseded) {   // its image may still be in use: the first barrier waits for all earlier work
             e->superseded = 0, e->reused = 1;
             n_restarts++;
@@ -4478,9 +7200,14 @@ static Tex *entry_of(const tex_t *t) {
             pool_watch_storage(&pent[e->pidx - 1]);
         }
     }
-    e->t = *t;
+    texture_rebind_object(e, t);
     touch(e);
+    if (installed_generation && installed) *installed_generation = agen[agen_idx(k.addr)];
     return e;
+}
+
+static Tex *entry_of(const tex_t *t) {
+    return entry_of_mode(t, 0, NULL);
 }
 
 // vk_dump: upload bookkeeping of an image vk_texture_get / vk_texture_by_id returned. pages_written: whether its
@@ -4495,37 +7222,719 @@ void vk_texture_debug(const VkTexImage *img, uint32_t *uploads, int *last_change
     unlock();
 }
 
+static int preserve_pool_contents_current(const Tex *e);
+static int preserve_pool_contents_handed(const Tex *e);
+
+static Tex *texture_get_locked(const tex_t *t, int present) {
+    Tex *e = nvn_texture_pin_attachment(t);
+    if (e && !e->pin_detached && !mem_backing_current(e->image_host_backing)) destroy_tex(e);
+    if (e && e->pin_detached) {
+        touch(e);
+        if (!e->pub.image) return NULL;
+    } else {
+        if (!e) e = entry_of(t);
+        else touch(e);
+        if (e) make_fresh(e);
+        if (tex_deferred || (e && e->source_canonical && !e->pub.gpu_owned &&
+            (e->source_blocked || !source_permission_current(e)))) return NULL;
+    }
+    if (!e || !e->pub.preserve_pool_bytes) return e;
+    if (present)
+        return e->t.serial == t->serial && preserve_pool_contents_handed(e) ? e : NULL;
+    return preserve_pool_contents_current(e) ? e : NULL;
+}
+
 const VkTexImage *vk_texture_get(const tex_t *t) {
     if (!t || !t->mem) return NULL;
     lock();
-    Tex *e = entry_of(t);
-    if (e) make_fresh(e);
-    if (tex_deferred) e = NULL;
+    Tex *e = texture_get_locked(t, 0);
     unlock();
     return e ? &e->pub : NULL;
 }
 
-// Mutable access is a separate operation from lookup: no writable view can capture an immutable shared image.
-const VkTexImage *vk_texture_writable_locked(const VkTexImage *img) {
+struct VkTexturePresentSource {
+    GfxPresentPictureSource picture;
+    TextureUseNode material;
+    const tex_t *pin;
+    VkMemoryImageHold *raw;
+    VkTextureAliasRead *seed;
+    RetainedTextureUpload *upload;
+    MemBackingCapture *sample_mapping;
+    RcRegistryPosition sample_read;
+    uint64_t sample_pool, sample_publication, sample_registration, sample_address, sample_size;
+    uint64_t sample_mapping_stamp, sample_protection_stamp;
+    uint32_t sample_wgen, sample_writes;
+    const char *sample_upload_gate;
+};
+
+static int texture_history_sample_locked(int logical, VkTextureSample *out, int *native, int recording) {
+    const TextureRegistration *record;
+    const TextureUseNode *owner;
+    int status = texture_registration_resolve_owner(logical, &record, native, &owner);
+    if (status == VK_TEXTURE_REGISTRATION_EXACT) {
+        *out = (VkTextureSample){.image = &record->exact, .view = record->exact_view, .has_view = record->has_exact_view,
+            .native_slot = -1, .historical = status, .registration = record->handle.id};
+        if (recording) texture_use_scene_material_locked(owner->use.instance, &owner->use);
+    }
+    return status;
+}
+
+int vk_texture_history_sample_current_locked(int logical, uint64_t registration, VkImage image) {
+    const TextureRegistration *record;
+    return texture_registration_resolve(logical, &record, NULL) == VK_TEXTURE_REGISTRATION_EXACT &&
+        record->handle.id == registration && record->exact.image == image;
+}
+
+static VkTexturePresentSource *texture_history_sample_retain(const TextureUseNode *owner) {
+    VkTexturePresentSource *hold = calloc(1, sizeof *hold);
+    if (!hold) return NULL;
+    if (texture_use_retain_instance(&hold->material, owner->use.instance, &owner->use) == RC_LIFETIME_OK) return hold;
+    free(hold);
+    return NULL;
+}
+
+VkTexturePresentSource *vk_texture_history_sample_retain_locked(int logical, uint64_t registration, VkImage image) {
+    const TextureRegistration *record;
+    const TextureUseNode *owner;
+    if (texture_registration_resolve_owner(logical, &record, NULL, &owner) != VK_TEXTURE_REGISTRATION_EXACT ||
+        record->handle.id != registration || record->exact.image != image) return NULL;
+    return texture_history_sample_retain(owner);
+}
+
+static int present_source_retain(VkTexturePresentSource *source, const VkTexImage *image, const Tex *entry) {
+    TextureMaterialInstance *instance = content_use_image_find(image->image);
+    if (instance) return texture_use_retain_instance(&source->material, instance, NULL) == RC_LIFETIME_OK;
+    if (!entry) {
+        for (entry = nvn_hm_get(&by_addr, &image->addr); entry && entry->pub.image != image->image; entry = entry->next_at) {}
+    }
+    if (!entry || entry->pub.gone || entry->pub.image != image->image || (!entry->alloc && !entry->bound_to)) return 0;
+    if (entry->pin_owned) {
+        source->pin = nvn_texture_pin_retain_attachment(entry->t.serial, entry);
+        if (!source->pin) return 0;
+    }
+    source->raw = vk_mem_image_hold(image->image);
+    return 1;
+}
+
+VkTexturePresentSource *vk_texture_present_retain_image(const VkTexImage *selected, VkImage exact) {
+    if (!selected || !exact) return NULL;
+    lock();
+    VkTexturePresentSource *source = NULL;
+    if (!selected->gone && selected->image == exact) {
+        source = calloc(1, sizeof *source);
+        if (!source) rt_fatal("vk: presentation image receipt allocation failed");
+        if (!present_source_retain(source, selected, (const Tex *)selected)) {
+            free(source);
+            source = NULL;
+        }
+    }
+    unlock();
+    return source;
+}
+
+VkTexturePresentSource *vk_texture_present_retain_held_image(VkMemoryImageHold *hold, VkImage exact) {
+    VkMemoryImageHold *owned = vk_mem_image_hold_retain_exact(hold, exact);
+    if (!owned) return NULL;
+    VkTexturePresentSource *source = calloc(1, sizeof *source);
+    if (source) source->raw = owned;
+    else vk_mem_image_release(owned);
+    return source;
+}
+
+VkTexturePresentSource *vk_texture_present_capture(const tex_t *t, VkTexImage *selected) {
+    if (!t || !t->mem) return NULL;
+    lock();
+    Tex *e = texture_get_locked(t, 1);
+    if (!e || !e->pub.image || !(e->pub.aspect & VK_IMAGE_ASPECT_COLOR_BIT)) {
+        unlock();
+        return NULL;
+    }
+    VkTexturePresentSource *source = calloc(1, sizeof *source);
+    if (!source) rt_fatal("vk: present source capture allocation failed");
+    VkTexImage picture = e->pub;
+    vk_hdr_present_source_locked(&e->pub, &picture);
+    if (picture.image != e->pub.image && present_source_retain(source, &picture, NULL)) {
+        *selected = picture;
+    } else if (present_source_retain(source, &e->pub, e)) {
+        *selected = e->pub;
+    } else {
+        free(source);
+        source = NULL;
+    }
+    if (source) {
+        const uint64_t serial = e->t.serial == t->serial ? t->serial : 0;
+        const RcRegistryPosition handed = rc_registry_handed_cutoff(rc_registry_runtime());
+        source->picture = (GfxPresentPictureSource){
+            .window_texture_serial = serial,
+            .source_texture_serial = selected->image == e->pub.image ? serial : 0,
+            .window_image = (uint64_t)(uintptr_t)e->pub.image,
+            .image = (uint64_t)(uintptr_t)selected->image,
+            .handed_scene = handed.scene, .handed_ordinal = handed.ordinal,
+            .width = selected->width, .height = selected->height, .format = selected->format};
+    }
+    unlock();
+    return source;
+}
+
+GfxPresentPictureSource vk_texture_present_picture(const VkTexturePresentSource *source) {
+    return source ? source->picture : (GfxPresentPictureSource){0};
+}
+
+void vk_texture_present_release(VkTexturePresentSource *source) {
+    if (!source) return;
+    if (source->upload) retained_texture_upload_release(source->upload);
+    mem_backing_release(&source->sample_mapping);
+    TextureMaterialInstance *instance = source->material.use.instance;
+    if (instance) {
+        lock();
+        texture_use_unlink(&source->material);
+        texture_material_require(texture_material_use_cancel(&source->material.use));
+        texture_uses.nodes--;
+        int reclaim = texture_material_instance_defer_ready(instance);
+        content_defer_instance(instance);
+        unlock();
+        if (reclaim) resource_core_budget_progress();
+    } else if (source->seed) {
+        vk_texture_alias_read_cancel(source->seed);
+    } else {
+        vk_mem_image_release(source->raw);
+        nvn_texture_pin_release(source->pin);
+    }
+    free(source);
+}
+
+VkTexturePresentSource *vk_texture_transfer_read_capture(const tex_t *t, VkTexImage *selected) {
+    if (!t || !t->mem) return NULL;
+    lock();
+    Tex *pinned = nvn_texture_pin_attachment(t);
+    Tex *e = pinned;
+    if (!e) {
+        TexKey key;
+        make_key(t, &key);
+        e = nvn_hm_get(&by_key, &key);
+        if (e && (e->released || e->retiring || e->superseded || e->overwritten || e->sfill ||
+            (e->image_host_backing && !mem_backing_current(e->image_host_backing)))) e = NULL;
+    }
+    VkTexturePresentSource *source = NULL;
+    if (e && e->t.serial == t->serial && e->pub.image && !e->pub.gone && !e->bound_to && !e->image_device_count &&
+        (e->pub.usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
+        TextureSourceObservation observation;
+        int ready = e->pub.gpu_owned ||
+            (e->material && e->material->ready && e->uploaded && !e->up_retry && e->source_canonical &&
+             source_observe(e, &e->source_stamp, &observation) == TEX_SOURCE_CLEAN);
+        if (ready) {
+            source = calloc(1, sizeof *source);
+            if (!source) rt_fatal("vk: transfer read source lease allocation failed");
+            if (present_source_retain(source, &e->pub, e)) *selected = e->pub;
+            else free(source), source = NULL;
+        }
+    }
+    unlock();
+    return source;
+}
+
+// Explicit transfer only. Select once with the existing ordered texture refresh, then retain the
+// actual Vulkan provider atomically with copying its shape. No present-format substitution applies.
+VkTexturePresentSource *vk_texture_transfer_read_select(const tex_t *t, VkTexImage *selected) {
+    if (!t || !t->mem) return NULL;
+    lock();
+    Tex *e = texture_get_locked(t, 0);
+    VkTexturePresentSource *source = e && e->t.serial == t->serial &&
+        (e->pub.usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) ?
+        vk_texture_present_retain_image(&e->pub, e->pub.image) : NULL;
+    if (source) *selected = e->pub;
+    unlock();
+    return source;
+}
+
+int vk_texture_transfer_read_current(const VkTexturePresentSource *source, VkImage image) {
+    if (!source || !image) return 0;
+    lock();
+    TextureMaterialInstance *instance = source->material.use.instance;
+    const Tex *pinned = source->pin ? nvn_texture_pin_attachment(source->pin) : NULL;
+    VkMemoryImageHold *raw = !instance && (!source->pin || (pinned && pinned->pub.image == image)) ?
+        vk_mem_image_hold_retain_exact(source->raw, image) : NULL;
+    int exact = instance ? instance->value.image == image : raw != NULL;
+    vk_mem_image_release(raw);
+    unlock();
+    return exact;
+}
+
+int vk_texture_transfer_read_use(const VkTexturePresentSource *source, VkImage image) {
+    if (!source || !image) rt_fatal("vk: missing exact transfer read lease");
+    if (source->pin) {
+        vk_texture_explicit_read_use(source->pin, image);
+        return 1;
+    }
+    if (source->material.use.instance) {
+        if (source->material.use.instance->value.image != image) rt_fatal("vk: transfer changed its exact material source");
+        vk_texture_use_images(&image, 1);
+        return 1;
+    }
+    return 0;
+}
+
+int vk_texture_record_selected_sample_locked(const VkTexturePresentSource *source, VkImage image) {
+    if (!source || !image) return 0;
+    TextureUseBatch *batch = texture_use_active(vk_exec_recording_fence(), 1);
+    if (!batch) return 0;
+    TextureMaterialInstance *instance = source->material.use.instance;
+    if (instance) {
+        if (instance->value.image != image) return 0;
+        texture_use_insert(&batch->head, batch->buckets, instance, &source->material.use);
+        return 1;
+    }
+    VkMemoryImageHold *held = vk_mem_image_hold_retain_exact(source->raw, image);
+    if (!held) return 0;
+    if (source->pin) {
+        const Tex *entry = nvn_texture_pin_attachment(source->pin);
+        if (!entry || entry->pub.image != image) {
+            vk_mem_image_release(held);
+            return 0;
+        }
+        texture_use_pin(entry, source->pin);
+    }
+    texture_native_use_batch(batch, &(TextureNativeUse){.hold = held, .image = image});
+    vk_mem_image_release(held);
+    if (source->upload) {
+        if (++source->upload->references == 0) rt_fatal("vk: retained texture upload reference count exhausted");
+        vk_completion_add_owned(vk_exec_recording_fence(), retained_texture_upload_release,
+                                retained_texture_upload_cancel, source->upload);
+    }
+    return 1;
+}
+
+static void tex_image_prepare(const Tex *e, uint64_t size) {
+    uint32_t count;
+    const RcInterval *source = image_backing_intervals(e, &count);
+    resource_image_prepare_mapped((uint64_t)(uintptr_t)e->pub.image, e->pub.addr, size, source, count);
+}
+
+static void image_write_prepare_locked(VkImage image, uint64_t addr, uint64_t size) {
+    if (!image || !size) return;
+    for (const Tex *e = nvn_hm_get(&by_addr, &addr); e; e = e->next_at) {
+        if (e->pub.image == image && e->pub.addr == addr && !e->pub.gone) {
+            tex_image_prepare(e, size);
+            return;
+        }
+    }
+    // A copied image handle is not permission to obtain the mapping currently at its guest address.
+    resource_image_prepare((uint64_t)(uintptr_t)image, addr, size);
+}
+
+void vk_texture_image_write_prepare_locked(const VkTexImage *image, uint64_t size) {
+    if (image) image_write_prepare_locked(image->image, image->addr, size);
+}
+
+void vk_texture_image_write_prepare(VkImage image, uint64_t addr, uint64_t size) {
+    if (!image || !size) return;
+    lock();
+    image_write_prepare_locked(image, addr, size);
+    unlock();
+}
+
+static const VkTexImage *texture_writable(const VkTexImage *img, int prepare_write) {
     if (!img || img->gone || !img->image) return NULL;
     Tex *e = (Tex *)img;
     if (e->material && vk_exec_turn_due()) { tex_deferred = 1; return NULL; }
+    texture_registration_source_clear(e);
     e->material_writable = 1;
-    content_write_begin(e, 1);
+    if (!content_write_begin(e, 1)) return NULL;
+    if (prepare_write) tex_image_prepare(e, e->t.L.size);
     return &e->pub;
 }
 
-const VkTexImage *vk_texture_get_write(const tex_t *t) {
+// Mutable access is a separate operation from lookup: no writable view can capture an immutable shared image.
+const VkTexImage *vk_texture_writable_locked(const VkTexImage *img) {
+    return texture_writable(img, 1);
+}
+
+static const VkTexImage *get_texture_write_mode(const tex_t *t, int prepare_write, int private_output) {
     if (!t || !t->mem) return NULL;
     lock();
-    Tex *e = entry_of(t);
+    Tex *e = entry_of_mode(t, private_output, NULL);
     const VkTexImage *result = NULL;
     if (e) {
         make_fresh(e);
-        if (!tex_deferred) result = vk_texture_writable_locked(&e->pub);
+        if (!tex_deferred) result = texture_writable(&e->pub, prepare_write);
     }
     unlock();
     return result;
+}
+
+static const VkTexImage *get_texture_write(const tex_t *t, int prepare_write) {
+    return get_texture_write_mode(t, prepare_write, 0);
+}
+
+const VkTexImage *vk_texture_get_write(const tex_t *t) {
+    return get_texture_write(t, 1);
+}
+
+static Tex *pinned_writable(const tex_t *t) {
+    Tex *e = nvn_texture_pin_attachment(t);
+    if (!e) return NULL;
+    if (!e->pub.image || !e->pub.gpu_owned || e->material)
+        rt_fatal("vk: writable binding selected an uncommitted pinned texture");
+    if (!e->pin_detached && !mem_backing_current(e->image_host_backing)) destroy_tex(e);
+    return e;
+}
+
+static void pinned_image_prepare(const Tex *e,VkImage image) {
+    uint32_t count;
+    const RcInterval *intervals = image_backing_intervals(e, &count);
+    resource_image_prepare_pinned((uint64_t)(uintptr_t)image, e->pub.addr, e->t.L.size, intervals, count, e->pin_detached);
+}
+
+static void pinned_image_declare(Tex *e,VkImage image,ResourceCommandEffects *effects) {
+    if (!e->pin_detached && !mem_backing_current(e->image_host_backing)) destroy_tex(e);
+    if (e->pin_detached) {
+        // Only ordinary private images get a pin attachment. Their former host backing still retains the
+        // history of earlier projected writes, but detached writes affect this native version alone.
+        if (e->bound_to || e->image_device_count) rt_fatal("vk: detached pinned texture shares native storage");
+        return;
+    }
+    uint32_t count;
+    const RcInterval *intervals = image_backing_intervals(e, &count);
+    if (resource_effects_add_pinned_image(effects, (uint64_t)(uintptr_t)image, intervals, count) != RC_REGISTRY_OK)
+        rt_fatal("resource effects: could not declare the pinned texture destination");
+}
+
+const VkTexImage *vk_texture_get_target(const tex_t *t) {
+    lock();
+    Tex *e = pinned_writable(t);
+    if (e) touch(e);
+    unlock();
+    // Attachment materialization may initialize or copy preserved contents. The actual draw/clear owns the
+    // guest write reservation, which is unnecessary while selecting or loading the attachment.
+    return e ? &e->pub : get_texture_write(t, 0);
+}
+
+struct VkTextureTargetLoan {
+    TexKey key;
+    uint64_t serial, size;
+    VkTexImage image;
+    VkPinnedTextureWrite pinned;
+    TextureUseNode material;
+    VkMemoryImageHold *raw;
+    int materialized;
+    int private_backing;
+};
+
+// The ordered pass can borrow an already writable ordinary image without calling make_fresh or beginning COW.
+// A binding to a writable pool alias still needs the existing compatibility resolver and its pool obligations.
+static int target_loan_ready(const Tex *e, uint64_t serial, uint64_t size, int pinned, int materialized) {
+    return e && e->t.serial == serial && e->t.L.size == size && e->pub.image && !e->pub.gone &&
+        (e->pub.gpu_owned || (materialized && e->material_writable)) &&
+        (e->pub.type == VK_IMAGE_TYPE_2D || materialized) && (!e->material || materialized) &&
+        (e->alloc || (materialized && e->bound_to)) &&
+        ((!e->pub.block_views && !e->bound_to && !e->image_device_count) || materialized) &&
+        (pinned || (!e->released && !e->superseded &&
+        (!e->image_host_backing || mem_backing_current(e->image_host_backing))));
+}
+
+VkTextureTargetLoan *vk_texture_target_loan(const tex_t *t, VkImage expected, int materialized) {
+    if (!t || !t->mem) return NULL;
+    lock();
+    TexKey key;
+    make_key(t, &key);
+    const Tex *pinned = nvn_texture_pin_attachment(t);
+    const Tex *e = pinned ? pinned : nvn_hm_get(&by_key, &key);
+    VkTextureTargetLoan *loan = NULL;
+    if (target_loan_ready(e, t->serial, t->L.size, pinned != NULL, materialized) &&
+        (!expected || e->pub.image == expected)) {
+        loan = calloc(1, sizeof *loan);
+        if (!loan) rt_fatal("vk: exact render target loan allocation failed");
+        loan->key = key;
+        loan->serial = t->serial;
+        loan->size = t->L.size;
+        loan->image = e->pub;
+        loan->materialized = materialized;
+        loan->private_backing = e->alloc && !e->bound_to && !e->image_device_count;
+        if (pinned) {
+            const tex_t *pin = nvn_texture_pin_retain_attachment(t->serial, e);
+            if (pin != t) rt_fatal("vk: exact render target could not retain the selected pin");
+            loan->pinned = (VkPinnedTextureWrite){pin, e->pub.image};
+        } else {
+            TextureMaterialInstance *instance = content_use_image_find(e->pub.image);
+            if (!instance) loan->raw = vk_mem_image_hold(e->pub.image);
+            else if (texture_use_retain_instance(&loan->material, instance, NULL) != RC_LIFETIME_OK)
+                rt_fatal("vk: exact render target could not retain the selected material instance");
+        }
+    }
+    unlock();
+    return loan;
+}
+
+const VkTexImage *vk_texture_target_loan_image(const VkTextureTargetLoan *loan) {
+    return &loan->image;
+}
+
+int vk_texture_target_loan_current(const VkTextureTargetLoan *loan) {
+    lock();
+    const Tex *e = loan->pinned.pin ? nvn_texture_pin_attachment(loan->pinned.pin) : nvn_hm_get(&by_key, &loan->key);
+    int current = target_loan_ready(e, loan->serial, loan->size, loan->pinned.pin != NULL, loan->materialized) &&
+        e->pub.image == loan->image.image && e->pub.fb_learned == loan->image.fb_learned;
+    unlock();
+    return current;
+}
+
+int vk_texture_target_loan_backing_current(const VkTextureTargetLoan *loan,
+    const RcRegistryImageWriteExtent *expected, uint32_t count) {
+    if (!loan || !expected || !count) return 0;
+    lock();
+    const Tex *entry = loan->pinned.pin ? nvn_texture_pin_attachment(loan->pinned.pin) : nvn_hm_get(&by_key, &loan->key);
+    uint32_t available = 0;
+    const RcInterval *intervals = NULL;
+    if (entry && entry->t.serial == loan->serial && entry->pub.image == loan->image.image) {
+        intervals = image_backing_intervals(entry, &available);
+        if (entry->image_device_count || entry->image_private_mapping_count) {
+            if (!image_alias_guest_mapping_current(entry->pub.addr, entry->t.L.size, intervals, available)) available = 0;
+        } else if (!entry->image_host_backing || !mem_backing_current(entry->image_host_backing)) available = 0;
+    }
+    int current = available == count;
+    for (uint32_t i = 0; current && i < count; i++) {
+        RcInterval a = expected[i].interval, b = intervals[i];
+        current = a.address == b.address && a.mapping == b.mapping && rc_range_equal(a.range,b.range);
+    }
+    unlock();
+    return current;
+}
+
+int vk_texture_target_loan_private(const VkTextureTargetLoan *loan) {
+    return loan->private_backing;
+}
+
+VkPinnedTextureWrite vk_texture_target_loan_take_pin(VkTextureTargetLoan *loan) {
+    VkPinnedTextureWrite pinned = loan->pinned;
+    loan->pinned = (VkPinnedTextureWrite){0};
+    return pinned;
+}
+
+void vk_texture_target_loan_release(VkTextureTargetLoan *loan) {
+    if (!loan) return;
+    vk_texture_pinned_write_release(&loan->pinned);
+    TextureMaterialInstance *instance = loan->material.use.instance;
+    if (instance) {
+        lock();
+        texture_use_unlink(&loan->material);
+        texture_material_require(texture_material_use_cancel(&loan->material.use));
+        texture_uses.nodes--;
+        int reclaim = texture_material_instance_defer_ready(instance);
+        content_defer_instance(instance);
+        unlock();
+        if (reclaim) resource_core_budget_progress();
+    } else vk_mem_image_release(loan->raw);
+    free(loan);
+}
+
+int vk_texture_alias_region_transfer(const tex_t *t, const view_t *view, const NVNcopyRegion *region) {
+    if (!t || !region || !nvn_gpu_only((uintptr_t)t->mem) || !t->L.size ||
+        t->L.size > VK_TEXTURE_ALIAS_MAX_BYTES || region->xoffset < 0 || region->yoffset < 0 || region->zoffset ||
+        region->width <= 0 || region->height <= 0 || (int64_t)region->xoffset + region->width > t->d.width ||
+        (int64_t)region->yoffset + region->height > t->d.height ||
+        t->d.target != NVN_TEXTURE_TARGET_2D || region->depth != 1 || t->d.levels != 1 || t->d.samples > 1 ||
+        (view && (view->set_format || (view->set_levels && view->base_level) ||
+                  (view->set_layers && view->min_layer)))) return 0;
+    TexVkFormat format;
+    int bw, bh;
+    return nvn_fmt_bpb(t->d.format, &bw, &bh) && bw == 1 && bh == 1 && tex_vk_format(t->d.format, &format) &&
+        format.vk == format.ideal && !format.expand_rgb && !format.astc_bw && !format.astc_bc && !format.depth && !format.stencil;
+}
+
+static int transfer_volume_layout(const tex_t *t, const view_t *view) {
+    if (!t || !t->mem || !t->L.size || t->L.size > VK_TEXTURE_ALIAS_MAX_BYTES ||
+        t->d.target != NVN_TEXTURE_TARGET_3D || nvn_tex_is_linear(&t->d) ||
+        t->d.width <= 0 || t->d.height <= 0 || t->d.depth <= 0 || !t->d.levels || t->d.levels >= 32 ||
+        t->L.layers != 1 || t->d.samples > 1 ||
+        (view && (view->set_layers || view->set_dsmode ||
+                  (view->set_target && view->target != NVN_TEXTURE_TARGET_3D) ||
+                  (view->set_format && view->format != t->d.format) ||
+                  (view->set_levels && view->base_level >= t->d.levels)))) return 0;
+    TexVkFormat format;
+    int bw, bh;
+    return nvn_fmt_bpb(t->d.format, &bw, &bh) && bw == 1 && bh == 1 &&
+        tex_vk_format(t->d.format, &format) && format.vk == format.ideal &&
+        !format.expand_rgb && !format.astc_bw && !format.astc_bc && !format.depth && !format.stencil;
+}
+
+int vk_texture_alias_volume_transfer(const tex_t *t, const view_t *view) {
+    return t && nvn_gpu_only((uintptr_t)t->mem) && transfer_volume_layout(t, view);
+}
+
+int vk_texture_host_volume_transfer(const tex_t *t, const view_t *view) {
+    return t && !nvn_gpu_only((uintptr_t)t->mem) && tex_mirrored(t) &&
+        t->d.levels == 1 && transfer_volume_layout(t, view);
+}
+
+int vk_texture_host_color_transfer(const tex_t *t, const view_t *view) {
+    if (!t || !t->mem || !t->L.size || t->L.size > VK_TEXTURE_ALIAS_MAX_BYTES || !tex_mirrored(t) ||
+        t->d.target != NVN_TEXTURE_TARGET_2D || t->d.width <= 0 || t->d.height <= 0 ||
+        t->d.levels != 1 || t->L.layers != 1 || t->d.samples > 1 ||
+        (view && ((view->set_format && view->format != t->d.format) ||
+                  (view->set_target && view->target != t->d.target) || view->set_dsmode ||
+                  (view->set_levels && view->base_level) || (view->set_layers && view->min_layer)))) return 0;
+    TexVkFormat format;
+    int bw, bh;
+    return nvn_fmt_bpb(t->d.format, &bw, &bh) && bw == 1 && bh == 1 &&
+        tex_vk_format(t->d.format, &format) && format.vk == format.ideal &&
+        !format.expand_rgb && !format.astc_bw && !format.astc_bc && !format.depth && !format.stencil;
+}
+
+static VkFormat alias_depth_format(int format) {
+    switch (format) {
+    case NVN_FORMAT_DEPTH16: return VK_FORMAT_D16_UNORM;
+    case NVN_FORMAT_DEPTH32F: return VK_FORMAT_D32_SFLOAT;
+    default: return VK_FORMAT_UNDEFINED;
+    }
+}
+
+int vk_texture_alias_depth_attachment_range(const tex_t *t, const view_t *view, VkImageSubresourceRange *range) {
+    if (!t || !alias_depth_format(t->d.format) || t->d.samples > 1 || !t->d.levels || t->d.levels >= 32 || !t->L.layers ||
+        (t->d.target != NVN_TEXTURE_TARGET_2D && t->d.target != NVN_TEXTURE_TARGET_2D_ARRAY) ||
+        !t->L.size || t->L.size > VK_TEXTURE_ALIAS_MAX_BYTES || !nvn_gpu_only((uintptr_t)t->mem)) return 0;
+    uint32_t level = view && view->set_levels ? view->base_level : 0;
+    uint32_t base = view && view->set_layers ? view->min_layer : 0;
+    if (level >= t->d.levels || base >= t->L.layers) return 0;
+    uint32_t layers = view && view->set_layers && view->nlayers ? view->nlayers : t->L.layers - base;
+    if (layers > t->L.layers - base || (view && ((view->set_format && view->format != t->d.format) ||
+        (view->set_target && view->target != t->d.target && (view->target != NVN_TEXTURE_TARGET_2D || layers != 1)) ||
+        (view->set_dsmode && view->dsmode != NVN_TEXTURE_DEPTH_STENCIL_MODE_DEPTH)))) return 0;
+    *range = (VkImageSubresourceRange){VK_IMAGE_ASPECT_DEPTH_BIT, level, 1, base, layers};
+    return 1;
+}
+
+int vk_texture_alias_attachment_range(const tex_t *t, const view_t *view, int depth,
+                                      VkImageSubresourceRange *range) {
+    if (depth) return vk_texture_alias_depth_attachment_range(t, view, range);
+    if (!t || !nvn_gpu_only((uintptr_t)t->mem) || !t->L.size || t->L.size > VK_TEXTURE_ALIAS_MAX_BYTES ||
+        t->d.samples > 1 || !t->d.levels || t->d.levels >= 32 || !t->L.layers) return 0;
+    switch (t->d.target) {
+    case NVN_TEXTURE_TARGET_2D: case NVN_TEXTURE_TARGET_2D_ARRAY:
+    case NVN_TEXTURE_TARGET_CUBEMAP: case NVN_TEXTURE_TARGET_CUBEMAP_ARRAY: break;
+    default: return 0;
+    }
+    TexVkFormat format;
+    int bw, bh;
+    if (!nvn_fmt_bpb(t->d.format, &bw, &bh) || bw != 1 || bh != 1 || !tex_vk_format(t->d.format, &format) ||
+        format.vk != format.ideal || format.expand_rgb || format.astc_bw || format.astc_bc ||
+        format.depth || format.stencil) return 0;
+    const uint32_t level = view && view->set_levels ? view->base_level : 0;
+    const uint32_t base = view && view->set_layers ? view->min_layer : 0;
+    if (level >= t->d.levels || base >= t->L.layers) return 0;
+    const uint32_t layers = view && view->set_layers && view->nlayers ? view->nlayers : t->L.layers - base;
+    if (layers > t->L.layers - base || (view && ((view->set_format && view->format != t->d.format) ||
+        (view->set_target && view->target != t->d.target && view->target != NVN_TEXTURE_TARGET_2D_ARRAY &&
+            (view->target != NVN_TEXTURE_TARGET_2D || layers != 1)) ||
+        (view->set_dsmode && view->dsmode != NVN_TEXTURE_DEPTH_STENCIL_MODE_DEPTH)))) return 0;
+    *range = (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, level, 1, base, layers};
+    return 1;
+}
+
+int vk_texture_alias_depth_clear_candidate(const tex_t *t) {
+    return t && alias_depth_format(t->d.format) && t->d.target == NVN_TEXTURE_TARGET_2D &&
+        t->d.levels == 1 && t->d.samples <= 1 && t->L.size && t->L.size <= VK_TEXTURE_ALIAS_MAX_BYTES &&
+        nvn_gpu_only((uintptr_t)t->mem);
+}
+
+int vk_texture_alias_depth_transfer(const tex_t *t, const view_t *view, const NVNcopyRegion *box) {
+    return vk_texture_alias_depth_clear_candidate(t) && t->L.layers == 1 &&
+        vk_texture_attachment_base_view(t, view) && box && box->depth == 1 && !box->zoffset &&
+        box->xoffset >= 0 && box->yoffset >= 0 && box->width > 0 && box->height > 0 &&
+        (int64_t)box->xoffset + box->width <= t->d.width && (int64_t)box->yoffset + box->height <= t->d.height;
+}
+
+int vk_texture_alias_depth_clear_bound(const tex_t *t) {
+    TexKey key;
+    make_key(t, &key);
+    lock();
+    const Tex *entry = nvn_texture_pin_attachment(t);
+    if (!entry) entry = nvn_hm_get(&by_key, &key);
+    int bound = entry && entry->t.serial == t->serial && entry->pub.image && !entry->pub.gone && entry->bound_to;
+    unlock();
+    return bound;
+}
+
+const VkTexImage *vk_texture_get_alias_transfer_write(const tex_t *t) {
+    // Transfer writes are independent of the old pixels. Only the actually emitted box contributes to
+    // guest contents; a future read that spans other producers must acquire their exact coverage.
+    return get_texture_write_mode(t, 1, 1);
+}
+
+const VkTexImage *vk_texture_get_transfer_write(const tex_t *t) {
+    if (!t) return NULL;
+    lock();
+    Tex *e = pinned_writable(t);
+    if (e) {
+        pinned_image_prepare(e, e->pub.image);
+        touch(e);
+        unlock();
+        return &e->pub;
+    }
+    unlock();
+    return vk_texture_get_write(t);
+}
+
+// A direct attachment can be resolved once and used by many commands in one pass. The receipt names the actual
+// selected texture pin and native image even if its live address projection disappears while recording the pass.
+void vk_texture_pinned_write_capture(const tex_t *t, VkImage image, VkPinnedTextureWrite *out) {
+    if (!t || !image) return;
+    lock();
+    Tex *e = pinned_writable(t);
+    if (e) {
+        if (out->pin || e->pub.image != image) rt_fatal("vk: pinned target differs from the selected native image");
+        out->pin = nvn_texture_pin_retain_attachment(t->serial, e);
+        if (out->pin != t) rt_fatal("vk: could not retain the selected pinned target");
+        out->image = image;
+    }
+    unlock();
+}
+
+void vk_texture_pinned_write_release(VkPinnedTextureWrite *capture) {
+    nvn_texture_pin_release(capture->pin);
+    *capture = (VkPinnedTextureWrite){0};
+}
+
+int vk_texture_pinned_write_matches_locked(const VkPinnedTextureWrite *capture, VkImage image) {
+    const Tex *e = nvn_texture_pin_attachment(capture->pin);
+    return e && image && capture->image == image && e->pub.image == image && !e->pub.gone;
+}
+
+static Tex *pinned_write_entry(const VkPinnedTextureWrite *capture) {
+    Tex *e = pinned_writable(capture->pin);
+    if (!e || e->pub.image != capture->image)
+        rt_fatal("vk: captured pinned texture no longer owns its selected image");
+    return e;
+}
+
+void vk_texture_pinned_write_use(const VkPinnedTextureWrite *capture) {
+    lock();
+    texture_use_pin(pinned_write_entry(capture), capture->pin);
+    unlock();
+}
+
+void vk_texture_pinned_write_prepare(const VkPinnedTextureWrite *capture) {
+    lock();
+    const Tex *e = pinned_write_entry(capture);
+    pinned_image_prepare(e, capture->image);
+    unlock();
+}
+
+int vk_texture_declare_pin_write(const tex_t *t, ResourceCommandEffects *effects) {
+    lock();
+    Tex *e = nvn_texture_pin_attachment(t);
+    if (e) pinned_image_declare(e, e->pub.image, effects);
+    unlock();
+    return e != NULL;
+}
+
+void vk_texture_explicit_read_use(const tex_t *t,VkImage image) {
+    lock();
+    const Tex *e = nvn_texture_pin_attachment(t);
+    if (e) {
+        if (e->pub.image != image) rt_fatal("vk: explicit copy changed its pinned source");
+        texture_use_pin(e, t);
+    }
+    unlock();
 }
 
 // Render targets the CPU reads without NVN's invalidate (vk_texture_write_back_small); small_pending: one may be dirty.
@@ -4554,6 +7963,8 @@ static void wb_cfg_init(void) {
 static int wb_wanted(const Tex *e) { return e->t.L.size <= wb_limit || e->run < WB_RUN; }
 
 static void mark_released(Tex *e) {   // tex_lock held; e is not released
+    texture_registration_source_clear(e);
+    compatibility_invalidate(e);
     e->upload_mapping = 0;
     flight_ev(e, FLIGHT_TEX_RELEASE, 0, 0);
     if (e->material) texture_material_set_live(e->material, 0);
@@ -4591,7 +8002,12 @@ static void overwrite_others(const Tex *e, uint64_t fr) {
 
 // The writable image has already been prepared. Do not refresh it here: when called after command recording that
 // could replace the destination or upload old CPU bytes over the GPU result that the command will produce.
-static void gpu_written_prepared(Tex *e) {
+static void gpu_written_prepared_at(Tex *e, const uint32_t *host_cpu_generation) {
+    texture_registration_source_clear(e);
+    e->native_write = vk_exec_resource_position();
+    bound_alias_forget(e);
+    if (!++e->content_revision) rt_fatal("vk: texture content revision exhausted");
+    resource_image_written((uint64_t)(uintptr_t)e->pub.image, e->pub.addr);
     vk_exec_frame_written(&e->t);
     content_image_forget(e);
     uint64_t now = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
@@ -4614,11 +8030,24 @@ static void gpu_written_prepared(Tex *e) {
     if (f > e->wr_fence) e->wr_fence = f;
     if (e->pub.mirrored) {
         e->gpu_dirty = 1;
-        storage_rewritten(e, 0, &e->gpu_gen);   // CPU writes up to here are older than this render
-        if (wb_exact < 0) wb_exact = cfg_bool("NX2NAVI_WB_EXACT");
-        if (wb_exact && !e->snap && e->t.L.size <= SNAP_MAX && fills_no_page(e) && !(e->snap = malloc(SNAP_MAX)))
-            rt_fatal("vk: out of memory for a texture's storage copy");
-        if (e->snap) memcpy(e->snap, (const void *)(uintptr_t)e->pub.addr, e->t.L.size);
+        if (host_cpu_generation) e->gpu_gen = *host_cpu_generation;
+        else {
+            e->snap_color_texels = 0;
+            storage_rewritten(e, 0, &e->gpu_gen);   // CPU writes up to here are older than this render
+            if (wb_exact < 0) wb_exact = cfg_bool("NX2NAVI_WB_EXACT");
+            if (wb_exact && !e->snap && e->t.L.size <= SNAP_MAX && fills_no_page(e) && !(e->snap = malloc(SNAP_MAX)))
+                rt_fatal("vk: out of memory for a texture's storage copy");
+            if (e->snap) {
+                if (!e->pin_owned) memcpy(e->snap, (const void *)(uintptr_t)e->pub.addr, e->t.L.size);
+                else if (mem_backing_read_hold(e->image_host_backing)) {
+                    memcpy(e->snap, (const void *)(uintptr_t)e->pub.addr, e->t.L.size);
+                    mem_read_release();
+                } else {
+                    free(e->snap);
+                    e->snap = NULL;
+                }
+            }
+        }
         e->gpu_seq = ++gpu_writes;
         e->gpu_fence = vk_exec_recording_fence();
         uint64_t fr = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
@@ -4631,27 +8060,4154 @@ static void gpu_written_prepared(Tex *e) {
     }
     // Nonmirrored CPU-address images also exclude overlapping stale CPU material reuse. Only mirrored dirty
     // images enter the write-back path; all CPU-address GPU owners participate in the authority overlap index.
-    if (!nvn_gpu_only(e->pub.addr)) own_add(e);
+    own_add(e);
+    image_bound_written(e);
+}
+
+static void gpu_written_prepared(Tex *e) { gpu_written_prepared_at(e, NULL); }
+
+typedef struct {
+    TextureMaterial *previous;
+    TextureRecoveryCopy copy;
+    VkPreparedStaging staging;
+    RcBudgetTicket workspace;
+    TextureSourceStamp stamp;
+    RcRegistryPosition read;
+    uint32_t proof_count;
+    TextureSourceAuthority proofs[];
+} TextureWriteCpuSeed;
+
+typedef struct {
+    RcRegistryPosition read;
+    uint64_t pool, registration;
+    int logical, native, has_view;
+    view_t view;
+} TextureWriteStorageSelection;
+
+struct VkTextureWriteTarget {
+    Tex *entry;
+    const tex_t *pin;
+    TextureMaterialUse source_use;
+    TextureMaterialResidency source;
+    VkTextureRestore *seed;
+    TextureWriteCpuSeed *cpu_seed;
+    ImgKey key;
+    VmaAllocation allocation;
+    VkImage image, selected;
+    uint64_t bytes, revision;
+    uint64_t host_seed_upload;
+    int seeded, viewed, bound;
+    TextureWriteStorageSelection storage;
+};
+
+static int write_target_storage_current_locked(const VkTextureWriteTarget *target);
+
+// An exact retained recipe can seed a private destination. Lossy representations, scaled targets and
+// unresolved storage aliases need a different writer contract.
+static int write_target_material_candidate(const Tex *e, int allow_cold) {
+    if (!e || e->released || !e->material || !e->material->ready ||
+        e->material->resident.image != e->pub.image ||
+        !e->image_host_backing || e->bound_to || e->pub.type != VK_IMAGE_TYPE_2D ||
+        e->pub.aspect != VK_IMAGE_ASPECT_COLOR_BIT || e->pub.samples != 1 || e->pub.scale > 1 ||
+        e->f.vk != e->f.ideal || e->f.expand_rgb || e->f.astc_bw || format_compressed(e->f.vk) ||
+        !content_image_eligible(e)) return 0;
+    return e->pub.image ? e->uploaded : allow_cold && e->material->provider;
+}
+
+static Tex *write_target_candidate(const tex_t *t, int allow_cold) {
+    Tex *e = nvn_texture_pin_attachment(t);
+    if (e) return e->pub.image && e->pub.gpu_owned ? e : NULL;
+    TexKey key;
+    make_key(t, &key);
+    e = nvn_hm_get(&by_key, &key);
+    return e && e->t.serial == t->serial && write_target_material_candidate(e, allow_cold) ? e : NULL;
+}
+
+static int write_target_shape(const tex_t *t, VkTexImage *out, int allow_cold) {
+    if (!t || !t->mem) return 0;
+    lock();
+    const Tex *e = write_target_candidate(t, allow_cold);
+    if (e) *out = e->pub;
+    unlock();
+    return e != NULL;
+}
+
+int vk_texture_write_target_shape(const tex_t *t, VkTexImage *out) {
+    return write_target_shape(t, out, 0);
+}
+
+int vk_texture_write_target_restore_shape(const tex_t *t, VkTexImage *out) {
+    return write_target_shape(t, out, 1);
+}
+
+static TextureWriteCpuSeed *write_target_capture_cpu(Tex *e, const TextureSourceObservation *observation) {
+    const RcRegistryPosition read = vk_exec_resource_position();
+    if (!rc_registry_position_valid(read) || !e->source_canonical || !e->source_mapping || !source_private_sample(e) ||
+        e->source_blocked || !texture_source_stamp_valid(&observation->stamp)) return NULL;
+    TextureRecoveryCopy copy = {0};
+    if (!recovery_copy_layout(e, &copy)) return NULL;
+    const TextureSourceMapping *mapping = e->source_mapping;
+    const uint32_t count = mapping->count;
+    if (!count || (size_t)count > (SIZE_MAX - sizeof(TextureWriteCpuSeed)) / sizeof *mapping->observed) return NULL;
+    TextureWriteCpuSeed *seed = calloc(1, sizeof *seed + count * sizeof *seed->proofs);
+    if (!seed) return NULL;
+    *seed = (TextureWriteCpuSeed){.previous = e->material, .copy = copy, .stamp = observation->stamp,
+        .read = read, .proof_count = count};
+    memcpy(seed->proofs, mapping->observed, count * sizeof *seed->proofs);
+    return seed;
+}
+
+static int write_target_capture(const tex_t *t, const VkTexImage *shape, VkTextureWriteTarget **out,
+                                int cpu_allowed, Tex *selected) {
+    lock();
+    Tex *e = selected ? selected : write_target_candidate(t, !shape->image);
+    if (!e || e->pub.image != shape->image) { unlock(); return -1; }
+    uint32_t count;
+    image_backing_intervals(e, &count);
+    if (!count) { unlock(); return 0; }
+    VkTextureWriteTarget *target = calloc(1, sizeof *target);
+    if (!target) rt_fatal("vk: required image write preparation record allocation failed");
+    if (!e->pin_owned) {
+        int exact = 0;
+        if (mem_backing_current(e->image_host_backing)) {
+            if (!e->pub.image) {
+                target->seed = restore_capture_locked(e, t->serial);
+                exact = target->seed != NULL;
+            } else {
+                TextureSourceObservation observed;
+                const int source = source_observe(e, &e->source_stamp, &observed);
+                if (source == TEX_SOURCE_CLEAN)
+                    exact = texture_material_use_begin(e->material, &target->source_use) == RC_LIFETIME_OK;
+                else if (cpu_allowed) {
+                    target->cpu_seed = write_target_capture_cpu(e, &observed);
+                    exact = target->cpu_seed != NULL;
+                }
+                if (selected && (!e->source_canonical || !e->source_mapping || !source_mapping_domain_current(e)))
+                    exact = 0;
+            }
+        }
+        if (!exact || !nvn_texture_pin_attach(t, e, pin_owner_release)) {
+            if (target->source_use.instance)
+                texture_material_require(texture_material_use_cancel(&target->source_use));
+            vk_texture_restore_cancel(target->seed);
+            free(target->cpu_seed);
+            free(target);
+            unlock();
+            return 0;
+        }
+        e->pin_owned = 1;
+        e->pending_write = target;
+        if (target->source_use.instance) target->source = target->source_use.instance->value;
+        target->key = e->material->key;
+    }
+    target->entry = e;
+    target->selected = shape->image;
+    target->pin = nvn_texture_pin_retain_attachment(t->serial, e);
+    if (target->pin != t) rt_fatal("vk: image write target lost its exact texture pin");
+    target->revision = e->content_revision;
+    *out = target;
+    unlock();
+    return 1;
+}
+
+int vk_texture_write_target_capture(const tex_t *t, const VkTexImage *shape, VkTextureWriteTarget **out) {
+    return write_target_capture(t, shape, out, 0, NULL);
+}
+
+static int write_target_cpu_current(const VkTextureWriteTarget *target) {
+    const Tex *e = target->entry;
+    const TextureWriteCpuSeed *cpu = target->cpu_seed;
+    return e->pending_write == target && e->material == cpu->previous && !e->pin_detached &&
+        !rc_registry_position_compare(cpu->read, vk_exec_resource_position()) && mem_backing_current(e->image_host_backing) &&
+        mem_mapping_range_unchanged(e->pub.addr, e->t.L.size, cpu->stamp.mapping) &&
+        mem_protection_range_unchanged(e->pub.addr, e->t.L.size, cpu->stamp.protection);
+}
+
+static int write_target_current_locked(const VkTextureWriteTarget *target) {
+    const Tex *e = target->entry;
+    if (!e->pin_owned || e->pub.gone || e->content_revision != target->revision) return 0;
+    if (target->storage.registration && !write_target_storage_current_locked(target)) return 0;
+    if (target->cpu_seed) return write_target_cpu_current(target);
+    // The receipt independently holds the COW source even if pressure detaches the current residency.
+    const TextureMaterial *prior = target->seed ? target->seed->material :
+        target->source_use.instance ? target->source_use.instance->material : NULL;
+    if (prior) return e->pending_write == target && e->material == prior;
+    return !e->pending_write && e->pub.image == target->selected && !e->material;
+}
+
+int vk_texture_write_target_current(const VkTextureWriteTarget *target) {
+    lock();
+    int current = write_target_current_locked(target);
+    unlock();
+    return current;
+}
+
+static void texture_cpu_copy_rollback(TextureRecoveryCopy *copy, VkPreparedStaging *staging, RcBudgetTicket *workspace) {
+    vk_staging_prepare_cancel(staging);
+    if (copy->regions) {
+        resource_core_budget_retire(workspace);
+        free(copy->regions);
+        resource_core_budget_destroyed(workspace);
+    } else if (workspace->token.ledger) resource_core_budget_cancel(workspace);
+    *workspace = (RcBudgetTicket){0};
+    copy->regions = NULL;
+    copy->scratch = NULL;
+}
+
+static void write_target_cpu_rollback(TextureWriteCpuSeed *seed) {
+    if (seed) texture_cpu_copy_rollback(&seed->copy, &seed->staging, &seed->workspace);
+}
+
+static VkResult texture_cpu_copy_peak(const TextureRecoveryCopy *copy, VkPreparedStaging *stage, RcAdmissionVector *peak) {
+    RcAdmissionVector staging;
+    VkResult result = vk_staging_prepare_plan(copy->bytes, stage, &staging);
+    if (result != VK_SUCCESS) return result;
+    RcAdmissionVector workspace = {{0}};
+    workspace.amount[RC_BUDGET_RAM] = workspace.amount[RC_BUDGET_COMMIT] = copy->workspace;
+    return restore_peak_add(peak, &staging) && restore_peak_add(peak, &workspace) ?
+        VK_SUCCESS : VK_ERROR_OUT_OF_HOST_MEMORY;
+}
+
+static VkResult write_target_cpu_peak(TextureWriteCpuSeed *seed, RcAdmissionVector *peak) {
+    return texture_cpu_copy_peak(&seed->copy, &seed->staging, peak);
+}
+
+static VkResult texture_cpu_copy_allocate(TextureRecoveryCopy *copy, VkPreparedStaging *staging,
+                                          RcBudgetTicket *workspace, RcBudgetTicket *peak) {
+    VkResult result = vk_staging_prepare_allocate(staging, peak, 1);
+    if (result != VK_SUCCESS) return result;
+    RcAdmissionVector work = {{0}};
+    work.amount[RC_BUDGET_RAM] = work.amount[RC_BUDGET_COMMIT] = copy->workspace;
+    if (resource_core_budget_split(peak, &work, RC_BUDGET_TEXTURE, workspace) != RC_ADMISSION_OK)
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    copy->regions = malloc(copy->workspace);
+    if (!copy->regions) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    if (resource_core_budget_materialize(workspace, &work) != RC_ADMISSION_OK) {
+        free(copy->regions);
+        copy->regions = NULL;
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    copy->scratch = (uint8_t *)(copy->regions + copy->count);
+    return VK_SUCCESS;
+}
+
+static VkResult write_target_cpu_stage(VkTextureWriteTarget *target, RcBudgetTicket *peak) {
+    TextureWriteCpuSeed *seed = target->cpu_seed;
+    VkResult result = texture_cpu_copy_allocate(&seed->copy, &seed->staging, &seed->workspace, peak);
+    if (result != VK_SUCCESS) return result;
+    lock();
+    Tex *e = target->entry;
+    TextureSourceObservation observed;
+    int exact = write_target_current_locked(target) && recovery_copy_layout(e, &seed->copy);
+    if (exact) {
+        source_observe(e, NULL, &observed);
+        const TextureSourceMapping *mapping = e->source_mapping;
+        exact = !e->source_blocked && source_stamp_equal(&seed->stamp, &observed.stamp) &&
+            mapping && mapping->count == seed->proof_count;
+        for (uint32_t i = 0; exact && i < seed->proof_count; ++i)
+            exact = texture_authority_same(&seed->proofs[i], &mapping->observed[i]);
+        exact = exact && source_snapshot_hold(e);
+    }
+    if (exact) {
+        Tex recipe = {.t = e->t, .f = e->f, .source_copy = e->t.mem};
+        int copied = recovery_copy_fill(&recipe, &seed->copy, seed->staging.map);
+        mem_read_release();
+        int verified = source_snapshot_verify(e, &observed.stamp, seed->proofs);
+        exact = copied && verified;
+    }
+    unlock();
+    if (!exact) return VK_ERROR_INITIALIZATION_FAILED;
+    return vmaFlushAllocation(vk_ctx()->vma, seed->staging.allocation, 0, seed->copy.bytes);
+}
+
+static void write_target_cpu_destroy(TextureWriteCpuSeed **source) {
+    TextureWriteCpuSeed *seed = *source;
+    if (!seed) return;
+    write_target_cpu_rollback(seed);
+    free(seed);
+    *source = NULL;
+}
+
+static uint64_t storage_cpu_seeded;
+uint64_t vk_texture_probe_storage_cpu_seeds(void) {
+    return __atomic_load_n(&storage_cpu_seeded, __ATOMIC_ACQUIRE);
+}
+
+static void write_target_cpu_record(VkTextureWriteTarget *target, VkCommandBuffer cb) {
+    TextureWriteCpuSeed *seed = target->cpu_seed;
+    // Even an open graphics pass can use this immutable pre-effect capture. Only its upload
+    // batch sees the native buffer transfer and layout transition.
+    const int separate = !vk_upload_recording_sequence(cb);
+    if (separate) cb = vk_upload_begin();
+    target->host_seed_upload = vk_upload_recording_sequence(cb);
+    VkBuffer staging = vk_staging_prepare_record(cb, &seed->staging);
+    const Tex *e = target->entry;
+    Tex recipe = {.t = e->t, .pub = e->pub, .f = e->f, .ik = target->key};
+    recipe.pub.image = target->image;
+    init_image(&recipe, cb);
+    barrier(cb, ALL_RW, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    vkCmdCopyBufferToImage(cb, staging, target->image, VK_IMAGE_LAYOUT_GENERAL, seed->copy.count, seed->copy.regions);
+    barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
+    target->seeded = 1;
+    if (separate) vk_upload_end();
+    __atomic_fetch_add(&storage_cpu_seeded, 1, __ATOMIC_RELAXED);
+}
+
+int vk_texture_write_target_needs_allocation(const VkTextureWriteTarget *target) {
+    return target->seed || target->cpu_seed || target->source_use.instance;
+}
+
+static VkTextureRestore *write_target_seed(const VkTextureWriteTarget *target) {
+    return target->seed;
+}
+
+static void write_target_seed_recorded(VkTextureWriteTarget *target) {
+    target->seeded = 1;
+}
+
+static VkImage write_target_allocation(const VkTextureWriteTarget *target) {
+    return target->image;
+}
+
+static VkImageCreateInfo write_target_image_info(const VkTextureWriteTarget *target) {
+    const ImgKey *k = &target->key;
+    return (VkImageCreateInfo){.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = k->flags,
+        .imageType = (VkImageType)k->type, .format = (VkFormat)k->format, .extent = {k->w, k->h, k->d},
+        .mipLevels = k->levels, .arrayLayers = k->layers, .samples = (VkSampleCountFlagBits)k->samples,
+        .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = k->usage, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+}
+
+static VkResult write_target_create(VkTextureWriteTarget *target, const VkImageCreateInfo *info,
+                                    const VmaAllocationCreateInfo *placement, const RcVmaRequest *request,
+                                    RcAdmissionStatus *admission) {
+    VmaAllocationInfo actual;
+    VkResult result = resource_core_vma_create_image(request, vk_ctx()->vma, info, placement,
+                                                     &target->image, &target->allocation, &actual, admission);
+    if (result == VK_SUCCESS) target->bytes = actual.size;
+    return result;
+}
+
+static void write_target_release_allocation(VkTextureWriteTarget *target) {
+    if (!target->image) return;
+    if (target->viewed) {
+        lock();
+        vk_exec_image_gone(target->image);
+        unlock();
+    }
+    if (target->seeded || target->viewed) vk_defer_image(target->image, target->allocation);
+    else resource_core_vma_destroy_image(vk_ctx()->vma, target->image, target->allocation);
+    target->image = VK_NULL_HANDLE;
+    target->allocation = NULL;
+    target->bytes = 0;
+}
+
+VkResult vk_texture_write_target_allocate(VkTextureWriteTarget *target, RcVmaDependency *dependency) {
+    *dependency = (RcVmaDependency){0};
+    if (target->image) return VK_SUCCESS;
+    if (target->seed) return VK_ERROR_INITIALIZATION_FAILED; // Its restore owner admits the placement and the seed together.
+    if (!target->source_use.instance) return VK_SUCCESS;
+    VkImageCreateInfo ci = write_target_image_info(target);
+    RcVmaRequest request = {.producer = RC_BUDGET_TEXTURE, .required = 1, .dependency = dependency};
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    VkCtx *c = vk_ctx();
+    VmaAllocationInfo actual;
+    // The ordinary texture provider uses raw VMA suballocation to avoid a driver's preferred dedicated allocation.
+    // Take a compatible committed block if available. The shared required admission owns any incremental growth.
+    target->image = suballoc_image_try(c, &ci, &target->allocation, SUBALLOC_MAX,
+                                      VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT, 1);
+    if (target->image) {
+        vmaGetAllocationInfo(c->vma, target->allocation, &actual);
+        target->bytes = actual.size;
+        return VK_SUCCESS;
+    }
+    return write_target_create(target, &ci, &ai, &request, NULL);
+}
+
+static int write_targets_disjoint(const Tex *entry, const Tex *peer) {
+    RcSourceRange a = {1, entry->pub.addr, entry->t.L.size};
+    RcSourceRange b = {1, peer->pub.addr, peer->t.L.size};
+    if (!rc_range_valid(a) || !rc_range_valid(b) || rc_range_overlap(a, b)) return 0;
+    uint32_t na, nb;
+    const RcInterval *ma = image_backing_intervals(entry, &na);
+    const RcInterval *mb = image_backing_intervals(peer, &nb);
+    if (!na || !nb) return 0;
+    for (uint32_t i = 0; i < na; i++)
+        for (uint32_t j = 0; j < nb; j++)
+            if (rc_range_overlap(ma[i].range, mb[j].range)) return 0;
+    return 1;
+}
+
+int vk_texture_write_plan_independent(const VkTextureWritePlan *plan) {
+    lock();
+    int valid = 1;
+    for (uint32_t i = 0; valid && i < plan->count; i++)
+        for (uint32_t j = 0; valid && j < i; j++)
+            valid = write_targets_disjoint(plan->targets[i]->entry, plan->targets[j]->entry);
+    unlock();
+    return valid;
+}
+
+int vk_texture_write_plan_disjoint_pin(const VkTextureWritePlan *plan, const VkPinnedTextureWrite *other) {
+    lock();
+    const Tex *peer = nvn_texture_pin_attachment(other->pin);
+    int valid = peer && peer->pub.image == other->image && !peer->pub.gone;
+    for (uint32_t i = 0; valid && i < plan->count; i++)
+        valid = write_targets_disjoint(plan->targets[i]->entry, peer);
+    unlock();
+    return valid;
+}
+
+RcRegistryResult vk_texture_write_compare_input(const VkTextureWriteTarget *target, const VkPinnedTextureWrite *pin,
+    const RcInterval *input, uint32_t input_count, RcInterval *overlap) {
+    if (overlap) *overlap = (RcInterval){0};
+    if ((target != NULL) == (pin != NULL) || !input || !input_count) return RC_REGISTRY_INVALID;
+    lock();
+    const Tex *entry = NULL;
+    if (target && write_target_current_locked(target)) entry = target->entry;
+    if (pin && pin->pin && vk_texture_pinned_write_matches_locked(pin, pin->image))
+        entry = nvn_texture_pin_attachment(pin->pin);
+    uint32_t count = 0;
+    const RcInterval *written = NULL;
+    if (entry && !entry->bound_to && !entry->image_device_count && entry->image_host_backing &&
+        mem_backing_current(entry->image_host_backing)) written = image_backing_intervals(entry, &count);
+    RcRegistryResult result = !entry ? RC_REGISTRY_STALE : written && count ? RC_REGISTRY_OK : RC_REGISTRY_UNSUPPORTED;
+    for (uint32_t i = 0; result == RC_REGISTRY_OK && i < count; ++i)
+        for (uint32_t j = 0; j < input_count; ++j) {
+            if (!rc_range_overlap(written[i].range, input[j].range)) continue;
+            if (overlap) *overlap = written[i];
+            result = RC_REGISTRY_BLOCKED;
+            break;
+        }
+    unlock();
+    return result;
+}
+
+int vk_texture_write_disjoint_input(const VkTextureWriteTarget *target, const VkPinnedTextureWrite *pin,
+                                    const RcInterval *input, uint32_t input_count) {
+    return vk_texture_write_compare_input(target, pin, input, input_count, NULL) == RC_REGISTRY_OK;
+}
+
+VkResult vk_texture_write_plan_allocate(const VkTextureWritePlan *plan, RcVmaDependency *dependency) {
+    *dependency = (RcVmaDependency){0};
+    if (!plan->count) return VK_SUCCESS;
+    if (plan->count == 1 && !plan->targets[0]->cpu_seed)
+        return vk_texture_write_target_allocate(plan->targets[0], dependency);
+    if (plan->targets[0]->image) return VK_SUCCESS; // the prior attempt admitted all placements together
+    struct {
+        VkImageCreateInfo image;
+        VmaAllocationCreateInfo placement;
+    } placements[plan->count];
+    VmaAllocationCreateInfo settings = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    RcVmaDependency native;
+    RcVmaRequest request = {.producer = RC_BUDGET_TEXTURE, .required = 1, .dependency = &native};
+    dependency->can_reuse = 1;
+    for (uint32_t i = 0; i < plan->count; i++) {
+        placements[i].image = write_target_image_info(plan->targets[i]);
+        RcAdmissionVector peak;
+        VkResult result = resource_core_vma_image_peak(&request, &placements[i].image, &settings,
+                                                        &placements[i].placement, &peak);
+        if (result != VK_SUCCESS) return result;
+        if (!restore_peak_add(&dependency->peak, &peak)) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        if (plan->targets[i]->cpu_seed) {
+            result = write_target_cpu_peak(plan->targets[i]->cpu_seed, &dependency->peak);
+            if (result != VK_SUCCESS) return result;
+            dependency->can_reuse = 0;
+        }
+        dependency->can_reuse = dependency->can_reuse && native.can_reuse &&
+            restore_peak_add(&dependency->reuse, &native.reuse);
+        if (!i) {
+            dependency->memory_type = native.memory_type;
+            dependency->released = native.released;
+        }
+    }
+    dependency->selected = 1;
+    resource_core_budget_readiness(1, &dependency->before);
+    RcBudgetTicket peak_ticket = {0};
+    RcAdmissionStatus status = resource_core_budget_reserve(RC_BUDGET_TEXTURE, 1, &dependency->peak, &peak_ticket);
+    int reuse_only = 0;
+    if (status == RC_ADMISSION_REFUSED && dependency->can_reuse) {
+        int working_set = 0;
+        for (uint32_t d = 0; d < RC_ADMISSION_MAX_DOMAINS; d++) working_set |= dependency->reuse.amount[d] != 0;
+        status = working_set ? resource_core_budget_reserve(RC_BUDGET_TEXTURE, 1, &dependency->reuse, &peak_ticket)
+                             : RC_ADMISSION_OK;
+        reuse_only = status == RC_ADMISSION_OK;
+        dependency->reuse_unattempted = !reuse_only;
+    }
+    if (status != RC_ADMISSION_OK)
+        return status == RC_ADMISSION_REFUSED || status == RC_ADMISSION_NO_RECORDS ? VK_NOT_READY : VK_ERROR_INITIALIZATION_FAILED;
+    request.peak_ticket = peak_ticket.token.ledger ? &peak_ticket : NULL;
+    VkResult result = VK_SUCCESS;
+    uint32_t created = 0;
+    for (; created < plan->count; created++) {
+        if (reuse_only) placements[created].placement.flags |= VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT;
+        result = write_target_create(plan->targets[created], &placements[created].image, &placements[created].placement,
+                                     &request, &status);
+        if (result != VK_SUCCESS) break;
+    }
+    for (uint32_t i = 0; result == VK_SUCCESS && i < plan->count; ++i)
+        if (plan->targets[i]->cpu_seed) result = write_target_cpu_stage(plan->targets[i], &peak_ticket);
+    if (peak_ticket.token.ledger && resource_core_budget_cancel(&peak_ticket) != RC_ADMISSION_OK)
+        rt_fatal("vk: compound storage preparation lost its placement reservation");
+    if (result == VK_SUCCESS) return result;
+    if (native.selected) {
+        dependency->memory_type = native.memory_type;
+        dependency->released = native.released;
+        dependency->owner_full = native.owner_full ? plan->count : 0;
+    }
+    for (uint32_t i = 0; i < created; i++) {
+        write_target_cpu_rollback(plan->targets[i]->cpu_seed);
+        write_target_release_allocation(plan->targets[i]);
+    }
+    if (created) resource_core_vma_dependency_rebase(dependency, 1);
+    if (status == RC_ADMISSION_NO_RECORDS && !dependency->owner_full) return VK_ERROR_TOO_MANY_OBJECTS;
+    return reuse_only && result == VK_ERROR_OUT_OF_DEVICE_MEMORY ? VK_NOT_READY : result;
+}
+
+VkImage vk_texture_write_target_prepared_image(const VkTextureWriteTarget *target) {
+    return target->image;
+}
+
+void vk_texture_write_target_viewed(VkTextureWriteTarget *target) {
+    target->viewed = 1;
+}
+
+void vk_texture_write_target_bound(VkTextureWriteTarget *target) {
+    target->bound = 1;
+}
+
+int vk_texture_write_target_bound_current(const VkTextureWriteTarget *target) {
+    return target->bound && vk_texture_write_target_current(target);
+}
+
+void vk_texture_write_target_declare(const VkTextureWriteTarget *target,ResourceCommandEffects *effects) {
+    lock();
+    Tex *e = target->entry;
+    pinned_image_declare(e, target->image ? target->image : e->pub.image, effects);
+    unlock();
+}
+
+static void write_target_release_source(VkTextureWriteTarget *target) {
+    TextureMaterialInstance *instance = target->source_use.instance;
+    if (!instance) return;
+    texture_material_require(texture_material_use_cancel(&target->source_use));
+    content_defer_instance(instance);
+}
+
+void vk_texture_write_target_cancel(VkTextureWriteTarget *target) {
+    if (!target) return;
+    write_target_release_allocation(target);
+    lock();
+    write_target_release_source(target);
+    Tex *e = target->entry;
+    if (e->pending_write == target) {
+        // Unpublish this tentative attachment. The callback runs after the pin lock is released, with the
+        // recursive texture lock still excluding a new owner. Existing physical material holds own their uses.
+        e->pending_write = NULL;
+        if (!nvn_texture_pin_unattach(target->pin, e)) rt_fatal("vk: canceled image write lost its pin attachment");
+    }
+    unlock();
+    nvn_texture_pin_release(target->pin);
+    vk_texture_restore_cancel(target->seed);
+    write_target_cpu_destroy(&target->cpu_seed);
+    free(target);
+}
+
+const VkTexImage *vk_texture_write_target_begin(VkTextureWriteTarget *target, VkCommandBuffer cb) {
+    lock();
+    Tex *e = target->entry;
+    if (!write_target_current_locked(target) || (target->seed && !target->seeded))
+        rt_fatal("vk: required image target changed while preparing its captured version");
+    if (!e->pin_detached && !mem_backing_current(e->image_host_backing)) destroy_tex(e);
+    VkImage destination = target->image ? target->image : e->pub.image;
+    pinned_image_prepare(e, destination);
+    if (target->cpu_seed) write_target_cpu_record(target, cb);
+    if (target->source_use.instance) {
+        const ImgKey *k = &target->key;
+        VkImageMemoryBarrier2 transition = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+            .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT, .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = target->image, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, k->levels, 0, k->layers}};
+        VkDependencyInfo dep = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1,
+                                .pImageMemoryBarriers = &transition};
+        vkCmdPipelineBarrier2(cb, &dep);
+        barrier(cb, ALL_RW, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        VkImageCopy copies[MATERIAL_LEVELS];
+        for (uint32_t lv = 0; lv < k->levels; lv++) {
+            VkImageSubresourceLayers sub = {VK_IMAGE_ASPECT_COLOR_BIT, lv, 0, k->layers};
+            copies[lv] = (VkImageCopy){.srcSubresource = sub, .dstSubresource = sub,
+                                      .extent = {mip(k->w, lv), mip(k->h, lv), mip(k->d, lv)}};
+        }
+        vkCmdCopyImage(cb, target->source.image, VK_IMAGE_LAYOUT_GENERAL, target->image, VK_IMAGE_LAYOUT_GENERAL,
+                       k->levels, copies);
+        barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
+        vk_texture_use_images(&target->source.image, 1);
+    }
+    if (target->source_use.instance || target->seed || target->cpu_seed) {
+        const int host_storage_seeded = !e->pin_detached && e->image_host_backing &&
+            (target->key.usage & VK_IMAGE_USAGE_STORAGE_BIT) &&
+            (target->source_use.instance || (target->cpu_seed && target->host_seed_upload));
+        const uint64_t host_storage_upload = target->cpu_seed ? target->host_seed_upload : vk_upload_recording_sequence(cb);
+        write_target_release_source(target);
+        content_release(e, 0);
+        image_owner_replaced(e, target->image);
+        e->pub.image = target->image;
+        e->alloc = target->allocation;
+        e->bytes = target->bytes;
+        e->uploaded = 1;
+        e->up_retry = 0;
+        e->material_prepared = e->reused = 0;
+        e->pending_write = NULL;
+        if (host_storage_seeded) {
+            e->host_storage_init = HOST_STORAGE_COW;
+            sample_general_record(e, vk_exec_resource_position(), host_storage_upload);
+            if (!host_storage_upload) storage_host_init_capture(e, vk_exec_resource_position());
+        }
+        if (e->released && !e->pin_detached) rel_bytes += target->bytes;
+        if (!e->pin_detached) tex_gen_bump(e->key.addr);
+        target->image = VK_NULL_HANDLE; // the pinned texture's native owner now owns it
+        material_stats.cow++;
+        material_stats.cow_bytes += target->seed || target->cpu_seed ? target->bytes : target->source.bytes;
+        write_target_cpu_destroy(&target->cpu_seed);
+    }
+    target->selected = destination;
+    e->material_writable = 1;
+    unlock();
+    return &e->pub;
+}
+
+static void explicit_written(Tex *e) {
+    if (!e->pin_detached && !mem_backing_current(e->image_host_backing)) destroy_tex(e);
+    if (e->pin_detached) {
+        if (!++e->content_revision) rt_fatal("vk: texture content revision exhausted");
+        e->pub.gpu_owned = 1;
+        e->wr_fence = vk_exec_recording_fence();
+        uint64_t image = (uint64_t)(uintptr_t)e->pub.image;
+        if (resource_image_pinned_projected(image, e->pub.addr)) {
+            resource_image_written(image, e->pub.addr);
+            image_hold_mapped(e);
+        } else image_holds_end(e); // A later private write cannot preserve an earlier live backing's image receipt.
+    } else {
+        gpu_written_prepared(e);
+        if (!mem_backing_current(e->image_host_backing)) {
+            destroy_tex(e);
+            image_hold_mapped(e);
+        }
+    }
+}
+
+void vk_texture_pinned_write_recorded(const VkPinnedTextureWrite *capture) {
+    lock();
+    Tex *e = pinned_write_entry(capture);
+    texture_use_pin(e, capture->pin);
+    explicit_written(e);
+    unlock();
+}
+
+void vk_texture_pinned_storage_picture_issued(const VkPinnedTextureWrite *capture, VkImage image) {
+    lock();
+    if (capture->image == image)
+        packed_storage_owner_issued_locked(nvn_texture_pin_attachment(capture->pin), image, vk_exec_resource_position());
+    unlock();
+}
+
+void vk_texture_write_target_picture_issued(const VkTextureWriteTarget *target, VkImage image) {
+    lock();
+    if (target->bound && !target->image && nvn_texture_pin_attachment(target->pin) == target->entry)
+        packed_storage_owner_issued_locked(target->entry, image, vk_exec_resource_position());
+    unlock();
+}
+
+static void write_target_recorded(VkTextureWriteTarget *target) {
+    texture_use_pin(target->entry, target->pin);
+    explicit_written(target->entry);
+    target->revision = target->entry->content_revision;
+}
+
+void vk_texture_write_target_recorded(VkTextureWriteTarget *target) {
+    lock();
+    write_target_recorded(target);
+    unlock();
+}
+
+int vk_texture_write_target_use(const VkTextureWriteTarget *target, VkImage image) {
+    lock();
+    int current = target->selected == image && !target->image && write_target_current_locked(target);
+    if (current) texture_use_pin(target->entry, target->pin);
+    unlock();
+    return current;
+}
+
+static int image_alias_planes_written_locked(Tex *, const VkImageSubresourceRange *);
+
+static void write_target_finish(VkTextureWriteTarget *target, const VkImageSubresourceRange *clear) {
+    lock();
+    write_target_recorded(target);
+    if (clear) image_alias_planes_written_locked(target->entry, clear);
+    nvn_texture_pin_release(target->pin);
+    unlock();
+    vk_texture_restore_cancel(target->seed);
+    free(target);
+}
+
+void vk_texture_write_target_written(VkTextureWriteTarget *target) {
+    write_target_finish(target, NULL);
+}
+
+void vk_texture_write_target_clear_written(VkTextureWriteTarget *target, const VkImageSubresourceRange *range) {
+    write_target_finish(target, range);
 }
 
 void vk_texture_gpu_written(const tex_t *t) {
     if (!t || !t->mem) return;
     lock();
+    Tex *e = nvn_texture_pin_attachment(t);
+    if (e) {
+        if (vk_exec_recording_fence()) texture_use_pin(e, t);
+        explicit_written(e);
+        unlock();
+        return;
+    }
     TexKey key;
     make_key(t, &key);
-    Tex *e = nvn_hm_get(&by_key, &key);
+    e = nvn_hm_get(&by_key, &key);
     if (e) {
         gpu_written_prepared(e);
     }
     unlock();
 }
 
-void vk_texture_release(const tex_t *t) {
-    if (!t || !t->mem) return;
+enum { IMAGE_ALIAS_MAX_WRITE_FRAGMENTS = 8192 };
+static uint64_t alias_native_producers, alias_native_reconstructions, alias_canceled_target_placements;
+
+static uint64_t alias_dormant_target_replacements;
+
+uint64_t vk_texture_alias_probe_dormant_loads(void) {
+    return __atomic_load_n(&alias_dormant_target_replacements, __ATOMIC_ACQUIRE);
+}
+
+uint64_t vk_texture_alias_probe_load_cancels(void) {
+    return __atomic_load_n(&alias_canceled_target_placements, __ATOMIC_ACQUIRE);
+}
+
+void vk_texture_alias_probe_counts(uint64_t *producers, uint64_t *assembled) {
+    *producers = __atomic_load_n(&alias_native_producers, __ATOMIC_ACQUIRE);
+    *assembled = __atomic_load_n(&alias_native_reconstructions, __ATOMIC_ACQUIRE);
+}
+
+static int image_alias_layout_for(const VkTexImage *image, const nvn_texdesc *desc, const TexVkFormat *format,
+                                  uint64_t guest_bytes, VkTextureAliasLayout *layout) {
+    if (!image->image || image->gone || image->skip) return 0;
+    // A single depth aspect has the same element format in guest storage and the native transfer plane.
+    const VkFormat depth = alias_depth_format(desc->format);
+    const int exact_aspect = image->aspect == VK_IMAGE_ASPECT_COLOR_BIT ||
+        (image->aspect == VK_IMAGE_ASPECT_DEPTH_BIT && depth != VK_FORMAT_UNDEFINED && depth == image->format);
+    return image->scale <= 1 && image->samples == 1 && exact_aspect &&
+        format->vk == format->ideal && !format->expand_rgb && !format->astc_bw && !format->astc_bc &&
+        !image->block_views && (image->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) &&
+        guest_bytes && guest_bytes <= VK_TEXTURE_ALIAS_MAX_BYTES && texture_alias_layout(desc, image, layout);
+}
+
+static int image_alias_exact_layout(const Tex *e, VkTextureAliasLayout *layout) {
+    return e && image_alias_layout_for(&e->pub, &e->t.d, &e->f, e->t.L.size, layout);
+}
+
+static int image_alias_material_layout(const Tex *e, VkTextureAliasLayout *layout) {
+    return e && e->alloc && !e->bound_to && image_alias_exact_layout(e, layout);
+}
+
+static int storage_volume_shape(const Tex *entry) {
+    const VkTexImage *image = &entry->pub;
+    const nvn_texdesc *desc = &entry->t.d;
+    const VkImageUsageFlags usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    int block_width, block_height;
+    return image->type == VK_IMAGE_TYPE_3D && image->view_type == VK_IMAGE_VIEW_TYPE_3D &&
+        desc->target == NVN_TEXTURE_TARGET_3D && !nvn_tex_is_linear(desc) &&
+        desc->width > 0 && desc->height > 0 && desc->depth > 0 && desc->levels > 0 && desc->samples <= 1 &&
+        image->width == (uint32_t)desc->width && image->height == (uint32_t)desc->height &&
+        image->depth == (uint32_t)desc->depth && image->levels == (uint32_t)desc->levels &&
+        image->layers == 1 && entry->t.L.layers == 1 && image->samples == 1 && image->scale <= 1 &&
+        image->format == entry->f.vk && image->aspect == VK_IMAGE_ASPECT_COLOR_BIT &&
+        !image->skip && !image->block_views && !image->bound &&
+        !image->mirrored && !image->fb_learned && (image->usage & usage) == usage &&
+        nvn_fmt_bpb(desc->format, &block_width, &block_height) && block_width == 1 && block_height == 1;
+}
+
+static int storage_volume_mip(const VkTexImage *image, const VkImageSubresourceRange *range) {
+    // A Vulkan 3D subresource has one array layer and all Z slices of the selected mip.
+    return range && range->aspectMask == VK_IMAGE_ASPECT_COLOR_BIT && range->baseMipLevel < image->levels &&
+        range->levelCount == 1 && !range->baseArrayLayer && range->layerCount == 1;
+}
+
+static int image_alias_write_offset_compare(const void *a, const void *b) {
+    const uint64_t x = ((const RcSourceRange *)a)->offset, y = ((const RcSourceRange *)b)->offset;
+    return (x > y) - (x < y);
+}
+
+static int image_alias_project_write(const Tex *e, const RcInterval *mapping, uint32_t maps,
+    const RcInterval *covered, uint32_t count, RcRegistryPosition output, int bound) {
+    const int possible = !rc_registry_position_valid(output);
+    RcSourceRange *ranges = malloc(count * sizeof *ranges);
+    RcRegistryNativeImageWrite *writes = calloc(maps, sizeof *writes);
+    int projected = 0;
+    if (!ranges || !writes) goto done;
+    uint32_t groups = 0, total = 0, unwritten = maps;
+    for (uint32_t i = 0; i < maps; i++) {
+        const RcInterval *owner = &mapping[i];
+        uint32_t from = total;
+        int ordered = 1;
+        for (uint32_t j = 0; j < count; j++) {
+            const RcInterval *piece = &covered[j];
+            if (piece->address < owner->address || piece->mapping != owner->mapping ||
+                piece->range.backing != owner->range.backing) continue;
+            const uint64_t offset = piece->address - owner->address;
+            if (offset >= owner->range.size || piece->range.size > owner->range.size - offset ||
+                piece->range.offset != owner->range.offset + offset) continue;
+            if (total == count) goto done;
+            if (total > from && ranges[total - 1].offset > piece->range.offset) ordered = 0;
+            ranges[total++] = piece->range;
+        }
+        if (from == total && !possible) {
+            if (!bound) writes[--unwritten].owner = (RcRegistryImageWriteExtent){*owner, e->image_mapped_holds[i]};
+            continue;
+        }
+        // Mip traversal can restart inside each array layer's guest storage.
+        if (!ordered) qsort(ranges + from, total - from, sizeof *ranges, image_alias_write_offset_compare);
+        writes[groups++] = (RcRegistryNativeImageWrite){
+            .owner = {*owner, e->image_mapped_holds[i]},
+            .written = ranges + from, .written_count = total - from,
+        };
+    }
+    if (total == count && groups && ((!bound && !possible) || groups == maps)) {
+        RcRegistry *registry = rc_registry_runtime();
+        const uint64_t native = (uint64_t)(uintptr_t)e->pub.image;
+        RcRegistryResult result = possible ? rc_registry_native_image_possible(registry, native, writes, groups) :
+            bound ? rc_registry_native_image_bound_written(registry, native, writes, groups, output) :
+                    rc_registry_native_image_write_fragments(registry, native, writes, groups, output);
+        projected = result == RC_REGISTRY_OK;
+        if (projected)
+            for (uint32_t i = unwritten; i < maps; i++)
+                resource_effects_image_unchanged_extent(native, writes[i].owner, output);
+    }
+done:
+    free(writes);
+    free(ranges);
+    return projected;
+}
+
+static void image_alias_note_private_projection(Tex *e, const RcInterval *covered, uint32_t count, int whole) {
+    __atomic_fetch_add(&alias_native_producers, 1, __ATOMIC_RELAXED);
+    native_texture_output_publish(e);
+    if (whole && !e->alias_full_demand) {
+        e->alias_full_demand = malloc(count * sizeof *e->alias_full_demand);
+        if (e->alias_full_demand) {
+            memcpy(e->alias_full_demand, covered, count * sizeof *covered);
+            e->alias_full_count = count;
+        }
+    }
+}
+
+static void image_alias_possible_written(Tex *e) {
+    const uint32_t maps = e->image_private_mapping_count;
+    VkTextureAliasLayout layout;
+    if (!maps || maps != e->image_mapped_hold_count ||
+        !image_alias_material_layout(e, &layout) || !native_texture_output_reserve(e)) return;
+    if (e->alias_full_demand) {
+        e->native_output->possible = image_alias_project_write(e, e->image_private_mapping, maps,
+            e->alias_full_demand, e->alias_full_count, (RcRegistryPosition){0}, 0);
+        return;
+    }
+    RcInterval *demands = malloc(IMAGE_ALIAS_MAX_WRITE_FRAGMENTS * sizeof *demands);
+    uint32_t count = 0;
+    if (demands && texture_alias_demand(&e->t.d, &layout, e->image_private_mapping, maps,
+            e->pub.addr, e->t.L.size, demands, IMAGE_ALIAS_MAX_WRITE_FRAGMENTS, &count) &&
+        image_alias_project_write(e, e->image_private_mapping, maps, demands, count, (RcRegistryPosition){0}, 0)) {
+        e->native_output->possible = 1;
+        RcInterval *trim = realloc(demands, count * sizeof *demands);
+        e->alias_full_demand = trim ? trim : demands;
+        e->alias_full_count = count;
+        return;
+    }
+    free(demands);
+}
+
+static int image_alias_note_written(Tex *e, const NVNcopyRegion *box, uint32_t pixel_bytes, RcRegistryPosition output) {
+    // Fragment proof attaches only to an independently placed actual VkImage. Its unchanged portions
+    // can survive a later write through another optimal tiling.
+    VkTextureAliasLayout layout;
+    if (!image_alias_material_layout(e, &layout) || !e->image_private_mapping_count ||
+        e->image_private_mapping_count != e->image_mapped_hold_count || !native_texture_output_reserve(e)) return 0;
+    const uint32_t maps = e->image_private_mapping_count;
+    RcInterval *box_coverage = NULL;
+    const RcInterval *covered = e->alias_full_demand;
+    uint32_t count = e->alias_full_count;
+    int whole = !box || (!box->xoffset && !box->yoffset && box->width == e->t.d.width && box->height == e->t.d.height);
+    if (box && (!whole || !covered)) {
+        box_coverage = malloc(IMAGE_ALIAS_MAX_WRITE_FRAGMENTS * sizeof *box_coverage);
+        if (!box_coverage || !texture_alias_demand_box(&e->t.d, box, pixel_bytes, e->image_private_mapping, maps,
+                e->pub.addr, e->t.L.size, box_coverage, IMAGE_ALIAS_MAX_WRITE_FRAGMENTS, &count)) {
+            free(box_coverage);
+            return 0;
+        }
+        covered = box_coverage;
+    }
+    if (!covered || !count) return 0;
+    int result = image_alias_project_write(e, e->image_private_mapping, maps, covered, count, output, 0);
+    if (result) image_alias_note_private_projection(e, covered, count, whole);
+    free(box_coverage);
+    return result;
+}
+
+static void bound_alias_whole_written(Tex *e, RcRegistryPosition output) {
+    const uint32_t count = e->image_device_count;
+    if (!count || count != e->image_mapped_hold_count || e->image_device_size != e->t.L.size) return;
+    if (!e->alias_full_demand) {
+        VkTextureAliasLayout layout;
+        if (!image_alias_exact_layout(e, &layout)) return;
+        RcInterval *demands = calloc(IMAGE_ALIAS_MAX_WRITE_FRAGMENTS, sizeof *demands);
+        uint32_t produced = 0;
+        if (!demands || !texture_alias_demand(&e->t.d, &layout, e->image_device_intervals, count,
+                e->pub.addr, e->t.L.size, demands, IMAGE_ALIAS_MAX_WRITE_FRAGMENTS, &produced) || !produced) {
+            free(demands);
+            return;
+        }
+        RcInterval *trimmed = realloc(demands, produced * sizeof *demands);
+        e->alias_full_demand = trimmed ? trimmed : demands;
+        e->alias_full_count = produced;
+    }
+    if (image_alias_project_write(e, e->image_device_intervals, count, e->alias_full_demand, e->alias_full_count,
+                                  output, 1)) {
+        e->bound_alias_whole = 1;
+        if (nvn_hm_put(&bound_alias_owners, &e->pub.image, e)) rt_fatal("vk: duplicate live bound texture owner");
+    }
+}
+
+static int image_alias_placement_current(const Tex *);
+
+static int image_alias_whole_range(const VkTexImage *image, const VkImageSubresourceRange *range) {
+    return !range->baseMipLevel && range->levelCount == image->levels &&
+        !range->baseArrayLayer && range->layerCount == image->layers;
+}
+
+static const RcInterval *image_alias_plane_demand(Tex *e, const VkImageSubresourceRange *range, uint32_t *count) {
+    const VkImageSubresourceRange *cached = &e->alias_plane_range;
+    if (!e->alias_plane_count || cached->aspectMask != range->aspectMask || cached->baseMipLevel != range->baseMipLevel ||
+        cached->levelCount != range->levelCount || cached->baseArrayLayer != range->baseArrayLayer ||
+        cached->layerCount != range->layerCount) {
+        VkTextureAliasLayout layout;
+        if (!image_alias_exact_layout(e, &layout) || !texture_alias_clear_planes(*range, &e->pub, &layout)) return NULL;
+        RcInterval *demand = malloc(IMAGE_ALIAS_MAX_WRITE_FRAGMENTS * sizeof *demand);
+        uint32_t pieces;
+        if (!demand || !texture_alias_demand(&e->t.d, &layout, e->image_private_mapping, e->image_private_mapping_count,
+                e->pub.addr, e->t.L.size, demand, IMAGE_ALIAS_MAX_WRITE_FRAGMENTS, &pieces)) {
+            free(demand);
+            return NULL;
+        }
+        RcInterval *trim = realloc(demand, pieces * sizeof *demand);
+        free(e->alias_plane_demand);
+        e->alias_plane_demand = trim ? trim : demand;
+        e->alias_plane_count = pieces;
+        e->alias_plane_range = *range;
+    }
+    *count = e->alias_plane_count;
+    return e->alias_plane_demand;
+}
+
+static ResourceImageTracePlacement texture_trace_placement(const Tex *e) {
+    return e->bound_to ? RESOURCE_IMAGE_TRACE_POOL_BOUND : e->alloc ?
+        RESOURCE_IMAGE_TRACE_PRIVATE : RESOURCE_IMAGE_TRACE_OTHER_PLACEMENT;
+}
+
+static int image_alias_plane_result(const Tex *e, const VkImageSubresourceRange *range,
+                                    ResourceImageTraceProjection projection) {
+    if (e && resource_effects_image_trace_enabled()) {
+        ResourceImageTraceDetails details = {.format = e->pub.format, .projection = projection,
+                                             .placement = texture_trace_placement(e)};
+        if (range) {
+            details.aspect = range->aspectMask;
+            details.mip = range->baseMipLevel;
+            details.mips = range->levelCount;
+            details.layer = range->baseArrayLayer;
+            details.layers = range->layerCount;
+        }
+        resource_effects_image_trace_details(NULL, (uint64_t)(uintptr_t)e->pub.image, details);
+    }
+    return projection == RESOURCE_IMAGE_TRACE_PLANE_PUBLISHED;
+}
+
+static int image_alias_private_planes_written_locked(Tex *e, const VkImageSubresourceRange *range,
+                                                      RcRegistryPosition output) {
+    const int whole = image_alias_whole_range(&e->pub, range);
+    const uint32_t maps = e->image_private_mapping_count;
+    if (!maps || maps != e->image_mapped_hold_count || !image_alias_placement_current(e) ||
+        !native_texture_output_reserve(e))
+        return image_alias_plane_result(e, range, RESOURCE_IMAGE_TRACE_PLANE_PLACEMENT);
+    uint32_t count = e->alias_full_count;
+    const RcInterval *covered = whole && count ? e->alias_full_demand :
+        image_alias_plane_demand(e, range, &count);
+    if (!covered) return image_alias_plane_result(e, range, RESOURCE_IMAGE_TRACE_PLANE_DEMAND);
+    if (!image_alias_project_write(e, e->image_private_mapping, maps, covered, count, output, 0))
+        return image_alias_plane_result(e, range, RESOURCE_IMAGE_TRACE_PLANE_PUBLICATION);
+    image_alias_note_private_projection(e, covered, count, whole);
+    return image_alias_plane_result(e, range, RESOURCE_IMAGE_TRACE_PLANE_PUBLISHED);
+}
+
+static int image_alias_planes_written_locked(Tex *e, const VkImageSubresourceRange *range) {
+    if (!e || !range || range->aspectMask != e->pub.aspect ||
+        (e->pub.type != VK_IMAGE_TYPE_2D && !(e->bound_to && e->pub.type == VK_IMAGE_TYPE_3D &&
+            e->t.d.target == NVN_TEXTURE_TARGET_3D && !nvn_tex_is_linear(&e->t.d) && e->pub.layers == 1)) ||
+        !nvn_gpu_only(e->pub.addr))
+        return image_alias_plane_result(e, range, RESOURCE_IMAGE_TRACE_PLANE_UNSUPPORTED);
+    RcRegistryPosition output = vk_exec_resource_position();
+    if (!rc_registry_position_valid(output)) return 0;
+    output.ordinal |= 1;
+    if (e->bound_to) {
+        // Bound snapshots require a whole-image receipt and current native binding. That receipt covers
+        // meaningful planes only. A partial clear must not revive the whole physical image.
+        if (image_alias_whole_range(&e->pub, range) && e->image_device_count &&
+            vk_mem_image_alias_current(e->pub.image, e->pub.addr,
+                e->image_device_size, e->bound_to, e->image_device_intervals, e->image_device_count)) {
+            bound_alias_forget(e);
+            bound_alias_whole_written(e, output);
+            return image_alias_plane_result(e, range, e->bound_alias_whole ?
+                RESOURCE_IMAGE_TRACE_PLANE_PUBLISHED : RESOURCE_IMAGE_TRACE_PLANE_PUBLICATION);
+        }
+        return image_alias_plane_result(e, range, RESOURCE_IMAGE_TRACE_PLANE_PLACEMENT);
+    }
+    return image_alias_private_planes_written_locked(e, range, output);
+}
+
+void vk_texture_alias_clear_written(const tex_t *t, VkImage image, const VkImageSubresourceRange *range) {
+    if (!t || !image || !nvn_gpu_only((uintptr_t)t->mem)) return;
+    lock();
+    Tex *e = nvn_texture_pin_attachment(t);
+    if (!e) {
+        TexKey key;
+        make_key(t, &key);
+        e = nvn_hm_get(&by_key, &key);
+    }
+    if (e && e->t.serial == t->serial && e->pub.image == image) image_alias_planes_written_locked(e, range);
+    unlock();
+}
+
+static void image_alias_region_written(const tex_t *t, VkImage image, const view_t *view,
+                                       const NVNcopyRegion *region, VkImageAspectFlags aspect) {
+    if (!t || !image || !region || !nvn_gpu_only((uintptr_t)t->mem) || region->xoffset < 0 || region->yoffset < 0 ||
+        region->zoffset || region->width <= 0 || region->height <= 0 || region->depth != 1 ||
+        t->d.target != NVN_TEXTURE_TARGET_2D || t->d.levels != 1 ||
+        (view && (view->set_format || (view->set_levels && view->base_level) ||
+                  (view->set_layers && view->min_layer)))) return;
+    int width, height, pixel = nvn_fmt_bpb(t->d.format, &width, &height);
+    if (pixel <= 0 || width != 1 || height != 1) return;
+    RcRegistryPosition output = vk_exec_resource_position();
+    if (!rc_registry_position_valid(output) || output.ordinal == UINT64_MAX) return;
+    if (!(output.ordinal & 1)) output.ordinal++;
+    lock();
+    Tex *e = nvn_texture_pin_attachment(t);
+    if (!e) {
+        TexKey key;
+        make_key(t, &key);
+        e = nvn_hm_get(&by_key, &key);
+    }
+    if (e && e->t.serial == t->serial && e->pub.image == image && e->pub.aspect == aspect) {
+        if (e->bound_to) {
+            if (!region->xoffset && !region->yoffset && region->width == t->d.width && region->height == t->d.height) {
+                bound_alias_forget(e);
+                bound_alias_whole_written(e, output);
+            }
+        } else image_alias_note_written(e, region, (uint32_t)pixel, output);
+    }
+    unlock();
+}
+
+int vk_texture_transfer_read_prove(const tex_t *t, const VkTexImage *selection, VkImageSubresourceLayers plane,
+                                   const NVNcopyRegion *box) {
+    if (!nvn_gpu_only(selection->addr)) return 1;
+    const RcRegistryPosition read = vk_exec_resource_position();
+    if (!rc_registry_position_valid(read)) return -1;
+    TexKey key;
+    make_key(t, &key);
+    lock();
+    const Tex *e = nvn_hm_get(&by_key, &key);
+    if (!e || e->t.serial != t->serial || e->pub.gone || e->pub.image != selection->image) { unlock(); return -1; }
+    VkTextureAliasLayout layout;
+    if (plane.layerCount != 1 || !image_alias_exact_layout(e, &layout)) { unlock(); return 0; }
+    RcRegistry *registry = rc_registry_runtime();
+    uint64_t image = (uint64_t)(uintptr_t)selection->image;
+    int exact = 0;
+    if (e->bound_to) {
+        RcRegistryPosition output = e->native_write;
+        output.ordinal |= 1;
+        exact = e->bound_alias_whole && e->image_mapped_hold_count == e->image_device_count &&
+            vk_mem_image_alias_current(e->pub.image, e->pub.addr, e->image_device_size, e->bound_to,
+                                        e->image_device_intervals, e->image_device_count) &&
+            rc_registry_native_image_read_current(registry, image, e->image_device_intervals,
+                e->image_mapped_holds, e->image_device_count, output, read);
+    } else if (e->image_private_mapping_count && image_alias_guest_mapping_current(e->pub.addr, e->t.L.size,
+                   e->image_private_mapping, e->image_private_mapping_count)) {
+        RcInterval *demand = malloc(IMAGE_ALIAS_MAX_WRITE_FRAGMENTS * sizeof *demand);
+        uint32_t count = 0;
+        int pixel = nvn_fmt_bpb(t->d.format, NULL, NULL);
+        exact = demand && texture_alias_demand_box_plane(&e->t.d, box, (uint32_t)pixel, plane.mipLevel,
+            plane.baseArrayLayer, e->image_private_mapping, e->image_private_mapping_count, e->pub.addr, e->t.L.size,
+            demand, IMAGE_ALIAS_MAX_WRITE_FRAGMENTS, &count) &&
+            rc_registry_native_image_covers(registry, image, demand, count, read);
+        free(demand);
+    }
+    unlock();
+    return exact ? 1 : -1;
+}
+
+typedef struct MirroredColorWrite {
+    TexKey key;
+    VkImage image;
+    uint64_t serial, revision, batch;
+    RcRegistryPosition native_write;
+    uint64_t wr_fence, gpu_seq, gpu_fence, run_frame, gw_frame, upload_mapping;
+    uint32_t gpu_gen;
+    uint8_t gpu_owned, gpu_dirty, run, chash_ok, snap_color_texels, fresh_authority;
+    uint8_t *snap;
+} MirroredColorWrite;
+
+struct VkTextureProjectedTransfer {
+    TexKey key;
+    VkImage image;
+    VkMemoryImageHold *hold;
+    RcRegistryPosition read;
+    uint64_t serial, revision, bytes;
+    RcInterval *mapping, *covered, *prior;
+    struct VkImageCopy *copies;
+    uint32_t mappings, pieces, prior_count, copy_count;
+    int whole;
+    Tex *issuing;
+    RcRegistryGpuCapture host_backing_proof;
+    RcSourceRange *host_ranges;
+    TextureSourceStamp host_stamp;
+    MirroredColorWrite *host_color;
+    uint8_t *host_color_snapshot;
+};
+
+static int first_mirrored_transfer_candidate(const Tex *e) {
+    return e->pub.mirrored && !e->pub.gpu_owned && !e->gpu_dirty &&
+        !e->image_authority.id && !e->image_mapped_holds && !e->pin_owned &&
+        !e->material && !e->pending_write && !e->bound_to && !e->image_device_count &&
+        !e->image_private_mapping_count && !e->pub.skip && !e->pub.block_views &&
+        e->alloc && e->image_host_backing && !e->released && !e->retiring && !e->superseded && !e->overwritten;
+}
+
+static int mirrored_transfer_stamp_current(const Tex *entry, const VkTextureProjectedTransfer *target) {
+    uint32_t generation;
+    return mem_backing_current(entry->image_host_backing) && texture_source_stamp_valid(&target->host_stamp) &&
+        mem_mapping_range_unchanged(entry->pub.addr, target->bytes, target->host_stamp.mapping) &&
+        mem_protection_range_unchanged(entry->pub.addr, target->bytes, target->host_stamp.protection) &&
+        vk_mem_changed(entry->pub.addr, target->bytes, target->host_stamp.generation, &generation) == 0;
+}
+
+static int first_mirrored_transfer_cpu_current(const Tex *e, const VkTextureProjectedTransfer *target) {
+    return first_mirrored_transfer_candidate(e) && mirrored_transfer_stamp_current(e, target) &&
+        rc_registry_gpu_capture_read_at(rc_registry_runtime(), target->host_backing_proof,
+                                        target->host_ranges, target->mappings, target->read) == RC_REGISTRY_OK;
+}
+
+static int mirrored_color_warm_candidate(const Tex *entry) {
+    return entry->pub.gpu_owned && entry->pub.mirrored && !entry->pin_owned && !entry->material &&
+        !entry->pending_write && !entry->image_device_count && !entry->image_private_mapping_count &&
+        !entry->released && !entry->retiring && !entry->superseded && !entry->overwritten;
+}
+
+static int mirrored_color_current(const Tex *entry, const VkTextureProjectedTransfer *target) {
+    if (!target->host_color->gpu_owned) return first_mirrored_transfer_cpu_current(entry, target);
+    if (!mirrored_color_warm_candidate(entry) || !mirrored_transfer_stamp_current(entry, target)) return 0;
+    if (target->host_ranges)
+        return !entry->gpu_dirty && !entry->image_authority.id && !entry->image_mapped_holds &&
+            rc_registry_gpu_capture_read_at(rc_registry_runtime(), target->host_backing_proof,
+                target->host_ranges, target->mappings, target->read) == RC_REGISTRY_OK;
+    if (!entry->gpu_dirty || !entry->image_authority.id ||
+        !entry->image_mapped_holds || entry->image_mapped_hold_count != target->mappings) return 0;
+    RcRegistry *registry = rc_registry_runtime();
+    const uint64_t image = (uint64_t)(uintptr_t)target->image;
+    if (!rc_registry_image_binding_current(registry, (RcRegistryImageBinding){image, entry->image_authority})) return 0;
+    for (uint32_t i = 0; i < target->mappings; ++i)
+        if (!rc_registry_image_binding_current(registry, (RcRegistryImageBinding){image, entry->image_mapped_holds[i]}) ||
+            !rc_registry_image_hold_covers(registry, entry->image_mapped_holds[i], target->mapping[i].range)) return 0;
+    return 1;
+}
+
+static int first_mirrored_transfer_cpu_capture(MemBackingCapture *backing, uint64_t address,
+                                                 const RcInterval *mapping, VkTextureProjectedTransfer *target) {
+    if (vk_mem_canonical_source_qualify(backing, address, target->bytes) != RC_REGISTRY_OK)
+        return 0;
+    const TextureSourceSpan whole = {0, target->bytes};
+    TextureSourceObservation observation;
+    vk_mem_observe_subresources(address, target->bytes, NULL, submit_epoch, &whole, 1, &observation);
+    target->host_stamp = observation.stamp;
+    if (!texture_source_stamp_valid(&target->host_stamp)) return 0;
+    target->host_ranges = malloc((size_t)target->mappings * sizeof *target->host_ranges);
+    if (!target->host_ranges) return 0;
+    for (uint32_t i = 0; i < target->mappings; i++) target->host_ranges[i] = mapping[i].range;
+    return rc_registry_gpu_capture_begin(rc_registry_runtime(), target->host_ranges, target->mappings,
+                                        &target->host_backing_proof) == RC_REGISTRY_OK &&
+        rc_registry_gpu_capture_read_at(rc_registry_runtime(), target->host_backing_proof, target->host_ranges,
+                                        target->mappings, target->read) == RC_REGISTRY_OK;
+}
+
+static void first_mirrored_transfer_cpu_cancel(VkTextureProjectedTransfer *target) {
+    if (target->host_backing_proof.id &&
+        rc_registry_gpu_capture_end(rc_registry_runtime(), &target->host_backing_proof) != RC_REGISTRY_OK)
+        rt_fatal("vk: mirrored transfer lost its original backing proof");
+    free(target->host_ranges);
+}
+
+static int projected_transfer_mapping_equal(const VkTextureProjectedTransfer *target,
+                                             const RcInterval *mapping, uint32_t count) {
+    if (!mapping || count != target->mappings) return 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        RcInterval old = target->mapping[i], current = mapping[i];
+        if (old.address != current.address || old.mapping != current.mapping || !rc_range_equal(old.range, current.range))
+            return 0;
+    }
+    return 1;
+}
+
+static Tex *projected_transfer_current_locked(const VkTextureProjectedTransfer *target) {
+    Tex *e = nvn_hm_get(&by_key, &target->key);
+    if (!e || e->t.serial != target->serial || e->pub.image != target->image || e->pub.gone ||
+        e->content_revision != target->revision || e->t.L.size != target->bytes || e->bound_to ||
+        !target->hold || vk_mem_image_hold_retired(target->hold)) return NULL;
+    uint32_t count;
+    const RcInterval *mapping = image_backing_intervals(e, &count);
+    if (!projected_transfer_mapping_equal(target, mapping, count)) return NULL;
+    const int current = target->host_color ? mirrored_color_current(e, target) :
+        target->host_ranges ? first_mirrored_transfer_cpu_current(e, target) :
+        e->image_private_mapping_count == count &&
+        image_alias_guest_mapping_current(e->pub.addr, target->bytes, target->mapping, count);
+    return current ? e : NULL;
+}
+
+VkImage vk_texture_projected_transfer_image(const VkTextureProjectedTransfer *target) {
+    return target->image;
+}
+
+int vk_texture_projected_transfer_current(const VkTextureProjectedTransfer *target) {
+    lock();
+    int current = projected_transfer_current_locked(target) != NULL;
+    unlock();
+    return current;
+}
+
+void vk_texture_projected_transfer_cancel(VkTextureProjectedTransfer **owned) {
+    VkTextureProjectedTransfer *target = *owned;
+    if (!target) return;
+    vk_mem_image_release(target->hold);
+    first_mirrored_transfer_cpu_cancel(target);
+    free(target->mapping);
+    free(target->covered);
+    free(target->prior);
+    free(target->copies);
+    free(target->host_color);
+    free(target->host_color_snapshot);
+    free(target);
+    *owned = NULL;
+}
+
+
+static VkTextureProjectedTransfer *projected_transfer_alloc(const Tex *e, TexKey key, RcRegistryPosition read) {
+    VkTextureProjectedTransfer *target = calloc(1, sizeof *target);
+    if (!target) return NULL;
+    target->key = key;
+    target->read = read;
+    target->image = e->pub.image;
+    target->serial = e->t.serial;
+    target->revision = e->content_revision;
+    target->bytes = e->t.L.size;
+    const RcInterval *mapping = image_backing_intervals(e, &target->mappings);
+    target->hold = vk_mem_image_hold(target->image);
+    if (target->mappings) target->mapping = malloc((size_t)target->mappings * sizeof *target->mapping);
+    if (e->image_private_mapping_count)
+        target->covered = malloc(IMAGE_ALIAS_MAX_WRITE_FRAGMENTS * sizeof *target->covered);
+    if (!target->hold || !target->mapping || (e->image_private_mapping_count && !target->covered)) {
+        vk_texture_projected_transfer_cancel(&target);
+        return NULL;
+    }
+    memcpy(target->mapping, mapping, target->mappings * sizeof *target->mapping);
+    return target;
+}
+
+static void projected_transfer_trim(RcInterval **items, uint32_t count) {
+    if (!count) return;
+    RcInterval *trim = realloc(*items, count * sizeof **items);
+    if (trim) *items = trim;
+}
+
+static int projected_transfer_address_compare(const void *a, const void *b) {
+    const uint64_t x = ((const RcInterval *)a)->address, y = ((const RcInterval *)b)->address;
+    return (x > y) - (x < y);
+}
+
+// The mapper supplies one affine segment for each guest byte. Merge only inside that segment.
+static void projected_transfer_union(RcInterval *spans, uint32_t *count) {
+    qsort(spans, *count, sizeof *spans, projected_transfer_address_compare);
+    uint32_t kept = 0;
+    for (uint32_t i = 0; i < *count; i++) {
+        const RcInterval span = spans[i];
+        if (kept) {
+            RcInterval *last = &spans[kept - 1];
+            const uint64_t last_end = last->address + last->range.size;
+            if (span.mapping == last->mapping && span.range.backing == last->range.backing &&
+                span.address <= last_end && span.range.offset - last->range.offset == span.address - last->address) {
+                const uint64_t end = span.address + span.range.size;
+                if (end > last_end) last->range.size = end - last->address;
+                continue;
+            }
+        }
+        spans[kept++] = span;
+    }
+    *count = kept;
+}
+
+static int projected_transfer_prior_part(VkTextureProjectedTransfer *target, RcInterval span,
+                                         uint64_t begin, uint64_t end) {
+    if (begin == end) return 1;
+    if (target->prior_count == IMAGE_ALIAS_MAX_WRITE_FRAGMENTS) return 0;
+    span.range.offset += begin - span.address;
+    span.range.size = end - begin;
+    span.address = begin;
+    target->prior[target->prior_count++] = span;
+    return 1;
+}
+
+// An earlier copy in this list can supply part of a later source on the very same image.
+static int projected_transfer_prior_source(VkTextureProjectedTransfer *target, const RcInterval *source,
+                                            uint32_t count) {
+    for (uint32_t i = 0; i < count; i++) {
+        const RcInterval span = source[i];
+        const uint64_t end = span.address + span.range.size;
+        uint64_t begin = span.address;
+        uint32_t lo = 0, hi = target->pieces;
+        while (lo < hi) {
+            const uint32_t mid = lo + (hi - lo) / 2;
+            const RcInterval written = target->covered[mid];
+            if (written.address + written.range.size <= begin) lo = mid + 1;
+            else hi = mid;
+        }
+        for (uint32_t j = lo; j < target->pieces && begin < end; j++) {
+            const RcInterval written = target->covered[j];
+            if (written.address >= end) break;
+            if (written.address > begin && !projected_transfer_prior_part(target, span, begin, written.address))
+                return 0;
+            begin = written.address + written.range.size;
+        }
+        if (begin < end && !projected_transfer_prior_part(target, span, begin, end)) return 0;
+    }
+    projected_transfer_union(target->prior, &target->prior_count);
+    return 1;
+}
+
+static int projected_transfer_rect(VkOffset3D offset, VkExtent3D size, uint32_t width, uint32_t height,
+                                  NVNcopyRegion *box) {
+    if (offset.x < 0 || offset.y < 0 || offset.z || !size.width || !size.height || size.depth != 1 ||
+        size.width > INT32_MAX || size.height > INT32_MAX || (uint64_t)offset.x + size.width > width ||
+        (uint64_t)offset.y + size.height > height) return 0;
+    *box = (NVNcopyRegion){offset.x, offset.y, 0, (int)size.width, (int)size.height, 1};
+    return 1;
+}
+
+static int projected_transfer_copy_boxes(const VkTexImage *image, const VkImageCopy *copy,
+                                        NVNcopyRegion *source, NVNcopyRegion *destination) {
+    const VkImageSubresourceLayers s = copy->srcSubresource, d = copy->dstSubresource;
+    if (s.aspectMask != image->aspect || d.aspectMask != s.aspectMask || s.layerCount != 1 || d.layerCount != 1 ||
+        s.mipLevel != d.mipLevel || s.baseArrayLayer != d.baseArrayLayer || s.mipLevel >= image->levels ||
+        s.mipLevel >= 32 || s.baseArrayLayer >= image->layers) return 0;
+    const uint32_t w = mip(image->width, s.mipLevel), h = mip(image->height, s.mipLevel);
+    if (!projected_transfer_rect(copy->srcOffset, copy->extent, w, h, source) ||
+        !projected_transfer_rect(copy->dstOffset, copy->extent, w, h, destination)) return 0;
+    // Same-image regions within one native copy must never overlap. Overlap between successive copies is allowed.
+    return (int64_t)source->xoffset + source->width <= destination->xoffset ||
+        (int64_t)destination->xoffset + destination->width <= source->xoffset ||
+        (int64_t)source->yoffset + source->height <= destination->yoffset ||
+        (int64_t)destination->yoffset + destination->height <= source->yoffset;
+}
+
+static int projected_transfer_self_copy_geometry(VkTextureProjectedTransfer *target, const VkTexImage *image,
+                                                 const nvn_texdesc *desc, uint32_t pixel_bytes) {
+    // A guest image with two non-affine views of the same backing byte cannot provide two independent pixels.
+    for (uint32_t i = 0; i < target->mappings; i++)
+        for (uint32_t j = 0; j < i; j++)
+            if (rc_range_overlap(target->mapping[i].range, target->mapping[j].range)) return 0;
+    RcInterval *scratch = malloc(IMAGE_ALIAS_MAX_WRITE_FRAGMENTS * sizeof *scratch);
+    if (!scratch) return 0;
+    int exact = 1;
+    for (uint32_t i = 0; exact && i < target->copy_count; i++) {
+        const VkImageCopy *copy = &target->copies[i];
+        const uint32_t level = copy->srcSubresource.mipLevel, layer = copy->srcSubresource.baseArrayLayer;
+        NVNcopyRegion source, destination;
+        uint32_t count;
+        exact = projected_transfer_copy_boxes(image, copy, &source, &destination) &&
+            texture_alias_demand_box_plane(desc, &source, pixel_bytes, level, layer, target->mapping,
+                target->mappings, image->addr, target->bytes, scratch, IMAGE_ALIAS_MAX_WRITE_FRAGMENTS, &count) &&
+            projected_transfer_prior_source(target, scratch, count) &&
+            texture_alias_demand_box_plane(desc, &destination, pixel_bytes, level, layer, target->mapping,
+                target->mappings, image->addr, target->bytes, target->covered + target->pieces,
+                IMAGE_ALIAS_MAX_WRITE_FRAGMENTS - target->pieces, &count);
+        if (exact) {
+            target->pieces += count;
+            projected_transfer_union(target->covered, &target->pieces);
+        }
+    }
+    free(scratch);
+    return exact && target->prior_count && target->pieces;
+}
+
+static int projected_transfer_sources_current(const VkTextureProjectedTransfer *target) {
+    return !target->prior_count || rc_registry_native_image_covers(rc_registry_runtime(),
+        (uint64_t)(uintptr_t)target->image, target->prior, target->prior_count, target->read);
+}
+
+int vk_texture_projected_self_copy_capture(const tex_t *t, const VkTexImage *selected, const VkImageCopy *copies,
+                                           uint32_t count, VkTextureProjectedTransfer **out) {
+    if (!t || !selected || !selected->image || !copies || !count || count > IMAGE_ALIAS_MAX_WRITE_FRAGMENTS ||
+        !nvn_gpu_only((uintptr_t)t->mem)) return 0;
+    const RcRegistryPosition read = vk_exec_resource_position();
+    if (!rc_registry_position_valid(read) || (read.ordinal & 1) || read.ordinal == UINT64_MAX) return -1;
+    TexKey key;
+    make_key(t, &key);
+    lock();
+    Tex *e = nvn_hm_get(&by_key, &key);
+    if (!e || e->pub.image != selected->image || e->pub.addr != selected->addr || e->t.serial != t->serial ||
+        e->pub.gone) { unlock(); return -1; }
+    VkTextureAliasLayout layout;
+    int block_width, block_height;
+    const int pixel_bytes = nvn_fmt_bpb(t->d.format, &block_width, &block_height);
+    if (!pixel_bytes || block_width != 1 || block_height != 1 || !e->image_private_mapping_count ||
+        e->pub.type != VK_IMAGE_TYPE_2D || e->pub.depth != 1 || !(e->pub.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) ||
+        !image_alias_material_layout(e, &layout)) { unlock(); return 0; }
+    VkTextureProjectedTransfer *target = projected_transfer_alloc(e, key, read);
+    if (!target) { unlock(); return -1; }
+    target->copies = malloc(count * sizeof *target->copies);
+    target->prior = malloc(IMAGE_ALIAS_MAX_WRITE_FRAGMENTS * sizeof *target->prior);
+    if (target->copies) memcpy(target->copies, copies, count * sizeof *target->copies);
+    target->copy_count = count;
+    if (!target->copies || !target->prior || !projected_transfer_current_locked(target) ||
+        !projected_transfer_self_copy_geometry(target, &e->pub, &e->t.d, (uint32_t)pixel_bytes) ||
+        !projected_transfer_sources_current(target) || !native_texture_output_reserve(e)) {
+        unlock();
+        vk_texture_projected_transfer_cancel(&target);
+        return -1;
+    }
+    projected_transfer_trim(&target->covered, target->pieces);
+    projected_transfer_trim(&target->prior, target->prior_count);
+    *out = target;
+    unlock();
+    return 1;
+}
+
+const VkImageCopy *vk_texture_projected_self_copy_regions(const VkTextureProjectedTransfer *target, uint32_t *count) {
+    *count = target->copy_count;
+    return target->copies;
+}
+
+static int first_mirrored_transfer_capture(const tex_t *t, const NVNcopyRegion *box, VkTexImage *shape,
+                                            RcRegistryPosition read, VkTextureProjectedTransfer **out) {
+    // This write defines the one complete color plane. No old image pixels serve as its initialization.
+    if (shape->type != VK_IMAGE_TYPE_3D || shape->format == VK_FORMAT_UNDEFINED ||
+        shape->aspect != VK_IMAGE_ASPECT_COLOR_BIT || shape->levels != 1 || shape->scale > 1 ||
+        box->xoffset || box->yoffset || box->zoffset || (uint32_t)box->width != shape->width ||
+        (uint32_t)box->height != shape->height || (uint32_t)box->depth != shape->depth) return 0;
+    TexKey key;
+    make_key(t, &key);
+    lock();
+    Tex *entry = nvn_hm_get(&by_key, &key);
+    if (entry && (entry->t.serial != t->serial || !first_mirrored_transfer_candidate(entry))) {
+        unlock();
+        return 0;
+    }
+    // Prove the unchanged host fallback before creating a native placement. No unsupported host input
+    // should become a quiet or empty texture merely because transfer preparation considered it.
+    MemBackingCapture *backing = NULL;
+    const uint64_t address = (uintptr_t)t->mem;
+    if (mem_backing_capture(address, t->L.size, &backing) != RC_BACKING_OK) {
+        unlock();
+        return 0;
+    }
+    VkTextureProjectedTransfer proof = {.bytes=t->L.size, .read=read};
+    const RcInterval *mapping = mem_backing_intervals(backing, &proof.mappings);
+    VkTextureProjectedTransfer *target = NULL;
+    int result = 0;
+    if (!mapping || !proof.mappings) goto done;
+    for (uint32_t i = 0; i < proof.mappings; i++) {
+        if (!rc_range_valid(mapping[i].range) || !mapping[i].mapping) goto done;
+    }
+    if (!first_mirrored_transfer_cpu_capture(backing, address, mapping, &proof)) goto done;
+    result = -1;
+    if (!entry) entry = entry_of_mode(t, 1, NULL);
+    if (!entry || !first_mirrored_transfer_candidate(entry) || entry->pub.gone || !entry->pub.image ||
+        entry->pub.type != shape->type || entry->pub.view_type != VK_IMAGE_VIEW_TYPE_3D ||
+        entry->pub.format != shape->format || entry->pub.aspect != shape->aspect ||
+        entry->pub.width != shape->width || entry->pub.height != shape->height ||
+        entry->pub.depth != shape->depth || entry->pub.samples != 1 || entry->pub.levels != 1 ||
+        entry->pub.layers != 1 || !(entry->pub.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) ||
+        !mem_backing_current(backing)) goto done;
+    target = projected_transfer_alloc(entry, key, read);
+    if (!target || !projected_transfer_mapping_equal(target, mapping, proof.mappings)) goto done;
+    target->host_stamp = proof.host_stamp;
+    target->host_ranges = proof.host_ranges;
+    target->host_backing_proof = proof.host_backing_proof;
+    proof.host_ranges = NULL;
+    proof.host_backing_proof = (RcRegistryGpuCapture){0};
+    if (!projected_transfer_current_locked(target)) goto done;
+    target->whole = 1;
+    *shape = entry->pub;
+    *out = target;
+    target = NULL;
+    result = 1;
+done:
+    vk_texture_projected_transfer_cancel(&target);
+    first_mirrored_transfer_cpu_cancel(&proof);
+    mem_backing_release(&backing);
+    unlock();
+    return result;
+}
+
+static int mirrored_color_transfer_capture(const tex_t *t, const NVNcopyRegion *box, VkTexImage *shape,
+                                            RcRegistryPosition read, VkTextureProjectedTransfer **out) {
+    if (shape->type != VK_IMAGE_TYPE_2D || shape->format == VK_FORMAT_UNDEFINED || shape->scale > 1 ||
+        shape->aspect != VK_IMAGE_ASPECT_COLOR_BIT || shape->levels != 1 || shape->layers != 1 || shape->samples != 1 ||
+        box->xoffset || box->yoffset || box->zoffset || box->depth != 1 ||
+        (uint32_t)box->width != shape->width || (uint32_t)box->height != shape->height) return 0;
+    TexKey key;
+    make_key(t, &key);
+    lock();
+    Tex *entry = nvn_hm_get(&by_key, &key);
+    const int warm = entry && entry->pub.gpu_owned;
+    if (entry && (entry->t.serial != t->serial ||
+        !(warm ? mirrored_color_warm_candidate(entry) : first_mirrored_transfer_candidate(entry)))) {
+        unlock();
+        return 0;
+    }
+    MirroredColorWrite original = {.gpu_owned = warm};
+    VkTextureProjectedTransfer proof = {.bytes = t->L.size, .read = read, .host_color = &original};
+    VkTextureProjectedTransfer *target = NULL;
+    MemBackingCapture *backing = NULL;
+    const uint64_t address = (uintptr_t)t->mem;
+    int result = 0;
+    if (mem_backing_capture(address, t->L.size, &backing) != RC_BACKING_OK) goto done;
+    const RcInterval *mapping = mem_backing_intervals(backing, &proof.mappings);
+    if (!mapping || !proof.mappings) goto done;
+    for (uint32_t i = 0; i < proof.mappings; ++i)
+        if (!rc_range_valid(mapping[i].range) || !mapping[i].mapping) goto done;
+    if (warm && entry->gpu_dirty) {
+        const TextureSourceSpan whole = {0, proof.bytes};
+        TextureSourceObservation observation;
+        vk_mem_observe_subresources(address, proof.bytes, NULL, submit_epoch, &whole, 1, &observation);
+        proof.host_stamp = observation.stamp;
+        if (!texture_source_stamp_valid(&proof.host_stamp)) goto done;
+    } else if (!first_mirrored_transfer_cpu_capture(backing, address, mapping, &proof)) goto done;
+
+    if (warm) {
+        proof.image = entry->pub.image;
+        proof.mapping = (RcInterval *)mapping; // borrowed until the actual transfer owner copies it
+        if (!mirrored_color_current(entry, &proof)) goto done;
+    }
+    if (!entry) entry = entry_of_mode(t, TEX_PRIVATE_MIRRORED_COLOR_TRANSFER, NULL);
+    if (!entry || entry->pub.gone || !entry->pub.image || entry->pub.block_views || entry->pub.skip ||
+        entry->pub.type != VK_IMAGE_TYPE_2D || entry->pub.view_type != VK_IMAGE_VIEW_TYPE_2D ||
+        entry->pub.format != shape->format || entry->pub.aspect != shape->aspect || entry->pub.scale > 1 ||
+        entry->pub.width != shape->width || entry->pub.height != shape->height || entry->pub.depth != 1 ||
+        entry->pub.levels != 1 || entry->pub.layers != 1 || entry->pub.samples != 1 ||
+        !(entry->pub.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) || !entry->alloc || !entry->image_host_backing ||
+        entry->bound_to) goto done;
+    target = projected_transfer_alloc(entry, key, read);
+    if (!target || !projected_transfer_mapping_equal(target, mapping, proof.mappings)) goto done;
+    target->host_color = calloc(1, sizeof *target->host_color);
+    target->covered = malloc(IMAGE_ALIAS_MAX_WRITE_FRAGMENTS * sizeof *target->covered);
+    if (!target->host_color || !target->covered) goto done;
+    target->host_color->gpu_owned = warm;
+    const uint32_t pixel = (uint32_t)nvn_fmt_bpb(t->d.format, NULL, NULL);
+    if (!texture_alias_demand_box_plane(&t->d, box, pixel, 0, 0, target->mapping, target->mappings, address,
+        target->bytes, target->covered, IMAGE_ALIAS_MAX_WRITE_FRAGMENTS, &target->pieces) || !target->pieces) goto done;
+    projected_transfer_trim(&target->covered, target->pieces);
+    target->host_stamp = proof.host_stamp;
+    target->host_ranges = proof.host_ranges;
+    target->host_backing_proof = proof.host_backing_proof;
+    proof.host_ranges = NULL;
+    proof.host_backing_proof = (RcRegistryGpuCapture){0};
+
+    // Match ordinary mirrored write-back's shared-page check using the raw bytes at this command's
+    // observation. These bytes only detect subsequent CPU edits, even if the current image is GPU-owned.
+    if (wb_exact < 0) wb_exact = cfg_bool("NX2NAVI_WB_EXACT");
+    if (wb_exact && target->bytes <= SNAP_MAX && fills_no_page(entry)) {
+        target->host_color_snapshot = malloc(SNAP_MAX);
+        if (!target->host_color_snapshot || !mem_backing_read_hold(backing)) goto done;
+        memcpy(target->host_color_snapshot, (const void *)(uintptr_t)address, target->bytes);
+        mem_read_release();
+    }
+    if (!projected_transfer_current_locked(target)) { result = -1; goto done; }
+    target->whole = 1;
+    *shape = entry->pub;
+    *out = target;
+    target = NULL;
+    result = 1;
+done:
+    vk_texture_projected_transfer_cancel(&target);
+    first_mirrored_transfer_cpu_cancel(&proof);
+    mem_backing_release(&backing);
+    unlock();
+    return result;
+}
+
+int vk_texture_projected_transfer_capture(const tex_t *t, const view_t *view, const NVNcopyRegion *box,
+                                          VkTexImage *shape, VkTextureProjectedTransfer **out) {
+    if (shape->type == VK_IMAGE_TYPE_2D && vk_texture_host_color_transfer(t, view)) {
+        const RcRegistryPosition read = vk_exec_resource_position();
+        return rc_registry_position_valid(read) ? mirrored_color_transfer_capture(t, box, shape, read, out) : -1;
+    }
+    if (vk_texture_host_volume_transfer(t, view)) {
+        const RcRegistryPosition read = vk_exec_resource_position();
+        return rc_registry_position_valid(read) ? first_mirrored_transfer_capture(t, box, shape, read, out) : -1;
+    }
+    const VkImageAspectFlags aspect = shape->aspect;
+    const int volume = shape->type == VK_IMAGE_TYPE_3D;
+    int supported = volume ? aspect == VK_IMAGE_ASPECT_COLOR_BIT && vk_texture_alias_volume_transfer(t, view) :
+        aspect == VK_IMAGE_ASPECT_DEPTH_BIT ? vk_texture_alias_depth_transfer(t, view, box) :
+        aspect == VK_IMAGE_ASPECT_COLOR_BIT && vk_texture_alias_region_transfer(t, view, box);
+    if (!supported) return 0;
+    RcRegistryPosition read = vk_exec_resource_position();
+    if (!rc_registry_position_valid(read)) return -1;
+    TexKey key;
+    make_key(t, &key);
+    lock();
+    const Tex *prior = nvn_hm_get(&by_key, &key);
+    VkMemSpan logical;
+    // A different object may still own a previously captured volume using the same key.
+    if ((prior && (prior->bound_to || prior->pin_owned || (volume && prior->t.serial != t->serial))) ||
+        !vk_mem_lookup((uintptr_t)t->mem, t->L.size, &logical) || !logical.alloc) {
+        unlock();
+        return 0;
+    }
+    const VkTexImage *selected = get_texture_write_mode(t, 0, 1);
+    Tex *e = (Tex *)selected;
+    VkTextureAliasLayout layout;
+    if (!e || e->t.serial != t->serial || e->pub.aspect != aspect || !image_alias_material_layout(e, &layout) ||
+        !(e->pub.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) || e->pub.skip ||
+        e->pub.width != (uint32_t)t->d.width || e->pub.height != (uint32_t)t->d.height || !e->image_private_mapping_count ||
+        (volume && (e->pub.type != VK_IMAGE_TYPE_3D || e->pub.view_type != VK_IMAGE_VIEW_TYPE_3D ||
+            e->pub.format != shape->format || e->pub.layers != 1 || e->pub.levels != shape->levels ||
+            e->pub.depth != shape->depth || e->pub.mirrored))) {
+        unlock();
+        return vk_texture_deferred_take() ? -1 : 0;
+    }
+    VkTextureProjectedTransfer *target = projected_transfer_alloc(e, key, read);
+    if (!target) { unlock(); return -1; }
+    const uint32_t mip = volume && view && view->set_levels ? view->base_level : 0;
+    target->whole = !box->xoffset && !box->yoffset && (uint32_t)box->width == e->t.d.width &&
+        (uint32_t)box->height == e->t.d.height &&
+        (!volume || (e->pub.levels == 1 && !box->zoffset && (uint32_t)box->depth == e->t.d.depth));
+    int pixel = nvn_fmt_bpb(t->d.format, NULL, NULL);
+    if (!texture_alias_demand_box_plane(&e->t.d, box, (uint32_t)pixel, mip, 0, target->mapping, target->mappings,
+            e->pub.addr, target->bytes, target->covered, IMAGE_ALIAS_MAX_WRITE_FRAGMENTS, &target->pieces) ||
+        !target->pieces || !projected_transfer_current_locked(target) || !native_texture_output_reserve(e)) {
+        unlock();
+        vk_texture_projected_transfer_cancel(&target);
+        return -1;
+    }
+    projected_transfer_trim(&target->covered, target->pieces);
+    *shape = e->pub;
+    *out = target;
+    unlock();
+    return 1;
+}
+
+RcRegistryResult vk_texture_projected_transfer_declare(const VkTextureProjectedTransfer *target,
+                                                        ResourceCommandEffects *effects, RcRegistryPosition output) {
+    if (target->read.scene != output.scene || target->read.ordinal + 1 != output.ordinal ||
+        !vk_texture_projected_transfer_current(target)) return RC_REGISTRY_STALE;
+    // Full captured backing identifies the image owner. Its meaningful write is the separately captured box.
+    return resource_effects_add_pinned_image(effects, (uint64_t)(uintptr_t)target->image,
+                                              target->mapping, target->mappings);
+}
+
+int vk_texture_projected_transfer_begin(VkTextureProjectedTransfer *target) {
+    if (rc_registry_position_compare(target->read, vk_exec_resource_position())) return 0;
+    lock();
+    Tex *e = projected_transfer_current_locked(target);
+    if (!e || !projected_transfer_sources_current(target)) { unlock(); return 0; }
+    resource_image_prepare_pinned((uint64_t)(uintptr_t)target->image, e->pub.addr, target->bytes,
+                                  target->mapping, target->mappings, 0);
+    target->issuing = e;
+    return 1; // Keep the selected entry locked through this command and its exact output report.
+}
+
+static void first_mirrored_write_recorded(Tex *, RcRegistryPosition, uint32_t);
+static void mirrored_color_write_recorded(Tex *, VkTextureProjectedTransfer *);
+
+void vk_texture_projected_transfer_written(VkTextureProjectedTransfer *target) {
+    Tex *e = target->issuing;
+    target->issuing = NULL;
+    if (target->host_color) {
+        if (target->host_backing_proof.id &&
+            rc_registry_gpu_capture_end(rc_registry_runtime(), &target->host_backing_proof) != RC_REGISTRY_OK)
+            rt_fatal("vk: issued mirrored color transfer lost its original backing proof");
+        resource_effects_emitted();
+        mirrored_color_write_recorded(e, target);
+        if (e->image_mapped_holds && e->image_mapped_hold_count == target->mappings)
+            image_alias_project_write(e, target->mapping, target->mappings,
+                target->covered, target->pieces, (RcRegistryPosition){0}, 0);
+        unlock();
+        return;
+    }
+    if (target->host_ranges) {
+        if (rc_registry_gpu_capture_end(rc_registry_runtime(), &target->host_backing_proof) != RC_REGISTRY_OK)
+            rt_fatal("vk: issued mirrored transfer lost its original backing proof");
+        resource_effects_emitted();
+        first_mirrored_write_recorded(e, target->read, target->host_stamp.generation);
+        unlock();
+        return;
+    }
+    gpu_written_prepared(e);
+    RcRegistryPosition output = {target->read.scene, target->read.ordinal + 1};
+    if (e->image_mapped_holds && e->image_mapped_hold_count == target->mappings &&
+        image_alias_project_write(e, target->mapping, target->mappings, target->covered, target->pieces, output, 0))
+        image_alias_note_private_projection(e, target->covered, target->pieces, target->whole);
+    unlock();
+}
+
+void vk_texture_alias_transfer_written(const tex_t *t, VkImage image, const view_t *view,
+                                        const NVNcopyRegion *region) {
+    image_alias_region_written(t, image, view, region, VK_IMAGE_ASPECT_COLOR_BIT);
+}
+
+void vk_texture_alias_depth_clear_written(const tex_t *t, VkImage image, const NVNcopyRegion *region) {
+    if (vk_texture_alias_depth_clear_candidate(t))
+        image_alias_region_written(t, image, NULL, region, VK_IMAGE_ASPECT_DEPTH_BIT);
+}
+
+typedef struct {
+    VkBuffer buffer;
+    VkBufferCopy region;
+    uint32_t fragment;
+} ImageAliasBufferCopy;
+
+typedef struct {
+    VkTexImage image;
+    nvn_texdesc desc;
+    VkTextureAliasLayout layout;
+    VkMemoryImageHold *hold;
+    uint64_t stage_offset, workspace_offset, guest_bytes;
+    uint64_t cpu_serial, cpu_revision, cpu_layout;
+    uint8_t bound;
+} ImageAliasSource;
+
+struct VkTextureAliasRead {
+    const tex_t *receiver;
+    TexKey key;
+    RcRegistryPosition read;
+    uint64_t receiver_registration;
+    uint64_t receiver_pool;
+    int receiver_logical, receiver_native;
+    uint8_t registration_only, transfer_source, raw_output, cpu_handed, sparse_buffer_rows;
+    VkMemSpan raw_source;
+    VkMemSpanCapture *raw_write_input;
+    RcRegistryBufferLocation raw_write_location;
+    VkCommandBuffer raw_write_cb;
+    uint8_t raw_write_staged, raw_write_canceled, raw_write_issued;
+    VkTexImage result;
+    VkImageSubresourceRange load_planes;
+    ImgKey placement;
+    VkTextureAliasLayout receiver_layout;
+    RcInterval *receiver_mapping, *demands;
+    RcRegistryNativeImageSnapshotFragment *fragments, *current;
+    VkTextureAliasSlice *slices;
+    VkMemImageAliasBaseline *baseline;
+    uint64_t raw_upload;
+    ImageAliasBufferCopy *buffer_copies;
+    uint32_t mapping_count, demand_count, fragment_count, source_count, buffer_count, owners;
+    uint64_t stage_bytes, upload_offset, workspace_bytes, guest_bytes;
+    ImageAliasSource *sources;
+    VkTextureAliasBytes *source_bytes;
+    RcBudgetTicket source_ticket;
+    VkMemoryImageHold *target_hold, *predecessor_hold;
+    VkImage predecessor;
+    uint64_t predecessor_serial, predecessor_revision, placement_bytes, storage_revision;
+    uint8_t storage_seed, comparison_depth, comparison_range_refused;
+    uint8_t predecessor_dormant, target_created, target_replaced, uploaded, upload_canceled;
+    VkPreparedStaging staging;
+    VmaAllocation allocation;
+    RcBudgetTicket workspace_ticket;
+    uint8_t *workspace;
+    struct ImageAliasView {
+        VkImageViewCreateInfo create;
+        VkImageView view;
+    } views[VK_POOL_KINDS];
+    uint32_t view_count;
+};
+
+static int image_alias_guest_mapping_current(uint64_t address, uint64_t bytes, const RcInterval *expected,
+                                             uint32_t count) {
+    VkMemSpan location;
+    RcInterval *mapping = NULL;
+    unsigned current = vk_mem_lookup(address, bytes, &location) ?
+        vk_mem_device_intervals(&location, address, bytes, &mapping) : 0;
+    int exact = count && current == count;
+    for (uint32_t i = 0; exact && i < count; i++)
+        exact = mapping[i].address == expected[i].address && mapping[i].mapping == expected[i].mapping &&
+            rc_range_equal(mapping[i].range, expected[i].range);
+    free(mapping);
+    return exact;
+}
+
+static int image_alias_placement_current(const Tex *e) {
+    return e && e->pub.image && !e->pub.gone && e->alloc && !e->bound_to &&
+        e->image_private_mapping_count && image_alias_guest_mapping_current(e->pub.addr, e->t.L.size,
+            e->image_private_mapping, e->image_private_mapping_count);
+}
+
+static int image_alias_source_current(const Tex *e) {
+    return e && e->alias_fragment_owner && image_alias_placement_current(e);
+}
+
+static int preserve_pool_contents_current(const Tex *e) {
+    if (!e->pub.preserve_pool_bytes) return 1;
+    if (!e->alias_full_count || !image_alias_source_current(e)) return 0;
+    const RcRegistryPosition read = vk_exec_resource_position();
+    if (!rc_registry_position_valid(read)) return 0;
+    return rc_registry_native_image_covers(rc_registry_runtime(), (uint64_t)(uintptr_t)e->pub.image,
+        e->alias_full_demand, e->alias_full_count, read);
+}
+
+static int preserve_pool_contents_handed(const Tex *e) {
+    // Called on the serialized present boundary. The captured VkImage remains the one
+    // qualified by the actual handed producer cutoff and is retained by the present job.
+    return e->pub.gpu_owned && !e->released && !e->retiring && !e->superseded && !e->overwritten &&
+        e->alias_full_count && image_alias_source_current(e) &&
+        rc_registry_native_image_covers_handed(rc_registry_runtime(), (uint64_t)(uintptr_t)e->pub.image,
+                                               e->alias_full_demand, e->alias_full_count);
+}
+
+static int image_alias_load_current(Tex *, const VkImageSubresourceRange *, RcRegistryPosition);
+
+int vk_texture_attachment_load_ready(const VkTexImage *selected, const VkImageSubresourceRange *planes) {
+    if (!selected->preserve_pool_bytes) return 1;
+    lock();
+    const NativeTextureOutput *owner = nvn_hm_get(&alias_fragment_owners, &selected->image);
+    Tex *entry = owner ? owner->entry : NULL;
+    int ready = entry && entry->pub.addr == selected->addr && (planes ?
+        image_alias_load_current(entry, planes, vk_exec_resource_position()) : preserve_pool_contents_current(entry));
+    unlock();
+    return ready;
+}
+
+static void image_alias_stage_release(VkTextureAliasRead *alias) {
+    vk_staging_prepare_cancel(&alias->staging);
+    if (alias->workspace) {
+        resource_core_budget_retire(&alias->workspace_ticket);
+        free(alias->workspace);
+        alias->workspace = NULL;
+        resource_core_budget_destroyed(&alias->workspace_ticket);
+    } else if (alias->workspace_ticket.token.ledger) resource_core_budget_cancel(&alias->workspace_ticket);
+}
+
+static void image_alias_sources_release(VkTextureAliasRead *alias) {
+    for (uint32_t i = 0; i < alias->source_count; i++) vk_mem_image_release(alias->sources[i].hold);
+    if (alias->sources) vk_replay_metadata_free(alias->sources, &alias->source_ticket);
+}
+
+static void image_alias_release(void *opaque) {
+    VkTextureAliasRead *alias = opaque;
+    if (__atomic_sub_fetch(&alias->owners, 1, __ATOMIC_ACQ_REL)) return;
+    image_alias_sources_release(alias);
+    for (uint32_t i = 0; i < alias->view_count; i++) vkDestroyImageView(vk_ctx()->device, alias->views[i].view, NULL);
+    if (alias->allocation) {
+        resource_core_vma_destroy_image(vk_ctx()->vma, alias->result.image, alias->allocation);
+        if (alias->predecessor && alias->uploaded)
+            __atomic_fetch_add(&alias_canceled_target_placements, 1, __ATOMIC_RELAXED);
+    }
+    if (alias->target_hold) vk_mem_image_release(alias->target_hold);
+    if (alias->predecessor_hold) vk_mem_image_release(alias->predecessor_hold);
+    image_alias_stage_release(alias);
+    free(alias->demands);
+    free(alias->receiver_mapping);
+    free(alias->fragments);
+    free(alias->current);
+    free(alias->slices);
+    vk_mem_image_alias_baseline_release(&alias->baseline);
+    vk_mem_span_capture_release(&alias->raw_write_input);
+    nvn_texture_pin_release(alias->receiver);
+    free(alias);
+}
+
+static void image_alias_cancel(void *opaque, int may_have_executed) {
+    (void)may_have_executed; // uncertain native ownership remains with the real completion record
+    image_alias_release(opaque);
+}
+
+static void image_alias_upload_completed(void *opaque) {
+    VkTextureAliasRead *alias = opaque;
+    image_alias_stage_release(alias);
+    image_alias_release(alias);
+}
+
+static void image_alias_upload_canceled(void *opaque, int may_have_executed) {
+    VkTextureAliasRead *alias = opaque;
+    (void)may_have_executed;
+    __atomic_store_n(&alias->upload_canceled, 1, __ATOMIC_RELEASE);
+    image_alias_upload_completed(alias);
+}
+
+const RcInterval *vk_texture_alias_read_intervals(const VkTextureAliasRead *alias, uint32_t *count) {
+    *count = alias ? alias->mapping_count : 0;
+    return alias ? alias->receiver_mapping : NULL;
+}
+
+void vk_texture_alias_read_cancel(VkTextureAliasRead *alias) {
+    if (alias) image_alias_release(alias);
+}
+
+VkTextureAliasRead *vk_texture_alias_read_retain(VkTextureAliasRead *alias) {
+    if (alias && __atomic_add_fetch(&alias->owners, 1, __ATOMIC_RELAXED) == 0)
+        rt_fatal("vk: image alias read owner count exhausted");
+    return alias;
+}
+
+void vk_texture_alias_read_use(VkTextureAliasRead *alias, uint64_t fence) {
+    vk_texture_alias_read_retain(alias);
+    vk_completion_add_owned(fence, image_alias_release, image_alias_cancel, alias);
+}
+
+VkImageView vk_texture_alias_read_view_locked(VkTextureAliasRead *alias, const VkImageViewCreateInfo *create) {
+    if (create->image != alias->result.image || create->pNext || create->flags) return VK_NULL_HANDLE;
+    if (alias->registration_only && !texture_alias_view_covered(create->subresourceRange, &alias->receiver_layout))
+        return VK_NULL_HANDLE;
+    if (alias->storage_seed && alias->result.type == VK_IMAGE_TYPE_3D &&
+        (create->viewType != VK_IMAGE_VIEW_TYPE_3D || create->format != alias->result.format ||
+         !storage_volume_mip(&alias->result, &create->subresourceRange) ||
+         !texture_alias_view_covered(create->subresourceRange, &alias->receiver_layout))) return VK_NULL_HANDLE;
+    for (uint32_t i = 0; i < alias->view_count; ++i) {
+        const struct ImageAliasView *view = &alias->views[i];
+        if (view->create.viewType == create->viewType && view->create.format == create->format &&
+            !memcmp(&view->create.components, &create->components, sizeof create->components) &&
+            !memcmp(&view->create.subresourceRange, &create->subresourceRange, sizeof create->subresourceRange))
+            return view->view;
+    }
+    if (alias->view_count == VK_POOL_KINDS) return VK_NULL_HANDLE;
+    VkImageView view;
+    if (vkCreateImageView(vk_ctx()->device, create, NULL, &view) != VK_SUCCESS) return VK_NULL_HANDLE;
+    alias->views[alias->view_count++] = (struct ImageAliasView){*create, view};
+    return view;
+}
+
+static int image_alias_bound_source_current(const Tex *e, VkImage image) {
+    return e && e->pub.image == image && !e->pub.gone &&
+        ((e->pub.aspect == VK_IMAGE_ASPECT_DEPTH_BIT && alias_depth_format(e->t.d.format) == e->pub.format) ||
+         image_alias_ordinary_color(e)) &&
+        e->bound_to && e->bound_alias_whole && e->image_device_count &&
+        e->image_device_count == e->image_mapped_hold_count &&
+        vk_mem_image_alias_current(image, e->pub.addr, e->image_device_size, e->bound_to,
+                                  e->image_device_intervals, e->image_device_count);
+}
+
+static RcRegistryResult image_alias_stage_buffer(VkTextureAliasRead *alias, uint32_t index) {
+    const RcRegistryNativeImageSnapshotFragment *fragment = &alias->fragments[index];
+    const RcRegistryNativeImageFragment *f = &fragment->fragment;
+    if (!alias->baseline || f->binding.image || fragment->baseline == UINT32_MAX) return RC_REGISTRY_INVALID;
+    VkBuffer buffer;
+    VkDeviceSize offset;
+    const uint64_t bytes = f->interval.range.size;
+    if (!vk_mem_image_alias_baseline_source(alias->baseline, fragment->baseline, fragment->native_buffer,
+                                            bytes, &buffer, &offset)) return RC_REGISTRY_STALE;
+    // A raw read copies only its own proved bytes. It cannot round into an image-owned interval.
+    if (offset != fragment->native_buffer.offset) return RC_REGISTRY_STALE;
+    if (!buffer || !bytes) return RC_REGISTRY_UNSUPPORTED;
+    const uint64_t stage_offset = alias->stage_bytes;
+    if (stage_offset > VK_TEXTURE_ALIAS_MAX_BYTES ||
+        bytes > VK_TEXTURE_ALIAS_MAX_BYTES - stage_offset) return RC_REGISTRY_CAPACITY;
+    alias->buffer_copies[alias->buffer_count++] = (ImageAliasBufferCopy){buffer, {offset, stage_offset, bytes}, index};
+    alias->stage_bytes = stage_offset + bytes;
+    alias->slices[index] = (VkTextureAliasSlice){.covered = f->interval.range, .writer_address = stage_offset,
+                                             .source = alias->source_count, .demand = f->demand};
+    return RC_REGISTRY_OK;
+}
+
+static int native_texture_output_contains(const NativeTextureOutput *owner,
+                                          const RcRegistryNativeImageFragment *fragment) {
+    const RcInterval part = fragment->interval;
+    for (uint32_t i = 0; i < owner->mapping_count; i++) {
+        const RcInterval mapping = owner->mapping[i];
+        if (fragment->binding.hold.id != owner->holds[i].id || fragment->binding.hold.index != owner->holds[i].index ||
+            part.mapping != mapping.mapping || part.range.backing != mapping.range.backing ||
+            part.address < mapping.address || part.range.size > mapping.range.size) continue;
+        const uint64_t offset = part.address - mapping.address;
+        if (offset <= mapping.range.size - part.range.size && part.range.offset == mapping.range.offset + offset)
+            return 1;
+    }
+    return 0;
+}
+
+static int image_alias_compare_handles(const void *left, const void *right) {
+    const uint64_t a = *(const uint64_t *)left, b = *(const uint64_t *)right;
+    return a < b ? -1 : a > b;
+}
+
+static RcRegistryResult image_alias_source_storage(VkTextureAliasRead *alias, uint64_t *keys) {
+    uint32_t images = 0, raw = 0;
+    for (uint32_t i = 0; i < alias->fragment_count; i++) {
+        const RcRegistryNativeImageSnapshotFragment *fragment = &alias->fragments[i];
+        if (fragment->native_buffer.allocation) raw++;
+        else if (fragment->fragment.binding.image) keys[images++] = fragment->fragment.binding.image;
+        else return RC_REGISTRY_INVALID;
+    }
+    qsort(keys, images, sizeof *keys, image_alias_compare_handles);
+    uint32_t unique = 0;
+    for (uint32_t i = 0; i < images; i++)
+        if (!unique || keys[i] != keys[unique - 1]) keys[unique++] = keys[i];
+    const uint64_t bytes = (uint64_t)unique * sizeof *alias->sources + (uint64_t)raw * sizeof *alias->buffer_copies +
+        ((uint64_t)unique + (raw != 0)) * sizeof *alias->source_bytes;
+    if (!bytes || bytes > SIZE_MAX) return RC_REGISTRY_CAPACITY;
+    void *memory;
+    if (vk_replay_metadata_allocate((size_t)bytes, 1, RC_BUDGET_TEXTURE, &alias->source_ticket, &memory) != VK_SUCCESS)
+        return RC_REGISTRY_CAPACITY;
+    alias->source_count = unique;
+    alias->sources = memory;
+    alias->buffer_copies = (ImageAliasBufferCopy *)(alias->sources + unique);
+    alias->source_bytes = (VkTextureAliasBytes *)(alias->buffer_copies + raw);
+    return RC_REGISTRY_OK;
+}
+
+static uint32_t image_alias_source_index(const uint64_t *keys, uint32_t count, uint64_t image) {
+    uint32_t begin = 0, end = count;
+    while (begin < end) {
+        const uint32_t middle = begin + (end - begin) / 2;
+        if (keys[middle] < image) begin = middle + 1;
+        else end = middle;
+    }
+    return begin;
+}
+
+static RcRegistryResult image_alias_capture_source_table(VkTextureAliasRead *alias, const uint64_t *keys,
+                                                         int retain, VkTextureAliasFailure *failure) {
+    for (uint32_t i = 0; i < alias->fragment_count; i++) {
+        const RcRegistryNativeImageSnapshotFragment *fragment = &alias->fragments[i];
+        const RcRegistryNativeImageFragment *f = &fragment->fragment;
+        if (f->demand >= alias->demand_count) return RC_REGISTRY_INVALID;
+        const RcInterval *demand = &alias->demands[f->demand];
+        const RcSourceRange part = f->interval.range;
+        if (!rc_range_valid(part) || part.backing != demand->range.backing ||
+            part.offset < demand->range.offset || part.size > demand->range.size ||
+            part.offset - demand->range.offset > demand->range.size - part.size) return RC_REGISTRY_INVALID;
+        if (fragment->native_buffer.allocation) {
+            if (failure) {
+                failure->receiver = (RcInterval){.address = demand->address + (part.offset - demand->range.offset),
+                    .mapping = demand->mapping, .range = part};
+                failure->coverage = (RcRegistryNativeImageFailure){.interval = failure->receiver,
+                    .selected_output = f->output, .demand = f->demand};
+            }
+            if (alias->raw_upload) {
+                if (f->binding.image || fragment->baseline == UINT32_MAX) return RC_REGISTRY_INVALID;
+            } else {
+                RcRegistryResult result = image_alias_stage_buffer(alias, i);
+                if (result != RC_REGISTRY_OK) return result;
+            }
+            continue;
+        }
+        if (!f->binding.image || fragment->baseline != UINT32_MAX) return RC_REGISTRY_INVALID;
+        VkImage image = (VkImage)(uintptr_t)f->binding.image;
+        const NativeTextureOutput *owner = nvn_hm_get(&alias_fragment_owners, &image);
+        if (owner && !owner->entry && !native_texture_output_contains(owner, f)) return RC_REGISTRY_STALE;
+        const uint32_t known = image_alias_source_index(keys, alias->source_count, f->binding.image);
+        if (known == alias->source_count || keys[known] != f->binding.image) return RC_REGISTRY_INVALID;
+        ImageAliasSource *source = &alias->sources[known];
+        if (!source->image.image) {
+            if (failure) {
+                const RcInterval *demand = &alias->demands[f->demand];
+                failure->receiver = (RcInterval){.address = demand->address + (f->interval.range.offset - demand->range.offset),
+                    .mapping = demand->mapping, .range = f->interval.range};
+                failure->coverage = (RcRegistryNativeImageFailure){.interval = failure->receiver,
+                    .selected = f->binding, .selected_output = f->output, .demand = f->demand};
+            }
+            const Tex *entry = owner ? owner->entry : nvn_hm_get(&bound_alias_owners, &image);
+            if (owner ? (entry ? !image_alias_source_current(entry) : !owner->allocation) :
+                !image_alias_bound_source_current(entry, image)) return RC_REGISTRY_STALE;
+            const VkTexImage *shape = entry ? &entry->pub : &owner->image;
+            const nvn_texdesc *descriptor = entry ? &entry->t.d : &owner->descriptor;
+            const TexVkFormat *format = entry ? &entry->f : &owner->format;
+            source->bound = owner == NULL;
+            if (alias->cpu_handed) {
+                if (!owner || !entry || !entry->content_revision || !entry->sample_general_revision ||
+                    entry->pending_write || entry->pin_detached) return RC_REGISTRY_UNSUPPORTED;
+                source->cpu_serial = entry->t.serial;
+                source->cpu_revision = entry->content_revision;
+                source->cpu_layout = entry->sample_general_revision;
+            }
+            source->guest_bytes = entry ? entry->t.L.size : owner->guest_bytes;
+            if (!image_alias_layout_for(shape, descriptor, format, source->guest_bytes, &source->layout))
+                return RC_REGISTRY_UNSUPPORTED;
+            source->stage_offset = (alias->stage_bytes + 15) & ~UINT64_C(15);
+            source->workspace_offset = alias->workspace_bytes;
+            if (source->stage_offset > VK_TEXTURE_ALIAS_MAX_BYTES ||
+                source->layout.bytes > VK_TEXTURE_ALIAS_MAX_BYTES - source->stage_offset ||
+                source->guest_bytes > VK_TEXTURE_ALIAS_MAX_BYTES - alias->workspace_bytes) return RC_REGISTRY_CAPACITY;
+            alias->stage_bytes = source->stage_offset + source->layout.bytes;
+            alias->workspace_bytes += source->guest_bytes;
+            source->image = *shape;
+            source->desc = *descriptor;
+            if (retain) {
+                source->hold = vk_mem_image_hold(image);
+                if (!source->hold) return RC_REGISTRY_STALE;
+            }
+        }
+        alias->slices[i] = (VkTextureAliasSlice){.covered = f->interval.range, .writer_address = f->interval.address,
+                                               .source = known, .demand = f->demand};
+    }
+    if (!alias->buffer_count && !alias->raw_upload) vk_mem_image_alias_baseline_release(&alias->baseline);
+    return alias->source_count || alias->buffer_count || alias->raw_upload ? RC_REGISTRY_OK : RC_REGISTRY_STALE;
+}
+
+static RcRegistryResult image_alias_capture_sources(VkTextureAliasRead *alias, int retain, VkTextureAliasFailure *failure) {
+    const uint64_t bytes = (uint64_t)alias->fragment_count * sizeof(uint64_t);
+    if (!bytes || bytes > SIZE_MAX) return RC_REGISTRY_CAPACITY;
+    RcBudgetTicket key_ticket = {0};
+    void *memory;
+    if (vk_replay_metadata_allocate((size_t)bytes, 0, RC_BUDGET_TEXTURE, &key_ticket, &memory) != VK_SUCCESS)
+        return RC_REGISTRY_CAPACITY;
+    uint64_t *keys = memory;
+    RcRegistryResult status = image_alias_source_storage(alias, keys);
+    if (status == RC_REGISTRY_OK) status = image_alias_capture_source_table(alias, keys, retain, failure);
+    vk_replay_metadata_free(keys, &key_ticket);
+    return status;
+}
+
+static int image_alias_refuse(VkTextureAliasFailure *out, VkTextureAliasPhase phase, RcRegistryResult status,
+                             RcInterval receiver) {
+    if (out) {
+        out->phase = phase;
+        out->status = status;
+        out->receiver = receiver;
+    }
+    return -1;
+}
+
+static int image_alias_refuse_layout(VkTextureAliasFailure *out, RcInterval receiver, const char *gate) {
+    if (out) out->layout_gate = gate;
+    return image_alias_refuse(out, VK_TEXTURE_ALIAS_LAYOUT, RC_REGISTRY_UNSUPPORTED, receiver);
+}
+
+typedef struct {
+    const tex_t *texture;
+    TexKey key;
+    ImgKey placement;
+    VkTexImage image;
+    const RcInterval *mapping;
+    uint32_t mapping_count;
+    const view_t *view;
+    const VkImageSubresourceRange *load_planes;
+    VkMemImageAliasBaseline **prepared_baseline;
+    const RcInterval *transfer_demand;
+    uint32_t transfer_demand_count;
+    int allow_rgba8_linear_view, allow_submitted_raw;
+} ImageAliasReceiver;
+
+static int image_alias_finish_upload_layout(VkTextureAliasRead *alias) {
+    const uint64_t offset = (alias->stage_bytes + 15) & ~UINT64_C(15);
+    if (offset > VK_TEXTURE_ALIAS_MAX_BYTES || alias->receiver_layout.bytes > VK_TEXTURE_ALIAS_MAX_BYTES - offset)
+        return 0;
+    alias->upload_offset = offset;
+    alias->stage_bytes = offset + alias->receiver_layout.bytes;
+    return 1;
+}
+
+static int image_alias_read_prepare_locked(const ImageAliasReceiver *receiver, const Tex *target_entry,
+    VkTextureAliasRead **out, VkTexImage *shape, int force, int target, VkTextureAliasFailure *failure) {
+    const tex_t *t = receiver->texture;
+    const RcInterval mapped = receiver->mapping[0];
+    const int prospective = target_entry == NULL;
+    RcRegistryPosition read = vk_exec_resource_position();
+    if (!rc_registry_position_valid(read))
+        return image_alias_refuse(failure, VK_TEXTURE_ALIAS_ORDER, RC_REGISTRY_INVALID, mapped);
+    VkTextureAliasRead *alias = calloc(1, sizeof *alias);
+    if (!alias) return image_alias_refuse(failure, VK_TEXTURE_ALIAS_CAPACITY, RC_REGISTRY_CAPACITY, mapped);
+    alias->owners = 1;
+    alias->read = read;
+    alias->key = receiver->key;
+    alias->result = receiver->image;
+    VkImage original = receiver->image.image;
+    alias->transfer_source = receiver->transfer_demand != NULL;
+    alias->registration_only = prospective && !alias->transfer_source;
+    if (target == 1) alias->target_hold = vk_mem_image_hold(original);
+    else alias->result.image = VK_NULL_HANDLE;
+    if (target == 2) {
+        alias->predecessor = original;
+        alias->predecessor_serial = target_entry->t.serial;
+        alias->predecessor_dormant = target_entry->released;
+        alias->predecessor_revision = target_entry->content_revision;
+        alias->predecessor_hold = vk_mem_image_hold(original);
+    }
+    alias->result.bound = 0;
+    alias->placement = receiver->placement;
+    if (receiver->load_planes) alias->load_planes = *receiver->load_planes;
+    alias->guest_bytes = t->L.size;
+    alias->workspace_bytes = alias->guest_bytes;
+    alias->mapping_count = receiver->mapping_count;
+    alias->receiver_mapping = malloc(alias->mapping_count * sizeof *alias->receiver_mapping);
+    alias->demands = malloc(IMAGE_ALIAS_MAX_WRITE_FRAGMENTS * sizeof *alias->demands);
+    if (!alias->receiver_mapping || !alias->demands) {
+        image_alias_release(alias);
+        return image_alias_refuse(failure, VK_TEXTURE_ALIAS_CAPACITY, RC_REGISTRY_CAPACITY, mapped);
+    }
+    memcpy(alias->receiver_mapping, receiver->mapping, alias->mapping_count * sizeof *alias->receiver_mapping);
+    if (receiver->prepared_baseline) {
+        alias->baseline = *receiver->prepared_baseline;
+        *receiver->prepared_baseline = NULL;
+    }
+    int layout = prospective ? texture_alias_layout(&t->d, &receiver->image, &alias->receiver_layout)
+                             : image_alias_material_layout(target_entry, &alias->receiver_layout);
+    const int planes = layout && (receiver->load_planes ?
+        texture_alias_clear_planes(alias->load_planes, &receiver->image, &alias->receiver_layout) :
+        texture_alias_selected_planes(receiver->view, &receiver->image, &alias->receiver_layout));
+    int demand = 0;
+    if (planes && receiver->transfer_demand) {
+        alias->demand_count = receiver->transfer_demand_count;
+        memcpy(alias->demands, receiver->transfer_demand, alias->demand_count * sizeof *alias->demands);
+        demand = 1;
+    } else if (planes) {
+        demand = texture_alias_demand(&t->d, &alias->receiver_layout, alias->receiver_mapping, alias->mapping_count,
+            alias->result.addr, alias->guest_bytes, alias->demands, IMAGE_ALIAS_MAX_WRITE_FRAGMENTS, &alias->demand_count);
+    }
+    if (!demand) {
+        const int required = !prospective || alias->baseline ||
+            rc_registry_native_image_buffer_requires_coverage(rc_registry_runtime(), receiver->mapping, receiver->mapping_count, read);
+        image_alias_release(alias);
+        return required ?
+            image_alias_refuse_layout(failure, mapped, !layout ? "native-layout" : !planes ? "selected-planes" : "mapped-demand") : 0;
+    }
+    // Only a projected meaningful byte can require reconstruction. A retained RAW receipt can
+    // independently prove the texels even when all image projections are confined to padding.
+    RcRegistry *registry = rc_registry_runtime();
+    const int bound = prospective && image_alias_single_color_view(t, receiver->view) &&
+        rc_registry_native_image_has_prior_bound_projection(registry, alias->demands, alias->demand_count, read);
+    if (prospective && !out && !bound && !rc_registry_native_image_has_prior_projection(
+            registry, alias->demands, alias->demand_count, read)) {
+        image_alias_release(alias);
+        return 0;
+    }
+    const int projected = prospective && (bound ||
+        rc_registry_native_image_buffer_requires_coverage(registry, alias->demands, alias->demand_count, read));
+    // Try projected authority first for an existing target or a registered competing writer.
+    // Seek a RAW receipt first for a prospective ordinary color registration without one.
+    const int image_first = !prospective || projected || receiver->image.aspect == VK_IMAGE_ASPECT_DEPTH_BIT;
+    RcRegistryNativeImageFailure local_detail = {.gate = RC_NATIVE_IMAGE_READ_NO_PRODUCER};
+    RcRegistryNativeImageFailure *detail = failure ? &failure->coverage : &local_detail;
+    RcRegistryResult coverage = RC_REGISTRY_BLOCKED;
+    if (image_first) {
+        alias->fragments = malloc(IMAGE_ALIAS_MAX_WRITE_FRAGMENTS * sizeof *alias->fragments);
+        if (!alias->fragments) {
+            image_alias_release(alias);
+            return image_alias_refuse(failure, VK_TEXTURE_ALIAS_CAPACITY, RC_REGISTRY_CAPACITY, mapped);
+        }
+        coverage = rc_registry_native_image_snapshot_mixed(rc_registry_runtime(), alias->demands, alias->demand_count,
+            NULL, 0, read, alias->fragments, IMAGE_ALIAS_MAX_WRITE_FRAGMENTS, &alias->fragment_count, detail);
+    }
+    if (coverage == RC_REGISTRY_BLOCKED && out) {
+        // The existing image-only path needs no raw provider. An uncovered part can
+        // proceed only with a positive native allocation and initialization receipt.
+        RcRegistryResult captured = alias->baseline ? RC_REGISTRY_OK :
+            vk_mem_image_alias_baseline_capture(alias->result.addr, alias->guest_bytes,
+                alias->receiver_mapping, alias->mapping_count, read, &alias->baseline);
+        if (captured == RC_REGISTRY_OK && !alias->baseline && receiver->allow_submitted_raw)
+            captured = vk_mem_image_alias_baseline_capture_submitted(alias->result.addr, alias->guest_bytes,
+                alias->receiver_mapping, alias->mapping_count, read, &alias->baseline, &alias->raw_upload);
+        if (failure) {
+            failure->raw_attempted = 1;
+            failure->raw_status = captured;
+        }
+        if (captured == RC_REGISTRY_OK && alias->baseline) {
+            if (!alias->fragments)
+                alias->fragments = malloc(IMAGE_ALIAS_MAX_WRITE_FRAGMENTS * sizeof *alias->fragments);
+            if (!alias->fragments) {
+                image_alias_release(alias);
+                return image_alias_refuse(failure, VK_TEXTURE_ALIAS_CAPACITY, RC_REGISTRY_CAPACITY, mapped);
+            }
+            uint32_t count;
+            const RcRegistryBufferSpan *spans = alias->raw_upload ?
+                vk_mem_image_alias_baseline_submitted_spans(alias->baseline, alias->raw_upload, &count) :
+                vk_mem_image_alias_baseline_spans(alias->baseline, &count);
+            if (alias->raw_upload && !count) {
+                image_alias_release(alias);
+                return image_alias_refuse(failure, VK_TEXTURE_ALIAS_MAPPING, RC_REGISTRY_STALE, mapped);
+            }
+            if (failure && count) {
+                failure->raw_spans = count;
+                failure->raw_origin = spans[0].native;
+            }
+            coverage = rc_registry_native_image_snapshot_mixed(rc_registry_runtime(), alias->demands, alias->demand_count,
+                spans, count, read, alias->fragments, IMAGE_ALIAS_MAX_WRITE_FRAGMENTS, &alias->fragment_count, detail);
+            if (coverage == RC_REGISTRY_OK && alias->raw_upload) {
+                int raw_selected = 0;
+                for (uint32_t i = 0; i < alias->fragment_count; i++)
+                    raw_selected |= alias->fragments[i].native_buffer.allocation != 0;
+                if (!raw_selected) alias->raw_upload = 0;
+            }
+        } else if (captured != RC_REGISTRY_OK) {
+            coverage = captured;
+        } else if (prospective && !projected && (!image_first || detail->gate == RC_NATIVE_IMAGE_READ_NO_PRODUCER)) {
+            image_alias_release(alias);
+            return 0;
+        }
+    }
+    if (coverage != RC_REGISTRY_OK) {
+        image_alias_release(alias);
+        return image_alias_refuse(failure, VK_TEXTURE_ALIAS_COVERAGE, coverage,
+                                  detail->interval.mapping ? detail->interval : mapped);
+    }
+    // The original live texture path is sufficient when that very VkImage supplies every demanded byte.
+    int reconstruct = force || prospective;
+    for (uint32_t i = 0; i < alias->fragment_count; i++)
+        reconstruct |= alias->fragments[i].fragment.binding.image != (uint64_t)(uintptr_t)original;
+    if (!reconstruct) {
+        image_alias_release(alias);
+        return 0;
+    }
+    if (out) {
+        alias->receiver = nvn_texture_pin_acquire(t);
+        alias->current = malloc(alias->fragment_count * sizeof *alias->current);
+    }
+    alias->slices = malloc(alias->fragment_count * sizeof *alias->slices);
+    if ((out && (!alias->receiver || !alias->current)) || !alias->slices) {
+        image_alias_release(alias);
+        return image_alias_refuse(failure, VK_TEXTURE_ALIAS_CAPACITY, RC_REGISTRY_CAPACITY, mapped);
+    }
+    RcRegistryResult sources = image_alias_capture_sources(alias, out != NULL, failure);
+    if (sources != RC_REGISTRY_OK) {
+        image_alias_release(alias);
+        return image_alias_refuse(failure, sources == RC_REGISTRY_CAPACITY ? VK_TEXTURE_ALIAS_CAPACITY : VK_TEXTURE_ALIAS_OWNER,
+                                  sources, failure && failure->receiver.mapping ? failure->receiver : mapped);
+    }
+    if (!alias->raw_upload && !image_alias_finish_upload_layout(alias)) {
+        image_alias_release(alias);
+        return image_alias_refuse(failure, VK_TEXTURE_ALIAS_CAPACITY, RC_REGISTRY_CAPACITY, mapped);
+    }
+    if (failure) {
+        failure->receiver = (RcInterval){0};
+        failure->coverage = (RcRegistryNativeImageFailure){0};
+    }
+    if (out) {
+        *shape = alias->result;
+        *out = alias;
+    } else image_alias_release(alias);
+    return 1;
+}
+
+// Clip the already captured hull mapping to the intervals the transfer actually reads.
+static uint32_t image_alias_buffer_rows(const RcInterval *mapping, uint32_t count, uint64_t address,
+    uint64_t bytes, uint64_t row_bytes, uint64_t stride, RcInterval *demand, uint32_t capacity) {
+    uint32_t used = 0, part = 0;
+    for (uint64_t row = 0; row <= bytes - row_bytes;) {
+        uint64_t next = address + row, limit = next + row_bytes;
+        while (next < limit) {
+            while (part < count && mapping[part].address + mapping[part].range.size <= next) ++part;
+            if (part == count || mapping[part].address > next || used == capacity) return 0;
+            RcInterval interval = mapping[part];
+            const uint64_t skip = next - interval.address;
+            interval.address = next;
+            interval.range.offset += skip;
+            interval.range.size -= skip;
+            if (interval.range.size > limit - next) interval.range.size = limit - next;
+            demand[used++] = interval;
+            next += interval.range.size;
+        }
+        if (bytes - row - row_bytes < stride) break;
+        row += stride;
+    }
+    return used;
+}
+
+RcRegistryResult vk_texture_alias_buffer_capture_rows(const VkMemSpanCapture *capture, const VkMemSpan *selected,
+    uint64_t address, uint64_t bytes, uint64_t row_bytes, uint64_t stride,
+    VkTextureAliasRead **out, VkTextureAliasFailure *failure) {
+    if (!capture || !selected || !out || *out || !row_bytes || row_bytes > bytes || stride < row_bytes ||
+        (bytes - row_bytes) % stride || bytes > selected->avail || bytes > UINT64_MAX - address)
+        return RC_REGISTRY_INVALID;
+    if (selected->cls != VK_MCLS_DEVICE) return RC_REGISTRY_OK;
+    const RcRegistryPosition read = vk_exec_resource_position();
+    if (!rc_registry_position_open(rc_registry_runtime(), read)) return RC_REGISTRY_STALE;
+    RcInterval *mapping;
+    uint32_t count = vk_mem_span_capture_device_intervals(capture, selected, address, bytes, &mapping);
+    if (!count) return RC_REGISTRY_STALE;
+    if (!rc_registry_native_image_buffer_requires_coverage(rc_registry_runtime(), mapping, count, read)) {
+        free(mapping);
+        return RC_REGISTRY_OK;
+    }
+    if (count > IMAGE_ALIAS_MAX_WRITE_FRAGMENTS || bytes > VK_TEXTURE_ALIAS_MAX_BYTES) {
+        free(mapping);
+        return RC_REGISTRY_CAPACITY;
+    }
+    VkTextureAliasRead *alias = calloc(1, sizeof *alias);
+    if (!alias) { free(mapping); return RC_REGISTRY_CAPACITY; }
+    alias->owners = 1;
+    alias->read = read;
+    alias->result.addr = address;
+    alias->guest_bytes = alias->workspace_bytes = bytes;
+    alias->raw_source = *selected;
+    alias->raw_output = 1;
+    alias->sparse_buffer_rows = stride != row_bytes && row_bytes < bytes;
+    alias->receiver_mapping = mapping;
+    alias->mapping_count = count;
+    const uint32_t capacity = alias->sparse_buffer_rows ? IMAGE_ALIAS_MAX_WRITE_FRAGMENTS : count;
+    alias->demands = malloc((size_t)capacity * sizeof *alias->demands);
+    alias->fragments = malloc(IMAGE_ALIAS_MAX_WRITE_FRAGMENTS * sizeof *alias->fragments);
+    alias->current = malloc(IMAGE_ALIAS_MAX_WRITE_FRAGMENTS * sizeof *alias->current);
+    alias->slices = malloc(IMAGE_ALIAS_MAX_WRITE_FRAGMENTS * sizeof *alias->slices);
+    RcRegistryResult status = RC_REGISTRY_CAPACITY;
+    if (!alias->demands || !alias->fragments || !alias->current || !alias->slices) goto fail;
+    if (alias->sparse_buffer_rows) {
+        alias->demand_count = image_alias_buffer_rows(mapping, count, address, bytes, row_bytes, stride, alias->demands, capacity);
+        if (!alias->demand_count) goto fail;
+        if (!rc_registry_native_image_buffer_requires_coverage(rc_registry_runtime(), alias->demands, alias->demand_count, read)) {
+            status = RC_REGISTRY_OK;
+            goto fail;
+        }
+    } else {
+        alias->demand_count = count;
+        memcpy(alias->demands, mapping, (size_t)count * sizeof *mapping);
+    }
+    RcRegistryNativeImageFailure *detail = failure ? &failure->coverage : NULL;
+    lock();
+    status = rc_registry_native_image_snapshot_mixed(rc_registry_runtime(), alias->demands, alias->demand_count,
+        NULL, 0, read, alias->fragments, IMAGE_ALIAS_MAX_WRITE_FRAGMENTS, &alias->fragment_count, detail);
+    if (status == RC_REGISTRY_BLOCKED) {
+        RcRegistryResult captured = vk_mem_image_alias_baseline_capture(address, bytes, mapping, count, read,
+                                                                        &alias->baseline);
+        if (captured == RC_REGISTRY_OK && alias->baseline) {
+            uint32_t spans_count;
+            const RcRegistryBufferSpan *spans = vk_mem_image_alias_baseline_spans(alias->baseline, &spans_count);
+            status = rc_registry_native_image_snapshot_mixed(rc_registry_runtime(), alias->demands, alias->demand_count,
+                spans, spans_count, read, alias->fragments, IMAGE_ALIAS_MAX_WRITE_FRAGMENTS, &alias->fragment_count,
+                detail);
+        } else if (captured != RC_REGISTRY_OK) status = captured;
+    }
+    int selected_image = 0;
+    if (status == RC_REGISTRY_OK) {
+        for (uint32_t i = 0; i < alias->fragment_count; i++)
+            selected_image |= alias->fragments[i].fragment.binding.image != 0;
+        if (selected_image) status = image_alias_capture_sources(alias, 1, failure);
+    }
+    unlock();
+    if (!selected_image || status != RC_REGISTRY_OK) goto fail;
+    alias->upload_offset = (alias->stage_bytes + 15) & ~UINT64_C(15);
+    if (alias->upload_offset > VK_TEXTURE_ALIAS_MAX_BYTES || bytes > VK_TEXTURE_ALIAS_MAX_BYTES - alias->upload_offset) {
+        status = RC_REGISTRY_CAPACITY;
+        goto fail;
+    }
+    alias->stage_bytes = alias->upload_offset + bytes;
+    *out = alias;
+    return RC_REGISTRY_OK;
+fail:
+    image_alias_release(alias);
+    return status;
+}
+
+RcRegistryResult vk_texture_alias_buffer_capture(const VkMemSpanCapture *capture, const VkMemSpan *selected,
+    uint64_t address, uint64_t bytes, VkTextureAliasRead **out, VkTextureAliasFailure *failure) {
+    return vk_texture_alias_buffer_capture_rows(capture, selected, address, bytes, bytes, bytes, out, failure);
+}
+
+// Destination admissibility and existing logical contents are independent. A projected image can
+// require a seed even when the current fixed buffer can be overwritten without clobbering another owner.
+static RcRegistryResult buffer_write_input_prove(const VkMemSpanCapture *capture, const VkMemSpan *selected,
+    uint64_t address, uint64_t bytes, RcRegistryPosition read, int direct,
+    RcRegistryBufferLocation *location, int *writable) {
+    *writable = 0;
+    if (!capture || !selected || selected->cls != VK_MCLS_DEVICE || !selected->alloc ||
+        !bytes || bytes > selected->avail || bytes > UINT64_MAX - address ||
+        !rc_registry_position_valid(read) || (read.ordinal & 1)) return RC_REGISTRY_INVALID;
+    if (!vk_mem_span_buffer_location(capture, selected, location) || location->incarnation ||
+        bytes > UINT64_MAX - location->offset) return RC_REGISTRY_STALE;
+
+    RcInterval *mapping = NULL;
+    uint32_t count = vk_mem_span_capture_device_intervals(capture, selected, address, bytes, &mapping);
+    if (!count) return RC_REGISTRY_STALE;
+    RcRegistry *registry = rc_registry_runtime();
+    uint64_t epoch = rc_registry_authority_epoch(registry);
+    RcInterval parts[VK_MEM_FIXED_WRITER_PARTS];
+    const uint32_t divided = vk_mem_span_buffer_fixed_partitions(capture, selected, mapping, count,
+                                                                parts, VK_MEM_FIXED_WRITER_PARTS);
+    const RcInterval *ranges = divided ? parts : mapping;
+    if (divided) count = divided;
+    RcRegistryResult result = RC_REGISTRY_OK;
+    uint64_t consumed = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        const RcInterval part = ranges[i];
+        if (part.address != address + consumed || !part.range.size || part.range.size > bytes - consumed) break;
+        RcRegistryBufferSpan span = {part, *location};
+        span.native.offset += consumed;
+        int initialized;
+        if (!vk_mem_span_buffer_preserve_current((void *)capture, span, read, &initialized)) break;
+        if (direct && result == RC_REGISTRY_OK)
+            result = rc_registry_buffer_preserve_input_at(registry, span, read, initialized);
+        consumed += part.range.size;
+    }
+    free(mapping);
+    if (!epoch || epoch != rc_registry_authority_epoch(registry) ||
+        !rc_registry_position_open(registry, read)) return RC_REGISTRY_STALE;
+    if (consumed != bytes) return RC_REGISTRY_BLOCKED;
+    *writable = 1;
+    return result;
+}
+
+RcRegistryResult vk_texture_alias_buffer_write_input_capture(const VkMemSpanCapture *capture,
+    const VkMemSpan *selected, uint64_t address, uint64_t bytes, VkTextureAliasRead **seed,
+    VkTextureAliasFailure *failure) {
+    if (!seed || *seed) return RC_REGISTRY_INVALID;
+    if (failure) *failure = (VkTextureAliasFailure){0};
+    const RcRegistryPosition read = vk_exec_resource_position();
+    RcRegistryBufferLocation location;
+    int writable;
+    RcRegistryResult result = buffer_write_input_prove(capture, selected, address, bytes, read, 1, &location, &writable);
+    if (result != RC_REGISTRY_BLOCKED || !writable) return result;
+    // The raw image snapshot returns an owner only for a real independently sourced fragment.
+    // With no such owner, the earlier direct proof's failure is still unauthenticated contents.
+    if ((location.offset | bytes) & 3) return RC_REGISTRY_UNSUPPORTED;
+    result = vk_texture_alias_buffer_capture(capture, selected, address, bytes, seed, failure);
+    if (result != RC_REGISTRY_OK) return result;
+    if (!*seed) return RC_REGISTRY_BLOCKED;
+    (*seed)->raw_write_input = vk_mem_span_capture_retain((VkMemSpanCapture *)capture);
+    (*seed)->raw_write_location = location;
+    return RC_REGISTRY_OK;
+}
+
+int vk_texture_alias_buffer_write_input_current(const VkMemSpanCapture *capture, const VkMemSpan *selected,
+    uint64_t address, uint64_t bytes, VkTextureAliasRead *seed) {
+    const RcRegistryPosition read = vk_exec_resource_position();
+    RcRegistryBufferLocation location;
+    int writable;
+    if (buffer_write_input_prove(capture, selected, address, bytes, read, !seed, &location, &writable) != RC_REGISTRY_OK)
+        return 0;
+    return !seed || (seed->raw_write_input == capture && seed->result.addr == address && seed->guest_bytes == bytes &&
+        seed->raw_source.buffer == selected->buffer && seed->raw_write_location.allocation == location.allocation &&
+        seed->raw_write_location.offset == location.offset &&
+        !__atomic_load_n(&seed->raw_write_canceled, __ATOMIC_ACQUIRE) && vk_texture_alias_read_current(seed));
+}
+
+static int image_alias_read_capture_locked(const tex_t *t, const Tex *e, VkTextureAliasRead **out,
+    VkTexImage *shape, int force, int target, const VkImageSubresourceRange *load_planes,
+    VkMemImageAliasBaseline **baseline, VkTextureAliasFailure *failure) {
+    if (!e || (!target && !e->alias_fragment_owner && !e->pub.preserve_pool_bytes)) return 0;
+    const RcInterval mapped = e->image_private_mapping_count ? e->image_private_mapping[0] : (RcInterval){0};
+    if (!image_alias_placement_current(e))
+        return image_alias_refuse(failure, VK_TEXTURE_ALIAS_MAPPING, RC_REGISTRY_STALE, mapped);
+    ImageAliasReceiver receiver = {.texture = t, .key = e->key, .placement = e->ik, .image = e->pub,
+        .mapping = e->image_private_mapping, .mapping_count = e->image_private_mapping_count,
+        .load_planes = load_planes, .prepared_baseline = baseline};
+    return image_alias_read_prepare_locked(&receiver, e, out, shape, force, target, failure);
+}
+
+int vk_texture_alias_read_capture(const tex_t *t, VkTextureAliasRead **out, VkTexImage *shape,
+                                   VkTextureAliasFailure *failure) {
+    if (!t || !t->mem || !t->serial || !nvn_gpu_only((uintptr_t)t->mem)) return 0;
+    TexKey key;
+    make_key(t, &key);
+    lock();
+    const Tex *e = nvn_hm_get(&by_key, &key);
+    int captured = e && e->t.serial == t->serial ? image_alias_read_capture_locked(t, e, out, shape, 0, 0, NULL, NULL, failure) : 0;
+    unlock();
+    return captured;
+}
+
+int vk_texture_transfer_source_geometry(const tex_t *t, VkTexImage *shape) {
+    if (!t || !t->mem || !nvn_gpu_only((uintptr_t)t->mem)) return 0;
+    TexKey key;
+    make_key(t, &key);
+    lock();
+    const Tex *entry = nvn_texture_pin_attachment(t);
+    if (!entry) entry = nvn_hm_get(&by_key, &key);
+    const int native = entry && entry->t.serial == t->serial && entry->pub.image && !entry->pub.gone;
+    if (native) *shape = entry->pub;
+    unlock();
+    if (!native && !vk_texture_transfer_write_geometry(t, shape)) return 0;
+    shape->addr = (uintptr_t)t->mem;
+    return 1;
+}
+
+static int texture_transfer_input_demand(const tex_t *t, const VkTexImage *shape, VkImageSubresourceLayers layers,
+        const NVNcopyRegion *box, const RcInterval *mapping, uint32_t count, RcInterval *intervals, uint32_t *used) {
+    VkTextureAliasDemand demand;
+    int bw, bh;
+    const unsigned bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
+    if (!bpb || bw <= 0 || bh <= 0 || !layers.layerCount || layers.aspectMask != shape->aspect ||
+        layers.mipLevel >= shape->levels || layers.baseArrayLayer >= shape->layers ||
+        layers.layerCount > shape->layers - layers.baseArrayLayer || box->xoffset < 0 || box->yoffset < 0 ||
+        box->zoffset < 0 || box->width <= 0 || box->height <= 0 || box->depth <= 0 ||
+        box->xoffset % bw || box->yoffset % bh || !texture_alias_demand_setup(mapping, count, shape->addr, t->L.size,
+            intervals, IMAGE_ALIAS_MAX_WRITE_FRAGMENTS, &demand)) return 0;
+
+    const uint64_t x = (uint64_t)(box->xoffset / bw) * bpb;
+    const uint64_t width = (((uint64_t)box->width + bw - 1) / bw) * bpb;
+    const uint32_t y = (uint32_t)(box->yoffset / bh);
+    const uint32_t rows = (uint32_t)(((uint64_t)box->height + bh - 1) / bh);
+    if (x > UINT32_MAX || width > UINT32_MAX) return 0;
+    const int volume = shape->type == VK_IMAGE_TYPE_3D;
+    const uint32_t first = volume ? (uint32_t)box->zoffset : 0;
+    const uint32_t slices = volume ? (uint32_t)box->depth : 1;
+    for (uint32_t l = 0; l < layers.layerCount && !demand.failed; l++)
+        for (uint32_t z = 0; z < slices && !demand.failed; z++)
+            if (nvn_texels_box_ranges(&t->d, layers.mipLevel, layers.baseArrayLayer + l, (uint32_t)x, y, first + z,
+                    (uint32_t)width, rows, texture_alias_demand_range, &demand)) return 0;
+    *used = demand.count;
+    return !demand.failed && demand.count != 0;
+}
+
+static int transfer_input_mapping(const tex_t *t, RcInterval **mapping, uint32_t *count) {
+    VkMemSpan span;
+    const uint64_t address = (uintptr_t)t->mem;
+    *mapping = NULL;
+    *count = vk_mem_lookup(address, t->L.size, &span) ?
+        vk_mem_device_intervals(&span, address, t->L.size, mapping) : 0;
+    return *count != 0;
+}
+
+int vk_texture_transfer_input_capture(const tex_t *t, const VkTexImage *shape, VkImageSubresourceLayers layers,
+        const NVNcopyRegion *box, VkTextureTransferInput *input, VkTextureAliasFailure *failure) {
+    const RcRegistryPosition read = vk_exec_resource_position();
+    RcRegistry *registry = rc_registry_runtime();
+    RcInterval *mapping;
+    uint32_t count;
+    if (!transfer_input_mapping(t, &mapping, &count))
+        return image_alias_refuse(failure, VK_TEXTURE_ALIAS_MAPPING, RC_REGISTRY_STALE, (RcInterval){0});
+    int status = 0;
+    RcInterval *intervals = NULL;
+    if (!rc_registry_native_image_buffer_requires_coverage(registry, mapping, count, read)) goto done;
+    intervals = malloc(IMAGE_ALIAS_MAX_WRITE_FRAGMENTS * sizeof *intervals);
+    if (!intervals) {
+        status = image_alias_refuse(failure, VK_TEXTURE_ALIAS_CAPACITY, RC_REGISTRY_CAPACITY, mapping[0]);
+        goto done;
+    }
+    uint32_t used = 0;
+    if (shape->scale > 1 || shape->skip || !texture_transfer_input_demand(t, shape, layers, box, mapping, count, intervals, &used)) {
+        status = image_alias_refuse_layout(failure, mapping[0], "transfer-rectangle");
+        goto done;
+    }
+    if (!rc_registry_native_image_buffer_requires_coverage(registry, intervals, used, read)) goto done;
+
+    lock();
+    VkTexImage resident = {0};
+    if (shape->image && rc_registry_native_image_covers(registry, (uintptr_t)shape->image, intervals, used, read))
+        input->resident = vk_texture_transfer_read_capture(t, &resident);
+    if (input->resident && resident.image == shape->image && resident.format == shape->format &&
+        resident.width == shape->width && resident.height == shape->height && resident.depth == shape->depth &&
+        resident.scale == shape->scale) {
+        input->image = resident;
+        status = 1;
+    } else {
+        vk_texture_present_release(input->resident);
+        input->resident = NULL;
+        TexVkFormat format;
+        if (shape->samples != 1 || !tex_vk_format(t->d.format, &format) ||
+            format.vk != shape->format || format.ideal != shape->format || format.astc_bw || format.astc_bc ||
+            format.expand_rgb || format.stencil || t->L.size > VK_TEXTURE_ALIAS_MAX_BYTES) {
+            status = image_alias_refuse_layout(failure, mapping[0], "transfer-representation");
+        } else {
+            ImageAliasReceiver receiver = {.texture = t, .mapping = mapping, .mapping_count = count, .image = *shape,
+                .transfer_demand = intervals, .transfer_demand_count = used, .allow_submitted_raw = 1};
+            const VkImageSubresourceRange planes = {layers.aspectMask, layers.mipLevel, 1,
+                                                     layers.baseArrayLayer, layers.layerCount};
+            receiver.load_planes = &planes;
+            make_key(t, &receiver.key);
+            receiver.image.image = VK_NULL_HANDLE;
+            receiver.image.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            receiver.placement = (ImgKey){.type = shape->type, .format = shape->format, .w = shape->width,
+                .h = shape->height, .d = shape->depth, .levels = shape->levels, .layers = shape->layers,
+                .samples = 1, .usage = receiver.image.usage};
+            status = image_alias_read_prepare_locked(&receiver, NULL, &input->alias, &input->image, 1, 0, failure);
+        }
+    }
+    unlock();
+    if (status > 0) {
+        input->texture = t;
+        input->read = read;
+        if (input->resident) {
+            input->mapping = mapping;
+            input->mapping_count = count;
+            input->demand = intervals;
+            input->demand_count = used;
+            mapping = NULL;
+            intervals = NULL;
+        }
+    }
+done:
+    free(intervals);
+    free(mapping);
+    return status;
+}
+
+int vk_texture_transfer_input_current(const VkTextureTransferInput *input) {
+    if (!input->texture) return 1;
+    if (rc_registry_position_compare(input->read, vk_exec_resource_position())) return 0;
+    if (input->alias) return vk_texture_alias_read_current(input->alias);
+    if (!vk_texture_transfer_read_current(input->resident, input->image.image)) return 0;
+    return image_alias_guest_mapping_current(input->image.addr, input->texture->L.size,
+        input->mapping, input->mapping_count) && rc_registry_native_image_covers(rc_registry_runtime(),
+            (uintptr_t)input->image.image, input->demand, input->demand_count, input->read);
+}
+
+int vk_texture_transfer_input_use(const VkTextureTransferInput *input) {
+    if (!input->texture) return 1;
+    lock();
+    const int ready = vk_texture_transfer_input_current(input) &&
+        (input->alias || vk_texture_record_selected_sample_locked(input->resident, input->image.image));
+    unlock();
+    return ready;
+}
+
+void vk_texture_transfer_input_cancel(VkTextureTransferInput *input) {
+    vk_texture_alias_read_cancel(input->alias);
+    vk_texture_present_release(input->resident);
+    free(input->mapping);
+    free(input->demand);
+    *input = (VkTextureTransferInput){0};
+}
+
+static int image_alias_predecessor_matches(const VkTextureAliasRead *alias, const Tex *entry) {
+    return entry && entry->t.serial == alias->predecessor_serial && entry->pub.image == alias->predecessor &&
+        entry->content_revision == alias->predecessor_revision && entry->released == alias->predecessor_dormant &&
+        !entry->retiring && !entry->pub.gone;
+}
+
+static int image_alias_sample_receiver_locked(int logical, const VkTextureAliasRead *alias);
+
+static int storage_seed_cold(const Tex *texture) {
+    // A compatibility clear only initialized the Vulkan allocation. An authored, uploaded or shared version
+    // needs its own current coverage or a separate writable placement; it cannot be overwritten in place.
+    return !texture->uploaded && !texture->up_retry && !texture->material && !texture->pin_owned &&
+        !texture->pub.gpu_owned && !texture->alias_fragment_owner && !rc_registry_position_valid(texture->native_write);
+}
+
+static int storage_seed_receiver_current(const VkTextureAliasRead *alias, const Tex *destination) {
+    return destination && !destination->released && !destination->retiring && !destination->superseded &&
+        !destination->overwritten && !destination->pub.gone && destination->content_revision == alias->storage_revision &&
+        destination->alloc && !destination->bound_to && !destination->material && !destination->pin_owned &&
+        !destination->pub.fb_learned &&
+        (alias->predecessor ? alias->predecessor_hold != NULL : alias->target_hold && storage_seed_cold(destination)) &&
+        !__atomic_load_n(&alias->upload_canceled, __ATOMIC_ACQUIRE);
+}
+
+static int image_alias_fragment_equal(const RcRegistryNativeImageSnapshotFragment *a,
+                                      const RcRegistryNativeImageSnapshotFragment *b) {
+    const RcRegistryNativeImageFragment *x = &a->fragment, *y = &b->fragment;
+    return x->demand == y->demand && x->interval.address == y->interval.address &&
+        x->interval.mapping == y->interval.mapping && rc_range_equal(x->interval.range, y->interval.range) &&
+        x->binding.image == y->binding.image && x->binding.hold.id == y->binding.hold.id &&
+        x->binding.hold.index == y->binding.hold.index && !rc_registry_position_compare(x->output, y->output) &&
+        a->baseline == b->baseline && a->native_buffer.allocation == b->native_buffer.allocation &&
+        a->native_buffer.incarnation == b->native_buffer.incarnation && a->native_buffer.offset == b->native_buffer.offset;
+}
+
+static RcRegistryResult image_alias_snapshot(const VkTextureAliasRead *alias, const RcRegistryBufferSpan *spans,
+    uint32_t count, RcRegistryPosition read, RcRegistryNativeImageSnapshotFragment *out, uint32_t capacity,
+    uint32_t *received) {
+    return alias->cpu_handed ?
+        rc_registry_native_image_snapshot_handed(rc_registry_runtime(), alias->demands, alias->demand_count,
+            spans, count, read, out, capacity, received, NULL) :
+        rc_registry_native_image_snapshot_mixed(rc_registry_runtime(), alias->demands, alias->demand_count,
+            spans, count, read, out, capacity, received, NULL);
+}
+
+static int image_alias_read_candidate_with(const VkTextureAliasRead *alias, RcRegistryPosition read,
+    RcRegistryNativeImageSnapshotFragment *scratch, uint32_t capacity, uint64_t raw_progress) {
+    lock();
+    const Tex *destination = alias->raw_output || alias->registration_only || alias->transfer_source ? NULL :
+        nvn_hm_get(&by_key, &alias->key);
+    int exact;
+    if (alias->raw_output) {
+        RcInterval *mapping;
+        uint32_t count = vk_mem_device_intervals(&alias->raw_source, alias->result.addr, alias->guest_bytes, &mapping);
+        exact = count && count == alias->mapping_count;
+        for (uint32_t i = 0; exact && i < count; i++)
+            exact = mapping[i].address == alias->receiver_mapping[i].address &&
+                mapping[i].mapping == alias->receiver_mapping[i].mapping &&
+                rc_range_equal(mapping[i].range, alias->receiver_mapping[i].range);
+        free(mapping);
+    } else {
+        const uint64_t expected_serial = alias->predecessor ? alias->predecessor_serial : alias->receiver->serial;
+        exact = alias->transfer_source || (alias->registration_only ?
+            image_alias_sample_receiver_locked(alias->receiver_logical, alias) :
+            (destination && destination->t.serial == expected_serial));
+        if (exact) exact = image_alias_guest_mapping_current(alias->result.addr, alias->guest_bytes,
+                                                             alias->receiver_mapping, alias->mapping_count);
+    }
+    if (exact && alias->target_hold)
+        exact = destination->pub.image == alias->result.image && !vk_mem_image_hold_retired(alias->target_hold);
+    if (exact && alias->storage_seed) exact = storage_seed_receiver_current(alias, destination);
+    if (exact && alias->predecessor)
+        exact = image_alias_predecessor_matches(alias, destination) && !vk_mem_image_hold_retired(alias->predecessor_hold);
+    for (uint32_t i = 0; exact && i < alias->source_count; i++) {
+        const ImageAliasSource *source = &alias->sources[i];
+        const VkImage image = source->image.image;
+        if (source->bound) {
+            const Tex *entry = nvn_hm_get(&bound_alias_owners, &image);
+            exact = image_alias_bound_source_current(entry, image);
+        } else {
+            const NativeTextureOutput *owner = nvn_hm_get(&alias_fragment_owners, &image);
+            const Tex *entry = owner ? owner->entry : NULL;
+            exact = owner && (entry ? image_alias_source_current(entry) : owner->allocation != NULL);
+            if (exact && alias->cpu_handed) exact = entry && entry->t.serial == source->cpu_serial &&
+                entry->content_revision == source->cpu_revision && entry->sample_general_revision == source->cpu_layout &&
+                !entry->pending_write && !entry->pin_detached;
+        }
+        exact = exact && !vk_mem_image_hold_retired(source->hold);
+    }
+    uint32_t count = 0, received = 0;
+    const RcRegistryBufferSpan *spans = NULL;
+    if (exact && alias->baseline) {
+        if (raw_progress) {
+            spans = vk_mem_image_alias_baseline_submitted_spans(alias->baseline, raw_progress, &count);
+            exact = count != 0;
+        } else {
+            exact = vk_mem_image_alias_baseline_current(alias->baseline);
+            if (exact) spans = vk_mem_image_alias_baseline_spans(alias->baseline, &count);
+        }
+    }
+    if (exact) exact = image_alias_snapshot(alias, spans, count, read, scratch, capacity, &received) == RC_REGISTRY_OK &&
+        received == alias->fragment_count;
+    for (uint32_t i = 0; exact && i < received; i++)
+        exact = image_alias_fragment_equal(&alias->fragments[i], &scratch[i]);
+    unlock();
+    return exact;
+}
+
+static int image_alias_read_current_with(const VkTextureAliasRead *alias, RcRegistryPosition read,
+    RcRegistryNativeImageSnapshotFragment *scratch, uint32_t capacity) {
+    return !alias->raw_upload && image_alias_read_candidate_with(alias, read, scratch, capacity, 0);
+}
+
+static int image_alias_read_current_at(VkTextureAliasRead *alias, RcRegistryPosition read) {
+    return image_alias_read_current_with(alias, read, alias->current, alias->fragment_count);
+}
+
+int vk_texture_alias_read_current(VkTextureAliasRead *alias) {
+    return !rc_registry_position_compare(alias->read, vk_exec_resource_position()) &&
+        image_alias_read_current_at(alias, alias->read);
+}
+
+int vk_texture_alias_read_raw_progress(VkTextureAliasRead *alias, RcRegistryPosition read, uint64_t *upload) {
+    if (!alias || !upload) return 0;
+    *upload = alias->raw_upload;
+    return !*upload || ((alias->registration_only || alias->transfer_source) && alias->baseline &&
+        !rc_registry_position_compare(read, alias->read) && !rc_registry_position_compare(read, vk_exec_resource_position()) &&
+        image_alias_read_candidate_with(alias, read, alias->current, alias->fragment_count, *upload));
+}
+
+int vk_texture_alias_read_raw_finish(VkTextureAliasRead *alias, RcRegistryPosition read) {
+    if (!alias) return 0;
+    if (!alias->raw_upload) return 1;
+    lock();
+    int exact = (alias->registration_only || alias->transfer_source) && alias->baseline && !alias->buffer_count &&
+        !rc_registry_position_compare(read, alias->read) && !rc_registry_position_compare(read, vk_exec_resource_position()) &&
+        image_alias_read_candidate_with(alias, read, alias->current, alias->fragment_count, 0);
+    if (exact) {
+        const uint64_t image_stage_bytes = alias->stage_bytes;
+        for (uint32_t i = 0; exact && i < alias->fragment_count; i++)
+            if (alias->fragments[i].native_buffer.allocation)
+                exact = image_alias_stage_buffer(alias, i) == RC_REGISTRY_OK;
+        exact = exact && alias->buffer_count && image_alias_finish_upload_layout(alias);
+        if (exact) alias->raw_upload = 0;
+        else {
+            alias->buffer_count = 0;
+            alias->stage_bytes = image_stage_bytes;
+        }
+    }
+    unlock();
+    return exact;
+}
+
+typedef struct {
+    VkImageCreateInfo image;
+    VmaAllocationCreateInfo placement;
+    RcAdmissionVector image_peak, image_reuse, staging, workspace;
+    int grow, must_grow;
+} AliasReadPlacement;
+
+static VkResult image_alias_placement_plan(VkTextureAliasRead *alias, int required, AliasReadPlacement *plan,
+                                           int *must_grow) {
+    if (!alias->raw_output && !alias->target_hold) {
+        const ImgKey *key = &alias->placement;
+        plan->image = (VkImageCreateInfo){.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = key->flags,
+            .imageType = (VkImageType)key->type, .format = (VkFormat)key->format, .extent = {key->w, key->h, key->d},
+            .mipLevels = key->levels, .arrayLayers = key->layers, .samples = (VkSampleCountFlagBits)key->samples,
+            .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = key->usage | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+        RcVmaDependency dependency;
+        RcVmaRequest request = {.producer = RC_BUDGET_TEXTURE, .required = required, .dependency = &dependency};
+        const VmaAllocationCreateInfo preferred = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        VkResult result = resource_core_vma_image_peak(&request, &plan->image, &preferred, &plan->placement, &plan->image_peak);
+        if (result != VK_SUCCESS) return result;
+        *must_grow = !dependency.can_reuse;
+        plan->image_reuse = dependency.reuse;
+    }
+    plan->workspace.amount[RC_BUDGET_RAM] = plan->workspace.amount[RC_BUDGET_COMMIT] = alias->workspace_bytes;
+    return vk_staging_prepare_plan(alias->stage_bytes, &alias->staging, &plan->staging);
+}
+
+static void image_alias_drop_unissued_image(VkTextureAliasRead *alias) {
+    if (!alias->allocation) return;
+    resource_core_vma_destroy_image(vk_ctx()->vma, alias->result.image, alias->allocation);
+    alias->result.image = VK_NULL_HANDLE;
+    alias->allocation = NULL;
+    alias->placement_bytes = 0;
+}
+
+void vk_texture_alias_read_unprepare(VkTextureAliasRead *const *aliases, uint32_t count) {
+    for (uint32_t i = 0; i < count; ++i) {
+        image_alias_stage_release(aliases[i]);
+        image_alias_drop_unissued_image(aliases[i]);
+    }
+}
+
+static int image_alias_cohort_peak(const AliasReadPlacement *plan, uint32_t count,
+                                   RcAdmissionVector *peak, RcAdmissionVector *without_staging) {
+    *without_staging = (RcAdmissionVector){0};
+    for (uint32_t i = 0; i < count; ++i) {
+        const RcAdmissionVector *image = plan[i].grow ? &plan[i].image_peak : &plan[i].image_reuse;
+        if (!restore_peak_add(without_staging, image) || !restore_peak_add(without_staging, &plan[i].workspace)) return 0;
+    }
+    *peak = *without_staging;
+    for (uint32_t i = 0; i < count; ++i)
+        if (!restore_peak_add(peak, &plan[i].staging)) return 0;
+    return 1;
+}
+
+static VkResult image_alias_cohort_images(VkTextureAliasRead *const *aliases, const AliasReadPlacement *plan,
+    uint32_t count, int required, RcBudgetTicket *ticket, RcVmaDependency *dependency,
+    uint32_t *failed) {
+    RcVmaRequest request = {.producer = RC_BUDGET_TEXTURE, .required = required, .peak_ticket = ticket,
+                            .dependency = dependency};
+    // Validate the non-growing placements before any placement can add native blocks.
+    for (int may_grow = 0; may_grow <= 1; ++may_grow) {
+        for (uint32_t i = 0; i < count; ++i) {
+            if (!plan[i].image.sType || plan[i].grow != may_grow) continue;
+            if (vk_sync_stopping() || vk_device_is_lost()) return VK_NOT_READY;
+            VmaAllocationCreateInfo selected = plan[i].placement;
+            if (!may_grow) selected.flags |= VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT;
+            VkTextureAliasRead *alias = aliases[i];
+            VmaAllocationInfo actual;
+            VkResult result = resource_core_vma_create_image(&request, vk_ctx()->vma, &plan[i].image, &selected,
+                                                            &alias->result.image, &alias->allocation, &actual, NULL);
+            if (result != VK_SUCCESS) {
+                *failed = i;
+                return result;
+            }
+            alias->placement_bytes = actual.size;
+        }
+    }
+    return VK_SUCCESS;
+}
+
+static VkTextureAliasStagingProgress image_alias_cohort_staging_supplier(VkTextureAliasRead *const *aliases,
+    const AliasReadPlacement *plans, uint32_t count, const RcAdmissionVector *peak,
+    const RcAdmissionVector *without_staging, uint64_t after) {
+    RcBudgetReadiness now;
+    resource_core_budget_readiness(1, &now);
+    if (!resource_core_budget_peak_ready(without_staging, &now)) return (VkTextureAliasStagingProgress){0};
+    VkTextureAliasStagingProgress selected = {0};
+    for (uint32_t i = 0; i < count; ++i) {
+        int contributes = 0;
+        for (unsigned d = 0; d < RC_ADMISSION_MAX_DOMAINS; ++d) {
+            if (plans[i].staging.amount[d] && peak->amount[d] > now.available.amount[d]) {
+                contributes = 1;
+                break;
+            }
+        }
+        if (!contributes) continue;
+        uint64_t upload = vk_staging_prepare_supplier(aliases[i]->stage_bytes, after);
+        if (upload && (!selected.upload || upload < selected.upload))
+            selected = (VkTextureAliasStagingProgress){upload, aliases[i]->stage_bytes};
+    }
+    return selected;
+}
+
+// The per-leg plans and optional large input index outlive each joint admission attempt.
+static VkResult image_alias_prepare_cohort(VkTextureAliasRead *const *aliases, uint32_t count, int required,
+    uint64_t after_upload, VkTextureAliasStagingProgress *upload, RcVmaDependency *native, AliasReadPlacement *plans) {
+    int can_try_reuse = 0;
+    uint64_t allocation_count = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        int must_grow = 0;
+        VkResult result = image_alias_placement_plan(aliases[i], required, &plans[i], &must_grow);
+        if (result != VK_SUCCESS) {
+            vk_texture_alias_read_unprepare(aliases, i + 1);
+            return result;
+        }
+        plans[i].grow = plans[i].image.sType != 0;
+        plans[i].must_grow = must_grow;
+        can_try_reuse |= plans[i].grow && !must_grow;
+        allocation_count += plans[i].grow + !aliases[i]->staging.buffer;
+    }
+
+    RcAdmissionVector peak, without_staging;
+    uint32_t failed_stage = count;
+    int tried_reuse = 0;
+    RcVmaDependency image_failure = {0};
+    VkResult result;
+    RcAdmissionStatus admission;
+    RcBudgetTicket ticket = {0};
+    for (;;) {
+        if (!image_alias_cohort_peak(plans, count, &peak, &without_staging)) {
+            vk_texture_alias_read_unprepare(aliases, count);
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+        admission = resource_core_budget_reserve(RC_BUDGET_TEXTURE, required, &peak, &ticket);
+        if (admission != RC_ADMISSION_OK) {
+            if (admission == RC_ADMISSION_REFUSED && !tried_reuse && can_try_reuse) {
+                tried_reuse = 1;
+                for (uint32_t i = 0; i < count; ++i) plans[i].grow = plans[i].must_grow;
+                continue;
+            }
+            result = admission == RC_ADMISSION_REFUSED || admission == RC_ADMISSION_NO_RECORDS
+                ? VK_NOT_READY : VK_ERROR_OUT_OF_HOST_MEMORY;
+            break;
+        }
+
+        uint32_t failed_image = count;
+        result = image_alias_cohort_images(aliases, plans, count, required, &ticket, &image_failure, &failed_image);
+        if (failed_image == count || result != VK_ERROR_OUT_OF_DEVICE_MEMORY || plans[failed_image].grow) break;
+        // A non-growing miss only reclassifies this leg. Cancel the whole attempt before reserving
+        // the adjusted cohort. Each leg can require this reclassification once, without a wait.
+        for (uint32_t i = 0; i < count; ++i) image_alias_drop_unissued_image(aliases[i]);
+        resource_core_budget_cancel(&ticket);
+        plans[failed_image].grow = 1;
+    }
+
+    if (result == VK_SUCCESS) {
+        image_failure = (RcVmaDependency){0};
+        for (uint32_t i = 0; i < count; ++i) {
+            if (vk_sync_stopping() || vk_device_is_lost()) {
+                result = VK_NOT_READY;
+                break;
+            }
+            result = vk_staging_prepare_allocate(&aliases[i]->staging, &ticket, required);
+            if (result != VK_SUCCESS) {
+                failed_stage = i;
+                break;
+            }
+        }
+    }
+    for (uint32_t i = 0; i < count && result == VK_SUCCESS; ++i) {
+        VkTextureAliasRead *alias = aliases[i];
+        if (resource_core_budget_split(&ticket, &plans[i].workspace, RC_BUDGET_TEXTURE, &alias->workspace_ticket) != RC_ADMISSION_OK) {
+            result = VK_ERROR_OUT_OF_HOST_MEMORY;
+            break;
+        }
+        alias->workspace = malloc(alias->workspace_bytes);
+        if (!alias->workspace || resource_core_budget_materialize(&alias->workspace_ticket, &plans[i].workspace) != RC_ADMISSION_OK) {
+            free(alias->workspace);
+            alias->workspace = NULL;
+            result = VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+    }
+    if (ticket.token.ledger) resource_core_budget_cancel(&ticket);
+    if (result == VK_SUCCESS) return VK_SUCCESS;
+    vk_texture_alias_read_unprepare(aliases, count);
+
+    const int pressure = result == VK_NOT_READY || result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY;
+    if (!required || !pressure || vk_sync_stopping() || vk_device_is_lost()) return result;
+    if (failed_stage < count) {
+        VkDeviceSize bytes = aliases[failed_stage]->stage_bytes;
+        *upload = (VkTextureAliasStagingProgress){vk_staging_prepare_supplier(bytes, after_upload), bytes};
+    } else if (admission == RC_ADMISSION_REFUSED) {
+        *upload = image_alias_cohort_staging_supplier(aliases, plans, count, &peak, &without_staging, after_upload);
+    }
+    if ((image_failure.can_reuse && (result == VK_ERROR_OUT_OF_DEVICE_MEMORY || admission == RC_ADMISSION_REFUSED)) ||
+        image_failure.owner_full) {
+        // The owner-record readiness API takes a signed count.
+        if (image_failure.owner_full && allocation_count > INT_MAX) return result;
+        *native = image_failure;
+        native->peak = (RcAdmissionVector){0};
+        if (native->owner_full) native->owner_full = (int)allocation_count;
+    }
+    return result;
+}
+
+static int image_alias_compare_addresses(const void *left, const void *right) {
+    const uintptr_t a = *(const uintptr_t *)left, b = *(const uintptr_t *)right;
+    return a < b ? -1 : a > b;
+}
+
+static VkResult image_alias_plan_storage(uint32_t count, int required, RcBudgetTicket *ticket, AliasReadPlacement **out) {
+    const size_t stride = sizeof(AliasReadPlacement) + sizeof(uintptr_t);
+    if (stride > SIZE_MAX / count) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    const size_t bytes = stride * count;
+    const RcAdmissionVector cost = {.amount = {[RC_BUDGET_RAM] = bytes, [RC_BUDGET_COMMIT] = bytes}};
+    RcAdmissionStatus admitted = resource_core_budget_reserve(RC_BUDGET_TEXTURE, required, &cost, ticket);
+    if (admitted != RC_ADMISSION_OK)
+        return admitted == RC_ADMISSION_REFUSED || admitted == RC_ADMISSION_NO_RECORDS
+            ? VK_NOT_READY : VK_ERROR_OUT_OF_HOST_MEMORY;
+    void *memory = malloc(bytes);
+    if (memory) {
+        memset(memory, 0, bytes);
+        volatile uint8_t *pages = memory;
+        for (size_t off = 0; ; off += 4096) {
+            pages[off] = 0;
+            if (bytes - off <= 4096) break;
+        }
+        pages[bytes - 1] = 0;
+    }
+    if (!memory || !rc_admission_accounted(resource_core_budget_materialize(ticket, &cost))) {
+        free(memory);
+        resource_core_budget_cancel(ticket);
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    *out = memory;
+    return VK_SUCCESS;
+}
+
+VkResult vk_texture_alias_read_prepare(VkTextureAliasRead *const *aliases, uint32_t count, int required,
+    uint64_t after_upload, VkTextureAliasStagingProgress *upload, RcVmaDependency *native) {
+    *upload = (VkTextureAliasStagingProgress){0};
+    *native = (RcVmaDependency){0};
+    if (!aliases || !count) return VK_ERROR_INITIALIZATION_FAILED;
+    for (uint32_t i = 0; i < count; ++i) {
+        const VkTextureAliasRead *alias = aliases[i];
+        if (!alias || alias->raw_upload || alias->uploaded || alias->allocation || alias->workspace || alias->staging.buffer)
+            return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    AliasReadPlacement local[VK_EXEC_ALIAS_READ_LIMIT] = {0};
+    AliasReadPlacement *plans = local;
+    RcBudgetTicket plan_ticket = {0};
+    if (count > VK_EXEC_ALIAS_READ_LIMIT) {
+        VkResult result = image_alias_plan_storage(count, required, &plan_ticket, &plans);
+        if (result != VK_SUCCESS) return result;
+        // Sort only the validation keys. Preparation and diagnostics retain the caller's exact order.
+        uintptr_t *keys = (uintptr_t *)(plans + count);
+        for (uint32_t i = 0; i < count; ++i) keys[i] = (uintptr_t)aliases[i];
+        qsort(keys, count, sizeof *keys, image_alias_compare_addresses);
+        for (uint32_t i = 1; i < count; ++i) if (keys[i] == keys[i - 1]) {
+            vk_replay_metadata_free(plans, &plan_ticket);
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+    } else {
+        for (uint32_t i = 0; i < count; ++i)
+            for (uint32_t j = 0; j < i; ++j)
+                if (aliases[j] == aliases[i]) return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    VkResult result = image_alias_prepare_cohort(aliases, count, required, after_upload, upload, native, plans);
+    if (plans != local) vk_replay_metadata_free(plans, &plan_ticket);
+    if (native->can_reuse || native->owner_full) {
+        // Ignore capacity returned by all of this attempt's rollback.
+        resource_core_vma_dependency_rebase(native, required);
+    }
+    return result;
+}
+
+static void image_alias_record_copies(VkTextureAliasRead *alias, VkCommandBuffer cb) {
+    barrier(cb, ALL_RW, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+    for (uint32_t i = 0; i < alias->source_count; i++) {
+        const ImageAliasSource *source = &alias->sources[i];
+        VkBufferImageCopy regions[VK_TEXTURE_ALIAS_MAX_PLANES];
+        for (uint32_t j = 0; j < source->layout.count; j++) {
+            regions[j] = source->layout.planes[j].copy;
+            regions[j].bufferOffset += source->stage_offset;
+        }
+        vkCmdCopyImageToBuffer(cb, source->image.image, VK_IMAGE_LAYOUT_GENERAL, alias->staging.buffer,
+                               source->layout.count, regions);
+    }
+    const char *probe = alias->buffer_count ? cfg_get("NX2NAVI_PROBE_CURRENT_IMAGE_ALIAS") : NULL;
+    for (uint32_t i = 0; i < alias->buffer_count; i++) {
+        const ImageAliasBufferCopy *copy = &alias->buffer_copies[i];
+        vkCmdCopyBuffer(cb, copy->buffer, alias->staging.buffer, 1, &copy->region);
+        if (probe && (!strcmp(probe, "24") || !strcmp(probe, "25") || !strcmp(probe, "26"))) {
+            const RcRegistryNativeImageSnapshotFragment *f = &alias->fragments[copy->fragment];
+            rt_log("vk: alias raw fragment demand %u baseline %u read %llu/%llu output %llu/%llu "
+                   "VkBuffer %p allocation %llu incarnation %llu offset %#llx size %#llx "
+                   "mapping %llu backing %llu offset %#llx",
+                   f->fragment.demand, f->baseline,
+                   (unsigned long long)alias->read.scene, (unsigned long long)alias->read.ordinal,
+                   (unsigned long long)f->fragment.output.scene, (unsigned long long)f->fragment.output.ordinal,
+                   (void *)copy->buffer, (unsigned long long)f->native_buffer.allocation,
+                   (unsigned long long)f->native_buffer.incarnation, (unsigned long long)copy->region.srcOffset,
+                   (unsigned long long)copy->region.size, (unsigned long long)f->fragment.interval.mapping,
+                   (unsigned long long)f->fragment.interval.range.backing,
+                   (unsigned long long)f->fragment.interval.range.offset);
+        }
+    }
+    barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
+}
+
+void vk_texture_alias_read_record(VkTextureAliasRead *alias, VkCommandBuffer cb, uint64_t fence) {
+    __atomic_add_fetch(&alias->owners, 1, __ATOMIC_RELAXED);
+    vk_completion_add_owned(fence, image_alias_release, image_alias_cancel, alias);
+    image_alias_record_copies(alias, cb);
+}
+
+static int image_alias_compose_guest(VkTextureAliasRead *alias) {
+    VkTextureAliasBytes *sources = alias->source_bytes;
+    uint32_t source_count = alias->source_count;
+    if (alias->buffer_count) {
+        sources[source_count++] = (VkTextureAliasBytes){alias->staging.map, 0, alias->upload_offset};
+    }
+    for (uint32_t i = 0; i < alias->source_count; i++) {
+        const ImageAliasSource *source = &alias->sources[i];
+        uint8_t *bytes = alias->workspace + source->workspace_offset;
+        if (!texture_alias_project(&source->desc, &source->layout, bytes, alias->staging.map + source->stage_offset, 0)) return 0;
+        sources[i] = (VkTextureAliasBytes){bytes, source->image.addr, source->guest_bytes};
+    }
+    if (alias->sparse_buffer_rows || alias->transfer_source) memset(alias->workspace, 0, alias->guest_bytes);
+    return texture_alias_compose(sources, source_count, alias->workspace, alias->result.addr, alias->guest_bytes,
+            alias->demands, alias->demand_count, alias->slices, alias->fragment_count);
+}
+
+static int image_alias_compose_buffer(VkTextureAliasRead *alias) {
+    return alias && alias->raw_output && vk_texture_alias_read_current(alias) &&
+        vmaInvalidateAllocation(vk_ctx()->vma, alias->staging.allocation, 0, alias->upload_offset) == VK_SUCCESS &&
+        image_alias_compose_guest(alias) && vk_texture_alias_read_current(alias);
+}
+
+int vk_texture_alias_buffer_copy(VkTextureAliasRead *alias, void *destination, uint64_t bytes) {
+    if (!alias || !destination || bytes != alias->guest_bytes || !image_alias_compose_buffer(alias)) return 0;
+    memcpy(destination, alias->workspace, bytes);
+    return vk_texture_alias_read_current(alias);
+}
+
+int vk_texture_alias_buffer_source(VkTextureAliasRead *alias, VkBuffer *buffer, VkDeviceSize *offset) {
+    if (!buffer || !offset || !image_alias_compose_buffer(alias)) return 0;
+    memcpy(alias->staging.map + alias->upload_offset, alias->workspace, alias->guest_bytes);
+    if (vmaFlushAllocation(vk_ctx()->vma, alias->staging.allocation, alias->upload_offset, alias->guest_bytes) != VK_SUCCESS ||
+        !vk_texture_alias_read_current(alias)) return 0;
+    *buffer = alias->staging.buffer;
+    *offset = alias->upload_offset;
+    return 1;
+}
+
+int vk_texture_alias_buffer_write_input_stage(VkTextureAliasRead *seed) {
+    if (!seed || !seed->raw_write_input || seed->raw_write_cb || !seed->staging.buffer || !seed->workspace ||
+        !vk_texture_alias_buffer_write_input_current(seed->raw_write_input, &seed->raw_source,
+                                                      seed->result.addr, seed->guest_bytes, seed)) return 0;
+    VkBuffer buffer;
+    VkDeviceSize offset;
+    seed->raw_write_staged = vk_texture_alias_buffer_source(seed, &buffer, &offset) &&
+        buffer == seed->staging.buffer && buffer != seed->raw_source.buffer && offset == seed->upload_offset;
+    return seed->raw_write_staged;
+}
+
+static void buffer_write_input_cancel_recording(void *opaque, int may_have_executed) {
+    VkTextureAliasRead *seed = opaque;
+    __atomic_store_n(&seed->raw_write_canceled, 1, __ATOMIC_RELEASE);
+    image_alias_cancel(seed, may_have_executed);
+}
+
+void vk_texture_alias_buffer_write_input_record(VkTextureAliasRead *seed, VkCommandBuffer cb, uint64_t fence) {
+    if (!seed || !seed->raw_write_staged || seed->raw_write_cb || !cb || fence != seed->read.scene)
+        rt_fatal("vk: invalid prepared writable buffer seed");
+    seed->raw_write_cb = cb;
+    vk_texture_alias_read_retain(seed);
+    vk_completion_add_owned(fence, image_alias_release, buffer_write_input_cancel_recording, seed);
+    barrier(cb, VK_PIPELINE_STAGE_2_HOST_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        VK_ACCESS_2_HOST_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    const VkBufferCopy copy = {seed->upload_offset, seed->raw_write_location.offset, seed->guest_bytes};
+    vkCmdCopyBuffer(cb, seed->staging.buffer, seed->raw_source.buffer, 1, &copy);
+    barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
+}
+
+void vk_texture_alias_buffer_write_input_issued(VkTextureAliasRead *seed, VkCommandBuffer issued_cb) {
+    if (!seed || !issued_cb || seed->raw_write_cb != issued_cb || seed->raw_write_issued ||
+        __atomic_load_n(&seed->raw_write_canceled, __ATOMIC_ACQUIRE) ||
+        rc_registry_position_compare(seed->read, vk_exec_resource_position())) return;
+    seed->raw_write_issued = 1;
+    // Every prior byte was materialized in this very buffer. Only the actual shader command can
+    // publish the final initialized result, including bytes it preserved. The seed is no guest output.
+    resource_effects_buffer_prepare_native(seed->receiver_mapping, seed->mapping_count,
+        seed->result.addr, seed->raw_write_location);
+}
+
+int vk_texture_alias_read_uses_image(const VkTextureAliasRead *alias, VkImage image) {
+    for (uint32_t i = 0; image && i < alias->source_count; ++i)
+        if (alias->sources[i].image.image == image) return 1;
+    return 0;
+}
+
+int vk_texture_alias_comparison_source(const VkTextureAliasRead *alias, VkImage image) {
+    return alias && alias->comparison_depth && vk_texture_alias_read_uses_image(alias, image);
+}
+
+int vk_texture_alias_comparison_range_refused(const VkTextureAliasRead *alias) {
+    return alias && alias->comparison_range_refused;
+}
+
+int vk_texture_publication_comparison_source_locked(const TextureImagePublication *publication,
+                                                     uint32_t kinds, VkImage image) {
+    for (const TextureNativeUse *use = publication ? publication->native : NULL; use; use = use->next)
+        if (use->descriptor < VK_POOL_KINDS * VK_POOL_TEX && (kinds >> (use->descriptor / VK_POOL_TEX) & 1) &&
+            vk_texture_alias_comparison_source(use->alias, image))
+            return 1;
+    return 0;
+}
+
+VkFormat vk_texture_color_depth_format(VkFormat color) {
+    return color == VK_FORMAT_R16_UNORM ? VK_FORMAT_D16_UNORM :
+           color == VK_FORMAT_R32_SFLOAT ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_UNDEFINED;
+}
+
+// Retype only the private destination of an already captured original color read.
+// Its normalized intervals, packing, original producer receipts and color source remain unchanged.
+int vk_texture_alias_depth_compare_locked(VkTextureAliasRead *alias, VkTexImage *shape) {
+    if (!alias || !shape || alias->result.image || alias->allocation || alias->target_hold ||
+        alias->transfer_source || alias->raw_output || alias->storage_seed || alias->uploaded ||
+        alias->result.type != VK_IMAGE_TYPE_2D || alias->result.depth != 1 || alias->result.samples != 1 ||
+        alias->result.aspect != VK_IMAGE_ASPECT_COLOR_BIT || !alias->receiver_layout.count)
+        return 0;
+    const VkFormat destination = vk_texture_color_depth_format(alias->result.format);
+    if (destination == VK_FORMAT_UNDEFINED) return 0;
+    const uint32_t bpp = destination == VK_FORMAT_D16_UNORM ? 2 : 4;
+    for (uint32_t i = 0; i < alias->receiver_layout.count; ++i) {
+        const VkTextureAliasPlane *plane = &alias->receiver_layout.planes[i];
+        if (plane->copy.imageSubresource.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT ||
+            !plane->row_bytes || plane->row_bytes % bpp || plane->copy.bufferOffset % 4)
+            return 0;
+    }
+    const VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    VkImageFormatProperties support;
+    VkCtx *vk = vk_ctx();
+    VkFormatProperties3 f3 = {.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3};
+    VkFormatProperties2 f2 = {.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, .pNext = &f3};
+    vkGetPhysicalDeviceFormatProperties2(vk->phys, destination, &f2);
+    const VkFormatFeatureFlags2 features = VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
+        VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT | VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT;
+    if ((f3.optimalTilingFeatures & features) != features ||
+        vkGetPhysicalDeviceImageFormatProperties(vk->phys, destination, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+            usage, 0, &support) != VK_SUCCESS ||
+        alias->placement.w > support.maxExtent.width || alias->placement.h > support.maxExtent.height ||
+        alias->placement.levels > support.maxMipLevels || alias->placement.layers > support.maxArrayLayers ||
+        !(support.sampleCounts & VK_SAMPLE_COUNT_1_BIT)) return 0;
+    alias->comparison_depth = 1;
+    alias->placement.flags = 0;
+    alias->placement.format = destination;
+    alias->placement.usage = usage;
+    alias->result.format = destination;
+    alias->result.aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+    alias->result.usage = usage;
+    *shape = alias->result;
+    return 1;
+}
+
+static int image_alias_sample_depth_values_valid(const VkTextureAliasRead *alias) {
+    if ((!alias->registration_only && !alias->comparison_depth) || alias->result.aspect != VK_IMAGE_ASPECT_DEPTH_BIT ||
+        alias->result.format != VK_FORMAT_D32_SFLOAT) return 1;
+    // With no unrestricted depth range enabled, a buffer upload may only supply depths in [0,1].
+    // Inspect the packed depth bits already composed for upload, excluding raw padding and other planes.
+    const uint8_t *packed = alias->staging.map + alias->upload_offset;
+    for (uint32_t i = 0; i < alias->receiver_layout.count; i++) {
+        const VkTextureAliasPlane *plane = &alias->receiver_layout.planes[i];
+        const uint8_t *row = packed + plane->copy.bufferOffset;
+        const uint64_t bytes = (uint64_t)plane->row_bytes * plane->rows * plane->slices;
+        if (bytes % sizeof(uint32_t)) return 0;
+        for (uint64_t offset = 0; offset < bytes; offset += sizeof(uint32_t)) {
+            uint32_t bits;
+            memcpy(&bits, row + offset, sizeof bits);
+            if (bits > UINT32_C(0x3f800000) && bits != UINT32_C(0x80000000)) return 0;
+        }
+    }
+    return 1;
+}
+
+const VkTexImage *vk_texture_alias_read_upload(VkTextureAliasRead *alias, VkCommandBuffer cb, uint64_t fence) {
+    if (!vk_texture_alias_read_current(alias) ||
+        vmaInvalidateAllocation(vk_ctx()->vma, alias->staging.allocation, 0, alias->upload_offset) != VK_SUCCESS ||
+        !image_alias_compose_guest(alias) ||
+        !texture_alias_project(&alias->receiver->d, &alias->receiver_layout, alias->workspace,
+            alias->staging.map + alias->upload_offset, 1)) return NULL;
+    if (!image_alias_sample_depth_values_valid(alias)) {
+        if (alias->comparison_depth) alias->comparison_range_refused = 1;
+        return NULL;
+    }
+    if (vmaFlushAllocation(vk_ctx()->vma, alias->staging.allocation, alias->upload_offset,
+                           alias->receiver_layout.bytes) != VK_SUCCESS) return NULL;
+    if (!vk_texture_alias_read_current(alias)) return NULL;
+    // The read prefix and the copy tail are independent native owners, even when they share the scene.
+    __atomic_add_fetch(&alias->owners, 1, __ATOMIC_RELAXED);
+    vk_completion_add_owned(fence, image_alias_upload_completed, image_alias_upload_canceled, alias);
+    VkImageMemoryBarrier2 initialize = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+        .srcStageMask = alias->target_hold ? VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_2_NONE,
+        .srcAccessMask = alias->target_hold ? (VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT) : 0, .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+        .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        .oldLayout = alias->target_hold ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = VK_IMAGE_LAYOUT_GENERAL, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = alias->result.image,
+        .subresourceRange = {alias->result.aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}};
+    VkDependencyInfo dependency = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &initialize};
+    vkCmdPipelineBarrier2(cb, &dependency);
+    VkBufferImageCopy regions[VK_TEXTURE_ALIAS_MAX_PLANES];
+    for (uint32_t i = 0; i < alias->receiver_layout.count; i++) {
+        regions[i] = alias->receiver_layout.planes[i].copy;
+        if (alias->comparison_depth) regions[i].imageSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        regions[i].bufferOffset += alias->upload_offset;
+    }
+    vkCmdCopyBufferToImage(cb, alias->staging.buffer, alias->result.image, VK_IMAGE_LAYOUT_GENERAL,
+                           alias->receiver_layout.count, regions);
+    barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
+    alias->uploaded = 1;
+    __atomic_fetch_add(&alias_native_reconstructions, 1, __ATOMIC_RELAXED);
+    return &alias->result;
+}
+
+static int image_alias_whole_load_current(const Tex *entry, RcRegistryPosition read) {
+    if (!entry->alias_full_count) return 0;
+    const VkImage image = entry->pub.image;
+    RcRegistry *registry = rc_registry_runtime();
+    if (image_alias_source_current(entry))
+        return rc_registry_native_image_covers(registry, (uint64_t)(uintptr_t)image,
+                                               entry->alias_full_demand, entry->alias_full_count, read);
+    if (!entry->bound_alias_whole || entry->pub.gone || !entry->image_device_count ||
+        entry->image_mapped_hold_count != entry->image_device_count ||
+        !vk_mem_image_alias_current(image, entry->pub.addr, entry->image_device_size, entry->bound_to,
+                                    entry->image_device_intervals, entry->image_device_count)) return 0;
+    RcRegistryPosition output = entry->native_write;
+    output.ordinal |= 1;
+    return rc_registry_native_image_read_current(registry, (uint64_t)(uintptr_t)image,
+        entry->image_device_intervals, entry->image_mapped_holds, entry->image_device_count, output, read);
+}
+
+static int image_alias_resident_current(const Tex *entry, const RcInterval *demand, uint32_t count,
+    RcRegistryPosition read) {
+    return demand && entry->image_private_mapping_count &&
+        entry->image_mapped_hold_count == entry->image_private_mapping_count &&
+        rc_registry_native_image_resident_covers(rc_registry_runtime(), (uint64_t)(uintptr_t)entry->pub.image,
+            entry->image_mapped_holds, entry->image_mapped_hold_count, demand, count, read);
+}
+
+static int image_alias_load_current(Tex *entry, const VkImageSubresourceRange *planes, RcRegistryPosition read) {
+    if (!planes) return image_alias_whole_load_current(entry, read);
+    if (planes->aspectMask != entry->pub.aspect || !planes->levelCount || !planes->layerCount ||
+        planes->baseMipLevel >= entry->pub.levels || planes->levelCount > entry->pub.levels - planes->baseMipLevel ||
+        planes->baseArrayLayer >= entry->pub.layers || planes->layerCount > entry->pub.layers - planes->baseArrayLayer)
+        return 0;
+    if (entry->bound_to || (entry->alias_full_count && image_alias_whole_range(&entry->pub, planes)))
+        return image_alias_whole_load_current(entry, read);
+    if (!image_alias_source_current(entry)) return 0;
+    uint32_t count;
+    const RcInterval *demands = image_alias_plane_demand(entry, planes, &count);
+    return demands && rc_registry_native_image_covers(rc_registry_runtime(), (uint64_t)(uintptr_t)entry->pub.image,
+                                                     demands, count, read);
+}
+
+int vk_texture_attachment_base_view(const tex_t *t, const view_t *view) {
+    if (!view) return 1;
+    // Attachments select one mip. An explicit zero layer count means all
+    // remaining layers, which is equivalent to one only for a single-layer texture.
+    return (!view->set_format || view->format == t->d.format) &&
+        (!view->set_target || view->target == t->d.target) &&
+        (!view->set_levels || (!view->base_level && view->nlevels <= 1)) &&
+        (!view->set_layers || (!view->min_layer &&
+            (view->nlayers == 1 || (!view->nlayers && t->L.layers == 1)))) &&
+        (!view->set_dsmode || view->dsmode == NVN_TEXTURE_DEPTH_STENCIL_MODE_DEPTH);
+}
+
+VkTextureStorageSeedResult vk_texture_storage_seed_capture(const VkTexImage *selected, VkImageSubresourceRange planes,
+    VkTextureAliasRead **out, VkTextureAliasFailure *failure) {
+    if (failure) *failure = (VkTextureAliasFailure){0};
+    const RcRegistryPosition read = vk_exec_resource_position();
+    if (!out || *out || !selected || !selected->image || !rc_registry_position_valid(read) || (read.ordinal & 1)) {
+        image_alias_refuse(failure, VK_TEXTURE_ALIAS_ORDER, RC_REGISTRY_INVALID, (RcInterval){0});
+        return VK_TEXTURE_STORAGE_SEED_REFUSED;
+    }
+
+    lock();
+    Tex *entry = nvn_hm_get(&by_addr, &selected->addr);
+    while (entry && entry->pub.image != selected->image) entry = entry->next_at;
+    const RcInterval mapped = entry && entry->image_private_mapping_count ? entry->image_private_mapping[0] : (RcInterval){0};
+    if (failure) {
+        failure->image = selected->image;
+        failure->material_serial = entry ? entry->t.serial : 0;
+    }
+    VkTextureStorageSeedResult result = VK_TEXTURE_STORAGE_SEED_REFUSED;
+    if (!entry || entry->released || entry->retiring || entry->superseded || entry->overwritten || entry->pub.gone ||
+        nvn_hm_get(&by_key, &entry->key) != entry || entry->pub.format != selected->format) {
+        image_alias_refuse(failure, VK_TEXTURE_ALIAS_OWNER, RC_REGISTRY_STALE, mapped);
+    } else {
+        VkTextureAliasLayout layout;
+        const VkImageUsageFlags usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        if (entry->pub.mirrored || !nvn_gpu_only(entry->pub.addr) || (entry->pub.usage & usage) != usage ||
+            (entry->pub.type == VK_IMAGE_TYPE_3D && (!storage_volume_shape(entry) ||
+                selected->type != VK_IMAGE_TYPE_3D || selected->view_type != VK_IMAGE_VIEW_TYPE_3D ||
+                !storage_volume_mip(&entry->pub, &planes))) ||
+            !image_alias_material_layout(entry, &layout) || !texture_alias_clear_planes(planes, &entry->pub, &layout)) {
+            result = VK_TEXTURE_STORAGE_SEED_UNSUPPORTED;
+        } else if (!image_alias_placement_current(entry)) {
+            image_alias_refuse(failure, VK_TEXTURE_ALIAS_MAPPING, RC_REGISTRY_STALE, mapped);
+        } else if (image_alias_load_current(entry, &planes, read)) {
+            result = VK_TEXTURE_STORAGE_SEED_CURRENT;
+        } else if (entry->material || entry->pin_owned || entry->pub.fb_learned) {
+            image_alias_refuse(failure, VK_TEXTURE_ALIAS_OWNER, RC_REGISTRY_BLOCKED, mapped);
+        } else {
+            VkTexImage shape;
+            const int replacement = !storage_seed_cold(entry);
+            const int captured = image_alias_read_capture_locked(&entry->t, entry, out, &shape, 1,
+                                                                 replacement ? 2 : 1, &planes, NULL, failure);
+            if (captured == 1) {
+                VkTextureAliasRead *seed = *out;
+                const int exact = replacement ? seed->predecessor_hold && seed->predecessor == selected->image && !shape.image :
+                    seed->target_hold && shape.image == selected->image;
+                if (exact) {
+                    seed->storage_seed = 1;
+                    seed->storage_revision = entry->content_revision;
+                    result = VK_TEXTURE_STORAGE_SEED_CAPTURED;
+                }
+            }
+            if (result == VK_TEXTURE_STORAGE_SEED_REFUSED && captured >= 0) {
+
+                if (*out) image_alias_release(*out);
+                *out = NULL;
+                image_alias_refuse(failure, VK_TEXTURE_ALIAS_OWNER, RC_REGISTRY_BLOCKED, mapped);
+            }
+        }
+    }
+    unlock();
+    return result;
+}
+
+int vk_texture_alias_target_capture(const tex_t *t, const view_t *view, uint32_t layer_limit, VkTextureAliasRead **out, int ordered,
+                                     VkTextureAliasFailure *failure) {
+    if (!t) return 0;
+    VkImageSubresourceRange planes;
+    const int depth = vk_texture_alias_depth_attachment_range(t, view, &planes);
+    if (!depth && !vk_texture_alias_attachment_range(t, view, 0, &planes)) return 0;
+    if (layer_limit && planes.layerCount > layer_limit) planes.layerCount = layer_limit;
+    RcRegistryPosition read = vk_exec_resource_position();
+    if (!rc_registry_position_valid(read)) return 0;
+    lock();
+    TexKey key;
+    make_key(t, &key);
+    Tex *e = nvn_hm_get(&by_key, &key);
+    if (e && e->t.serial == t->serial && !e->released && !e->superseded && !e->overwritten &&
+        image_alias_load_current(e, &planes, read)) { unlock(); return 0; }
+    VkMemSpan span;
+    RcInterval *intervals = NULL;
+    uint32_t count = vk_mem_lookup((uintptr_t)t->mem, t->L.size, &span) ?
+        vk_mem_device_intervals(&span, (uintptr_t)t->mem, t->L.size, &intervals) : 0;
+    RcRegistry *registry = rc_registry_runtime();
+    const int projected = count && (rc_registry_native_image_has_prior_projection(registry, intervals, count, read) ||
+        (!depth && image_alias_single_color_view(t, view) &&
+         rc_registry_native_image_has_prior_bound_projection(registry, intervals, count, read)));
+    const RcInterval mapped = count ? intervals[0] : (RcInterval){0};
+    // Pure buffer data is relevant on the first LOAD, before an independent image has
+    // produced contents. An existing ordinary native attachment still supports its own LOAD.
+    const int needs_seed = e && e->pub.preserve_pool_bytes &&
+        (depth || !image_alias_whole_range(&e->pub, &planes) || (!e->pub.gpu_owned && !e->alias_fragment_owner));
+    VkMemImageAliasBaseline *baseline = NULL;
+    RcRegistryResult raw = RC_REGISTRY_OK;
+    if (count && !projected && (!e || needs_seed))
+        raw = vk_mem_image_alias_baseline_capture((uintptr_t)t->mem, t->L.size, intervals, count, read, &baseline);
+    free(intervals);
+    if (raw != RC_REGISTRY_OK || (needs_seed && !projected && !baseline)) {
+        vk_mem_image_alias_baseline_release(&baseline);
+        unlock();
+        return image_alias_refuse(failure, VK_TEXTURE_ALIAS_COVERAGE,
+                                  raw == RC_REGISTRY_OK ? RC_REGISTRY_BLOCKED : raw, mapped);
+    }
+    if (!projected && !baseline) { unlock(); return 0; }
+    if (!ordered) {
+        vk_mem_image_alias_baseline_release(&baseline);
+        unlock();
+        return 2;
+    }
+    // A used native attachment keeps its earlier physical pixels and its writer ownership until
+    // an actual draw issues. A seed for that attachment goes to an independently placed writable image.
+    // A learned depth target can take that path if the replacement inherits its native feedback usage.
+    const VkImageUsageFlags depth_feedback_usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    const int learned_depth = e && depth && e->pub.fb_learned && e->pub.fb_usage &&
+        (e->pub.usage & depth_feedback_usage) == depth_feedback_usage &&
+        (e->ik.usage & depth_feedback_usage) == depth_feedback_usage;
+    if (e && ((e->t.serial != t->serial && !e->released) || e->t.L.size != t->L.size ||
+              e->bound_to || e->pin_owned || e->material || (e->pub.fb_learned && !learned_depth) || e->retiring)) {
+        vk_mem_image_alias_baseline_release(&baseline);
+        unlock();
+        return image_alias_refuse(failure, VK_TEXTURE_ALIAS_OWNER, RC_REGISTRY_BLOCKED, mapped);
+    }
+    int created = !e;
+    int replacement = e && (learned_depth || e->released || e->superseded || e->overwritten || e->pub.gpu_owned ||
+                            e->alias_fragment_owner || vk_mem_image_held(e->pub.image));
+    if (!e) e = entry_of_mode(t, 1, NULL);
+    VkTexImage shape;
+    const VkImageUsageFlags usage = depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    int captured = e && e->pub.image && (e->pub.usage & usage) &&
+        (e->pub.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) ?
+        image_alias_read_capture_locked(t, e, out, &shape, 1, replacement ? 2 : 1, &planes, &baseline, failure) :
+        image_alias_refuse(failure, VK_TEXTURE_ALIAS_LAYOUT, RC_REGISTRY_UNSUPPORTED, mapped);
+    vk_mem_image_alias_baseline_release(&baseline);
+    if (captured == 1) (*out)->target_created = (uint8_t)created;
+    else if (created && e) drop_tex(e, DROP_REPLACED);
+    unlock();
+    return captured;
+}
+
+void vk_texture_alias_target_cancel(VkTextureAliasRead *alias) {
+    if (!alias) return;
+    if (alias->target_created) {
+        lock();
+        Tex *e = nvn_hm_get(&by_key, &alias->key);
+        if (e && e->t.serial == alias->receiver->serial && e->pub.image == alias->result.image &&
+            !e->pub.gpu_owned && !e->alias_fragment_owner) {
+            drop_tex(e, DROP_REPLACED);
+            __atomic_fetch_add(&alias_canceled_target_placements, 1, __ATOMIC_RELAXED);
+        }
+        unlock();
+    }
+    image_alias_release(alias);
+}
+
+int vk_texture_alias_target_current(VkTextureAliasRead *alias, VkImage image) {
+    return alias && (alias->target_hold || alias->predecessor) && alias->uploaded && alias->result.image == image &&
+        (alias->target_replaced ? vk_texture_render_target_load_current(image, alias->result.addr,
+                                      alias->load_planes.aspectMask ? &alias->load_planes : NULL) :
+         vk_texture_alias_read_current(alias));
+}
+
+int vk_texture_alias_target_load_current(VkTextureAliasRead *alias, VkImage image, const VkImageSubresourceRange *planes) {
+    if (!alias || !planes) return 0;
+    const VkImageSubresourceRange *prepared = &alias->load_planes;
+    // The rendering layer count can be smaller than this attachment's retained view.
+    return planes->aspectMask == prepared->aspectMask && planes->baseMipLevel == prepared->baseMipLevel &&
+        planes->levelCount == prepared->levelCount && planes->baseArrayLayer == prepared->baseArrayLayer &&
+        planes->layerCount && planes->layerCount <= prepared->layerCount && vk_texture_alias_target_current(alias, image);
+}
+
+VkTexturePresentSource *vk_texture_present_retain_alias_image(VkTextureAliasRead *seed, VkImage exact) {
+    const VkTexImage *image = vk_texture_alias_target_image(seed);
+    // The selected operation already proved its LOAD while its read was open.
+    // Retaining that owned placement later must not re-read today's registration.
+    if (!image || !exact || image->image != exact || (!seed->allocation && !seed->target_hold) ||
+        __atomic_load_n(&seed->upload_canceled, __ATOMIC_ACQUIRE)) return NULL;
+    VkTexturePresentSource *source = calloc(1, sizeof *source);
+    if (source) source->seed = vk_texture_alias_read_retain(seed);
+    return source;
+}
+
+const VkTexImage *vk_texture_alias_target_image(const VkTextureAliasRead *alias) {
+    return alias && alias->uploaded && (alias->target_hold || alias->predecessor) && alias->result.image ?
+        &alias->result : NULL;
+}
+
+int vk_texture_alias_probe_detach(const tex_t *texture, VkImage expected) {
+    TexKey key;
+    make_key(texture, &key);
+    lock();
+    Tex *e = nvn_hm_get(&by_key, &key);
+    const int exact = e && e->released && e->t.serial == texture->serial &&
+                      e->pub.image == expected && e->alias_fragment_owner;
+    if (exact) drop_tex(e, DROP_REPLACED);
+    unlock();
+    return exact;
+}
+
+int vk_texture_alias_probe_retained(VkImage image) {
+    lock();
+    const NativeTextureOutput *owner = nvn_hm_get(&alias_fragment_owners, &image);
+    const int retained = owner && !owner->entry && owner->allocation && owner->holds;
+    unlock();
+    return retained;
+}
+
+void vk_texture_alias_probe_retirements(uint64_t *detached, uint64_t *destroyed) {
+    *detached = __atomic_load_n(&native_outputs_detached, __ATOMIC_ACQUIRE);
+    *destroyed = __atomic_load_n(&native_outputs_destroyed, __ATOMIC_ACQUIRE);
+}
+
+const VkTexImage *vk_texture_alias_target_replacement(const VkTextureAliasRead *alias) {
+    return alias && alias->predecessor && !alias->target_replaced ? &alias->result : NULL;
+}
+
+// The pending replacement has its own VMA allocation and is populated at this read.
+int vk_texture_alias_target_read_prior(VkTextureAliasRead *alias, VkImage target, VkImage sampled, int fragment) {
+    if (!vk_texture_alias_target_replacement(alias) || !alias->allocation || !target || !sampled ||
+        target == sampled || alias->result.image != target ||
+        __atomic_load_n(&alias->upload_canceled, __ATOMIC_ACQUIRE)) return 0;
+    // Preserve the native fragment feedback relation when the selected input is the actual predecessor.
+    return (!fragment || sampled != alias->predecessor) && vk_texture_alias_target_current(alias, target);
+}
+
+int vk_texture_alias_target_prepare_replacement(VkTextureAliasRead *alias, const VkImageSubresourceRange *planes) {
+    if (!vk_texture_alias_target_replacement(alias) ||
+        !vk_texture_alias_target_load_current(alias, alias->result.image, planes)) return 0;
+    resource_image_prepare_mapped((uint64_t)(uintptr_t)alias->result.image, alias->result.addr, alias->guest_bytes,
+                                  alias->receiver_mapping, alias->mapping_count);
+    return 1;
+}
+
+static void image_alias_promote_target_locked(VkTextureAliasRead *alias, Tex *e) {
+    if (!image_alias_predecessor_matches(alias, e) || !alias->allocation || alias->target_replaced)
+        rt_fatal("vk: issued image cannot own its prepared writable replacement");
+    if (e->released) texture_resume_use(e);
+    if (e->superseded) n_restarts++;
+    e->superseded = e->overwritten = 0;
+    texture_rebind_object(e, alias->receiver);
+    const VkImage previous = e->pub.image;
+    const VmaAllocation previous_allocation = e->alloc;
+    const uint64_t previous_bytes = e->bytes;
+    const int retained = image_owner_replaced(e, alias->result.image);
+    compatibility_invalidate(e);
+    e->pub.image = alias->result.image;
+    e->alloc = alias->allocation;
+    e->bytes = alias->placement_bytes;
+    e->image_private_mapping = alias->receiver_mapping;
+    e->image_private_mapping_count = alias->mapping_count;
+    if (!alias->load_planes.aspectMask || image_alias_whole_range(&e->pub, &alias->load_planes)) {
+        e->alias_full_demand = alias->demands;
+        e->alias_full_count = alias->demand_count;
+    } else {
+        e->alias_plane_demand = alias->demands;
+        e->alias_plane_count = alias->demand_count;
+        e->alias_plane_range = alias->load_planes;
+    }
+    alias->allocation = NULL;
+    alias->receiver_mapping = NULL;
+    alias->demands = NULL;
+    alias->target_hold = vk_mem_image_hold(e->pub.image);
+    alias->target_replaced = 1;
+    if (!retained) {
+        vk_exec_image_gone(previous);
+        vk_defer_image_reclaim(previous, previous_allocation, previous_bytes);
+    }
+    tex_gen_bump(e->key.addr);
+}
+
+static void image_alias_replacement_part_dispose(void *part, void *owner, int known_unhanded);
+
+static void image_alias_replacement_record_part(VkTextureAliasRead *alias, TextureUseBatch *batch) {
+    if (!batch) rt_fatal("vk: issued image replacement has no recording part");
+    resource_effects_retain_part_disposition(texture_use_part_retain(batch), texture_use_part_known_unhanded,
+        vk_texture_alias_read_retain(alias), image_alias_replacement_part_dispose);
+}
+
+void vk_texture_alias_target_record_replacement(VkTextureAliasRead *alias, const VkImageSubresourceRange *planes) {
+    lock();
+    Tex *e = nvn_hm_get(&by_key, &alias->key);
+    image_alias_promote_target_locked(alias, e);
+    vk_dlaa_hud_write(e->pub.image);
+    gpu_written_prepared(e);
+    alias->load_planes = *planes;
+    if (!image_alias_whole_range(&e->pub, planes)) e->pub.preserve_pool_bytes = 1;
+    resource_effects_emitted();
+    image_alias_replacement_record_part(alias, texture_use_active(vk_exec_resource_position().scene, 1));
+    if (!image_alias_planes_written_locked(e, planes))
+        rt_fatal("vk: emitted replacement did not publish its initialized meaningful bytes");
+    if (alias->predecessor_dormant) __atomic_fetch_add(&alias_dormant_target_replacements, 1, __ATOMIC_RELAXED);
+    unlock();
+}
+
+enum { MAX_BOUND_RELOCATIONS = 8 };
+typedef struct {
+    const tex_t *texture;
+    TexKey key;
+    VkTexImage source;
+    ImgKey placement;
+    VmaAllocation source_allocation;
+    VkMemoryImageHold *source_hold;
+    RcRegistryPosition output;
+    RcRegistryImageWriteExtent *extents;
+    VkTextureAliasLayout layout;
+    VkImage clone;
+    VmaAllocation clone_allocation;
+    uint64_t clone_bytes;
+    uint32_t extent_count;
+    NativeTextureOutput *provider;
+} BoundRelocation;
+
+struct VkTextureBoundRelocation {
+    RcRegistryPosition read;
+    uint64_t destination, destination_size;
+    RcInterval *destination_intervals;
+    uint32_t destination_count, count, owners;
+    BoundRelocation images[MAX_BOUND_RELOCATIONS];
+};
+
+static uint64_t alias_relocated_images;
+uint64_t vk_texture_alias_probe_relocations(void) {
+    return __atomic_load_n(&alias_relocated_images, __ATOMIC_ACQUIRE);
+}
+
+static void bound_relocation_drop_allocations(VkTextureBoundRelocation *plan);
+
+static void bound_relocation_release(void *opaque) {
+    VkTextureBoundRelocation *plan = opaque;
+    if (__atomic_sub_fetch(&plan->owners, 1, __ATOMIC_ACQ_REL)) return;
+    bound_relocation_drop_allocations(plan);
+    for (uint32_t i = 0; i < plan->count; ++i) {
+        BoundRelocation *entry = &plan->images[i];
+        if (entry->source_hold) vk_mem_image_release(entry->source_hold);
+        nvn_texture_pin_release(entry->texture);
+        free(entry->extents);
+        native_texture_output_drop(entry->provider);
+    }
+    free(plan->destination_intervals);
+    free(plan);
+}
+
+static void bound_relocation_canceled(void *opaque, int may_have_executed) {
+    (void)may_have_executed;
+    bound_relocation_release(opaque);
+}
+
+void vk_texture_bound_relocation_cancel(VkTextureBoundRelocation *plan) {
+    if (plan) bound_relocation_release(plan);
+}
+
+static int bound_relocation_capture_one(BoundRelocation *entry, const Tex *e) {
+    const uint32_t count = e->image_device_count;
+    if (!count || count != e->image_mapped_hold_count || !e->alias_full_count ||
+        !image_alias_exact_layout(e, &entry->layout) || !(e->pub.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) return 0;
+    entry->texture = nvn_texture_pin_acquire(&e->t);
+    entry->key = e->key;
+    entry->source = e->pub;
+    entry->source_hold = vk_mem_image_hold(e->pub.image);
+    entry->source_allocation = e->bound_to;
+    entry->placement = e->ik;
+    entry->output = e->native_write;
+    entry->output.ordinal |= 1;
+    entry->extent_count = count;
+    entry->extents = malloc(count * sizeof *entry->extents);
+    entry->provider = native_texture_output_create();
+    if (!entry->texture || !entry->source_hold || !entry->extents || !entry->provider) return 0;
+    for (uint32_t i = 0; i < count; ++i)
+        entry->extents[i] = (RcRegistryImageWriteExtent){e->image_device_intervals[i], e->image_mapped_holds[i]};
+    return 1;
+}
+
+static int bound_relocation_current_locked(const VkTextureBoundRelocation *plan) {
+    if (rc_registry_position_compare(plan->read, vk_exec_resource_position()) ||
+        !image_alias_guest_mapping_current(plan->destination, plan->destination_size,
+                                           plan->destination_intervals, plan->destination_count)) return 0;
+    for (uint32_t i = 0; i < plan->count; ++i) {
+        const BoundRelocation *entry = &plan->images[i];
+        const Tex *e = nvn_hm_get(&by_key, &entry->key);
+        if (!e || e->t.serial != entry->texture->serial || !e->bound_alias_whole ||
+            e->pub.image != entry->source.image || e->bound_to != entry->source_allocation ||
+            e->image_device_count != entry->extent_count || e->image_mapped_hold_count != entry->extent_count ||
+            vk_mem_image_hold_retired(entry->source_hold) ||
+            !vk_mem_image_alias_current(e->pub.image, e->pub.addr, e->image_device_size, e->bound_to,
+                                        e->image_device_intervals, e->image_device_count) ||
+            !rc_registry_native_image_read_current(rc_registry_runtime(), (uint64_t)(uintptr_t)e->pub.image,
+                e->image_device_intervals, e->image_mapped_holds, entry->extent_count, entry->output, plan->read)) return 0;
+        for (uint32_t j = 0; j < entry->extent_count; ++j) {
+            const RcInterval registered = entry->extents[j].interval, current = e->image_device_intervals[j];
+            if (entry->extents[j].hold.id != e->image_mapped_holds[j].id ||
+                entry->extents[j].hold.index != e->image_mapped_holds[j].index || registered.address != current.address ||
+                registered.mapping != current.mapping || !rc_range_equal(registered.range, current.range)) return 0;
+        }
+    }
+    return 1;
+}
+
+int vk_texture_bound_relocation_capture(const tex_t *destination, VkTextureBoundRelocation **out) {
+    const RcRegistryPosition read = vk_exec_resource_position();
+    if (!destination || !nvn_gpu_only((uintptr_t)destination->mem) || !destination->L.size ||
+        !rc_registry_position_valid(read)) return 0;
+    lock();
+    if (!bound_alias_owners.n) { unlock(); return 0; }
+    VkMemSpan span;
+    const uint64_t address = (uintptr_t)destination->mem;
+    VkImage overlapping[MAX_BOUND_RELOCATIONS];
+    int count = vk_mem_lookup(address, destination->L.size, &span) ?
+        vk_mem_image_alias_overlaps(address, destination->L.size, &span, overlapping, MAX_BOUND_RELOCATIONS) : 0;
+    if (count <= 0) { unlock(); return count; }
+    VkTextureBoundRelocation *plan = calloc(1, sizeof *plan);
+    if (!plan) { unlock(); return -1; }
+    plan->read = read;
+    plan->destination = address;
+    plan->destination_size = destination->L.size;
+    plan->owners = 1;
+    plan->destination_count = vk_mem_device_intervals(&span, address, destination->L.size, &plan->destination_intervals);
+    int exact = plan->destination_count != 0;
+    for (int i = 0; exact && i < count; ++i) {
+        const Tex *older = nvn_hm_get(&bound_alias_owners, &overlapping[i]);
+        if (!older || older->t.serial == destination->serial) continue;
+        exact = bound_relocation_capture_one(&plan->images[plan->count++], older);
+    }
+    if (exact && plan->count) exact = bound_relocation_current_locked(plan);
+    unlock();
+    if (!exact || !plan->count) {
+        bound_relocation_release(plan);
+        return exact ? 0 : -1;
+    }
+    *out = plan;
+    return 1;
+}
+
+int vk_texture_bound_relocation_current(VkTextureBoundRelocation *plan) {
+    lock();
+    int current = bound_relocation_current_locked(plan);
+    unlock();
+    return current;
+}
+
+static void bound_relocation_drop_allocations(VkTextureBoundRelocation *plan) {
+    for (uint32_t i = 0; i < plan->count; ++i) {
+        BoundRelocation *entry = &plan->images[i];
+        if (entry->clone) resource_core_vma_destroy_image(vk_ctx()->vma, entry->clone, entry->clone_allocation);
+        entry->clone = VK_NULL_HANDLE;
+        entry->clone_allocation = NULL;
+        entry->clone_bytes = 0;
+    }
+}
+
+VkResult vk_texture_bound_relocation_allocate(VkTextureBoundRelocation *plan, RcVmaDependency *dependency) {
+    VmaAllocationCreateInfo preferred = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    VmaAllocationCreateInfo placements[MAX_BOUND_RELOCATIONS];
+    VkImageCreateInfo images[MAX_BOUND_RELOCATIONS];
+    RcAdmissionVector combined = {0};
+    RcVmaRequest request = {.producer = RC_BUDGET_TEXTURE, .required = 1, .dependency = dependency};
+    for (uint32_t i = 0; i < plan->count; ++i) {
+        const ImgKey *key = &plan->images[i].placement;
+        images[i] = (VkImageCreateInfo){.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .flags = key->flags & ~VK_IMAGE_CREATE_ALIAS_BIT, .imageType = (VkImageType)key->type,
+            .format = (VkFormat)key->format, .extent = {key->w, key->h, key->d},
+            .mipLevels = key->levels, .arrayLayers = key->layers, .samples = (VkSampleCountFlagBits)key->samples,
+            .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = key->usage, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+        RcAdmissionVector required;
+        VkResult result = resource_core_vma_image_peak(&request, &images[i], &preferred, &placements[i], &required);
+        if (result != VK_SUCCESS) return result;
+        if (!restore_peak_add(&combined, &required)) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    dependency->peak = combined;
+    if (plan->count > 1) dependency->can_reuse = dependency->reuse_unattempted = 0;
+    RcBudgetTicket peak = {0};
+    RcAdmissionStatus admitted = resource_core_budget_reserve(RC_BUDGET_TEXTURE, 1, &combined, &peak);
+    if (admitted != RC_ADMISSION_OK) {
+        if (admitted == RC_ADMISSION_NO_RECORDS) dependency->owner_full = (int)plan->count;
+        return admitted == RC_ADMISSION_REFUSED || admitted == RC_ADMISSION_NO_RECORDS ? VK_NOT_READY : VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    request.dependency = NULL;
+    request.peak_ticket = &peak;
+    VkResult result = VK_SUCCESS;
+    for (uint32_t i = 0; i < plan->count; ++i) {
+        BoundRelocation *entry = &plan->images[i];
+        VmaAllocationInfo actual;
+        result = resource_core_vma_create_image(&request, vk_ctx()->vma, &images[i], &placements[i],
+                                               &entry->clone, &entry->clone_allocation, &actual, NULL);
+        if (result != VK_SUCCESS) break;
+        entry->clone_bytes = actual.size;
+    }
+    if (peak.token.ledger) resource_core_budget_cancel(&peak);
+    if (result != VK_SUCCESS) {
+        bound_relocation_drop_allocations(plan);
+        resource_core_vma_dependency_rebase(dependency, 1);
+    }
+    return result;
+}
+
+void vk_texture_bound_relocation_record(VkTextureBoundRelocation *plan, VkCommandBuffer cb, uint64_t fence) {
+    __atomic_add_fetch(&plan->owners, 1, __ATOMIC_RELAXED);
+    vk_completion_add_owned(fence, bound_relocation_release, bound_relocation_canceled, plan);
+    barrier(cb, ALL_RW, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+    for (uint32_t i = 0; i < plan->count; ++i) {
+        const BoundRelocation *entry = &plan->images[i];
+        VkImageMemoryBarrier2 initialize = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+            .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT, .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = entry->clone, .subresourceRange = {entry->source.aspect, 0, VK_REMAINING_MIP_LEVELS,
+                                                       0, VK_REMAINING_ARRAY_LAYERS}};
+        VkDependencyInfo dependency = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &initialize};
+        vkCmdPipelineBarrier2(cb, &dependency);
+        VkImageCopy copies[VK_TEXTURE_ALIAS_MAX_PLANES];
+        for (uint32_t j = 0; j < entry->layout.count; ++j) {
+            const VkBufferImageCopy *plane = &entry->layout.planes[j].copy;
+            copies[j] = (VkImageCopy){.srcSubresource = plane->imageSubresource,
+                                    .dstSubresource = plane->imageSubresource, .extent = plane->imageExtent};
+        }
+        vkCmdCopyImage(cb, entry->source.image, VK_IMAGE_LAYOUT_GENERAL, entry->clone, VK_IMAGE_LAYOUT_GENERAL,
+                       entry->layout.count, copies);
+    }
+    barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
+}
+
+int vk_texture_bound_relocation_commit(VkTextureBoundRelocation *plan) {
+    lock();
+    int current = bound_relocation_current_locked(plan);
+    for (uint32_t i = 0; current && i < plan->count; ++i) {
+        BoundRelocation *entry = &plan->images[i];
+        Tex *e = nvn_hm_get(&by_key, &entry->key);
+        current = rc_registry_native_image_relocate(rc_registry_runtime(), (uint64_t)(uintptr_t)entry->source.image,
+            (uint64_t)(uintptr_t)entry->clone, entry->extents, entry->extent_count, entry->output, plan->read) == RC_REGISTRY_OK;
+        if (!current) break;
+        bound_alias_forget(e);
+        texture_registration_source_clear(e);
+        compatibility_invalidate(e);
+        // The logical native writer keeps its original held extents. Only its physical placement moves.
+        // Older retained descriptor/command owners release the previous image on their own fences.
+        packed_storage_writes_drop(e);
+        e->pub.image = entry->clone;
+        e->pub.bound = 0;
+        e->ik.flags &= ~VK_IMAGE_CREATE_ALIAS_BIT;
+        e->alloc = entry->clone_allocation;
+        e->bytes = entry->clone_bytes;
+        e->bound_to = NULL;
+        e->image_device_size = 0;
+        e->image_private_mapping = e->image_device_intervals;
+        e->image_private_mapping_count = e->image_device_count;
+        e->image_device_intervals = NULL;
+        e->image_device_count = 0;
+        entry->provider->entry = e;
+        e->native_output = entry->provider;
+        entry->provider = NULL;
+        native_texture_output_publish(e);
+        image_alias_possible_written(e);
+        entry->clone = VK_NULL_HANDLE;
+        entry->clone_allocation = NULL;
+        tex_gen_bump(e->key.addr);
+        vk_exec_image_gone(entry->source.image);
+        vk_defer_image(entry->source.image, NULL);
+        __atomic_fetch_add(&alias_relocated_images, 1, __ATOMIC_RELAXED);
+    }
+    unlock();
+    return current;
+}
+
+int vk_texture_render_target_load_current(VkImage image, uint64_t addr, const VkImageSubresourceRange *planes) {
+    if (!image) return 0;
+    const RcRegistryPosition read = vk_exec_resource_position();
+    lock();
+    int current = 0;
+    for (Tex *e = nvn_hm_get(&by_addr, &addr); e; e = e->next_at) {
+        if (e->pub.image != image) continue;
+        current = image_alias_load_current(e, planes, read);
+        break;
+    }
+    unlock();
+    return current;
+}
+
+static int render_target_written(VkImage image, uint64_t addr, int loaded, VkTextureAliasRead *seed,
+                                 const VkImageSubresourceRange *planes) {
+    if (!image) return 0;
+    lock();
+    for (Tex *e = nvn_hm_get(&by_addr, &addr); e; e = e->next_at) {
+        if (e->pub.image != image) continue;
+        vk_dlaa_hud_write(image);
+        gpu_written_prepared(e);
+        if (loaded && planes) {
+            const int projected = image_alias_planes_written_locked(e, planes);
+            unlock();
+            return projected ? 2 : 1;
+        }
+        if (seed && loaded && !e->alias_full_demand && seed->result.image == image && seed->receiver->serial == e->t.serial) {
+            e->alias_full_demand = malloc(seed->demand_count * sizeof *e->alias_full_demand);
+            if (e->alias_full_demand) {
+                memcpy(e->alias_full_demand, seed->demands, seed->demand_count * sizeof *seed->demands);
+                e->alias_full_count = seed->demand_count;
+            }
+        }
+        int projected = 0;
+        if (loaded && e->alias_full_count) {
+            RcRegistryPosition output = vk_exec_resource_position();
+            if (rc_registry_position_valid(output) && output.ordinal < UINT64_MAX) {
+                output.ordinal |= 1;
+                if (e->bound_to) bound_alias_whole_written(e, output);
+                else if (image_alias_placement_current(e)) projected = image_alias_note_written(e, NULL, 0, output);
+            }
+        }
+        unlock();
+        return projected ? 2 : 1;
+    }
+    unlock();
+    return 0;
+}
+
+int vk_texture_render_target_written(VkImage image, uint64_t addr) {
+    return render_target_written(image, addr, 0, NULL, NULL);
+}
+
+int vk_texture_render_target_loaded_written(VkImage image, uint64_t addr, VkTextureAliasRead *seed,
+                                           const VkImageSubresourceRange *planes) {
+    return render_target_written(image, addr, 1, seed, planes);
+}
+
+static int finalize_slot(int id, const TexKey *key, uint64_t serial) {
+    TexSlot *s = &tslots[id];
+    if (s->finalized || (uintptr_t)s->t.mem != key->addr) return 0;
+    TexKey own;
+    make_key(&s->t, &own);
+    if (memcmp(&own, key, sizeof own)) return 0;
+    if (s->t.serial != serial) {
+        n_fin_other++; n_fin_other_hm += terrain_heightmap(&s->t);
+        return 0;
+    }
+    texture_registration_finalize(s,id);
+    s->finalized = 1; s->ce = NULL; s->sample_owned = 0;
+    group_finalize_slot(id);
+    n_fin_own++;
+    return 1;
+}
+
+static int texture_finalize_slot(int id, const TexKey *key, uint64_t serial, uint64_t queued_publication) {
+    if (!queued_publication) return finalize_slot(id, key, serial);
+    const TexSlot *slot = &tslots[id];
+    if (slot->finalized || (uintptr_t)slot->t.mem != key->addr || slot->t.serial != serial) return 0;
+    TexKey own;
+    make_key(&slot->t, &own);
+    return !memcmp(&own, key, sizeof own) && texture_registration_pending(slot, queued_publication);
+}
+
+static int texture_finalize_slots(const TexKey *key, uint64_t serial, uint64_t queued_publication) {
+    if (!sinfo) return 0;
+    int changed = 0;
+    uint32_t bucket = agen_idx(key->addr);
+    for (int id = bucket_head[bucket], next; id >= 0; id = next) {
+        next = slot_next[id];
+        changed |= texture_finalize_slot(id, key, serial, queued_publication);
+        if (queued_publication && changed) return 1;
+    }
+    // Finalizing a member can move it or recycle its group. Save both links before changing it.
+    for (int g = bucket_ghead[bucket], next_group; g >= 0; g = next_group) {
+        next_group = grp[g].gnext;
+        for (int id = grp[g].pub.head, next; id >= 0; id = next) {
+            next = slot_next[id];
+            changed |= texture_finalize_slot(id, key, serial, queued_publication);
+            if (queued_publication && changed) return 1;
+        }
+    }
+    return changed;
+}
+
+int vk_texture_finalize_registration_ordered(const tex_t *t, uint64_t queued_publication) {
+    TexKey key;
+    make_key(t, &key);
+    lock();
+    queued_publication = texture_registration_cutoff_locked(queued_publication);
+    if (queued_publication && texture_finalize_slots(&key, t->serial, queued_publication)) {
+        unlock();
+        return 0;
+    }
+    if (texture_finalize_slots(&key, t->serial, 0)) tex_gen_bump(key.addr);
+    unlock();
+    return 1;
+}
+
+static int texture_release_matches(const Tex *entry, uint64_t serial) {
+    return entry && !entry->released &&
+        (entry->t.serial == serial || (!entry->source_canonical && !entry->storage_registration_owned));
+}
+
+static int texture_release(const tex_t *t, int finalize_registrations, uint64_t queued_publication) {
+    if (!t || !t->mem) return 1;
     TexKey k;
     make_key(t, &k);
     lock();
+    queued_publication = texture_registration_cutoff_locked(queued_publication);
+    if (finalize_registrations && queued_publication && texture_finalize_slots(&k, t->serial, queued_publication)) {
+        unlock();
+        return 0;
+    }
+    rc_registry_finalize_object(rc_registry_runtime(), t->serial,
+                                (RcSourceRange){RC_GUEST_COMPATIBILITY_BACKING, (uintptr_t)t->mem, t->L.size});
     Tex *e = nvn_hm_get(&by_key, &k);
+    if (e && e->source_mapping && e->t.serial==t->serial) {
+        const TextureSourceMapping *mapped=e->source_mapping;
+        for (uint32_t i=0;i<mapped->count;i++)
+            rc_registry_finalize_object(rc_registry_runtime(),t->serial,mapped->intervals[i].range);
+    }
     // Staleness belongs to the registered descriptor, not the cached image: a released Tex can be destroyed before the
     // slot looks again (eviction, the released cap, start_at for a mirrored one). A registered texture may also be
     // finalized before its image is created.
@@ -4660,32 +12216,28 @@ void vk_texture_release(const tex_t *t) {
     // streams terrain heightmaps (R32F 260x260) through a fixed set of storage and initializes and registers the next
     // chunk's texture there before it finalizes the previous one; finalizing the new registration left the slot stale,
     // the draws sampled the zero stand-in, and the chunk was drawn at height zero, tens of metres below the ground.
-    int changed = 0;
-    if (sinfo)
-        for (int id = bucket_head[agen_idx(k.addr)]; id >= 0; id = slot_next[id]) {
-            TexSlot *s = &tslots[id];
-            if (s->finalized || (uintptr_t)s->t.mem != k.addr) continue;
-            TexKey sk;
-            make_key(&s->t, &sk);
-            if (memcmp(&sk, &k, sizeof k)) continue;
-            if (s->t.serial != t->serial) {   // another texture object's registration: it stays current
-                n_fin_other++, n_fin_other_hm += terrain_heightmap(&s->t);
-                continue;
-            }
-            s->finalized = 1, s->ce = NULL, s->sample_owned = 0, changed = 1;
-            n_fin_own++;
-        }
-    if (e && !e->released) {
+    int changed = finalize_registrations && texture_finalize_slots(&k, t->serial, 0);
+    if (texture_release_matches(e, t->serial)) {
         mark_released(e);
         changed = 0;   // the image's release already invalidated the address bucket
         sweep_released();
     }
     if (changed) tex_gen_bump(k.addr);
     unlock();
+    return 1;
 }
+
+int vk_texture_release_ordered(const tex_t *t, uint64_t queued_publication) {
+    return texture_release(t, 1, queued_publication);
+}
+void vk_texture_release(const tex_t *t) {
+    if (!vk_texture_release_ordered(t, 0)) rt_fatal("vk: direct texture release requires an idle registration resolver");
+}
+void vk_texture_release_replayed(const tex_t *t) { texture_release(t, 0, 0); }
 
 void vk_texture_range_gone(uint64_t lo, uint64_t size, VmaAllocation alloc) {
     lock();
+    rc_registry_range_gone(rc_registry_runtime(), (RcSourceRange){1, lo, size});
     Tex **list = malloc(sizeof *list * (size_t)(by_key.n + 1));
     int n = 0;
     for (uint32_t i = 0; i < by_key.cap; i++) {
@@ -4698,9 +12250,18 @@ void vk_texture_range_gone(uint64_t lo, uint64_t size, VmaAllocation alloc) {
 }
 
 // ---------------------------------------------------------------- descriptor slots
-void vk_texture_register(int id, const tex_t *t, const view_t *v) {
-    if (id < 0 || id >= (1 << 20)) rt_fatal("vk: texture slot %d out of range", id);
+int vk_texture_register_in_pool_ordered(uint64_t owner, int logical, const tex_t *t, const view_t *v,
+                                        uint64_t queued_publication) {
+    if (logical < 0 || logical >= (1 << 20)) rt_fatal("vk: texture slot %d out of range", logical);
     lock();
+    queued_publication = texture_registration_cutoff_locked(queued_publication);
+    int previous = vk_texture_pool_slot_locked(owner, logical);
+    if (previous >= 0 && texture_registration_pending(&tslots[previous], queued_publication) &&
+        !texture_registration_same(&tslots[previous], t, v)) {
+        unlock();
+        return 0;
+    }
+    int id = texture_pool_claim(owner, logical);
     if (id >= ntslots) {
         int n = ntslots ? ntslots : 1024;
         while (n <= id) n *= 2;
@@ -4720,20 +12281,30 @@ void vk_texture_register(int id, const tex_t *t, const view_t *v) {
         __atomic_store_n(&sinfo, p, __ATOMIC_RELEASE);
     }
     TexSlot *s = &tslots[id];
+    s->pool_owner = owner;
+    s->logical_id = logical;
     // The same texture and view registered again (Ocarina rewrites much of its descriptor pool every frame): the slot
     // keeps its serial and resolved entry, so the texture pool refresh (vk_exec_draw.c pool_sync_entries) does not
     // resolve it again. Only while that entry is live: after a release, a registration is what makes a slot current
     // again (slot_resolve's stale rule), so it goes the full way. A slot held out of the pool (cheld) keeps that too:
     // the same descriptor names the same held texture. Both only while the resolution is current (cgen): a destroyed
     // entry bumped the generation and its record may be freed, so ce is not read past that.
+    if (s->used && !s->finalized && texture_registration_source(s) && texture_registration_same(s, t, v)) {
+        n_same_regs++;
+        unlock();
+        return 1;
+    }
     int current = s->used && !s->finalized && s->cgen == agen[sinfo[id] & 0xffff];
     if (current && ((s->ce && !s->ce->released) || s->cheld) && !memcmp(&s->t, t, sizeof *t) &&
         s->has_view == (v != NULL) && (!v || !memcmp(&s->v, v, sizeof *v))) {
         n_same_regs++;
         unlock();
-        return;
+        return 1;
     }
-    s->t = *t;
+    // Replay history changes with the descriptor or its lifetime. Association refresh can repeat under
+    // the same logical registration even when its cache never selected an image or lost its current entry.
+    if (!texture_registration_same(s, t, v)) texture_registration_publish(s,id,t,v);
+    s->t = s->registration->descriptor;
     if (!s->used && id < VK_POOL_TEX) pool_slots++;
     s->used = 1;
     s->finalized = 0;
@@ -4745,9 +12316,8 @@ void vk_texture_register(int id, const tex_t *t, const view_t *v) {
     if (!++reg_serial) reg_serial = 1;
     __atomic_store_n(&sinfo[id], (uint64_t)reg_serial << 16 | agen_idx((uintptr_t)t->mem), __ATOMIC_RELEASE);
     dirty_push((uint32_t)id);
-    s->has_view = v != NULL;
-    if (v) s->v = *v;
-    else memset(&s->v, 0, sizeof s->v);
+    s->has_view = s->registration->has_view;
+    s->v = s->registration->view;
     s->khash = 0;
     if (!tex_mirrored(t)) {   // FNV-1a over the key (make_key zeroes its padding) and the view
         TexKey k;
@@ -4763,6 +12333,82 @@ void vk_texture_register(int id, const tex_t *t, const view_t *v) {
     if (id < VK_POOL_TEX && !s->khash && t->mem && stream_images_enabled() && !nvn_gpu_only((uintptr_t)t->mem))
         stream_image_request(t);
     unlock();
+    return 1;
+}
+
+void vk_texture_register_in_pool(uint64_t owner, int logical, const tex_t *t, const view_t *v) {
+    if (!vk_texture_register_in_pool_ordered(owner, logical, t, v, 0))
+        rt_fatal("vk: direct texture registration requires an idle registration resolver");
+}
+
+void vk_texture_register(int id, const tex_t *t, const view_t *v) {
+    vk_texture_register_in_pool(0, id, t, v);
+}
+
+static void texture_pool_close_slot(int native_slot) {
+    TexSlot *s = &tslots[native_slot];
+    texture_registration_finalize(s, native_slot);
+    slot_unplace(native_slot);
+    __atomic_store_n(&sinfo[native_slot], 0, __ATOMIC_RELEASE);
+    dirty_push((uint32_t)native_slot);
+    *s = (TexSlot){0};
+    if (native_slot < VK_POOL_TEX) pool_slots--;
+    else {
+        s->free_slot = texture_free_extra_slot;
+        texture_free_extra_slot = native_slot;
+    }
+}
+
+static int texture_pool_needs_replay(const TexturePoolNames *names, int primary_count, uint64_t queued_publication) {
+    for (int id = 0; id < primary_count; id++)
+        if (texture_registration_pending(&tslots[id], queued_publication)) return 1;
+    for (uint32_t i = 0; i < names->extra_slots.cap; ++i) if (names->extra_slots.vals[i]) {
+        int id = (int)(intptr_t)names->extra_slots.vals[i] - 1;
+        if (texture_registration_pending(&tslots[id], queued_publication)) return 1;
+    }
+    return 0;
+}
+
+int vk_texture_pool_release_ordered(uint64_t owner, uint64_t queued_publication) {
+    lock();
+    queued_publication = texture_registration_cutoff_locked(queued_publication);
+    TexturePoolNames *names = nvn_hm_get(&texture_pool_names, &owner);
+    if (names) {
+        int primary = vk_texture_pool_primary(owner);
+        int primary_count = primary ? (names->count < VK_POOL_TEX ? names->count : VK_POOL_TEX) : 0;
+        if (queued_publication && texture_pool_needs_replay(names, primary_count, queued_publication)) {
+            unlock();
+            return 0;
+        }
+        nvn_hm_del(&texture_pool_names, &owner);
+        if (primary) {
+            for (int id = 0; id < primary_count; ++id)
+                if (tslots[id].used) texture_pool_close_slot(id);
+            __atomic_store_n(&texture_primary_pool, UINT64_MAX, __ATOMIC_RELEASE);
+        }
+        for (uint32_t i = 0; i < names->extra_slots.cap; ++i)
+            if (names->extra_slots.vals[i])
+                texture_pool_close_slot((int)(intptr_t)names->extra_slots.vals[i] - 1);
+        texture_pool_names_free(names);
+        slots_gen++;
+    }
+    unlock();
+    return 1;
+}
+
+void vk_texture_pool_release(uint64_t owner) {
+    if (!vk_texture_pool_release_ordered(owner, 0))
+        rt_fatal("vk: direct texture pool release requires an idle registration resolver");
+}
+
+uint64_t vk_texture_pool_slot_token(uint64_t owner, int logical) {
+    if (logical >= 0 && logical < VK_POOL_TEX && vk_texture_pool_primary(owner))
+        return vk_texture_slot_token(logical);
+    lock();
+    int slot = vk_texture_pool_slot_locked(owner, logical);
+    uint64_t token = slot >= 0 ? vk_texture_slot_token(slot) : 0;
+    unlock();
+    return token;
 }
 
 // The descriptor hash of a GPU-written slot: two slots with equal hashes, the same address generation and no entry
@@ -4791,6 +12437,12 @@ static int want_take(void) {
 
 void vk_texture_create_budget_locked(int n) { create_budget = n, create_deferred = 0; }
 int vk_texture_create_deferred_locked(void) { int d = create_deferred; create_deferred = 0; return d; }
+
+// A cache hit by address and descriptor identifies a representation, not the object that registered it.
+static int slot_finalized_owner(const TexSlot *slot, const Tex *entry) {
+    return entry && entry->released && !entry->pub.gone && slot->t.serial &&
+        entry->t.serial == slot->t.serial && entry->t.L.size == slot->t.L.size;
+}
 
 // NX2NAVI_TEX_STALE_KEPT (default 1; 0: the stand-in, as before): a finalized slot of a CPU-written texture resolves to
 // its own entry while that entry holds the texture's content: uploaded or drawn by the GPU, and neither superseded by
@@ -4831,23 +12483,158 @@ static int slot_absence_valid(const TexSlot *s, uint32_t generation) {
 }
 
 static void slot_result_view(const TexSlot *s, const Tex *e, view_t *view, int *has_view) {
-    *view = s->v;
-    *has_view = s->has_view;
-    if (!e || (s->has_view && s->v.set_swizzle)) return;
-    const nvn_texdesc *d = &s->t.d;
+    const TextureRegistration *record = s->registration;
+    int qualified = record && record->source && record->source == e;
+    *view = qualified ? record->view : s->v;
+    *has_view = qualified ? record->has_view : s->has_view;
+    if (!e || (*has_view && view->set_swizzle)) return;
+    const nvn_texdesc *d = qualified ? &record->descriptor.d : &s->t.d;
     uint8_t sw[4] = {(uint8_t)d->swizzle_r, (uint8_t)d->swizzle_g, (uint8_t)d->swizzle_b, (uint8_t)d->swizzle_a};
     if (!(sw[0] | sw[1] | sw[2] | sw[3]))
         sw[0] = NVN_TEXTURE_SWIZZLE_R, sw[1] = NVN_TEXTURE_SWIZZLE_G,
         sw[2] = NVN_TEXTURE_SWIZZLE_B, sw[3] = NVN_TEXTURE_SWIZZLE_A;
     if (memcmp(sw, e->pub.swz, sizeof sw)) {
-        if (!s->has_view) memset(view, 0, sizeof *view);
+        if (!*has_view) memset(view, 0, sizeof *view);
         memcpy(view->swz, sw, sizeof sw);
         view->set_swizzle = 1;
         *has_view = 1;
     }
 }
 
-static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view) {
+// Shader selection needs the registered type and the representation's format, not uploaded texels. These
+// metadata values deliberately have no image handle or readiness flags and must never be used as a binding.
+static VkTexImage shader_metadata_of(const VkTexImage *p) {
+    return (VkTexImage){.format = p->format, .type = p->type, .view_type = p->view_type,
+        .samples = p->samples, .width = p->width, .height = p->height, .depth = p->depth,
+        .levels = p->levels, .layers = p->layers};
+}
+static int shader_metadata_cold(const tex_t *t, VkTexImage *out) {
+    const nvn_texdesc *d = &t->d;
+    if (!t->mem || d->target == NVN_TEXTURE_TARGET_BUFFER) return 0;
+    if (!vk_ctx()) return -1;
+    TexVkFormat f;
+    if (!tex_vk_format(d->format, &f) || !tex_vk_format_supported(&f)) return 0;
+    nvn_texlayout layout;
+    nvn_tex_layout(d, &layout);
+    uint32_t layers = 1, samples = d->samples > 1 ? (uint32_t)d->samples : 1;
+    VkImageType type = VK_IMAGE_TYPE_2D;
+    switch (d->target) {
+    case NVN_TEXTURE_TARGET_1D: type = VK_IMAGE_TYPE_1D; break;
+    case NVN_TEXTURE_TARGET_1D_ARRAY: type = VK_IMAGE_TYPE_1D; layers = layout.layers; break;
+    case NVN_TEXTURE_TARGET_3D: type = VK_IMAGE_TYPE_3D; break;
+    case NVN_TEXTURE_TARGET_2D_ARRAY: case NVN_TEXTURE_TARGET_2D_MULTISAMPLE_ARRAY:
+    case NVN_TEXTURE_TARGET_CUBEMAP: case NVN_TEXTURE_TARGET_CUBEMAP_ARRAY: layers = layout.layers; break;
+    default: break;
+    }
+    // Detail reduction applies only to 2D/2D-array ASTC images, and shadow scaling only to depth arrays. Neither
+    // changes these shader-visible type answers. ASTC's optional BC1/BC3 choice has no integer view format answer.
+    int cube = type == VK_IMAGE_TYPE_2D && layers >= 6 && umax(d->width, 1) == umax(d->height, 1) && samples == 1;
+    VkImageViewType view_type = type == VK_IMAGE_TYPE_1D ?
+        (d->target == NVN_TEXTURE_TARGET_1D_ARRAY ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_1D) :
+        type == VK_IMAGE_TYPE_3D ? VK_IMAGE_VIEW_TYPE_3D :
+        cube && d->target == NVN_TEXTURE_TARGET_CUBEMAP ? VK_IMAGE_VIEW_TYPE_CUBE :
+        cube && d->target == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY ? VK_IMAGE_VIEW_TYPE_CUBE_ARRAY :
+        layers > 1 || d->target == NVN_TEXTURE_TARGET_2D_ARRAY || d->target == NVN_TEXTURE_TARGET_2D_MULTISAMPLE_ARRAY ?
+        VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+    *out = (VkTexImage){.format = f.vk, .type = type, .view_type = view_type, .samples = samples,
+        .width = umax(d->width, 1), .height = type == VK_IMAGE_TYPE_1D ? 1 : umax(d->height, 1),
+        .depth = type == VK_IMAGE_TYPE_3D ? umax(d->depth, 1) : 1, .layers = layers, .levels = umax(d->levels, 1)};
+    return 1;
+}
+int vk_texture_transfer_write_geometry(const tex_t *t, VkTexImage *out) {
+    TexVkFormat f;
+    if (!t || shader_metadata_cold(t, out) != 1 || !tex_vk_format(t->d.format, &f)) return 0;
+    out->aspect = (f.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : 0) | (f.stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
+    if (!out->aspect) out->aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+    out->scale = shadow_scale_of(&t->d, &f, out->samples, tex_mirrored(t));
+    return 1;
+}
+
+static int shader_metadata_equal(const VkTexImage *a, const VkTexImage *b, const view_t *v, int hv) {
+    // A view target fully determines gfx_type_of; without it only view kind and multisample class matter.
+    return ((hv && v->set_target) || (a->view_type == b->view_type && (a->samples > 1) == (b->samples > 1))) &&
+        (!(hv && v->set_format) || a->format == b->format);
+}
+static void shader_metadata_merge(VkTexImage *out, int *state, const VkTexImage *candidate,
+                                  const view_t *view, int has_view) {
+    int next = candidate ? 1 : 2;
+    if (!*state) { *state = next; if (candidate) *out = shader_metadata_of(candidate); return; }
+    if (*state != next || (candidate && !shader_metadata_equal(out, candidate, view, has_view))) *state = -1;
+}
+int vk_texture_metadata_locked(int logical, VkTexImage *out, view_t *view, int *has_view) {
+    *out = (VkTexImage){0}; *view = (view_t){0}; *has_view = 0;
+    const TextureRegistration *history;
+    int historical=texture_registration_resolve(logical,&history,NULL);
+    if (historical == VK_TEXTURE_REGISTRATION_ABSENT) return 0;
+    if (historical == VK_TEXTURE_REGISTRATION_GONE) {
+        *view = history->view;
+        *has_view = history->has_view;
+        return shader_metadata_cold(&history->descriptor, out) > 0;
+    }
+    if (historical>0) {
+        *out=shader_metadata_of(&history->exact);
+        *view=history->exact_view;
+        *has_view=history->has_exact_view;
+        return 1;
+    }
+    int id = vk_texture_pool_slot_locked(vk_exec_texture_pool(), logical);
+    if (id < 0 || id >= ntslots || !tslots[id].used) return 0;
+    const TexSlot *s = &tslots[id];
+    *view = s->v; *has_view = s->has_view;
+    const Tex *source = texture_registration_source(s);
+    if (source) {
+        *out = shader_metadata_of(&source->pub);
+        slot_result_view(s, source, view, has_view);
+        return 1;
+    }
+    if (s->ce && s->cgen == agen[sinfo[id] & 0xffff] && !s->ce->pub.gone) {
+        *out = shader_metadata_of(&s->ce->pub);
+        slot_result_view(s, s->ce, view, has_view);
+        return 1;
+    }
+    TexKey key;
+    make_key(&s->t, &key);
+    const Tex *own = nvn_hm_get(&by_key, &key);
+    if (own && !own->released && !s->finalized) {
+        *out = shader_metadata_of(&own->pub); slot_result_view(s, own, view, has_view); return 1;
+    }
+    int cpu_slot = tex_mirrored(&s->t), state = 0, any_state = 0, any_certain = 0;
+    VkTexImage any = {0};
+    for (const Tex *p = nvn_hm_get(&by_addr, &key.addr); p; p = p->next_at) {
+        if (p->released || p->key.d.target != key.d.target) continue;
+        // CPU overwrite decides whether a mirrored GPU alias still owns the bytes. Do not read or write-watch
+        // those bytes for shader selection: retain both possible choices and accept only agreeing metadata.
+        int gpu_possible = p->pub.gpu_owned && (!p->pub.mirrored || p->gpu_dirty);
+        int gpu_certain = p->pub.gpu_owned && !p->pub.mirrored;
+        if (same_but_swizzle(&p->key, &key) && (!cpu_slot || !s->finalized || gpu_possible)) {
+            shader_metadata_merge(out, &state, &p->pub, view, *has_view);
+            if (!cpu_slot || !s->finalized || gpu_certain) return state == 1 ? 1 : -1;
+        }
+        if (!any_certain && (!cpu_slot || gpu_possible) && follow_size_matches(p, &key)) {
+            shader_metadata_merge(&any, &any_state, &p->pub, view, *has_view);
+            any_certain = !cpu_slot || gpu_certain;
+        }
+    }
+    if (any_state == -1) return -1;
+    if (any_state) shader_metadata_merge(out, &state, &any, view, *has_view);
+    if (!any_certain) {
+        if (own && ((!cpu_slot && !own->superseded) ||
+            (cpu_slot && s->finalized && slot_finalized_owner(s, own) &&
+             (stale_kept(own) || (own->material && !own->pub.image)))))
+            shader_metadata_merge(out, &state, &own->pub, view, *has_view);
+        else if (cpu_slot && s->finalized) shader_metadata_merge(out, &state, NULL, view, *has_view);
+        else {
+            VkTexImage cold = {0};
+            int known = shader_metadata_cold(&s->t, &cold);
+            if (known < 0) return -1;
+            shader_metadata_merge(out, &state, known ? &cold : NULL, view, *has_view);
+        }
+    }
+    return state == 1 ? 1 : state == 2 ? 0 : -1;
+}
+
+static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view, int private_output,
+    uint32_t *installed_generation) {
     s->absent_mapping = s->absent_protection = 0;
     *view = s->v;
     *has_view = s->has_view;
@@ -4878,19 +12665,22 @@ static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view) {
             if (same_but_swizzle(&p->key, &k) && (!cpu_slot || !s->finalized || alias_has_gpu_content(p))) { e = p; break; }
             if (!any && (!cpu_slot || alias_has_gpu_content(p)) && follow_size_ok(p, &k)) any = p;
         }
-        // A finalized CPU descriptor must not recreate its image from freed storage. The slot keeps this state even
-        // after its released image was evicted; registering the descriptor again makes it current. While its own
-        // entry still holds the texture (stale_kept), the slot samples that image as it is.
+        // A finalized CPU descriptor can reconstruct its own retained provider without consulting freed storage.
+        const int kept_owner = cpu_slot && s->finalized && slot_finalized_owner(s, own);
+        if (!e && !any && kept_owner && own->material && !own->pub.image)
+            content_require_resident(own);
         if (!e && any) e = any;
         else if (!e && !cpu_slot) e = own && own->superseded ? NULL : own;   // a superseded one: entry_of takes it back
-        else if (!e && cpu_slot && s->finalized && stale_kept(own)) e = own, n_stale_kept++;
+        else if (!e && kept_owner && stale_kept(own)) e = own, n_stale_kept++;
         else if (!e && cpu_slot && s->finalized) stale = 1, n_stale++, n_stale_hm += terrain_heightmap(&s->t);
     }
     resolve_stale = stale;
+    // A stale same-key owner cannot enter legacy alias-copy revival during ordered capture.
+    if (!e && private_output && !stale) e = nvn_hm_get(&by_key, &k);
     if (!e && s->t.mem && !stale) {
         // evicted by disuse: the pool refresh keeps the stand-in, without spending the creation budget on it
         if (pool_ctx && holds.n && nvn_hm_get(&holds, &k)) resolve_held = 1;
-        else if (create_budget < 0) e = entry_of(&s->t);
+        else if (create_budget < 0) e = entry_of_mode(&s->t, private_output, installed_generation);
         // Unmapped storage first: such a slot has nothing to make, now or later. Asked after the budget, every stale
         // slot a refresh met with the budget at 0 was noted as left: in a busy frame (its creation time spent) that
         // was about a thousand slots at once, which vk_exec_draw.c pool_sync_entries took for an area load, several
@@ -4898,7 +12688,7 @@ static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view) {
         else if (!slot_storage_readable(s)) e = NULL;
         else if (!create_budget && !(s->cwant && want_take())) create_deferred = 1;
         else {
-            e = entry_of(&s->t);
+            e = entry_of_mode(&s->t, private_output, installed_generation);
             if (create_budget > 0) create_budget--;
         }
         if (e) s->cwant = 0;
@@ -4914,26 +12704,1919 @@ static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view) {
     return e;
 }
 
+// Ordinary bindings use the source's own authority revision, not every unrelated writer in the scene. The memory
+// observation still refreshes once per submit, and a newly overlapping producer or crossed write boundary refuses.
+static int source_binding_ordered(const Tex *e) {
+    TextureSourceAuthority content = rc_registry_source_access_content(source_access_anchor(e));
+    return !e->source_blocked && (content.ordered.handle.id || content.legacy.handle.id);
+}
+static TextureBindingProof source_binding_proof(Tex *e, RcRegistryPosition position, int kind) {
+    TextureBindingProof key = {.position = position, .kind = (uint8_t)kind, .image = e->pub.image,
+        .wgen = e->wgen, .writes = e->wt_n, .authority = rc_registry_ordered_epoch(rc_registry_runtime()),
+        .mapping = mem_mapping_serial(), .protection = mem_protection_serial()};
+    if (kind == 1 || kind == 3) {
+        RcRegistryReadObservation permission = source_latest_read(e);
+        const RcRegistryReadObservation *o = &permission;
+        key.handle = o->handle; key.range = o->range; key.revision = o->revision;
+        key.content_revision = o->content_revision; key.guard = o->guard; key.scope = o->scope;
+        key.origin = o->position; key.edge = o->next_write; key.stamp = e->source_stamp;
+        key.sealed_through = o->sealed_through;
+        key.topology_revision = o->topology_revision;
+    } else {
+        const RcRegistryBindingObservation *o = &e->compatibility_receipt.observation;
+        key.handle = o->handle; key.range = o->range; key.revision = o->revision;
+        key.guard = o->guard; key.scope = o->scope; key.origin = o->position; key.edge = o->next_read;
+        key.stamp.mapping = e->compatibility_mapping; key.stamp.protection = e->compatibility_protection;
+        key.provenance = o->provenance; key.writer_kinds = o->writer_kinds;
+        key.representation = o->image_binding;
+        key.sealed_through = o->sealed_through;
+        key.topology_revision = o->topology_revision;
+        key.next_producer = o->next_producer;
+    }
+    return key;
+}
+static int source_binding_proof_same(const TextureBindingProof *a, const TextureBindingProof *b) {
+    return a->authority && a->kind == b->kind && a->authority == b->authority &&
+        a->mapping == b->mapping && a->protection == b->protection &&
+        a->position.scene == b->position.scene && a->position.ordinal == b->position.ordinal &&
+        a->origin.scene == b->origin.scene && a->origin.ordinal == b->origin.ordinal &&
+        a->handle.id == b->handle.id && a->handle.index == b->handle.index &&
+        a->range.backing == b->range.backing && a->range.offset == b->range.offset && a->range.size == b->range.size &&
+        a->revision == b->revision && a->content_revision == b->content_revision &&
+        a->topology_revision == b->topology_revision &&
+        a->guard == b->guard && a->scope == b->scope &&
+        a->edge.scene == b->edge.scene && a->edge.ordinal == b->edge.ordinal &&
+        a->sealed_through.scene == b->sealed_through.scene && a->sealed_through.ordinal == b->sealed_through.ordinal &&
+        a->next_producer.scene == b->next_producer.scene && a->next_producer.ordinal == b->next_producer.ordinal &&
+        source_stamp_equal(&a->stamp, &b->stamp) && a->image == b->image && a->wgen == b->wgen &&
+        a->writes == b->writes && a->provenance == b->provenance && a->writer_kinds == b->writer_kinds &&
+        a->representation.image == b->representation.image &&
+        a->representation.hold.id == b->representation.hold.id &&
+        a->representation.hold.index == b->representation.hold.index;
+}
+static int source_binding_proof_stable(const TextureBindingProof *key) {
+    return key->authority && key->authority == rc_registry_ordered_epoch(rc_registry_runtime()) &&
+        key->mapping == mem_mapping_serial() && key->protection == mem_protection_serial();
+}
+
+static RcRegistryResult source_binding_mapped_permission(Tex *e, RcRegistryPosition position) {
+    TextureSourceMapping *mapping = e->source_mapping;
+    if (!mapping || !mem_backing_read_hold(mapping->lease)) return RC_REGISTRY_STALE;
+    RcRegistryResult result = RC_REGISTRY_STALE;
+    if (mem_mapping_range_unchanged(e->pub.addr, e->t.L.size, e->source_stamp.mapping)) {
+        result = rc_registry_source_access_read_extents(rc_registry_runtime(), mapping->access, mapping->count,
+                                                       submit_epoch, position, &e->source_vector_read);
+        if (result == RC_REGISTRY_OK &&
+            !mem_protection_range_unchanged(e->pub.addr, e->t.L.size, e->source_stamp.protection))
+            result = RC_REGISTRY_STALE;
+    }
+    mem_read_release();
+    return result;
+}
+
+static int source_binding_mapped_current(Tex *e, RcRegistryPosition position, int needs_version,
+                                         const TextureBindingProof *before) {
+    int refresh = e->checked != submit_epoch;
+    uint64_t freshness_epoch = refresh ? rc_registry_authority_epoch(rc_registry_runtime()) : 0;
+    int fresh = !refresh || pool_deps_certificate(e);
+    if (fresh && needs_version) content_version(e, e->material);
+    RcRegistryResult result = source_binding_mapped_permission(e, position);
+    if (result != RC_REGISTRY_OK) {
+        ordinary_path.registry++;
+        source_note_refusal(e, SOURCE_REFUSAL_PERMISSION, result);
+        return 0;
+    }
+    if (!fresh || (needs_version && !e->material_version.id)) {
+        if (fresh) ordinary_path.material++;
+        else ordinary_path.unchecked++;
+        source_note_refusal(e, SOURCE_REFUSAL_PERMISSION, RC_REGISTRY_STALE);
+        return 0;
+    }
+    if (refresh) {
+        e->checked = submit_epoch;
+        e->checked_authority = freshness_epoch;
+    }
+    TextureBindingProof renewed = source_binding_proof(e, position, 1);
+    // An unrelated writer may advance the global epoch during the scoped read. Only reuse this memo
+    // under the epochs sampled before validation. A later consumer rechecks the actual ranges.
+    renewed.authority = before->authority;
+    renewed.mapping = before->mapping;
+    renewed.protection = before->protection;
+    e->binding_proof = renewed;
+    return 1;
+}
+
+static int source_binding_current(Tex *e) {
+    RcRegistryPosition position = vk_exec_resource_position();
+    if (!source_binding_ordered(e)) { ordinary_path.unordered++; return 0; }
+    if (!rc_registry_position_valid(position)) { ordinary_path.position++; return 0; }
+    if (!texture_source_stamp_valid(&e->source_stamp)) { ordinary_path.stamp++; return 0; }
+    if (!source_effects_read_allowed(e)) { ordinary_path.feedback++; return 0; }
+    if (e->material && (!e->material->ready || e->material->resident.image != e->pub.image ||
+        (rc_input_exact(&e->material->input) && e->material_version.id &&
+        !rc_input_equal(&e->material_version.input, &e->material->input)))) { ordinary_path.material++; return 0; }
+    int needs_version = e->material && rc_input_exact(&e->material->input) && !e->material_version.id;
+    TextureBindingProof key = source_binding_proof(e, position, 1);
+    if (!needs_version && e->checked == submit_epoch && key.scope == submit_epoch && source_binding_proof_same(&key, &e->binding_proof) &&
+        source_binding_proof_stable(&key)) return 1;
+    if (e->source_canonical) return source_binding_mapped_current(e, position, needs_version, &key);
+    if (!mem_mapping_range_unchanged(e->pub.addr, e->t.L.size, e->source_stamp.mapping)) { ordinary_path.mapping++; return 0; }
+    if (!mem_protection_range_unchanged(e->pub.addr, e->t.L.size, e->source_stamp.protection)) { ordinary_path.protection++; return 0; }
+    RcRegistryReadObservation prior = source_latest_read(e);
+    if (!source_permission_at(e, position, NULL)) {
+        if (prior.scope != submit_epoch) ordinary_path.scope++;
+        else if (rc_registry_position_compare(position, prior.position) < 0) ordinary_path.backwards++;
+        else ordinary_path.registry++;
+        return 0;
+    }
+    if (!source_binding_proof_stable(&key)) { ordinary_path.race++; return 0; }
+    // Carry the dependency owner's already-observed CPU freshness into this binding. Dirty, unobserved,
+    // remapped or untracked sources still require actual preparation; a new submit alone does not.
+    if (e->checked != submit_epoch) {
+        if (!pool_deps_certificate(e)) { ordinary_path.unchecked++; return 0; }
+        if (!source_binding_proof_stable(&key)) { ordinary_path.race++; return 0; }
+        e->checked = submit_epoch;
+        e->checked_authority = rc_registry_authority_epoch(rc_registry_runtime());
+    }
+    if (needs_version) {
+        // Positionless preparation may install exact owned bytes before an ordered consumer exists. Acquire
+        // that consumer's version from the already validated material instead of resolving/uploading it again.
+        content_version(e, e->material);
+        if (!e->material_version.id) { ordinary_path.material++; return 0; }
+    }
+    TextureBindingProof renewed = source_binding_proof(e, position, 1);
+    if (!source_binding_proof_stable(&key)) { ordinary_path.race++; return 0; }
+    e->binding_proof = renewed;
+    return 1;
+}
+
+static int source_binding_compat_receipt(Tex *e, RcRegistryPosition *next_read) {
+    compatibility_path.uses++;
+    const RcRegistryBindingObservation *o = &e->compatibility_receipt.observation;
+    if (!o->handle.id) { compatibility_path.use_empty++; return 0; }
+    RcRegistryPosition position = vk_exec_resource_position();
+    if (!rc_registry_position_valid(position)) { compatibility_path.use_position++; return 0; }
+    // The receipt's scope proves actual preparation in this submit. A notification-ring overflow may clear the
+    // unrelated legacy checked field; overlapping changes still invalidate the receipt's own registry revision.
+    if (!e->uploaded || e->up_retry || e->compatibility_image != e->pub.image ||
+        e->compatibility_wgen != e->wgen || e->compatibility_writes != e->wt_n) {
+        compatibility_path.use_identity++; return 0;
+    }
+    if (o->image_binding.image && (o->image_binding.image != (uint64_t)(uintptr_t)e->pub.image ||
+        o->image_binding.hold.id != e->image_authority.id ||
+        o->image_binding.hold.index != e->image_authority.index)) {
+        compatibility_path.use_identity++; return 0;
+    }
+    if (!vk_exec_effects_read_allowed(e->pub.addr, e->t.L.size)) { compatibility_path.use_feedback++; return 0; }
+    TextureBindingProof key = source_binding_proof(e, position, 2);
+    if (key.scope == submit_epoch && source_binding_proof_same(&key, &e->binding_proof) &&
+        source_binding_proof_stable(&key)) {
+        if (next_read) *next_read = o->next_read;
+        compatibility_path.use_ready++;
+        return 1;
+    }
+    if (!mem_mapping_range_unchanged(e->pub.addr, e->t.L.size, e->compatibility_mapping)) {
+        compatibility_path.use_mapping++; return 0;
+    }
+    if (!mem_protection_range_unchanged(e->pub.addr, e->t.L.size, e->compatibility_protection)) {
+        compatibility_path.use_protection++; return 0;
+    }
+    if (o->scope != submit_epoch) { compatibility_path.use_epoch++; return 0; }
+    if (position.scene != o->position.scene) { compatibility_path.use_scope++; return 0; }
+    if (rc_registry_position_compare(position, o->position) < 0) { compatibility_path.use_backwards++; return 0; }
+    RcRegistryPosition sealed = rc_registry_sealed_deadline(o->sealed_through);
+    int renew = rc_registry_position_valid(sealed) && rc_registry_position_compare(position, sealed) >= 0 &&
+        !rc_registry_position_compare(o->next_read, sealed);
+    if (!renew && rc_registry_position_valid(o->next_read) && rc_registry_position_compare(position, o->next_read) >= 0) {
+        compatibility_path.use_edge++; return 0;
+    }
+    RcRegistryBindingReceipt fresh;
+    RcRegistryResult result = renew ?
+        rc_registry_binding_renew(rc_registry_runtime(), &e->compatibility_receipt, submit_epoch, position, &fresh) :
+        rc_registry_binding_revalidate(rc_registry_runtime(), &e->compatibility_receipt, submit_epoch, position, &fresh);
+    if (result != RC_REGISTRY_OK) { compatibility_path.use_registry++; return 0; }
+    if (!source_binding_proof_stable(&key)) { compatibility_path.use_registry++; return 0; }
+    e->compatibility_receipt = fresh;
+    TextureBindingProof renewed = source_binding_proof(e, position, 2);
+    if (!source_binding_proof_stable(&key)) { compatibility_path.use_registry++; return 0; }
+    e->binding_proof = renewed;
+    if (next_read) *next_read = fresh.observation.next_read;
+    compatibility_path.use_ready++;
+    return 1;
+}
+
+static int source_binding_receipt(Tex *e, RcRegistryPosition *next_write) {
+    if (!source_binding_current(e)) { binding_path.ordinary_refused++; return 0; }
+    RcRegistryPosition edge = source_latest_read(e).next_write;
+    // An aggregate ends before the next producer's read phase, where writable view checks run.
+    if (rc_registry_position_valid(edge)) {
+        if (edge.ordinal <= 1) { binding_path.ordinary_refused++; return 0; }
+        edge.ordinal--;
+    }
+    RcRegistryPosition sealed = rc_registry_sealed_deadline(source_latest_read(e).sealed_through);
+    if (!rc_registry_position_valid(sealed)) { binding_path.ordinary_refused++; return 0; }
+    if (!rc_registry_position_valid(edge) || rc_registry_position_compare(sealed, edge) < 0) edge = sealed;
+    if (next_write) *next_write = edge;
+    binding_path.ordinary++;
+    return VK_TEXTURE_BINDING_SOURCE;
+}
+
+static Tex *texture_binding_entry(const TexSlot *slot, int native_slot) {
+    Tex *source = texture_registration_source(slot);
+    if (source) return source;
+    return slot->ce && slot->cgen == agen[sinfo[native_slot] & 0xffff] ? slot->ce : NULL;
+}
+
+static VkTextureSampleGeometryResult sample_general_current(const Tex *e, RcRegistryPosition read) {
+    if (!e->sample_general_revision) return VK_TEXTURE_SAMPLE_GEOMETRY_LAYOUT_UNOBSERVED;
+    if (e->sample_general_upload) {
+        uint64_t submitted;
+        vk_upload_progress(&submitted, NULL);
+        return e->sample_general_upload <= submitted ? VK_TEXTURE_SAMPLE_GEOMETRY_READY :
+            VK_TEXTURE_SAMPLE_GEOMETRY_LAYOUT_UNORDERED;
+    }
+    const RcRegistryPosition initialized = e->sample_general_inline;
+    if (!rc_registry_position_valid(initialized)) return VK_TEXTURE_SAMPLE_GEOMETRY_LAYOUT_UNOBSERVED;
+    if (rc_registry_position_compare(initialized, read) >= 0) return VK_TEXTURE_SAMPLE_GEOMETRY_LAYOUT_UNORDERED;
+    // Same-scene initialization precedes the original read. An earlier scene must have handed its
+    // final part to the graphics queue. A stopped recording never supplies a new geometry receipt.
+    return initialized.scene == read.scene ||
+           (initialized.scene <= vk_sync_issued() && initialized.scene <= vk_sync_handed_fence()) ?
+        VK_TEXTURE_SAMPLE_GEOMETRY_READY : VK_TEXTURE_SAMPLE_GEOMETRY_LAYOUT_UNORDERED;
+}
+
+static int sample_geometry_view(const tex_t *descriptor, const VkTexImage *image, const view_t *view,
+                                int has_view, VkImageSubresourceRange *planes) {
+    uint32_t level = 0, levels = image->levels;
+    if (has_view) {
+        if ((view->set_format && view->format != descriptor->d.format) ||
+            (view->set_target && view->target != NVN_TEXTURE_TARGET_2D) || view->set_dsmode ||
+            (view->set_layers && (view->min_layer || view->nlayers > 1))) return 0;
+        if (view->set_levels) {
+            level = view->base_level;
+            if (level >= levels) return 0;
+            levels -= level;
+            if (view->nlevels) {
+                if (view->nlevels > levels) return 0;
+                levels = view->nlevels;
+            }
+        }
+    }
+    *planes = (VkImageSubresourceRange){image->aspect, level, levels, 0, 1};
+    return 1;
+}
+
+static int sample_geometry_mapping(const Tex *e, RcInterval *mapping) {
+    uint32_t count;
+    const RcInterval *intervals = image_backing_intervals(e, &count);
+    if (!intervals || count != 1 || !intervals->mapping || !rc_range_valid(intervals->range) ||
+        intervals->address != e->pub.addr || intervals->range.size != e->t.L.size) return 0;
+    if (e->image_private_mapping_count) {
+        if (!image_alias_guest_mapping_current(e->pub.addr, e->t.L.size, intervals, count)) return 0;
+    } else if (!e->image_host_backing || !mem_backing_current(e->image_host_backing)) {
+        return 0;
+    }
+    *mapping = *intervals;
+    return 1;
+}
+
+VkTextureSampleGeometryResult vk_texture_sample_geometry_report_locked(int logical, VkTextureSample *out,
+    VkTextureSampleGeometry *geometry) {
+    *out = (VkTextureSample){.native_slot = -1};
+    *geometry = (VkTextureSampleGeometry){0};
+    const VkTextureRegistrationScope *scope = vk_exec_texture_registration_scope();
+    const RcRegistryPosition read = vk_exec_resource_position();
+    const uint64_t pool = vk_exec_texture_pool();
+    const uint64_t publication = vk_texture_registration_scope_publication(scope);
+    if (!rc_registry_position_valid(read) || (read.ordinal & 1) || vk_sync_stopping() ||
+        vk_device_is_lost() || vk_exec_recording_failed()) return VK_TEXTURE_SAMPLE_GEOMETRY_ORDER;
+    if (!scope || !pool || !publication) return VK_TEXTURE_SAMPLE_GEOMETRY_REGISTRATION;
+    const TextureRegistration *record;
+    int native;
+    if (texture_registration_resolve(logical, &record, &native) != VK_TEXTURE_REGISTRATION_CURRENT ||
+        native < 0 || native >= ntslots) return VK_TEXTURE_SAMPLE_GEOMETRY_REGISTRATION;
+    const TexSlot *slot = &tslots[native];
+    record = slot->registration;
+    if (!slot->used || slot->finalized || slot->pool_owner != pool || slot->logical_id != logical ||
+        !record || !record->handle.id || record->publication > publication) return VK_TEXTURE_SAMPLE_GEOMETRY_REGISTRATION;
+    const tex_t *descriptor = &record->descriptor;
+    const Tex *entry = texture_binding_entry(slot, native);
+    if (!entry || !descriptor->mem || !descriptor->serial || !descriptor->L.size ||
+        entry->t.serial != descriptor->serial || entry->t.L.size != descriptor->L.size ||
+        !entry->alloc || entry->bound_to || entry->image_device_count || entry->released || entry->retiring ||
+        entry->superseded || entry->overwritten || entry->pin_detached || entry->pending_write) return VK_TEXTURE_SAMPLE_GEOMETRY_PROVIDER;
+    const VkTexImage *image = &entry->pub;
+    const TexVkFormat *format = &entry->f;
+    if (!image->image || image->gone || image->bound) return VK_TEXTURE_SAMPLE_GEOMETRY_PROVIDER;
+    if (image->fb_learned || image->scale != 1 ||
+        image->skip || image->block_views || !(image->usage & VK_IMAGE_USAGE_SAMPLED_BIT) ||
+        descriptor->d.target != NVN_TEXTURE_TARGET_2D || descriptor->d.samples > 1 ||
+        image->type != VK_IMAGE_TYPE_2D || image->view_type != VK_IMAGE_VIEW_TYPE_2D ||
+        image->samples != 1 || image->depth != 1 || image->layers != 1 || descriptor->L.layers != 1 ||
+        !image->levels || image->levels > 32 || image->levels != (uint32_t)descriptor->d.levels ||
+        !image->width || !image->height || image->width != (uint32_t)descriptor->d.width ||
+        image->height != (uint32_t)descriptor->d.height || image->addr != (uintptr_t)descriptor->mem ||
+        image->format != format->vk || format->vk != format->ideal || format->stencil ||
+        format->expand_rgb || format->astc_bw || format->astc_bc ||
+        (format->depth ? (descriptor->d.format != NVN_FORMAT_DEPTH32F || image->format != VK_FORMAT_D32_SFLOAT ||
+                          image->aspect != VK_IMAGE_ASPECT_DEPTH_BIT) : image->aspect != VK_IMAGE_ASPECT_COLOR_BIT))
+        return VK_TEXTURE_SAMPLE_GEOMETRY_SHAPE;
+    TexKey key;
+    make_key(descriptor, &key);
+    if (memcmp(&entry->key, &key, sizeof key)) return VK_TEXTURE_SAMPLE_GEOMETRY_PROVIDER;
+    view_t view = slot->cview;
+    int has_view = slot->chas_view;
+    if (texture_registration_source(slot)) slot_result_view(slot, entry, &view, &has_view);
+    VkImageSubresourceRange planes, registered;
+    RcInterval mapping;
+    if (!sample_geometry_view(descriptor, image, &record->view, record->has_view, &registered) ||
+        !sample_geometry_view(descriptor, image, &view, has_view, &planes) ||
+        planes.baseMipLevel != registered.baseMipLevel || planes.levelCount != registered.levelCount)
+        return VK_TEXTURE_SAMPLE_GEOMETRY_VIEW;
+    if (!sample_geometry_mapping(entry, &mapping)) return VK_TEXTURE_SAMPLE_GEOMETRY_MAPPING;
+    const VkTextureSampleGeometryResult layout = sample_general_current(entry, read);
+    if (layout != VK_TEXTURE_SAMPLE_GEOMETRY_READY) return layout;
+    *out = (VkTextureSample){.image = image, .view = view, .has_view = has_view,
+        .registration = record->handle.id, .native_slot = native};
+    *geometry = (VkTextureSampleGeometry){.scope = scope, .read = read, .pool = pool, .publication = publication,
+        .registration = record->handle.id, .material = entry->t.serial, .layout_revision = entry->sample_general_revision,
+        .image = image->image, .allocation = entry->alloc, .mapping = mapping, .planes = planes,
+        .extent = {umax(image->width >> planes.baseMipLevel, 1), umax(image->height >> planes.baseMipLevel, 1)},
+        .format = image->format, .native_slot = native};
+    return VK_TEXTURE_SAMPLE_GEOMETRY_READY;
+}
+
+static VkTextureSampleGeometryResult sample_registered_geometry_mapping(const tex_t *descriptor, RcInterval *mapping) {
+    const uint64_t address = (uintptr_t)descriptor->mem, bytes = descriptor->L.size;
+    RcInterval *device = NULL;
+    MemBackingCapture *host = NULL;
+    const RcInterval *intervals;
+    uint32_t count;
+    if (nvn_gpu_only(address)) {
+        VkMemSpan span;
+        if (!vk_mem_lookup(address, bytes, &span) || span.cls != VK_MCLS_DEVICE)
+            return VK_TEXTURE_SAMPLE_GEOMETRY_MAPPING;
+        count = vk_mem_device_intervals(&span, address, bytes, &device);
+        intervals = device;
+    } else {
+        const uint64_t mapping_serial = mem_mapping_serial(), protection = mem_protection_serial();
+        MemBackingCapturePlan plan;
+        const RcBackingResult result = mem_backing_capture_plan(address, bytes, &plan);
+        if (result == RC_BACKING_ABSENT && mem_mapping_range_unchanged(address, bytes, mapping_serial) &&
+            mem_protection_range_unchanged(address, bytes, protection)) return VK_TEXTURE_SAMPLE_GEOMETRY_UNBACKED;
+        if (result != RC_BACKING_OK || plan.count != 1 ||
+            mem_backing_capture_bounded(&plan, &host) != RC_BACKING_OK) return VK_TEXTURE_SAMPLE_GEOMETRY_MAPPING;
+        intervals = mem_backing_intervals(host, &count);
+    }
+    const int exact = count == 1 && intervals && intervals->address == address && intervals->mapping &&
+        intervals->range.size == bytes && rc_range_valid(intervals->range) && (!host || mem_backing_current(host));
+    if (exact) *mapping = *intervals;
+    free(device);
+    mem_backing_release(&host);
+    return exact ? VK_TEXTURE_SAMPLE_GEOMETRY_READY : VK_TEXTURE_SAMPLE_GEOMETRY_MAPPING;
+}
+
+static int sample_geometry_exact_format(const nvn_texdesc *descriptor, const TexVkFormat *format) {
+    return format->vk == format->ideal && !format->expand_rgb && !format->astc_bw && !format->astc_bc &&
+        !format->stencil && vk_format_shader_numeric_type(format->vk) == GFX_TYPE_FLOAT &&
+        (!format->depth || (descriptor->format == NVN_FORMAT_DEPTH32F && format->vk == VK_FORMAT_D32_SFLOAT));
+}
+
+static int sample_geometry_effective_equal(const VkTexImage *a, const VkImageSubresourceRange *a_view,
+    const VkTexImage *b, const VkImageSubresourceRange *b_view) {
+    return a->format == b->format && a->aspect == b->aspect && a->type == b->type &&
+        a->view_type == b->view_type && a->samples == b->samples && a->layers == b->layers && a->depth == b->depth &&
+        !memcmp(a_view, b_view, sizeof *a_view) &&
+        umax(a->width >> a_view->baseMipLevel, 1) == umax(b->width >> b_view->baseMipLevel, 1) &&
+        umax(a->height >> a_view->baseMipLevel, 1) == umax(b->height >> b_view->baseMipLevel, 1);
+}
+
+static int sample_geometry_native_shape(const VkTexImage *image, const nvn_texdesc *descriptor,
+    const TexVkFormat *format) {
+    return image->image && !image->gone && !image->skip && !image->block_views &&
+        (image->usage & VK_IMAGE_USAGE_SAMPLED_BIT) && image->type == VK_IMAGE_TYPE_2D &&
+        image->view_type == VK_IMAGE_VIEW_TYPE_2D && image->depth == 1 && image->layers == 1 &&
+        image->samples == 1 && image->width && image->height && image->levels && image->levels <= 32 &&
+        image->format == format->vk && image->aspect == aspect_of(format) &&
+        sample_geometry_exact_format(descriptor, format);
+}
+
+static int sample_association_view_locked(const TexSlot *slot, const Tex *entry, int cached,
+    VkImageSubresourceRange *planes) {
+    const VkTexImage *image = &entry->pub;
+    if (entry->released || entry->retiring || entry->superseded || entry->overwritten || entry->pin_detached ||
+        entry->pending_write || !sample_geometry_native_shape(image, &entry->t.d, &entry->f)) return 0;
+    view_t view = slot->cview;
+    int has_view = slot->chas_view;
+    if (!cached || texture_registration_source(slot)) slot_result_view(slot, entry, &view, &has_view);
+    return sample_geometry_view(&entry->t, image, &view, has_view, planes);
+}
+
+static int sample_association_agrees(const TexSlot *slot, const Tex *entry, int cached,
+    const VkTexImage *shape, const VkImageSubresourceRange *planes) {
+    if (!entry) return 1;
+    VkImageSubresourceRange view;
+    return sample_association_view_locked(slot, entry, cached, &view) &&
+        sample_geometry_effective_equal(shape, planes, &entry->pub, &view);
+}
+
+static int sample_registered_geometry_candidates(const TexSlot *slot, int native, const tex_t *descriptor,
+    const VkTexImage *shape, const VkImageSubresourceRange *planes, int allow_agreement) {
+    const Tex *cached = texture_binding_entry(slot, native);
+    TexKey key;
+    make_key(descriptor, &key);
+    const Tex *own = nvn_hm_get(&by_key, &key);
+    if ((cached && (!allow_agreement || !sample_association_agrees(slot, cached, 1, shape, planes))) ||
+        (own && own != cached && (!allow_agreement || !sample_association_agrees(slot, own, 0, shape, planes)))) return 0;
+    const int cpu = tex_mirrored(descriptor);
+    for (const Tex *peer = nvn_hm_get(&by_addr, &key.addr); peer; peer = peer->next_at) {
+        if (peer == cached || peer == own || peer->released || peer->key.d.target != key.d.target) continue;
+        const int gpu_possible = peer->pub.gpu_owned && (!peer->pub.mirrored || peer->gpu_dirty);
+        if ((same_but_swizzle(&peer->key, &key) || ((!cpu || gpu_possible) && follow_size_matches(peer, &key))) &&
+            (!allow_agreement || !sample_association_agrees(slot, peer, 0, shape, planes))) return 0;
+    }
+    return 1;
+}
+
+static int sample_association_mapping(const Tex *entry, const RcInterval *registered, RcInterval *mapping) {
+    if (entry->bound_to) {
+        if (entry->image_device_count != 1 || !entry->image_device_intervals ||
+            !vk_mem_image_alias_current(entry->pub.image, entry->pub.addr, entry->image_device_size, entry->bound_to,
+                                        entry->image_device_intervals, entry->image_device_count) ||
+            sample_registered_geometry_mapping(&entry->t, mapping) != VK_TEXTURE_SAMPLE_GEOMETRY_READY)
+            return 0;
+        const RcInterval *owned = entry->image_device_intervals;
+        if (owned->address != mapping->address || owned->mapping != mapping->mapping ||
+            owned->range.backing != mapping->range.backing || owned->range.offset != mapping->range.offset ||
+            owned->range.size < mapping->range.size) return 0;
+    } else if (!entry->alloc || !sample_geometry_mapping(entry, mapping)) {
+        return 0;
+    }
+    return mapping->address == registered->address && mapping->mapping == registered->mapping &&
+        mapping->range.backing == registered->range.backing && mapping->range.offset == registered->range.offset;
+}
+
+static VkTextureSampleGeometryResult sample_registered_geometry_locked(int logical, const VkTextureSample *selected,
+    int allow_agreement, VkTextureSample *out, VkTextureSampleGeometry *geometry) {
+    *out = (VkTextureSample){.native_slot = -1};
+    *geometry = (VkTextureSampleGeometry){0};
+    const VkTextureRegistrationScope *scope = vk_exec_texture_registration_scope();
+    const RcRegistryPosition read = vk_exec_resource_position();
+    const uint64_t pool = vk_exec_texture_pool();
+    const uint64_t publication = vk_texture_registration_scope_publication(scope);
+    if (!rc_registry_position_valid(read) || (read.ordinal & 1) || vk_sync_stopping() || vk_device_is_lost() ||
+        vk_exec_recording_failed() || !rc_registry_position_open(rc_registry_runtime(), read))
+        return VK_TEXTURE_SAMPLE_GEOMETRY_ORDER;
+    if (!scope || !pool || !publication) return VK_TEXTURE_SAMPLE_GEOMETRY_REGISTRATION;
+    const TextureRegistration *record;
+    int native;
+    const int registration_status = texture_registration_resolve(logical, &record, &native);
+    if (registration_status == VK_TEXTURE_REGISTRATION_GONE) return VK_TEXTURE_SAMPLE_GEOMETRY_GONE;
+    if (registration_status != VK_TEXTURE_REGISTRATION_CURRENT || native < 0 || native >= ntslots)
+        return VK_TEXTURE_SAMPLE_GEOMETRY_REGISTRATION;
+    const TexSlot *slot = &tslots[native];
+    record = slot->registration;
+    if (!slot->used || slot->finalized || slot->pool_owner != pool || slot->logical_id != logical ||
+        !record || !record->handle.id || record->publication > publication) return VK_TEXTURE_SAMPLE_GEOMETRY_REGISTRATION;
+    const tex_t *descriptor = &record->descriptor;
+    const nvn_texdesc *d = &descriptor->d;
+    if (!descriptor->mem || !descriptor->serial || !descriptor->L.size || d->target != NVN_TEXTURE_TARGET_2D ||
+        d->width <= 0 || d->height <= 0 || d->depth != 1 || d->levels <= 0 || d->samples > 1 ||
+        descriptor->L.layers != 1) return VK_TEXTURE_SAMPLE_GEOMETRY_SHAPE;
+    VkTexImage shape;
+    VkImageSubresourceRange planes;
+    const Tex *entry = NULL;
+    if (selected) {
+        entry = texture_binding_entry(slot, native);
+        if (!entry || !selected->image || selected->image->image != entry->pub.image || selected->historical ||
+            selected->registration != record->handle.id || selected->native_slot != native ||
+            !vk_texture_binding_receipt_locked(native, entry->pub.image, NULL)) return VK_TEXTURE_SAMPLE_GEOMETRY_PROVIDER;
+        VkImageSubresourceRange supplied, registered;
+        if (!sample_association_view_locked(slot, entry, 1, &planes) ||
+            !sample_geometry_view(&entry->t, selected->image, &selected->view, selected->has_view, &supplied) ||
+            !sample_geometry_view(&entry->t, &entry->pub, &record->view, record->has_view, &registered) ||
+            !sample_geometry_effective_equal(&entry->pub, &planes, selected->image, &supplied) ||
+            memcmp(&planes, &registered, sizeof planes)) return VK_TEXTURE_SAMPLE_GEOMETRY_VIEW;
+        shape = entry->pub;
+    } else {
+        const uint32_t max_levels = 32u - (uint32_t)__builtin_clz(umax(d->width, d->height));
+        int block_width, block_height;
+        TexVkFormat format;
+        if ((uint32_t)d->levels > max_levels || nvn_fmt_bpb(d->format, &block_width, &block_height) <= 0 ||
+            block_width != 1 || block_height != 1 || !tex_vk_format(d->format, &format) ||
+            !sample_geometry_exact_format(d, &format) || shader_metadata_cold(descriptor, &shape) != 1)
+            return VK_TEXTURE_SAMPLE_GEOMETRY_SHAPE;
+        shape.aspect = aspect_of(&format);
+        if (!sample_geometry_view(descriptor, &shape, &record->view, record->has_view, &planes))
+            return VK_TEXTURE_SAMPLE_GEOMETRY_VIEW;
+        if (!sample_registered_geometry_candidates(slot, native, descriptor, &shape, &planes, allow_agreement))
+            return VK_TEXTURE_SAMPLE_GEOMETRY_ALTERNATE;
+    }
+    RcInterval mapping;
+    const VkTextureSampleGeometryResult mapped = sample_registered_geometry_mapping(descriptor, &mapping);
+    if (mapped != VK_TEXTURE_SAMPLE_GEOMETRY_READY) return mapped;
+    if (entry) {
+        RcInterval actual;
+        if (!sample_association_mapping(entry, &mapping, &actual)) return VK_TEXTURE_SAMPLE_GEOMETRY_MAPPING;
+        mapping = actual;
+    }
+    *out = (VkTextureSample){.image = entry ? &entry->pub : NULL,
+        .registration = record->handle.id, .native_slot = native, .has_view = 1,
+        .view = {.set_levels = 1, .base_level = planes.baseMipLevel, .nlevels = planes.levelCount,
+                 .set_layers = 1, .min_layer = 0, .nlayers = 1}};
+    *geometry = (VkTextureSampleGeometry){.scope = scope, .read = read, .pool = pool, .publication = publication,
+        .registration = record->handle.id, .material = entry ? entry->t.serial : descriptor->serial,
+        .image = shape.image, .allocation = entry ? (entry->bound_to ? entry->bound_to : entry->alloc) : NULL,
+        .mapping = mapping, .planes = planes,
+        .extent = {umax(shape.width >> planes.baseMipLevel, 1), umax(shape.height >> planes.baseMipLevel, 1)},
+        .format = shape.format, .native_slot = native, .registration_only = !allow_agreement, .association_only = allow_agreement};
+    return VK_TEXTURE_SAMPLE_GEOMETRY_READY;
+}
+
+VkTextureSampleGeometryResult vk_texture_sample_registered_geometry_locked(int logical, VkTextureSample *out,
+    VkTextureSampleGeometry *geometry) {
+    return sample_registered_geometry_locked(logical, NULL, 0, out, geometry);
+}
+
+VkTextureSampleGeometryResult vk_texture_sample_associated_geometry_locked(int logical, const VkTextureSample *selected,
+    VkTextureSample *out, VkTextureSampleGeometry *geometry) {
+    return sample_registered_geometry_locked(logical, selected, 1, out, geometry);
+}
+
+VkTextureSampleGeometryResult vk_texture_sample_historical_geometry_locked(int logical, VkTextureSample *out,
+    VkTextureSampleGeometry *geometry) {
+    *out = (VkTextureSample){.native_slot = -1};
+    *geometry = (VkTextureSampleGeometry){0};
+    const VkTextureRegistrationScope *scope = vk_exec_texture_registration_scope();
+    const RcRegistryPosition read = vk_exec_resource_position();
+    const uint64_t pool = vk_exec_texture_pool();
+    const uint64_t publication = vk_texture_registration_scope_publication(scope);
+    if (!rc_registry_position_valid(read) || (read.ordinal & 1) || vk_sync_stopping() || vk_device_is_lost() ||
+        vk_exec_recording_failed() || !rc_registry_position_open(rc_registry_runtime(), read))
+        return VK_TEXTURE_SAMPLE_GEOMETRY_ORDER;
+    if (!scope || !scope->horizon.id || !pool || !publication) return VK_TEXTURE_SAMPLE_GEOMETRY_REGISTRATION;
+    const TextureRegistration *record;
+    const int status = texture_registration_resolve(logical, &record, NULL);
+    if (status == VK_TEXTURE_REGISTRATION_GONE) return VK_TEXTURE_SAMPLE_GEOMETRY_GONE;
+    if (status != VK_TEXTURE_REGISTRATION_EXACT || !record || !record->handle.id || record->publication > publication)
+        return VK_TEXTURE_SAMPLE_GEOMETRY_REGISTRATION;
+    const RcRegistryCapture *held = &record->retained_record;
+    if (!held->id || held->record.handle.id != record->handle.id || held->record.handle.index != record->handle.index ||
+        held->record.interpretation != (uintptr_t)record || !record->exact_instance)
+        return VK_TEXTURE_SAMPLE_GEOMETRY_GONE;
+    const tex_t *descriptor = &record->descriptor;
+    const VkTexImage *shape = &record->exact;
+    TexVkFormat format;
+    if (descriptor->d.target != NVN_TEXTURE_TARGET_2D || !tex_vk_format(descriptor->d.format, &format) ||
+        !sample_geometry_native_shape(shape, &descriptor->d, &format)) return VK_TEXTURE_SAMPLE_GEOMETRY_SHAPE;
+    VkImageSubresourceRange planes;
+    if (!sample_geometry_view(descriptor, shape, &record->exact_view, record->has_exact_view, &planes))
+        return VK_TEXTURE_SAMPLE_GEOMETRY_VIEW;
+    *out = (VkTextureSample){.registration = record->handle.id, .native_slot = -1, .historical = VK_TEXTURE_REGISTRATION_EXACT,
+        .has_view = 1, .view = {.set_levels = 1, .base_level = planes.baseMipLevel, .nlevels = planes.levelCount,
+                               .set_layers = 1, .min_layer = 0, .nlayers = 1}};
+    *geometry = (VkTextureSampleGeometry){.scope = scope, .read = read, .history_scope = scope->horizon,
+        .history_capture = held->id, .pool = pool, .publication = publication, .registration = record->handle.id,
+        .material = record->exact_instance, .planes = planes,
+        .extent = {umax(shape->width >> planes.baseMipLevel, 1), umax(shape->height >> planes.baseMipLevel, 1)},
+        .format = shape->format, .native_slot = -1};
+    return VK_TEXTURE_SAMPLE_GEOMETRY_READY;
+}
+
+int vk_texture_sample_geometry_locked(int logical, VkTextureSample *out, VkTextureSampleGeometry *geometry) {
+    return vk_texture_sample_geometry_report_locked(logical, out, geometry) == VK_TEXTURE_SAMPLE_GEOMETRY_READY;
+}
+
+const char *vk_texture_sample_geometry_status_name(VkTextureSampleGeometryResult result) {
+    switch (result) {
+    case VK_TEXTURE_SAMPLE_GEOMETRY_READY: return "ready";
+    case VK_TEXTURE_SAMPLE_GEOMETRY_ORDER: return "read-order";
+    case VK_TEXTURE_SAMPLE_GEOMETRY_REGISTRATION: return "registration";
+    case VK_TEXTURE_SAMPLE_GEOMETRY_PROVIDER: return "provider";
+    case VK_TEXTURE_SAMPLE_GEOMETRY_SHAPE: return "shape";
+    case VK_TEXTURE_SAMPLE_GEOMETRY_VIEW: return "view";
+    case VK_TEXTURE_SAMPLE_GEOMETRY_MAPPING: return "mapping";
+    case VK_TEXTURE_SAMPLE_GEOMETRY_LAYOUT_UNOBSERVED: return "layout-init-unobserved";
+    case VK_TEXTURE_SAMPLE_GEOMETRY_LAYOUT_UNORDERED: return "layout-init-unordered";
+    case VK_TEXTURE_SAMPLE_GEOMETRY_GONE: return "registration-gone";
+    case VK_TEXTURE_SAMPLE_GEOMETRY_UNBACKED: return "registered-storage-hole";
+    case VK_TEXTURE_SAMPLE_GEOMETRY_ALTERNATE: return "registered-alternate-image";
+    }
+    return "unknown";
+}
+
+int vk_texture_sample_geometry_current_locked(int logical, const VkTextureSample *captured, const VkTexImage *exact,
+    const VkTextureSampleGeometry *geometry, const RcInterval **ranges, uint32_t *count) {
+    if (ranges) *ranges = NULL;
+    if (count) *count = 0;
+    if (!captured || !exact || !geometry || geometry->registration_only || geometry->association_only ||
+        geometry->history_capture || !geometry->image ||
+        geometry->scope != vk_exec_texture_registration_scope() || geometry->pool != vk_exec_texture_pool() ||
+        rc_registry_position_compare(geometry->read, vk_exec_resource_position())) return 0;
+    VkTextureSample sample;
+    VkTextureSampleGeometry current;
+    if (!vk_texture_sample_geometry_locked(logical, &sample, &current) ||
+        current.publication != geometry->publication || current.registration != geometry->registration ||
+        current.material != geometry->material || current.layout_revision != geometry->layout_revision ||
+        current.image != geometry->image || current.allocation != geometry->allocation || current.format != geometry->format ||
+        current.native_slot != geometry->native_slot || current.mapping.address != geometry->mapping.address ||
+        current.mapping.mapping != geometry->mapping.mapping ||
+        !rc_range_equal(current.mapping.range, geometry->mapping.range) ||
+        memcmp(&current.planes, &geometry->planes, sizeof current.planes) ||
+        current.extent.width != geometry->extent.width || current.extent.height != geometry->extent.height ||
+        sample.registration != captured->registration || sample.native_slot != captured->native_slot ||
+        sample.has_view != captured->has_view || (sample.has_view && memcmp(&sample.view, &captured->view, sizeof sample.view)) ||
+        sample.image->image != exact->image || sample.image->format != exact->format ||
+        sample.image->width != exact->width || sample.image->height != exact->height ||
+        sample.image->levels != exact->levels || sample.image->layers != exact->layers ||
+        sample.image->type != exact->type || sample.image->view_type != exact->view_type || sample.image->aspect != exact->aspect ||
+        sample.image->samples != exact->samples || sample.image->depth != exact->depth) return 0;
+    if (ranges) *ranges = &geometry->mapping;
+    if (count) *count = 1;
+    return 1;
+}
+
+struct VkTextureQueryImage {
+    VkTextureSample original;
+    VkTextureSampleGeometry geometry;
+    VkTexImage source;
+    VkDevice device;
+    VmaAllocator allocator;
+    VmaAllocation allocation;
+    VkImage image;
+    VkImageView view;
+    VkCommandBuffer cb;
+    RcBudgetTicket metadata;
+    uint32_t refs;
+    int logical;
+};
+
+static void query_image_drop(void *opaque) {
+    VkTextureQueryImage *query = opaque;
+    if (__atomic_sub_fetch(&query->refs, 1, __ATOMIC_ACQ_REL)) return;
+    vkDestroyImageView(query->device, query->view, NULL);
+    resource_core_vma_destroy_image(query->allocator, query->image, query->allocation);
+    RcBudgetTicket metadata = query->metadata;
+    vk_replay_metadata_free(query, &metadata);
+}
+
+static void query_image_cancel(void *opaque, int may_have_executed) {
+    (void)may_have_executed; // The completion queue disposes handed work only after native retirement or drain.
+    query_image_drop(opaque);
+}
+
+static int query_image_private_memory(VmaAllocator allocator, VmaAllocation allocation, VmaAllocation source) {
+    if (!allocation || allocation == source) return 0;
+    VmaAllocationInfo2 placed;
+    vmaGetAllocationInfo2(allocator, allocation, &placed);
+    const VmaAllocationInfo *owned = &placed.allocationInfo;
+    // The whole native block belongs to this image. The allocation is never exported, shared or rebound.
+    if (!placed.dedicatedMemory || !owned->deviceMemory || !owned->size || owned->offset ||
+        owned->size != placed.blockSize) return 0;
+    if (!source) return 1;
+    VmaAllocationInfo peer;
+    vmaGetAllocationInfo(allocator, source, &peer);
+    return peer.deviceMemory && peer.deviceMemory != owned->deviceMemory && peer.size && peer.offset <= UINT64_MAX - peer.size;
+}
+
+static int query_image_geometry_current_locked(int logical, const VkTextureSample *original,
+    const VkTextureSampleGeometry *geometry) {
+    if (!original || !geometry || !rc_registry_position_open(rc_registry_runtime(), geometry->read)) return 0;
+    const int history = geometry->history_capture != 0;
+    if (!geometry->registration_only && !geometry->association_only && !history)
+        return vk_texture_sample_geometry_current_locked(logical, original, original->image, geometry, NULL, NULL);
+    const int native_association = geometry->image != VK_NULL_HANDLE;
+    if ((geometry->registration_only && (geometry->association_only || native_association)) ||
+        (history && (geometry->registration_only || geometry->association_only || native_association)) ||
+        native_association != (original->image != NULL) || native_association != (geometry->allocation != NULL) ||
+        original->historical != (history ? VK_TEXTURE_REGISTRATION_EXACT : VK_TEXTURE_REGISTRATION_CURRENT) ||
+        original->canonical || original->projected || geometry->layout_revision) return 0;
+    VkTextureSample sample;
+    VkTextureSampleGeometry current;
+    VkTextureSampleGeometryResult result;
+    if (history) {
+        result = vk_texture_sample_historical_geometry_locked(logical, &sample, &current);
+    } else if (geometry->association_only) {
+        result = vk_texture_sample_associated_geometry_locked(logical, native_association ? original : NULL, &sample, &current);
+    } else {
+        result = vk_texture_sample_registered_geometry_locked(logical, &sample, &current);
+    }
+    return result == VK_TEXTURE_SAMPLE_GEOMETRY_READY &&
+        current.scope == geometry->scope && !rc_registry_position_compare(current.read, geometry->read) &&
+        current.pool == geometry->pool && current.publication == geometry->publication &&
+        current.registration == geometry->registration && current.material == geometry->material &&
+        current.history_scope.id == geometry->history_scope.id && current.history_scope.index == geometry->history_scope.index &&
+        current.history_capture == geometry->history_capture &&
+        current.native_slot == geometry->native_slot && current.format == geometry->format &&
+        current.image == geometry->image && current.allocation == geometry->allocation &&
+        current.mapping.address == geometry->mapping.address && current.mapping.mapping == geometry->mapping.mapping &&
+        rc_range_equal(current.mapping.range, geometry->mapping.range) &&
+        !memcmp(&current.planes, &geometry->planes, sizeof current.planes) &&
+        current.extent.width == geometry->extent.width && current.extent.height == geometry->extent.height &&
+        sample.registration == original->registration && sample.native_slot == original->native_slot &&
+        sample.has_view == original->has_view && !memcmp(&sample.view, &original->view, sizeof sample.view);
+}
+
+VkResult vk_texture_query_image_create_locked(int logical, const VkTextureSample *original,
+    const VkTextureSampleGeometry *geometry, VkTextureQueryImage **out) {
+    VkCtx *ctx = vk_ctx();
+    if (!out || *out || !ctx || !query_image_geometry_current_locked(logical, original, geometry))
+        return VK_ERROR_INITIALIZATION_FAILED;
+    const VkTexImage *source = original->image;
+    if (vk_format_shader_numeric_type(geometry->format) != GFX_TYPE_FLOAT ||
+        !(features_of(geometry->format) & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    const VkImageCreateInfo image = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = VK_IMAGE_TYPE_2D, .format = geometry->format,
+        .extent = {geometry->extent.width, geometry->extent.height, 1},
+        .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_SAMPLED_BIT, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+    VkImageFormatProperties limits;
+    VkResult result = vkGetPhysicalDeviceImageFormatProperties(ctx->phys, image.format, image.imageType,
+        image.tiling, image.usage, image.flags, &limits);
+    if (result != VK_SUCCESS) return result;
+    if (!(limits.sampleCounts & image.samples) || !limits.maxMipLevels || !limits.maxArrayLayers ||
+        limits.maxExtent.width < image.extent.width || limits.maxExtent.height < image.extent.height ||
+        !limits.maxExtent.depth) return VK_ERROR_FORMAT_NOT_SUPPORTED;
+
+    RcBudgetTicket metadata = {0};
+    const RcVmaRequest request = {.producer = RC_BUDGET_TEXTURE, .host_bytes = sizeof(VkTextureQueryImage),
+        .host_ticket = &metadata};
+    const VmaAllocationCreateInfo placement = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        .flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT};
+    VkImage native = VK_NULL_HANDLE;
+    VmaAllocation allocation = NULL;
+    result = resource_core_vma_create_image(&request, ctx->vma, &image, &placement, &native, &allocation, NULL, NULL);
+    if (result != VK_SUCCESS) {
+        vk_device_lost_check(result, "allocating a private query image");
+        return result;
+    }
+    VkImageView view = VK_NULL_HANDLE;
+    VkTextureQueryImage *query = NULL;
+    if (native == geometry->image || !query_image_private_memory(ctx->vma, allocation, geometry->allocation)) {
+        result = VK_ERROR_FEATURE_NOT_PRESENT;
+    } else {
+        const VkImageViewCreateInfo create = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .image = native, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = image.format,
+            .subresourceRange = {geometry->planes.aspectMask, 0, 1, 0, 1}};
+        result = vkCreateImageView(ctx->device, &create, NULL, &view);
+        if (result == VK_SUCCESS && !(query = malloc(sizeof *query))) result = VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    if (result != VK_SUCCESS) {
+        if (view) vkDestroyImageView(ctx->device, view, NULL);
+        resource_core_vma_destroy_image(ctx->vma, native, allocation);
+        if (resource_core_budget_cancel(&metadata) != RC_ADMISSION_OK)
+            rt_fatal("vk: private query image metadata cancellation failed");
+        vk_device_lost_check(result, "creating a private query image view");
+        return result;
+    }
+    const RcAdmissionVector cost = {.amount = {[RC_BUDGET_RAM] = sizeof *query, [RC_BUDGET_COMMIT] = sizeof *query}};
+    if (!rc_admission_accounted(resource_core_budget_materialize(&metadata, &cost)))
+        rt_fatal("vk: private query image metadata settlement failed");
+    *query = (VkTextureQueryImage){.original = *original, .geometry = *geometry,
+        .device = ctx->device, .allocator = ctx->vma, .allocation = allocation, .image = native, .view = view,
+        .metadata = metadata, .refs = 1, .logical = logical};
+    if (source) {
+        query->source = *source;
+        query->original.image = &query->source;
+    }
+    *out = query;
+    return VK_SUCCESS;
+}
+
+int vk_texture_query_image_current_locked(const VkTextureQueryImage *query) {
+    return query && query_image_geometry_current_locked(query->logical, &query->original, &query->geometry);
+}
+
+static int query_image_recorder_current(const VkExec *ex, const VkTextureQueryImage *query) {
+    return query && ex && ex->cb && ex->fence == query->geometry.read.scene &&
+        vk_exec_recording_fence() == ex->fence && !vk_sync_stopping() && !vk_device_is_lost() &&
+        !vk_exec_recording_failed() && !rc_registry_position_compare(vk_exec_resource_position(), query->geometry.read);
+}
+
+VkImageView vk_texture_query_image_view(const VkExec *ex, const VkTextureQueryImage *query, VkImage *native_image) {
+    if (native_image) *native_image = VK_NULL_HANDLE;
+    if (!query_image_recorder_current(ex, query) || query->cb != ex->cb) return VK_NULL_HANDLE;
+    if (native_image) *native_image = query->image;
+    return query->view;
+}
+
+int vk_texture_query_image_record_locked(VkExec *ex, VkTextureQueryImage *query) {
+    if (!query_image_recorder_current(ex, query) || ex->in_pass || !vk_texture_query_image_current_locked(query)) return 0;
+    if (query->cb) return query->cb == ex->cb;
+
+    const VkImageMemoryBarrier2 transition = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+        .srcStageMask = VK_PIPELINE_STAGE_2_NONE, .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        .dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = VK_IMAGE_LAYOUT_GENERAL, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = query->image,
+        .subresourceRange = {query->geometry.planes.aspectMask, 0, 1, 0, 1}};
+    const VkDependencyInfo dependency = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &transition};
+    __atomic_add_fetch(&query->refs, 1, __ATOMIC_RELAXED);
+    vk_completion_add_owned(ex->fence, query_image_drop, query_image_cancel, query);
+    vkCmdPipelineBarrier2(ex->cb, &dependency);
+    query->cb = ex->cb;
+    return 1;
+}
+
+void vk_texture_query_image_release(VkTextureQueryImage **owned) {
+    if (!owned || !*owned) return;
+    VkTextureQueryImage *query = *owned;
+    *owned = NULL;
+    query_image_drop(query);
+}
+
+int vk_texture_binding_receipt_locked(int id, VkImage expected, RcRegistryPosition *next_write) {
+    binding_path.calls++;
+    if (next_write) *next_write = (RcRegistryPosition){0};
+    if (id < 0 || id >= ntslots || !tslots[id].used) {
+        if (expected == VK_NULL_HANDLE) { binding_path.absent++; return 1; }
+        binding_path.invalid_slot++; return 0;
+    }
+    const TexSlot *s = &tslots[id];
+    // A retained raw image is insufficient identity: aliases may share it while their current sources differ.
+    Tex *e = texture_binding_entry(s, id);
+    if (!e) { binding_path.stale_slot++; return 0; }
+    if (expected && expected != e->pub.image && !e->pub.gone) {
+        RcRegistryPosition position = vk_exec_resource_position();
+        for (const TextureFlat3D *copy = e->flat3d; copy; copy = copy->next) {
+            if (copy->image.image != expected || !flat3d_current(e, copy, position, 0)) continue;
+            view_t view = s->cview;
+            int has_view = s->chas_view;
+            if (texture_registration_source(s)) slot_result_view(s, e, &view, &has_view);
+            uint32_t layer = has_view && view.set_layers ? view.min_layer : 0;
+            if (copy->layer != layer) continue;
+            int ordered = e->pub.gpu_owned || e->content_revision || e->material_writable || !from_storage(e);
+            if (ordered && position.ordinal == UINT64_MAX) { binding_path.not_ready++; return 0; }
+            RcRegistryPosition edge = {0};
+            // The underlying source receipt records this query's single outcome.
+            binding_path.calls--;
+            int proof = vk_texture_binding_receipt_locked(id, e->pub.image, &edge);
+            if (!proof) return 0;
+            if (ordered) {
+                RcRegistryPosition operation_end = {position.scene, position.ordinal + 1};
+                if (!edge.scene || rc_registry_position_compare(operation_end, edge) < 0) edge = operation_end;
+            }
+            if (next_write) *next_write = edge;
+            return VK_TEXTURE_BINDING_SOURCE | (proof & VK_TEXTURE_BINDING_LEGACY);
+        }
+    }
+    if (!expected || e->pub.image != expected || e->pub.gone) { binding_path.image_mismatch++; return 0; }
+    if (s->finalized && e->released) { // Exact captured contents do not require a current guest source.
+        binding_path.finalized++; return 1;
+    }
+    if (e->retiring || e->up_retry || !preserve_pool_contents_current(e)) {
+        binding_path.not_ready++;
+        return 0;
+    }
+    int direct = !from_storage(e) || e->pub.gpu_owned;
+    // slot_resolve may retain a released GPU-only slot's own image. The current bucket generation proves this
+    // association was selected after release; a CPU slot still requires its finalized exact-content path above.
+    if (e->released && (tex_mirrored(&s->t) || e->superseded || !direct)) {
+        binding_path.not_ready++; return 0;
+    }
+    // Direct/bound and GPU-authored images have no guest-to-image upload to certify. Their contents follow the
+    // existing GPU command/barrier path; requiring a CPU-source receipt here would retry a nonexistent operation.
+    if (direct) { binding_path.direct_gpu++; return 1; }
+    if (!e->uploaded) { binding_path.not_ready++; return 0; }
+    if (source_binding_ordered(e)) return source_binding_receipt(e, next_write);
+    if (e->source_canonical) return 0;
+    if (source_binding_compat_receipt(e, next_write)) { binding_path.compatibility++; return VK_TEXTURE_BINDING_SOURCE; }
+    // Failed/unsupported interval preparation retains only its exact operation, never an unchecked epoch-wide hit.
+    RcRegistryPosition now = vk_exec_resource_position();
+    uint64_t authority = rc_registry_authority_epoch(rc_registry_runtime());
+    if (e->checked != submit_epoch || !authority || e->checked_authority != authority ||
+        !rc_registry_position_valid(now) || rc_registry_position_compare(now, e->compatibility_position)) {
+        binding_path.compatibility_refused++; return 0;
+    }
+    if (next_write && rc_registry_position_valid(now))
+        *next_write = (RcRegistryPosition){now.scene, now.ordinal + 1};
+    binding_path.same_operation++;
+    return VK_TEXTURE_BINDING_SOURCE | VK_TEXTURE_BINDING_LEGACY;
+}
+int vk_texture_binding_current_locked(int id, VkImage expected) {
+    return vk_texture_binding_receipt_locked(id, expected, NULL) != 0;
+}
+
+static const TexSlot *texture_read_key_slot(VkTextureReadKey key) {
+    if (!key.registration || key.native_slot < 0 || key.native_slot >= ntslots) return NULL;
+    const TexSlot *slot = &tslots[key.native_slot];
+    return slot->used && !slot->finalized && slot->pool_owner == vk_exec_texture_pool() && slot->registration &&
+        slot->registration->handle.id == key.registration &&
+        slot->registration->publication <= vk_texture_registration_publication() ? slot : NULL;
+}
+
+static Tex *image_alias_sample_entry_locked(const TexSlot *slot, int native);
+static int image_alias_sample_entry_stale(const Tex *entry, const TextureRegistration *record);
+
+static int texture_projected_color_current(const Tex *entry, const RcInterval *demand, uint32_t count,
+    RcRegistryPosition read) {
+    return demand && (rc_registry_native_image_covers(rc_registry_runtime(), (uint64_t)(uintptr_t)entry->pub.image,
+        demand, count, read) || image_alias_resident_current(entry, demand, count, read));
+}
+
+static int texture_projected_single_plane_current(Tex *entry, const TextureRegistration *record,
+    const view_t *view, int has_view, RcRegistryPosition read) {
+    const tex_t *descriptor = &record->descriptor;
+    const VkTexImage *image = &entry->pub;
+    const int array = descriptor->d.target == NVN_TEXTURE_TARGET_2D_ARRAY;
+    const view_t *registered = &record->view;
+    if ((!array && descriptor->d.target != NVN_TEXTURE_TARGET_2D) ||
+        image->view_type != (array ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D) ||
+        descriptor->d.samples > 1 || image->levels != (uint32_t)descriptor->d.levels ||
+        image->layers != descriptor->L.layers || image->format != entry->f.vk ||
+        !record->has_view || !has_view || !registered->set_levels || registered->nlevels != 1 ||
+        !registered->set_layers || registered->nlayers != 1 || registered->set_dsmode ||
+        (registered->set_format && registered->format != descriptor->d.format) ||
+        (registered->set_target && registered->target != descriptor->d.target) ||
+        !view->set_levels || view->nlevels != 1 || view->base_level != registered->base_level ||
+        !view->set_layers || view->nlayers != 1 || view->min_layer != registered->min_layer ||
+        view->set_dsmode || (view->set_format && view->format != descriptor->d.format) ||
+        (view->set_target && view->target != descriptor->d.target)) return 0;
+    const VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, view->base_level, 1, view->min_layer, 1};
+    uint32_t count;
+    const RcInterval *demand = image_alias_plane_demand(entry, &range, &count);
+    return texture_projected_color_current(entry, demand, count, read);
+}
+
+static const Tex *texture_projected_sample_report_locked(const TexSlot *slot, int native, VkImage expected,
+    VkTextureSample *sample, RcRegistryPosition *next_read, const char **depth_gate) {
+    const TextureRegistration *record = slot->registration;
+    if (!record || slot->finalized) return NULL;
+    const int report_depth = depth_gate && alias_depth_format(record->descriptor.d.format) != VK_FORMAT_UNDEFINED;
+    if (report_depth) *depth_gate = "depth-material";
+    Tex *entry = image_alias_sample_entry_locked(slot, native);
+    if (!entry || (expected && entry->pub.image != expected) || !entry->pub.gpu_owned ||
+        image_alias_sample_entry_stale(entry, record) || !(entry->pub.usage & VK_IMAGE_USAGE_SAMPLED_BIT)) return NULL;
+    const tex_t *descriptor = &record->descriptor;
+    const VkTexImage *image = &entry->pub;
+    const int depth = image->aspect == VK_IMAGE_ASPECT_DEPTH_BIT;
+    if (report_depth) *depth_gate = "depth-native-shape";
+    if ((!depth && (image->aspect != VK_IMAGE_ASPECT_COLOR_BIT || !image_alias_source_current(entry))) ||
+        image->type != VK_IMAGE_TYPE_2D || image->depth != 1 || image->samples != 1 || image->skip ||
+        image->width != (uint32_t)descriptor->d.width || image->height != (uint32_t)descriptor->d.height) return NULL;
+    TexKey receiver;
+    make_key(descriptor, &receiver);
+    if (!same_but_swizzle(&receiver, &entry->key) || entry->t.L.size != descriptor->L.size) return NULL;
+    view_t view;
+    int has_view;
+    slot_result_view(slot, entry, &view, &has_view);
+    const RcRegistryPosition read = vk_exec_resource_position();
+    if (report_depth) *depth_gate = "depth-original-read";
+    if (!rc_registry_position_valid(read) || read.ordinal == UINT64_MAX) return NULL;
+    if (report_depth) *depth_gate = "depth-sampled-view";
+    if (image->levels == 1 && image->layers == 1) {
+        if (descriptor->d.target != NVN_TEXTURE_TARGET_2D || image->view_type != VK_IMAGE_VIEW_TYPE_2D ||
+            (has_view && ((view.set_format && view.format != descriptor->d.format) ||
+             (view.set_target && view.target != descriptor->d.target) ||
+             (view.set_levels && (view.base_level || view.nlevels > 1)) ||
+             (view.set_layers && (view.min_layer || view.nlayers > 1)) ||
+             (view.set_dsmode && (!depth || view.dsmode != NVN_TEXTURE_DEPTH_STENCIL_MODE_DEPTH))))) return NULL;
+        if (depth) {
+            const VkFormat format = alias_depth_format(descriptor->d.format);
+            const VkImageSubresourceRange plane = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+            if (format == VK_FORMAT_UNDEFINED || image->format != format || image->scale > 1 ||
+                descriptor->d.levels != 1 || descriptor->L.layers != 1 || descriptor->d.samples > 1 ||
+                (record->has_view && record->view.set_dsmode &&
+                    record->view.dsmode != NVN_TEXTURE_DEPTH_STENCIL_MODE_DEPTH)) return NULL;
+            if (!image_alias_load_current(entry, &plane, read)) {
+                if (report_depth) *depth_gate = entry->bound_to ? "depth-bound-plane" :
+                    image_alias_source_current(entry) ? "depth-private-plane" : "depth-native-placement";
+                return NULL;
+            }
+        } else if (!texture_projected_color_current(entry, entry->alias_full_demand, entry->alias_full_count, read)) {
+            return NULL;
+        }
+    } else if (depth || !texture_projected_single_plane_current(entry, record, &view, has_view, read)) {
+        return NULL;
+    }
+    if (report_depth) *depth_gate = NULL;
+    if (sample) *sample = (VkTextureSample){.image = image, .view = view, .has_view = has_view,
+        .registration = record->handle.id, .native_slot = native, .projected = 1};
+    if (next_read) *next_read = (RcRegistryPosition){read.scene, read.ordinal + 1};
+    return entry;
+}
+
+static const Tex *texture_projected_sample_locked(const TexSlot *slot, int native, VkImage expected,
+    VkTextureSample *sample, RcRegistryPosition *next_read) {
+    return texture_projected_sample_report_locked(slot, native, expected, sample, next_read, NULL);
+}
+
+static void pool_mapping_source(const Tex *);
+
+int vk_texture_projected_sample_receipt_locked(VkTextureReadKey key, VkImage expected, VkTextureSample *sample) {
+    const TexSlot *slot = key.projected ? texture_read_key_slot(key) : NULL;
+    const Tex *entry = slot && expected ?
+        texture_projected_sample_locked(slot, key.native_slot, expected, sample, NULL) : NULL;
+    if (entry) pool_mapping_source(entry);
+    return entry != NULL;
+}
+
+static Tex *texture_read_key_source(const TexSlot *slot, VkImage expected) {
+    Tex *e = texture_registration_source(slot);
+    if (!e || !expected || e->pub.image != expected || !source_private_sample(e) || !e->source_canonical ||
+        e->t.serial != slot->registration->descriptor.serial || e->released || e->retiring ||
+        e->up_retry || !e->uploaded) return NULL;
+    return e;
+}
+
+static int texture_read_derived_current(const TexSlot *slot, const Tex *source, VkImage expected) {
+    if (!expected || !source->flat3d) return 0;
+    view_t view;
+    int has_view;
+    slot_result_view(slot, source, &view, &has_view);
+    uint32_t layer = has_view && view.set_layers ? view.min_layer : 0;
+    RcRegistryPosition position = vk_exec_resource_position();
+    for (const TextureFlat3D *copy = source->flat3d; copy; copy = copy->next)
+        if (copy->material && copy->image.image == expected && copy->layer == layer)
+            return flat3d_current(source, copy, position, 1);
+    return 0;
+}
+
+int vk_texture_flat3d_selected_current_locked(VkTextureReadKey key, VkImage child) {
+    const TexSlot *slot = key.canonical ? texture_read_key_slot(key) : NULL;
+    Tex *source = slot ? texture_registration_source(slot) : NULL;
+    return source && texture_read_key_source(slot, source->pub.image) && texture_read_derived_current(slot, source, child);
+}
+
+static Tex *texture_read_key_image(const TexSlot *slot, VkImage expected) {
+    Tex *source = texture_registration_source(slot);
+    return source && texture_read_key_source(slot, source->pub.image) &&
+        (source->pub.image == expected || texture_read_derived_current(slot, source, expected)) ? source : NULL;
+}
+
+const RcInterval *vk_texture_selected_sample_intervals_locked(VkTextureReadKey key, VkImage expected,
+    uint32_t *count) {
+    *count = 0;
+    const TexSlot *slot = texture_read_key_slot(key);
+    if (!slot || !expected) return NULL;
+    if (key.projected) {
+        const Tex *entry = texture_projected_sample_locked(slot, key.native_slot, expected, NULL, NULL);
+        return entry ? image_backing_intervals(entry, count) : NULL;
+    }
+    const Tex *entry = key.canonical ? texture_read_key_image(slot, expected) : texture_binding_entry(slot, key.native_slot);
+    if (!entry || entry->t.serial != slot->registration->descriptor.serial ||
+        (!key.canonical && entry->pub.image != expected)) return NULL;
+    const TextureSourceMapping *source = entry->source_mapping;
+    if (source && mem_backing_current(source->lease) && source_mapping_domain_current(entry))
+        return mem_backing_intervals(source->lease, count);
+    if (image_alias_source_current(entry) || (entry->image_host_backing && mem_backing_current(entry->image_host_backing)))
+        return image_backing_intervals(entry, count);
+    if (entry->image_device_count && image_alias_guest_mapping_current(entry->pub.addr, entry->t.L.size,
+            entry->image_device_intervals, entry->image_device_count))
+        return image_backing_intervals(entry, count);
+    return NULL;
+}
+
+static int texture_image_placement(VmaAllocation allocation, VkImageMemoryPlacement *placement) {
+    if (!allocation) return 0;
+    VmaAllocationInfo info;
+    vmaGetAllocationInfo(vk_ctx()->vma, allocation, &info);
+    if (!info.deviceMemory || !info.size || info.size > UINT64_MAX - info.offset) return 0;
+    *placement = (VkImageMemoryPlacement){info.deviceMemory, info.offset, info.size};
+    return 1;
+}
+
+const RcInterval *vk_texture_native_sample_intervals_locked(RcRegistryPosition read,
+    const VkTextureSample *original, const VkTexturePresentSource *hold, VkImage expected,
+    VkImageMemoryPlacement *placement, uint32_t *count) {
+    *count = 0;
+    *placement = (VkImageMemoryPlacement){0};
+    if (!original || !hold || !expected || original->historical || original->native_slot < 0 ||
+        original->native_slot >= ntslots || rc_registry_position_compare(read, vk_exec_resource_position()) ||
+        !vk_texture_transfer_read_current(hold, expected)) return NULL;
+    const int native = original->native_slot;
+    const TexSlot *slot = &tslots[native];
+    if (!slot->used || slot->finalized || slot->pool_owner != vk_exec_texture_pool() ||
+        (original->registration && (!slot->registration || slot->registration->handle.id != original->registration)))
+        return NULL;
+    // The caller validated the original binding token/key before entering this adapter. Read
+    // only that cached physical image and view. An unkeyed GPU receipt stays unkeyed.
+    const Tex *entry = texture_binding_entry(slot, native);
+    if (!entry || entry->pub.image != expected || entry->pub.gone) return NULL;
+    view_t view;
+    int has_view;
+    slot_result_view(slot, entry, &view, &has_view);
+    if (has_view != original->has_view || (has_view && memcmp(&view, &original->view, offsetof(view_t, pad1))))
+        return NULL;
+    if (entry->bound_to) {
+        if (!vk_mem_image_alias_current(expected, entry->pub.addr, entry->image_device_size, entry->bound_to,
+                entry->image_device_intervals, entry->image_device_count) ||
+            !vk_mem_image_hold_placement(hold->raw, expected, placement) || placement->size != entry->image_device_size)
+            return NULL;
+        *count = entry->image_device_count;
+        return entry->image_device_intervals;
+    }
+    if (!texture_image_placement(entry->alloc, placement)) return NULL;
+    // A private GPU image can own logical guest bytes without supporting a raw-image projection.
+    if (image_alias_placement_current(entry)) {
+        *count = entry->image_private_mapping_count;
+        return entry->image_private_mapping;
+    }
+    if (entry->image_device_count || entry->image_private_mapping_count ||
+        !mem_backing_current(entry->image_host_backing)) return NULL;
+    return mem_backing_intervals(entry->image_host_backing, count);
+}
+
+static int texture_read_key_compatibility(const TexSlot *slot, int native_slot) {
+    const Tex *e = texture_binding_entry(slot, native_slot);
+    return e && e->t.serial == slot->registration->descriptor.serial;
+}
+
+static const char *retained_texture_sample_range_gate(const VkTexturePresentSource *source) {
+    if (!mem_backing_current(source->sample_mapping)) return "host-backing";
+    if (!mem_mapping_range_unchanged(source->sample_address, source->sample_size, source->sample_mapping_stamp))
+        return "host-remapped";
+    if (!mem_protection_range_unchanged(source->sample_address, source->sample_size, source->sample_protection_stamp))
+        return "host-protection";
+    RcRegistry *registry = rc_registry_runtime();
+    if (rc_registry_read_range_at(registry,
+            (RcSourceRange){RC_GUEST_COMPATIBILITY_BACKING, source->sample_address, source->sample_size},
+            source->sample_read) != RC_REGISTRY_OK) return "compatibility-range";
+    uint32_t count;
+    const RcInterval *parts = mem_backing_intervals(source->sample_mapping, &count);
+    if (!count) return "normalized-empty";
+    for (uint32_t i = 0; i < count; i++)
+        if (rc_registry_read_range_at(registry, parts[i].range, source->sample_read) != RC_REGISTRY_OK)
+            return "normalized-range";
+    return NULL;
+}
+
+void vk_texture_retain_compat_sample_locked(VkTexturePresentSource *source, VkTextureReadKey key, VkImage image) {
+    if (!source || source->upload) return;
+    source->sample_upload_gate = "owner-class";
+    if (!source->raw || source->pin || key.canonical || key.projected || !image) return;
+    source->sample_upload_gate = "original-slot";
+    const TexSlot *slot = texture_read_key_slot(key);
+    Tex *entry = slot ? texture_binding_entry(slot, key.native_slot) : NULL;
+    if (!entry || entry->t.serial != slot->registration->descriptor.serial || entry->pub.image != image) return;
+    source->sample_upload_gate = "private-upload-class";
+    if (!source_private_sample(entry) || entry->source_canonical || entry->pub.skip || entry->pub.samples != 1 ||
+        entry->pub.type != VK_IMAGE_TYPE_2D || !entry->pub.levels || entry->pub.levels > MATERIAL_LEVELS ||
+        entry->pub.aspect != VK_IMAGE_ASPECT_COLOR_BIT || !entry->alloc ||
+        (entry->t.pool_flags & (NVN_MEMORY_POOL_FLAGS_PHYSICAL | NVN_MEMORY_POOL_FLAGS_VIRTUAL))) return;
+    source->sample_upload_gate = "upload-unobserved";
+    if (!entry->uploaded || entry->up_retry || !entry->sample_upload_sequence) return;
+    source->sample_upload_gate = "image-host-backing";
+    if (!mem_backing_current(entry->image_host_backing)) return;
+    source->sample_upload_gate = "original-read";
+    RcRegistryPosition read = vk_exec_resource_position();
+    if (!rc_registry_position_valid(read) || (read.ordinal & 1)) return;
+    // Called only after this actual compatibility image passed its original resolved binding proof.
+    // Separately capture the real host backing and the ordered range for this one read, not a raw pointer.
+    source->sample_read = read;
+    source->sample_address = entry->pub.addr;
+    source->sample_size = entry->t.L.size;
+    source->sample_mapping_stamp = mem_mapping_serial();
+    source->sample_protection_stamp = mem_protection_serial();
+    if (mem_backing_capture(source->sample_address, source->sample_size, &source->sample_mapping) != RC_BACKING_OK) {
+        source->sample_upload_gate = "host-capture";
+        return;
+    }
+    source->sample_upload_gate = retained_texture_sample_range_gate(source);
+    if (source->sample_upload_gate) {
+        mem_backing_release(&source->sample_mapping);
+        return;
+    }
+    RetainedTextureUpload *upload = entry->retained_sample_upload;
+    if (!upload) {
+        upload = malloc(sizeof *upload);
+        if (!upload) {
+            source->sample_upload_gate = "proof-capacity";
+            mem_backing_release(&source->sample_mapping);
+            return;
+        }
+        *upload = (RetainedTextureUpload){.entry = entry, .image = image, .sequence = entry->sample_upload_sequence,
+            .revision = entry->content_revision, .uploads = entry->n_up};
+        entry->retained_sample_upload = upload;
+    }
+    if (upload->image != image || upload->sequence != entry->sample_upload_sequence ||
+        upload->revision != entry->content_revision || upload->uploads != entry->n_up) {
+        source->sample_upload_gate = "capture-generation";
+        mem_backing_release(&source->sample_mapping);
+        return;
+    }
+    if (++upload->references == 0) rt_fatal("vk: retained texture upload reference count exhausted");
+    source->upload = upload;
+    source->sample_pool = vk_exec_texture_pool();
+    source->sample_publication = vk_texture_registration_publication();
+    source->sample_registration = key.registration;
+    source->sample_wgen = entry->wgen;
+    source->sample_writes = entry->wt_n;
+}
+
+static const char *retained_compat_upload_issue_gate(const VkTexturePresentSource *source,
+    uint64_t registration, VkImage image, uint64_t *timeline, uint32_t *wgen) {
+    const RetainedTextureUpload *upload = source ? source->upload : NULL;
+    if (!upload) return source && source->sample_upload_gate ? source->sample_upload_gate : "certificate-unobserved";
+    if (!image || upload->image != image) return "sample-image";
+    if (registration != source->sample_registration || vk_exec_texture_pool() != source->sample_pool ||
+        vk_texture_registration_publication() != source->sample_publication) return "registration-scope";
+    if (rc_registry_position_compare(source->sample_read, vk_exec_resource_position())) return "original-read";
+    if (vk_sync_stopping() || vk_device_is_lost() || vk_exec_recording_failed()) return "recorder-stopped";
+    const Tex *entry = upload->entry;
+    // Only a bound descriptor can keep using a retired placement. Creating a new cached view
+    // after its image left the cache would outlive its exact view-retirement frontier.
+    if (!entry) return "detached-before-view";
+    if (entry->pub.image != image || !source_private_sample(entry)) return "source-owner";
+    if (entry->up_retry || !entry->uploaded || entry->sample_upload_sequence != upload->sequence ||
+        entry->content_revision != upload->revision || entry->n_up != upload->uploads ||
+        entry->wt_n != source->sample_writes) return "native-version";
+    // Outstanding upload batches are in the ordinary upload stream flushed before this graphics part.
+    // Reset/stop refuses the receipt, and actual mutation always splits a retained raw upload first.
+    const uint64_t dependency = vk_upload_dependency();
+    if (timeline) *timeline = dependency;
+    if (!upload->sequence || dependency < upload->sequence) return "upload-sequence";
+    const char *range = retained_texture_sample_range_gate(source);
+    if (range) return range;
+    uint32_t now = 0;
+    const int changed = vk_mem_changed(source->sample_address, source->sample_size, source->sample_wgen, &now);
+    if (wgen) *wgen = now;
+    return changed == TEX_SOURCE_CLEAN ? NULL : "host-write-generation";
+}
+
+int vk_texture_retained_compat_sample_current_locked(const VkTexturePresentSource *source,
+    uint64_t registration, VkImage image) {
+    return retained_compat_upload_issue_gate(source, registration, image, NULL, NULL) == NULL;
+}
+
+void vk_texture_report_retained_compat_sample_locked(const VkTexturePresentSource *source,
+    uint64_t registration, VkImage image) {
+    uint64_t timeline = 0;
+    uint32_t wgen = 0;
+    const char *gate = retained_compat_upload_issue_gate(source, registration, image, &timeline, &wgen);
+    const RetainedTextureUpload *upload = source ? source->upload : NULL;
+    const Tex *entry = upload ? upload->entry : NULL;
+    const RcRegistryPosition read = source ? source->sample_read : (RcRegistryPosition){0};
+    rt_log("vk: retained upload receipt gate=%s acquired=%d attached=%d read=%llu/%llu registration=%llu/%llu "
+           "source=%p current=%p guest=%#llx+%#llx sequence=%llu/%llu/%llu revision=%llu/%llu "
+           "upload-count=%u/%u wgen=%u/%u",
+           gate ? gate : "range-version-ready", upload != NULL, entry != NULL, (unsigned long long)read.scene,
+           (unsigned long long)read.ordinal, (unsigned long long)registration,
+           (unsigned long long)(source ? source->sample_registration : 0), (void *)image,
+           (void *)(entry ? entry->pub.image : VK_NULL_HANDLE),
+           (unsigned long long)(source ? source->sample_address : 0),
+           (unsigned long long)(source ? source->sample_size : 0),
+           (unsigned long long)(upload ? upload->sequence : 0),
+           (unsigned long long)(entry ? entry->sample_upload_sequence : 0), (unsigned long long)timeline,
+           (unsigned long long)(upload ? upload->revision : 0),
+           (unsigned long long)(entry ? entry->content_revision : 0),
+           upload ? upload->uploads : 0, entry ? entry->n_up : 0, source ? source->sample_wgen : 0, wgen);
+}
+
+int vk_texture_resolved_receipt_locked(VkTextureReadKey key, VkImage expected, RcRegistryPosition *next_write) {
+    const TexSlot *slot = texture_read_key_slot(key);
+    if (!slot) return 0;
+    if (key.projected)
+        return expected && texture_projected_sample_locked(slot, key.native_slot, expected, NULL, next_write) ?
+            VK_TEXTURE_BINDING_SOURCE : 0;
+    if (!key.canonical)
+        return texture_read_key_compatibility(slot, key.native_slot) ?
+            vk_texture_binding_receipt_locked(key.native_slot, expected, next_write) : 0;
+    Tex *e = texture_read_key_image(slot, expected);
+    if (!e) return 0;
+    binding_path.calls++;
+    if (next_write) *next_write = (RcRegistryPosition){0};
+    return source_binding_receipt(e, next_write);
+}
+
+static uint64_t texture_slot_registration(int native) {
+    const TextureRegistration *record = tslots[native].registration;
+    return record ? record->handle.id : 0;
+}
+
+int vk_texture_pool_note_selected_locked(const VkTextureSample *sample, uint32_t *ent, VkTextureReadKey *key) {
+    *ent = 0;
+    const int native = sample->native_slot;
+    if (sample->historical || !sample->image || !sample->image->image || native < 0 || native >= ntslots)
+        return 0;
+    const TexSlot *slot = &tslots[native];
+    const TextureRegistration *record = slot->registration;
+    if (!slot->used || slot->finalized || slot->pool_owner != vk_exec_texture_pool() ||
+        !record || record->publication > vk_texture_registration_publication() ||
+        (sample->registration && sample->registration != record->handle.id))
+        return 0;
+    Tex *entry = texture_registration_source(slot);
+    if (!entry || &entry->pub != sample->image)
+        entry = slot->cgen == agen[sinfo[native] & 0xffff] ? slot->ce : NULL;
+    if (!entry || &entry->pub != sample->image) return 0;
+
+    // The PRef is activity accounting. The indexed native descriptor must take its own physical hold.
+    content_use(entry);
+    *ent = pool_ref(entry);
+    if (pref[*ent - 1].refs) pool_list(entry);
+    key->registration = record->handle.id;
+    return 1;
+}
+
+static _Thread_local VkTexturePoolMappingProof *pool_mapping_proof;
+
+void vk_texture_pool_mapping_proof_locked(VkTexturePoolMappingProof *proof) {
+    pool_mapping_proof = proof;
+}
+
+static void pool_mapping_read(uint64_t address, uint64_t bytes, const MemBackingCapture *backing,
+                              int needs_readable) {
+    VkTexturePoolMappingProof *proof = pool_mapping_proof;
+    if (!proof || nvn_gpu_only(address)) return;
+    for (uint32_t i = 0; i < proof->count; i++) {
+        MemMappingReadRange *range = &proof->ranges[i];
+        if (range->address == address && range->bytes == bytes && range->backing == backing) {
+            range->needs_readable |= needs_readable;
+            return;
+        }
+    }
+    if (!address || !bytes || proof->count == proof->capacity) {
+        proof->incomplete = 1;
+        return;
+    }
+    proof->ranges[proof->count++] = (MemMappingReadRange){backing, address, bytes, needs_readable};
+}
+
+static void pool_mapping_source(const Tex *entry) {
+    if (!pool_mapping_proof) return;
+    if (from_storage(entry) && !entry->pub.gpu_owned) {
+        const MemBackingCapture *host = entry->source_canonical && entry->source_mapping ?
+            entry->source_mapping->lease : NULL;
+        pool_mapping_read(entry->pub.addr, entry->t.L.size, host, 1);
+    } else if (entry->image_host_backing) {
+        pool_mapping_read(entry->pub.addr, entry->t.L.size, entry->image_host_backing, 0);
+    }
+}
+
+// Installed bindless tables subscribe to schedule changes and bracket publication with the legacy topology
+// epoch. Their certificate may therefore end at the actual producer instead of every unrelated declaration
+// prefix. The inner source proof stays finite; other consumers must not use this certificate without that
+// subscription, the aggregate open-position gate, and independent native descriptor lifetime ownership.
+static int texture_binding_schedule(Tex *e, VkImage expected, RcRegistryPosition *next_read, int proof) {
+    if (!from_storage(e) || e->pub.gpu_owned) {
+        pool_mapping_source(e);
+        return proof; // A flat-3D physical copy keeps its operation boundary.
+    }
+    RcRegistryPosition position = vk_exec_resource_position();
+    int kind = source_binding_ordered(e) ? 3 : 4;
+    TextureBindingProof key = source_binding_proof(e, position, kind);
+    key.authority = rc_registry_authority_epoch(rc_registry_runtime());
+    RcRegistryPosition edge = {0};
+    if (key.authority && source_binding_proof_same(&key, &e->pool_binding_proof) &&
+        key.authority == rc_registry_authority_epoch(rc_registry_runtime()) &&
+        key.mapping == mem_mapping_serial() && key.protection == mem_protection_serial()) {
+        edge = e->pool_schedule_edge;
+    } else {
+        uint64_t epoch;
+        if (kind == 3) {
+            RcRegistryReadSchedule schedule;
+            TextureSourceMapping *mapped=e->source_mapping;
+            RcRegistryResult scheduled=mapped?rc_registry_source_access_schedule_extents(rc_registry_runtime(),
+                mapped->access,mapped->count,submit_epoch,position,&schedule):rc_registry_source_access_schedule(
+                    rc_registry_runtime(),&e->source_access,submit_epoch,position,&schedule);
+            if (scheduled!=RC_REGISTRY_OK) return 0;
+            // Schedule discovery is a consumer query; retain the independently anchored finite permission.
+            edge = schedule.next_read; epoch = schedule.epoch;
+        } else {
+            RcRegistryBindingSchedule schedule;
+            if (rc_registry_binding_schedule(rc_registry_runtime(), &e->compatibility_receipt,
+                submit_epoch, position, &schedule) != RC_REGISTRY_OK) return 0;
+            e->compatibility_receipt = schedule.receipt;
+            edge = schedule.next_read; epoch = schedule.epoch;
+        }
+        TextureBindingProof renewed = source_binding_proof(e, position, kind);
+        renewed.authority = epoch;
+        if (!epoch || key.authority != epoch || epoch != rc_registry_authority_epoch(rc_registry_runtime()) ||
+            key.mapping != mem_mapping_serial() || key.protection != mem_protection_serial()) return 0;
+        e->pool_binding_proof = renewed;
+        e->pool_schedule_edge = edge;
+    }
+    if (expected != e->pub.image && (e->content_revision || e->material_writable)) {
+        if (position.ordinal == UINT64_MAX) return 0;
+        RcRegistryPosition operation_end = {position.scene, position.ordinal + 1};
+        if (!edge.scene || rc_registry_position_compare(operation_end, edge) < 0) edge = operation_end;
+    }
+    pool_mapping_source(e);
+    if (next_read) *next_read = edge;
+    return proof;
+}
+
+int vk_texture_binding_schedule_locked(int id, VkImage expected, RcRegistryPosition *next_read) {
+    int proof = vk_texture_binding_receipt_locked(id, expected, next_read);
+    if (proof != VK_TEXTURE_BINDING_SOURCE) return proof;
+    return texture_binding_schedule(texture_binding_entry(&tslots[id], id), expected, next_read, proof);
+}
+
+int vk_texture_resolved_schedule_locked(VkTextureReadKey key, VkImage expected, RcRegistryPosition *next_read) {
+    const TexSlot *slot = texture_read_key_slot(key);
+    if (!slot) return 0;
+    if (key.projected)
+        return expected && texture_projected_sample_locked(slot, key.native_slot, expected, NULL, next_read) ?
+            VK_TEXTURE_BINDING_SOURCE : 0;
+    if (!key.canonical)
+        return texture_read_key_compatibility(slot, key.native_slot) ?
+            vk_texture_binding_schedule_locked(key.native_slot, expected, next_read) : 0;
+    Tex *e = texture_read_key_image(slot, expected);
+    if (!e) return 0;
+    binding_path.calls++;
+    if (!source_binding_receipt(e, next_read)) return 0;
+    return texture_binding_schedule(e, expected, next_read, VK_TEXTURE_BINDING_SOURCE);
+}
+
+static int source_binding_compat_current(Tex *e) {
+    if (e->source_canonical) return 0;
+    RcRegistryPosition position = vk_exec_resource_position();
+    if (source_binding_compat_receipt(e, NULL)) return 1;
+    uint64_t authority = rc_registry_authority_epoch(rc_registry_runtime());
+    return authority && e->checked_authority == authority &&
+        (!rc_registry_position_valid(position) ||
+         (rc_registry_position_valid(e->compatibility_position) &&
+          !rc_registry_position_compare(position, e->compatibility_position)));
+}
+
+int vk_texture_published_sample_schedule_locked(const TextureImagePublication *set_images, uint32_t descriptor,
+                                               VkTextureReadKey key, VkImage expected, RcRegistryPosition *next_read) {
+    if (next_read) *next_read = (RcRegistryPosition){0};
+    if (!key.canonical || !rc_registry_position_valid(vk_exec_resource_position())) return 0;
+    const TexSlot *slot = texture_read_key_slot(key);
+    if (!slot || slot->finalized) return 0;
+    Tex *e = texture_registration_source(slot);
+    if (!e || !e->material || e->released || e->retiring || e->superseded ||
+        e->t.serial != slot->registration->descriptor.serial || !e->source_canonical ||
+        !source_private_sample(e) || !source_effects_read_allowed(e)) return 0;
+    const TextureMaterialInstance *installed = texture_publication_image_locked(set_images, descriptor, expected);
+    TextureMaterial *material = e->material;
+    if (!installed || installed->material != material || !material->ready || material->retired ||
+        !material->provider || !rc_input_exact(&material->input)) return 0;
+    if (e->pub.image == expected) return vk_texture_resolved_schedule_locked(key, expected, next_read);
+
+    // The indexed descriptor retains its native image independently from its material's resident slot.
+    // Renew only the same immutable content when the live registration's exact bytes are still clean.
+    TextureSourceObservation observation;
+    if (source_observe(e, &e->source_stamp, &observation) != TEX_SOURCE_CLEAN) return 0;
+    source_commit(e, &observation.stamp, 1);
+    if (!texture_source_stamp_valid(&e->source_stamp) || !source_permission_current(e)) return 0;
+    return texture_binding_schedule(e, expected, next_read, VK_TEXTURE_BINDING_SOURCE);
+}
+
+int vk_texture_published_alias_schedule_locked(const TextureImagePublication *images, uint32_t descriptor,
+    int logical, VkTextureReadKey receiver, VkImage expected, const VkTexImage **source, view_t *view,
+    int *has_view, RcRegistryPosition *next_read) {
+    RcRegistryPosition read = vk_exec_resource_position();
+    if (receiver.canonical || !rc_registry_position_valid(read) || read.ordinal == UINT64_MAX) return 0;
+    const TexSlot *slot = texture_read_key_slot(receiver);
+    if (!slot) return 0;
+    const TextureRegistration *history, *record = slot->registration;
+    int native;
+    if (texture_registration_resolve(logical, &history, &native) != VK_TEXTURE_REGISTRATION_CURRENT ||
+        native != receiver.native_slot || !texture_registration_ordinary(&record->descriptor)) return 0;
+    Tex *entry = texture_binding_entry(slot, native);
+    if (!entry || entry != slot->ce || !expected || entry->pub.image != expected || entry->released ||
+        entry->retiring || entry->superseded || !entry->source_canonical || !source_private_sample(entry) ||
+        !entry->uploaded || entry->up_retry || !texture_registration_ordinary(&entry->t) ||
+        entry->t.serial == record->descriptor.serial || entry->t.L.size != record->descriptor.L.size) return 0;
+    TexKey receiver_key;
+    make_key(&record->descriptor, &receiver_key);
+    if (!same_but_swizzle(&receiver_key, &entry->key)) return 0;
+    const TextureMaterialInstance *installed = texture_publication_image_locked(images, descriptor, expected);
+    const TextureMaterial *material = entry->material;
+    if (!installed || !material || installed != material->resident.instance || installed->material != material ||
+        !material->ready || material->retired || !material->provider || !rc_input_exact(&material->input)) return 0;
+
+    RcRegistryPosition edge = {0};
+    if (vk_texture_binding_receipt_locked(native, expected, &edge) != VK_TEXTURE_BINDING_SOURCE) return 0;
+    // Receiver membership does not subscribe to the supplying entry's future topology. This receipt authorizes
+    // only the current read. The source proof above can still end earlier or refuse for an overlapping writer.
+    RcRegistryPosition until = {read.scene, read.ordinal + 1};
+    if (edge.scene && rc_registry_position_compare(edge, until) < 0) until = edge;
+    if (rc_registry_position_compare(read, until) >= 0) return 0;
+    slot_result_view(slot, entry, view, has_view);
+    pool_mapping_source(entry);
+    *source = &entry->pub;
+    *next_read = until;
+    return 1;
+}
+
+int vk_texture_pool_current_view_locked(const TextureImagePublication *set, uint32_t descriptor,
+    int logical, VkImage expected, VkTexImage *image, view_t *view, int *has_view) {
+    const TextureRegistration *history;
+    int native;
+    if (texture_registration_resolve(logical, &history, &native) != VK_TEXTURE_REGISTRATION_CURRENT || native < 0)
+        return 0;
+    const TexSlot *slot = &tslots[native];
+    const Tex *entry = texture_binding_entry(slot, native);
+    if (!slot->registration || slot->finalized || !entry || entry->pub.gone ||
+        entry->retiring || entry->overwritten || entry->pub.skip) return 0;
+    if (entry->pub.image != expected) {
+        // Exact detached material can remain owned by this physical descriptor. No other resident
+        // image, same-address replacement or different material may supply the requested view.
+        const TextureMaterialInstance *installed = texture_publication_image_locked(set, descriptor, expected);
+        const TextureMaterial *material = entry->material;
+        if (!installed || !material || installed->material != material || !material->ready || material->retired ||
+            !material->provider || !rc_input_exact(&material->input) || texture_registration_source(slot) != entry)
+            return 0;
+    }
+    *image = entry->pub;
+    image->image = expected;
+    slot_result_view(slot, entry, view, has_view);
+    return 1;
+}
+
+VkImage vk_texture_alias_probe_receiver_image(const tex_t *texture) {
+    TexKey key;
+    make_key(texture, &key);
+    lock();
+    const Tex *entry = nvn_hm_get(&by_key, &key);
+    VkImage image = entry && entry->t.serial == texture->serial ? entry->pub.image : VK_NULL_HANDLE;
+    unlock();
+    return image;
+}
+
+static Tex *image_alias_sample_entry_locked(const TexSlot *slot, int native) {
+    Tex *entry = texture_binding_entry(slot, native);
+    if (entry || !slot->registration) return entry;
+    // A newly seen registration can have an exact independently placed image before descriptor lookup
+    // cached the slot. Select that immutable registration's own descriptor and serial without mutating it.
+    const tex_t *descriptor = &slot->registration->descriptor;
+    TexKey key;
+    make_key(descriptor, &key);
+    entry = nvn_hm_get(&by_key, &key);
+    return entry && entry->t.serial == descriptor->serial ? entry : NULL;
+}
+
+static int image_alias_sample_depth_exact(const TextureRegistration *record, const TexVkFormat *format) {
+    const VkFormat depth = alias_depth_format(record->descriptor.d.format);
+    return format->depth && !format->stencil && depth != VK_FORMAT_UNDEFINED && format->vk == depth &&
+        (!record->has_view || !record->view.set_dsmode || record->view.dsmode == NVN_TEXTURE_DEPTH_STENCIL_MODE_DEPTH);
+}
+
+static const char *image_alias_sample_recipe(const TextureRegistration *record, ImageAliasReceiver *receiver) {
+    const tex_t *t = &record->descriptor;
+    const nvn_texdesc *d = &t->d;
+    TexVkFormat f;
+    if (d->target != NVN_TEXTURE_TARGET_2D && d->target != NVN_TEXTURE_TARGET_2D_ARRAY) return "texture-target";
+    const int reinterpreted = record->has_view && record->view.set_format && record->view.format != d->format;
+    const int linear_rgba8 = reinterpreted && receiver->allow_rgba8_linear_view &&
+        d->target == NVN_TEXTURE_TARGET_2D && d->format == NVN_FORMAT_RGBA8_SRGB &&
+        record->view.format == NVN_FORMAT_RGBA8 &&
+        (!record->view.set_target || record->view.target == NVN_TEXTURE_TARGET_2D);
+    if (reinterpreted && !linear_rgba8) return "registered-view-format";
+    if (!tex_vk_format(d->format, &f)) return "guest-format";
+    if (f.stencil || (f.depth && !image_alias_sample_depth_exact(record, &f))) return "depth-stencil-format";
+    if (f.vk != f.ideal || f.expand_rgb || f.astc_bw || f.astc_bc) return "converted-format";
+    if (shader_metadata_cold(t, &receiver->image) != 1) return "native-format";
+    if (receiver->image.samples != 1) return "multisample";
+    make_key(t, &receiver->key);
+    VkTexImage *image = &receiver->image;
+    image->addr = receiver->key.addr;
+    image->scale = 1;
+    image->aspect = f.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+    image->usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    texture_image_components(d, &f, image);
+    const VkImageCreateFlags flags = linear_rgba8 ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
+    if (linear_rgba8) {
+        const VkImageCreateInfo create = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = flags,
+            .format = image->format, .imageType = image->type, .extent = {image->width, image->height, image->depth},
+            .mipLevels = image->levels, .arrayLayers = image->layers, .samples = VK_SAMPLE_COUNT_1_BIT,
+            .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = image->usage, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+        if (!rgba8_linear_view_supported(&create)) return "linear-view-format-capability";
+        image->rgba8_linear_view = 1;
+    }
+    receiver->placement = (ImgKey){.flags = flags, .type = image->type, .format = image->format, .w = image->width,
+        .h = image->height, .d = image->depth, .levels = image->levels, .layers = image->layers, .samples = 1,
+        .usage = image->usage};
+    receiver->texture = t;
+    receiver->view = record->has_view ? &record->view : NULL;
+    return NULL;
+}
+
+static int image_alias_sample_prospective_locked(const TextureRegistration *record, int logical, int native,
+    RcRegistryPosition read, VkTextureAliasRead **alias, VkTextureSample *sample, VkTexImage *shape,
+    unsigned options, VkTextureAliasFailure *failure) {
+    const tex_t *t = &record->descriptor;
+    const uint64_t address = (uintptr_t)t->mem;
+    if (!address || !nvn_gpu_only(address) || !t->serial || !t->L.size) return 0;
+    if (!rc_registry_position_valid(read) || rc_registry_position_compare(read, vk_exec_resource_position())) return 0;
+    VkMemSpan span;
+    RcInterval *mapping = NULL;
+    uint32_t count = vk_mem_lookup(address, t->L.size, &span) ?
+        vk_mem_device_intervals(&span, address, t->L.size, &mapping) : 0;
+    int status = 0;
+    if (count) {
+        ImageAliasReceiver receiver = {.mapping = mapping, .mapping_count = count,
+            .allow_rgba8_linear_view = !!(options & VK_TEXTURE_ALIAS_SAMPLE_LINEAR_RGBA8_VIEW),
+            .allow_submitted_raw = alias && !(options & VK_TEXTURE_ALIAS_SAMPLE_ONLY)};
+        const char *gate = t->L.size <= VK_TEXTURE_ALIAS_MAX_BYTES ? image_alias_sample_recipe(record, &receiver) : NULL;
+        if (t->L.size > VK_TEXTURE_ALIAS_MAX_BYTES) {
+            if (rc_registry_native_image_has_prior_projection(rc_registry_runtime(), mapping, count, read))
+                status = image_alias_refuse(failure, VK_TEXTURE_ALIAS_CAPACITY, RC_REGISTRY_CAPACITY, mapping[0]);
+        } else if (gate) {
+            if (rc_registry_native_image_has_prior_projection(rc_registry_runtime(), mapping, count, read))
+                status = image_alias_refuse_layout(failure, mapping[0], gate);
+        } else {
+            RcRegistry *registry = rc_registry_runtime();
+            if (alias || rc_registry_native_image_has_prior_projection(registry, mapping, count, read) ||
+                (image_alias_single_color_view(t, receiver.view) &&
+                 rc_registry_native_image_has_prior_bound_projection(registry, mapping, count, read)))
+                status = image_alias_read_prepare_locked(&receiver, NULL, alias, shape, 1, 0, failure);
+        }
+    }
+    free(mapping);
+    if (status > 0 && alias) {
+        (*alias)->receiver_registration = record->handle.id;
+        (*alias)->receiver_pool = vk_exec_texture_pool();
+        (*alias)->receiver_logical = logical;
+        (*alias)->receiver_native = native;
+        *sample = (VkTextureSample){.registration = record->handle.id, .native_slot = native,
+            .view = record->view, .has_view = record->has_view};
+    }
+    return status;
+}
+
+static int image_alias_sample_entry_stale(const Tex *entry, const TextureRegistration *record) {
+    return entry->t.serial != record->descriptor.serial || !entry->pub.image || entry->pub.gone ||
+        entry->released || entry->retiring || entry->superseded || entry->overwritten;
+}
+
+void vk_texture_alias_sample_report_layout_locked(int logical, const VkTextureAliasFailure *failure) {
+    if (!failure->layout_gate) return;
+    const TextureRegistration *record;
+    int native;
+    if (texture_registration_resolve(logical, &record, &native) != VK_TEXTURE_REGISTRATION_CURRENT || native < 0)
+        return;
+    const TexSlot *slot = &tslots[native];
+    record = slot->registration;
+    if (!record || (failure->registration && failure->registration != record->handle.id)) return;
+    const Tex *entry = image_alias_sample_entry_locked(slot, native);
+    VkTexImage cold = {0};
+    shader_metadata_cold(&record->descriptor, &cold);
+    const VkTexImage *image = entry ? &entry->pub : &cold;
+    const RcRegistryPosition read = vk_exec_resource_position();
+    const tex_t *t = &record->descriptor;
+    const nvn_texdesc *d = &t->d;
+    const view_t *view = &record->view;
+    TexVkFormat format = {0};
+    tex_vk_format(d->format, &format);
+    rt_log("vk: required sampled image layout read=%llu/%llu slot=%d gate=%s registration=%llu material=%llu "
+        "address=%p bytes=0x%llx target=%d guest-format=%d extent=%dx%dx%d mips=%d layers=%d samples=%d flags=%#x "
+        "image=%p resident=%d actual-format=%u ideal-format=%u aspect=%#x native-target=%u native-usage=%#x "
+        "native-extent=%ux%ux%u native-mips=%u native-layers=%u native-samples=%u "
+        "view=%d view-target=%d view-format=%d view-mips=%u/%u view-layers=%u/%u view-ds=%d",
+        (unsigned long long)read.scene, (unsigned long long)read.ordinal, logical, failure->layout_gate,
+        (unsigned long long)record->handle.id, (unsigned long long)t->serial, t->mem, (unsigned long long)t->L.size,
+        d->target, d->format, d->width, d->height, d->depth, d->levels, t->L.layers, d->samples, (unsigned)d->flags,
+        (void *)image->image, entry && !image_alias_sample_entry_stale(entry, record), image->format, format.ideal,
+        (unsigned)image->aspect, (unsigned)image->view_type, (unsigned)image->usage, image->width, image->height,
+        image->depth, image->levels, image->layers, image->samples, (int)record->has_view,
+        record->has_view && view->set_target ? view->target : -1, record->has_view && view->set_format ? view->format : -1,
+        record->has_view && view->set_levels ? view->base_level : UINT32_MAX, (unsigned)view->nlevels,
+        record->has_view && view->set_layers ? view->min_layer : UINT32_MAX, (unsigned)view->nlayers,
+        record->has_view && view->set_dsmode ? view->dsmode : -1);
+}
+
+static int image_alias_sample_select_locked(int logical, int native, RcRegistryPosition read, VkTextureAliasRead **alias,
+    VkTextureSample *sample, VkTexImage *shape, unsigned options, VkTextureAliasFailure *failure) {
+    const int force = !!(options & VK_TEXTURE_ALIAS_SAMPLE_FORCE);
+    if (failure) *failure = (VkTextureAliasFailure){0};
+    if (native < 0) {
+        const TextureRegistration *history;
+        if (texture_registration_resolve(logical, &history, &native) != VK_TEXTURE_REGISTRATION_CURRENT || native < 0)
+            return 0;
+    }
+    const TexSlot *slot = &tslots[native];
+    const TextureRegistration *record = slot->registration;
+    if (!record || slot->finalized) return 0;
+    const Tex *entry = image_alias_sample_entry_locked(slot, native);
+    if (failure) {
+        failure->registration = record->handle.id;
+        failure->material_serial = entry ? entry->t.serial : record->descriptor.serial;
+        if (entry) failure->image = entry->pub.image;
+    }
+    const RcInterval mapped = entry && entry->image_private_mapping_count ? entry->image_private_mapping[0] : (RcInterval){0};
+    if (rc_registry_position_compare(read, vk_exec_resource_position()))
+        return image_alias_refuse(failure, VK_TEXTURE_ALIAS_ORDER, RC_REGISTRY_STALE, mapped);
+    if (!entry || (!entry->alias_fragment_owner && !entry->pub.preserve_pool_bytes &&
+                   alias && !(options & VK_TEXTURE_ALIAS_SAMPLE_ONLY)))
+        return image_alias_sample_prospective_locked(record, logical, native, read, alias, sample, shape, options, failure);
+    if (!entry->alias_fragment_owner && !entry->pub.preserve_pool_bytes) return 0;
+    if (image_alias_sample_entry_stale(entry, record)) {
+        // The registration can remain current after its old cached image stops being
+        // a valid receiver. Reconstruct at the same read using the registered recipe.
+        // The old image can contribute only as an independently qualified producer.
+        if (failure && alias && rt_knob("GRAPHICS_PREP_TRACE", "0")) {
+            static uint32_t observed;
+            if (__atomic_fetch_add(&observed, 1, __ATOMIC_RELAXED) < 24) {
+                TexKey key;
+                make_key(&record->descriptor, &key);
+                const Tex *current = nvn_hm_get(&by_key, &key);
+                rt_log("vk: image selected owner stale read %llu/%llu logical %d native %d registration %llu "
+                       "registered material %llu selected %llu current %llu VkImage %p current-image %p "
+                       "released %u retiring %u superseded %u overwritten %u gone %u owned %u preserve %u projection %u "
+                       "recorded output %llu/%llu mapping %llu backing %llu offset %#llx size %#llx",
+                       (unsigned long long)read.scene, (unsigned long long)read.ordinal, logical, native,
+                       (unsigned long long)record->handle.id, (unsigned long long)record->descriptor.serial,
+                       (unsigned long long)entry->t.serial, (unsigned long long)(current ? current->t.serial : 0),
+                       (void *)entry->pub.image, (void *)(current ? current->pub.image : VK_NULL_HANDLE),
+                       entry->released, entry->retiring, entry->superseded, entry->overwritten, entry->pub.gone,
+                       entry->pub.gpu_owned, entry->pub.preserve_pool_bytes, entry->alias_fragment_owner,
+                       (unsigned long long)entry->native_write.scene, (unsigned long long)entry->native_write.ordinal,
+                       (unsigned long long)mapped.mapping, (unsigned long long)mapped.range.backing,
+                       (unsigned long long)mapped.range.offset, (unsigned long long)mapped.range.size);
+            }
+        }
+        int recovered = image_alias_sample_prospective_locked(record, logical, native, read, alias, sample, shape, options, failure);
+        if (recovered) return recovered;
+        return image_alias_refuse(failure, VK_TEXTURE_ALIAS_OWNER, RC_REGISTRY_STALE, mapped);
+    }
+    TexKey receiver;
+    make_key(&record->descriptor, &receiver);
+    if (!same_but_swizzle(&receiver, &entry->key) || entry->t.L.size != record->descriptor.L.size ||
+        !(entry->pub.usage & VK_IMAGE_USAGE_SAMPLED_BIT))
+        return image_alias_refuse_layout(failure, mapped, "resident-identity");
+    if (!force && entry->alias_full_count && image_alias_source_current(entry) &&
+        rc_registry_native_image_covers(rc_registry_runtime(), (uint64_t)(uintptr_t)entry->pub.image,
+                                       entry->alias_full_demand, entry->alias_full_count, read)) return 0;
+    int status = image_alias_read_capture_locked(&entry->t, entry, alias, shape, force, 0, NULL, NULL, failure);
+    if (status <= 0 || !alias) return status;
+    (*alias)->receiver_registration = record->handle.id;
+    *sample = (VkTextureSample){.registration = record->handle.id, .native_slot = native};
+    slot_result_view(slot, entry, &sample->view, &sample->has_view);
+    return 1;
+}
+
+int vk_texture_alias_sample_inspect_locked(int logical, RcRegistryPosition read, int force, VkTextureAliasFailure *failure) {
+    return image_alias_sample_select_locked(logical, -1, read, NULL, NULL, NULL,
+        force ? VK_TEXTURE_ALIAS_SAMPLE_FORCE : 0, failure);
+}
+
+static int image_alias_sample_receiver_locked(int logical, const VkTextureAliasRead *alias) {
+    const TextureRegistration *history;
+    int native;
+    if (texture_registration_resolve(logical, &history, &native) != VK_TEXTURE_REGISTRATION_CURRENT || native < 0)
+        return 0;
+    const TexSlot *slot = &tslots[native];
+    if (!slot->registration || slot->finalized || slot->registration->handle.id != alias->receiver_registration) return 0;
+    if (alias->registration_only)
+        return logical == alias->receiver_logical && native == alias->receiver_native &&
+            vk_exec_texture_pool() == alias->receiver_pool &&
+            slot->registration->descriptor.serial == alias->receiver->serial;
+    const Tex *entry = image_alias_sample_entry_locked(slot, native);
+    return entry && entry->t.serial == alias->receiver->serial;
+}
+
+int vk_texture_alias_sample_current_locked(int logical, VkTextureAliasRead *alias) {
+    return image_alias_sample_receiver_locked(logical, alias) && vk_texture_alias_read_current(alias);
+}
+
+int vk_texture_alias_sample_selection_current_locked(int logical, VkTextureAliasRead *alias) {
+    if (!alias->raw_upload) return vk_texture_alias_sample_current_locked(logical, alias);
+    uint64_t upload;
+    return logical == alias->receiver_logical &&
+        vk_texture_alias_read_raw_progress(alias, vk_exec_resource_position(), &upload);
+}
+
+static void image_alias_pool_member_locked(uint64_t pool, int native, VkAliasPoolMember visit, void *opaque) {
+    const int logical = vk_texture_pool_logical_locked(pool, native);
+    if (logical < 0) return;
+    const TextureRegistration *history;
+    int selected;
+    if (texture_registration_resolve(logical, &history, &selected) != VK_TEXTURE_REGISTRATION_CURRENT ||
+        selected != native) return;
+    const TexSlot *slot = &tslots[native];
+    if (!slot->registration || slot->finalized) return;
+    const Tex *entry = image_alias_sample_entry_locked(slot, native);
+    VkTextureSample sample = {.registration = slot->registration->handle.id, .native_slot = native};
+    ImageAliasReceiver receiver = {0};
+    if (entry && !entry->alias_fragment_owner && !entry->pub.preserve_pool_bytes) return;
+    if (entry && !image_alias_sample_entry_stale(entry, slot->registration)) {
+        sample.image = &entry->pub;
+        slot_result_view(slot, entry, &sample.view, &sample.has_view);
+    } else {
+        if (image_alias_sample_recipe(slot->registration, &receiver) || !nvn_gpu_only(receiver.image.addr)) return;
+        sample.image = &receiver.image;
+        sample.view = slot->registration->view;
+        sample.has_view = slot->registration->has_view;
+    }
+    visit(logical, &sample, opaque);
+}
+
+void vk_texture_alias_pool_members_locked(uint64_t pool, VkAliasPoolMember visit, void *opaque) {
+    if (!slot_next || !alias_fragment_owners.n) return;
+    uint64_t visited[AGEN_N / 64] = {0};
+    for (uint32_t i = 0; i < alias_fragment_owners.cap; ++i) {
+        const NativeTextureOutput *owner = alias_fragment_owners.vals[i];
+        if (!owner) continue;
+        const uint32_t bucket = agen_idx(owner->entry ? owner->entry->pub.addr : owner->image.addr);
+        const uint64_t bit = UINT64_C(1) << (bucket % 64);
+        if (visited[bucket / 64] & bit) continue;
+        visited[bucket / 64] |= bit;
+        for (int native = bucket_head[bucket]; native >= 0; native = slot_next[native])
+            image_alias_pool_member_locked(pool, native, visit, opaque);
+        for (int group = bucket_ghead[bucket]; group >= 0; group = grp[group].gnext)
+            for (int native = grp[group].pub.head; native >= 0; native = slot_next[native])
+                image_alias_pool_member_locked(pool, native, visit, opaque);
+    }
+}
+
+int vk_texture_alias_published_current_locked(int logical, VkTextureAliasRead *alias, RcRegistryPosition read) {
+    return image_alias_sample_receiver_locked(logical, alias) &&
+        rc_registry_position_compare(read, alias->read) >= 0 && image_alias_read_current_at(alias, read);
+}
+
+int vk_texture_alias_published_inspect_locked(int logical, const VkTextureAliasRead *alias, RcRegistryPosition read) {
+    if (!image_alias_sample_receiver_locked(logical, alias) || rc_registry_position_compare(read, alias->read) < 0) return 0;
+    RcRegistryNativeImageSnapshotFragment *scratch = malloc(alias->fragment_count * sizeof *scratch);
+    if (!scratch) return 0;
+    int current = image_alias_read_current_with(alias, read, scratch, alias->fragment_count);
+    free(scratch);
+    return current;
+}
+
+int vk_texture_pool_gpu_sample_locked(int logical, VkImage expected, VkTextureSample *sample) {
+    if (!expected) return 0;
+    const RcRegistryPosition read = vk_exec_resource_position();
+    if (!rc_registry_position_valid(read) || read.ordinal == UINT64_MAX) return 0;
+    const TextureRegistration *history;
+    int native;
+    if (texture_registration_resolve(logical, &history, &native) != VK_TEXTURE_REGISTRATION_CURRENT || native < 0)
+        return 0;
+    const TexSlot *slot = &tslots[native];
+    const TextureRegistration *record = slot->registration;
+    const Tex *entry = texture_binding_entry(slot, native);
+    if (!record || slot->finalized || !entry || entry->pub.image != expected || !entry->pub.gpu_owned ||
+        entry->material || from_storage(entry)) return 0;
+    if (entry->t.L.size != record->descriptor.L.size || entry->pub.gone || entry->released ||
+        entry->retiring || entry->superseded || entry->overwritten ||
+        !(entry->pub.usage & VK_IMAGE_USAGE_SAMPLED_BIT) || entry->pub.skip ||
+        (entry->image_host_backing && !mem_backing_current(entry->image_host_backing))) return -1;
+    TexKey receiver;
+    make_key(&record->descriptor, &receiver);
+    // The receiver and supplying Tex need not be the same registration. Use the current cached
+    // receiver-to-image binding only when their byte layout agrees. The caller checks the exact native view.
+    if (!same_but_swizzle(&receiver, &entry->key) ||
+        (entry->t.serial != record->descriptor.serial && entry != slot->ce)) return -1;
+    RcRegistryPosition producer = entry->native_write;
+    if (!rc_registry_position_valid(producer) || rc_registry_position_compare(producer, read) >= 0 ||
+        (producer.scene != read.scene && !rc_registry_position_handed(rc_registry_runtime(), producer))) return -1;
+    if (entry->bound_to) {
+        if (producer.ordinal & 1) return -1;
+        producer.ordinal++;
+        if (!entry->image_device_count || entry->image_mapped_hold_count != entry->image_device_count ||
+            !vk_mem_image_alias_current(expected, entry->pub.addr, entry->image_device_size, entry->bound_to,
+                                        entry->image_device_intervals, entry->image_device_count) ||
+            !rc_registry_native_image_read_current(rc_registry_runtime(), (uint64_t)(uintptr_t)expected,
+                entry->image_device_intervals, entry->image_mapped_holds, entry->image_device_count, producer, read))
+            return -1;
+    } else if (!entry->alloc || entry->image_device_count) return -1;
+    pool_mapping_source(entry);
+    *sample = (VkTextureSample){.image = &entry->pub, .registration = record->handle.id, .native_slot = native};
+    slot_result_view(slot, entry, &sample->view, &sample->has_view);
+    return 1;
+}
+
+int vk_texture_pool_gpu_hold_locked(TextureImagePublication *images, uint32_t descriptor, const VkTextureSample *sample) {
+    return sample->image && texture_publication_native_retain_locked(images, descriptor, sample->image->image);
+}
+
+int vk_texture_pool_gpu_layout_current(const TextureImagePublication *images, const VkImage *feedback, uint32_t count) {
+    lock();
+    int current = 1;
+    for (const TextureNativeUse *p = images ? images->native : NULL; current && p; p = p->next)
+        for (uint32_t i = 0; i < count; ++i) if (feedback[i] == p->image) { current = 0; break; }
+    unlock();
+    return current;
+}
+
+static int source_binding_ready(Tex *e) {
+    if (!from_storage(e) || e->pub.gpu_owned || (e->sfill && e->released)) return 1;
+    return source_binding_ordered(e) ? source_binding_current(e) : source_binding_compat_current(e);
+}
+
 // RESOURCE_SAMPLE_BEGIN: the host fixture compiles the same query/preparation decisions with controlled producers.
 static int sample_slot_eligible(const TexSlot *s) {
-    return s->used && !s->finalized && tex_mirrored(&s->t);
+    return s->used && !s->finalized && tex_mirrored(s->registration ? &s->registration->descriptor : &s->t);
 }
 
 static int sample_entry_eligible(const Tex *e) {
-    return e && e->pub.mirrored && !e->pub.gpu_owned && !e->pub.gone && !e->sfill &&
+    return e && (!e->source_blocked || e->source_canonical) && e->pub.mirrored && !e->pub.gpu_owned && !e->pub.gone && !e->sfill &&
            !e->superseded && !e->overwritten;
 }
 
-static int sample_entry_matches(const Tex *e, const TexSlot *s) {
+static int sample_entry_matches(const Tex *e, const tex_t *descriptor) {
     TexKey key;
-    make_key(&s->t, &key);
+    make_key(descriptor, &key);
     return !memcmp(&e->key, &key, sizeof key);
 }
 
-static void sample_result(const TexSlot *s, VkTextureSample *out) {
-    out->image = &s->ce->pub;
-    out->view = s->cview;
-    out->has_view = s->chas_view;
+static void sample_result(int native, const Tex *e, VkTextureSample *out) {
+    const TexSlot *s = &tslots[native];
+    out->image = &e->pub;
+    out->native_slot = native;
+    out->registration = texture_slot_registration(native);
+    out->canonical = out->registration && texture_registration_source(s) == e;
+    if (out->canonical) {
+        slot_result_view(s, e, &out->view, &out->has_view);
+        resource_bridge.canonical_ready++;
+    } else {
+        out->view = s->cview;
+        out->has_view = s->chas_view;
+    }
 }
 
 VkTextureSampleStatus vk_texture_sample_query_locked(int id, VkTextureSample *out) {
@@ -4944,34 +14627,186 @@ VkTextureSampleStatus vk_texture_sample_query_locked(int id, VkTextureSample *ou
         return VK_TEXTURE_SAMPLE_FALLBACK;
     }
     const TexSlot *s = &tslots[id];
-    // A stale cached pointer must not be dereferenced: another entry in its address bucket may have been freed.
-    if (!s->ce || s->cgen != agen[sinfo[id] & 0xffff]) return VK_TEXTURE_SAMPLE_PREPARE;
-    if (!s->sample_owned) return VK_TEXTURE_SAMPLE_PREPARE;
-    const Tex *e = s->ce;
+    Tex *owned = texture_registration_source(s);
+    // Legacy pointers are valid only while their address generation still agrees.
+    if (!owned && (!s->sample_owned || !s->ce || s->cgen != agen[sinfo[id] & 0xffff]))
+        return VK_TEXTURE_SAMPLE_PREPARE;
+    Tex *e = owned ? owned : s->ce;
+    const tex_t *descriptor = s->registration ? &s->registration->descriptor : &s->t;
+    if (e->t.serial != descriptor->serial) return VK_TEXTURE_SAMPLE_PREPARE;
+    if (!owned && e->source_canonical && source_private_sample(e)) return VK_TEXTURE_SAMPLE_PREPARE;
     if (!sample_entry_eligible(e)) {
         resource_path.fallback++;
         return VK_TEXTURE_SAMPLE_FALLBACK;
     }
-    if (e->released || e->retiring || !e->uploaded || e->up_retry ||
-        e->checked != submit_epoch || s->cepoch != submit_epoch) return VK_TEXTURE_SAMPLE_PREPARE;
-    sample_result(s, out);
+    if (e->released || e->retiring || !e->uploaded || !e->pub.image || e->up_retry ||
+        e->checked != submit_epoch || (!owned && s->cepoch != submit_epoch) || source_mapping_due(e))
+        return VK_TEXTURE_SAMPLE_PREPARE;
+    if (source_binding_ordered(e)) {
+        if (!source_binding_current(e)) return VK_TEXTURE_SAMPLE_PREPARE;
+    } else if (!source_binding_compat_current(e))
+        return VK_TEXTURE_SAMPLE_PREPARE;
+    sample_result(id, e, out);
     resource_path.ready++;
     return VK_TEXTURE_SAMPLE_READY;
 }
 
-VkTextureSampleStatus vk_texture_sample_prepare_locked(int id, VkTextureSample *out) {
+VkTextureSampleStatus vk_texture_select_sample_locked(int logical, unsigned flags, VkTextureSample *out) {
+    int native;
+    int historical = texture_history_sample_locked(logical, out, &native, 0);
+    if (historical == VK_TEXTURE_REGISTRATION_EXACT) return VK_TEXTURE_SAMPLE_READY;
+    VkTextureSampleStatus status = VK_TEXTURE_SAMPLE_FALLBACK;
+    *out = (VkTextureSample){.native_slot = native, .historical = historical};
+    if (historical == VK_TEXTURE_REGISTRATION_GONE) return VK_TEXTURE_SAMPLE_GONE;
+    if (historical == VK_TEXTURE_REGISTRATION_ABSENT || (!historical && native < 0)) return VK_TEXTURE_SAMPLE_ABSENT;
+    if (!historical && !(flags & VK_TEXTURE_READ_FORCE_COMPAT)) {
+        if (!(flags & VK_TEXTURE_READ_EXACT_DETAIL)) status = vk_texture_sample_query_locked(native, out);
+        if (status == VK_TEXTURE_SAMPLE_FALLBACK &&
+            texture_projected_sample_locked(&tslots[native], native, VK_NULL_HANDLE, out, NULL))
+            status = VK_TEXTURE_SAMPLE_READY;
+        out->native_slot = native;
+    }
+    return status;
+}
+
+static int sample_storage_hole_current(const TexSlot *slot, const tex_t *descriptor) {
+    const uint64_t address = (uint64_t)(uintptr_t)descriptor->mem;
+    const uint64_t size = descriptor->L.size;
+    MemBackingCapturePlan plan;
+    // Unreadable mapped storage can still have an ordered producer or permission dependency.
+    return mem_backing_capture_plan(address, size, &plan) == RC_BACKING_ABSENT &&
+        mem_mapping_range_unchanged(address, size, slot->absent_mapping) &&
+        mem_protection_range_unchanged(address, size, slot->absent_protection);
+}
+
+static int sample_storage_unbacked(TexSlot *slot, const tex_t *descriptor, uint32_t generation) {
+    if (!slot_absence_valid(slot, generation)) {
+        slot->absent_mapping = slot->absent_protection = 0;
+        if (slot_storage_readable(slot) || !slot->absent_mapping) return 0;
+    }
+    if (!sample_storage_hole_current(slot, descriptor)) {
+        slot->absent_mapping = slot->absent_protection = 0;
+        return 0;
+    }
+    slot->ce = NULL;
+    slot->sample_owned = 0;
+    slot->cgen = generation;
+    return 1;
+}
+
+int vk_texture_sample_unbacked_current_locked(VkTextureReadKey key) {
+    const TexSlot *slot = texture_read_key_slot(key);
+    if (!slot || !key.unbacked || !sample_slot_eligible(slot) || texture_registration_source(slot) ||
+        !slot_absence_valid(slot, agen[sinfo[key.native_slot] & 0xffff]) ||
+        !sample_storage_hole_current(slot, &slot->registration->descriptor)) return 0;
+    const tex_t *descriptor = &slot->registration->descriptor;
+    pool_mapping_read((uintptr_t)descriptor->mem, descriptor->L.size, NULL, 0);
+    return 1;
+}
+
+static const char *texture_source_refusal_name(unsigned stage) {
+    static const char *const names[] = {"unrecorded", "mapping-acquisition", "operation-effects",
+        "registry-authority", "host-write-tracking", "observation-race", "snapshot-capacity",
+        "snapshot-mapping", "snapshot-changed", "snapshot-commit", "no-snapshot", "material-restore",
+        "binding-permission", "upload-unavailable"};
+    return stage < sizeof names / sizeof names[0] ? names[stage] : "unrecorded";
+}
+
+static void sample_mapping_refusal_report(const TexSlot *slot, const Tex *entry, RcRegistryPosition read) {
+    const SampleMappingRefusal *m = &sample_mapping_refusal;
+    if (m->entry != entry || !m->step || rc_registry_position_compare(m->read, read)) return;
+    static unsigned reports; // Under the existing texture lock.
+    if (reports >= 32) return;
+    ++reports;
+    const VkMemCanonicalSourceQualification *n = &m->native;
+    rt_log("vk: sampled mapping refusal read %llu/%llu step %s format %#x target %d size %#llx at %#llx "
+           "registration %llu attached %d material %llu version %llu retained %u pins %u current %d "
+           "generation retained/start/qualify/finish %llu/%llu/%llu/%llu capture %d qualification %d",
+           (unsigned long long)m->read.scene, (unsigned long long)m->read.ordinal, m->step, entry->t.d.format,
+           entry->t.d.target, (unsigned long long)entry->t.L.size, (unsigned long long)entry->pub.addr,
+           (unsigned long long)(slot->registration ? slot->registration->handle.id : 0),
+           texture_registration_source(slot) == entry, (unsigned long long)entry->t.serial,
+           (unsigned long long)entry->material_version.id, m->retained_count, m->pins, m->retained_current,
+           (unsigned long long)m->retained_generation, (unsigned long long)m->start_generation,
+           (unsigned long long)m->passed_generation, (unsigned long long)m->final_generation,
+           m->captured, m->qualification);
+    rt_log("vk: sampled mapping proof read %llu/%llu retained source %llu/%u span %llu %llu:%#llx+%#llx at %#llx, "
+           "new %u span %llu %llu:%#llx+%#llx at %#llx; provider step %d kind %d pub %llu envelope %#llx+%#llx cutoff %llu "
+           "first comparison %#llx counts %u/%u source %llu %llu:%#llx provider %llu %llu:%#llx",
+           (unsigned long long)m->read.scene, (unsigned long long)m->read.ordinal,
+           (unsigned long long)m->retained_source.id, m->retained_source.index,
+           (unsigned long long)m->retained.mapping, (unsigned long long)m->retained.range.backing,
+           (unsigned long long)m->retained.range.offset, (unsigned long long)m->retained.range.size,
+           (unsigned long long)m->retained.address, m->opened_count,
+           (unsigned long long)m->opened.mapping, (unsigned long long)m->opened.range.backing,
+           (unsigned long long)m->opened.range.offset, (unsigned long long)m->opened.range.size,
+           (unsigned long long)m->opened.address, n->stage, n->provider_kind,
+           (unsigned long long)n->provider_publication, (unsigned long long)n->provider_address,
+           (unsigned long long)n->provider_bytes, (unsigned long long)n->provider_mapping_cutoff,
+           (unsigned long long)n->mismatch_address, n->source_count, n->provider_count,
+           (unsigned long long)n->source_interval.mapping, (unsigned long long)n->source_interval.range.backing,
+           (unsigned long long)n->source_interval.range.offset, (unsigned long long)n->provider_interval.mapping,
+           (unsigned long long)n->provider_interval.range.backing, (unsigned long long)n->provider_interval.range.offset);
+    sample_mapping_refusal.entry = NULL;
+}
+
+static void sample_refusal_record(VkTextureSampleRefusal *refused, const TexSlot *slot,
+                                  const Tex *entry, const char *fallback) {
+    if (!refused) return;
+    const tex_t *descriptor = slot->registration ? &slot->registration->descriptor : &slot->t;
+    *refused = (VkTextureSampleRefusal){.stage = fallback,
+        .registration = slot->registration ? slot->registration->handle.id : 0,
+        .address = (uintptr_t)descriptor->mem, .bytes = descriptor->L.size};
+    if (!entry) return;
+    refused->material = entry->t.serial;
+    refused->image = entry->pub.image;
+    refused->material_shape = entry->pub;
+    // These are bytes retained by the attempted source. They are not a fresh mapping observation.
+    if (entry->source_mapping && entry->source_mapping->count)
+        refused->mapped_source = entry->source_mapping->intervals[0];
+    refused->uploaded = !!entry->uploaded;
+    refused->upload_retry = entry->up_retry;
+    if (entry->source_refusal && rc_registry_position_valid(entry->source_refusal_position) &&
+        !rc_registry_position_compare(entry->source_refusal_position,
+                                                               vk_exec_resource_position())) {
+        refused->stage = texture_source_refusal_name(entry->source_refusal);
+        refused->position = entry->source_refusal_position;
+        refused->result = entry->source_refusal_result;
+        refused->recorded = 1;
+        if (entry->source_refusal == SOURCE_REFUSAL_WATCH) {
+            refused->tracking_failure = entry->source_tracking_failure;
+            refused->material_version = entry->material_version.id;
+            const TextureMaterial *material = entry->material;
+            if (material && rc_input_exact(&material->input)) {
+                refused->material_payload = material->input.payload;
+                refused->material_provider = material->provider != NULL;
+            }
+            if (entry->source_copy && rc_input_exact(&entry->source_copy_version.input))
+                refused->source_copy_version = entry->source_copy_version.id;
+        }
+        if (entry->source_refusal == SOURCE_REFUSAL_ACQUIRE && refused->result == RC_REGISTRY_STALE)
+            sample_mapping_refusal_report(slot, entry, refused->position);
+    }
+}
+
+static VkTextureSampleStatus texture_sample_prepare_locked(int id, VkTextureSample *out, int budgeted,
+                                                           VkTextureSampleRefusal *refused) {
     *out = (VkTextureSample){0};
     if (id < 0 || id >= ntslots || !sample_slot_eligible(&tslots[id])) {
         resource_path.fallback++;
         return VK_TEXTURE_SAMPLE_FALLBACK;
     }
     TexSlot *s = &tslots[id];
-    uint32_t gen = agen[sinfo[id] & 0xffff];
-    Tex *e = s->ce && s->cgen == gen ? s->ce : NULL;
-    int own_identity = e && s->sample_owned;
+    const tex_t *descriptor = s->registration ? &s->registration->descriptor : &s->t;
+    Tex *e = texture_registration_source(s);
+    int own_identity = e != NULL;
+    if (!e && s->ce && s->cgen == agen[sinfo[id] & 0xffff]) {
+        e = s->ce;
+        own_identity = s->sample_owned;
+    }
     if (!e) {
         TexKey key;
-        make_key(&s->t, &key);
+        make_key(descriptor, &key);
         e = nvn_hm_get(&by_key, &key);
         // Aliased GPU content requires the existing target/view resolution rules, even for a CPU-accessible pool.
         // Cold ordinary textures still enter preparation here; absence is not itself a fallback condition.
@@ -4981,26 +14816,38 @@ VkTextureSampleStatus vk_texture_sample_prepare_locked(int id, VkTextureSample *
                 return VK_TEXTURE_SAMPLE_FALLBACK;
             }
     }
-    if (e && (!sample_entry_eligible(e) || (!own_identity && !sample_entry_matches(e, s)))) {
+    if (e && (!sample_entry_eligible(e) || (!own_identity && !sample_entry_matches(e, descriptor)))) {
         resource_path.fallback++;
         return VK_TEXTURE_SAMPLE_FALLBACK;
     }
+    if (!e && sample_storage_unbacked(s, descriptor, agen[sinfo[id] & 0xffff])) {
+        out->native_slot = id;
+        out->registration = texture_slot_registration(id);
+        return VK_TEXTURE_SAMPLE_UNBACKED;
+    }
     resource_path.prepared++;
-    if (!e || e->released || e->retiring) {
+    if (budgeted && e && (e->retiring || (e->material && !e->pub.image))) return VK_TEXTURE_SAMPLE_PREPARE;
+    if (!e || e->released || e->retiring || e->t.serial != descriptor->serial) {
+        if (budgeted && !create_budget && !(s->cwant && want_take())) {
+            create_deferred = 1;
+            return VK_TEXTURE_SAMPLE_PREPARE;
+        }
         // Allocation/revival is an explicit preparation operation. No pool-refresh mode or speculative creation
         // budget is consulted here: this is a demanded sampled resource, ordered at the replay's current position.
         // The compatibility identity owner may restore a bucket's earlier generation on revival. Preparation,
         // like the old resolver, must invalidate a remembered state whose finalized-slot relationship changes.
         int prior_lookup = in_lookup;
         in_lookup = 1;
-        e = entry_of(&s->t);
+        e = entry_of(descriptor);
         in_lookup = prior_lookup;
+        if (budgeted && create_budget > 0) create_budget--;
         if (!e) {
             if (vk_texture_deferred()) {
                 resource_path.deferred++;
                 return VK_TEXTURE_SAMPLE_DEFERRED;
             }
             resource_path.unavailable++;
+            sample_refusal_record(refused, s, NULL, "no-provider");
             return VK_TEXTURE_SAMPLE_UNAVAILABLE;
         }
         if (!sample_entry_eligible(e)) {
@@ -5008,42 +14855,423 @@ VkTextureSampleStatus vk_texture_sample_prepare_locked(int id, VkTextureSample *
             return VK_TEXTURE_SAMPLE_FALLBACK;
         }
     }
-    if (!e->uploaded || e->checked != submit_epoch) {
-        if (!pool_deps_certificate(e)) make_fresh_snap(e);
+    if (e->material && !e->pub.image && !content_require_resident(e)) {
+        if (vk_texture_deferred()) return resource_path.deferred++, VK_TEXTURE_SAMPLE_DEFERRED;
+        resource_path.unavailable++;
+        source_note_refusal(e, SOURCE_REFUSAL_RESTORE, RC_REGISTRY_UNSUPPORTED);
+        sample_refusal_record(refused, s, e, "material-restore");
+        return e->source_canonical ? VK_TEXTURE_SAMPLE_CANONICAL_REFUSED : VK_TEXTURE_SAMPLE_UNAVAILABLE;
+    }
+    uint64_t authority = rc_registry_authority_epoch(rc_registry_runtime());
+    int current = source_binding_ordered(e) ? source_binding_current(e) :
+        source_binding_compat_current(e);
+    if (!e->uploaded || e->checked != submit_epoch || !current || source_mapping_due(e)) {
+        if (!current || source_mapping_due(e) || !pool_deps_certificate(e)) make_fresh_snap(e);
         if (vk_texture_deferred()) {
             resource_path.deferred++;
             return VK_TEXTURE_SAMPLE_DEFERRED;
         }
         e->checked = submit_epoch;
+        e->checked_authority = authority;
+    }
+    if (e->source_canonical && (e->source_blocked || !source_permission_current(e))) {
+        resource_path.unavailable++;
+        source_note_refusal(e, SOURCE_REFUSAL_PERMISSION, RC_REGISTRY_BLOCKED);
+        sample_refusal_record(refused, s, e, "binding-permission");
+        return VK_TEXTURE_SAMPLE_CANONICAL_REFUSED;
+    }
+    if (e->source_blocked) {
+        resource_path.fallback++;
+        return VK_TEXTURE_SAMPLE_FALLBACK;
     }
     if (!e->uploaded || e->up_retry) {
         // Failed uploads have an explicit later retry. An allocated but unpopulated image is not ready data.
         resource_path.unavailable++;
-        return VK_TEXTURE_SAMPLE_UNAVAILABLE;
+        source_note_refusal(e, SOURCE_REFUSAL_UPLOAD, RC_REGISTRY_UNSUPPORTED);
+        sample_refusal_record(refused, s, e, "upload-unavailable");
+        return e->source_canonical ? VK_TEXTURE_SAMPLE_CANONICAL_REFUSED : VK_TEXTURE_SAMPLE_UNAVAILABLE;
     }
     // The image can change during upload (for example an opaque ASTC image selecting its final format), so publish
     // the address generation after preparation, never the value observed before allocation/conversion.
     if (s->cepoch != submit_epoch) round_checks++;
-    s->ce = e;
-    s->sample_owned = 1;
-    s->cgen = agen[sinfo[id] & 0xffff];
+    if (texture_registration_source_attach(s, e)) {
+        s->ce = NULL;
+        s->sample_owned = 0;
+    } else {
+        s->ce = e;
+        s->sample_owned = 1;
+        s->cgen = agen[sinfo[id] & 0xffff];
+        int has_view;
+        slot_result_view(s, e, &s->cview, &has_view);
+        s->chas_view = (uint8_t)has_view;
+    }
     s->cepoch = submit_epoch;
-    int has_view;
-    slot_result_view(s, e, &s->cview, &has_view);
-    s->chas_view = (uint8_t)has_view;
     s->cheld = 0;
     s->cwant = 0;
     s->absent_mapping = s->absent_protection = 0;
-    sample_result(s, out);
+    sample_result(id, e, out);
     return VK_TEXTURE_SAMPLE_READY;
+}
+
+VkTextureSampleStatus vk_texture_sample_prepare_locked(int id, VkTextureSample *out) {
+    return texture_sample_prepare_locked(id, out, 0, NULL);
 }
 
 void vk_texture_sample_use_locked(const VkTextureSample *sample) {
     if (!sample || !sample->image) return;
     touch((Tex *)sample->image);
     resource_path.used++;
+    const Tex *e = (const Tex *)sample->image;
+    resource_path.material_used += e->material != NULL;
+    resource_path.versioned_used += e->material && e->material_version.id;
 }
 // RESOURCE_SAMPLE_END
+
+VkTextureSampleStatus vk_texture_ordered_sample_select_locked(int logical, RcRegistryPosition read, unsigned flags,
+    unsigned alias_options, VkTextureSample *sample, VkTextureAliasRead **alias, VkTexImage *shape,
+    VkTextureAliasFailure *failure) {
+    if (failure) *failure = (VkTextureAliasFailure){0};
+    const int alias_only = !!(alias_options & VK_TEXTURE_ALIAS_SAMPLE_ONLY);
+    const int ordered = rc_registry_position_valid(read);
+    if (ordered && rc_registry_position_compare(read, vk_exec_resource_position())) {
+        *sample = (VkTextureSample){.native_slot = -1};
+        image_alias_refuse(failure, VK_TEXTURE_ALIAS_ORDER, RC_REGISTRY_STALE, (RcInterval){0});
+        return VK_TEXTURE_SAMPLE_UNAVAILABLE;
+    }
+    VkTextureSampleStatus status = VK_TEXTURE_SAMPLE_FALLBACK;
+    int native = -1;
+    if (!alias_only) {
+        status = vk_texture_select_sample_locked(logical, flags, sample);
+        if (!ordered || !alias || status == VK_TEXTURE_SAMPLE_ABSENT || sample->historical ||
+            (status == VK_TEXTURE_SAMPLE_READY && (sample->canonical || sample->projected))) return status;
+        native = sample->native_slot;
+    } else {
+        *sample = (VkTextureSample){.native_slot = -1};
+        if (!ordered || !alias) return status;
+    }
+    if (flags & VK_TEXTURE_READ_LINEAR_RGBA8_VIEW) alias_options |= VK_TEXTURE_ALIAS_SAMPLE_LINEAR_RGBA8_VIEW;
+    const int composed = image_alias_sample_select_locked(logical, native, read, alias, sample, shape, alias_options, failure);
+    if (composed < 0) return VK_TEXTURE_SAMPLE_UNAVAILABLE;
+    return composed > 0 ? VK_TEXTURE_SAMPLE_READY : status;
+}
+
+VkTextureSampleStatus vk_texture_comparison_alias_capture_locked(int logical, RcRegistryPosition read,
+    VkTextureSample *sample, VkTextureAliasRead **alias, VkTexImage *shape, VkTextureAliasFailure *failure) {
+    *sample = (VkTextureSample){.native_slot = -1};
+    *alias = NULL;
+    const int selected = image_alias_sample_select_locked(logical, -1, read, alias, sample, shape,
+                                                           VK_TEXTURE_ALIAS_SAMPLE_FORCE, failure);
+    return selected < 0 ? VK_TEXTURE_SAMPLE_UNAVAILABLE : selected ? VK_TEXTURE_SAMPLE_READY : VK_TEXTURE_SAMPLE_FALLBACK;
+}
+
+int vk_texture_sample_restore_plan_locked(int logical, VkTextureRestoreShape *shape, VkTextureRestore **out) {
+    if (out) *out = NULL;
+    const TextureRegistration *record;
+    int native;
+    if (texture_registration_resolve(logical, &record, &native) != VK_TEXTURE_REGISTRATION_CURRENT ||
+        native < 0 || native >= ntslots || !sample_slot_eligible(&tslots[native])) return 0;
+    const TexSlot *slot = &tslots[native];
+    Tex *e = texture_registration_source(slot);
+    RcRegistryPosition read = vk_exec_resource_position();
+    if (!slot->registration || !rc_registry_position_valid(read) || !sample_entry_eligible(e) ||
+        !source_private_sample(e)) return 0;
+    TextureRecoveryCopy copy;
+    TextureSourceStamp stamp;
+    if (!restore_plan_locked(e, slot->registration->descriptor.serial, &copy, &stamp)) return 0;
+    if (shape) {
+        const MaterialSource *source = e->material->provider;
+        shape->image = source->representation;
+        slot_result_view(slot, e, &shape->view, &shape->has_view);
+    }
+    if (out) {
+        VkTextureRestore *restore = restore_take_plan_locked(e, &copy, &stamp);
+        restore->sample_read = read;
+        restore->sample_logical = logical;
+        restore->sample_native = native;
+        restore->sample_registration = texture_slot_registration(native);
+        *out = restore;
+    }
+    return 1;
+}
+
+VkTextureRestore *vk_texture_sample_restore_capture_locked(int logical) {
+    VkTextureRestore *restore;
+    vk_texture_sample_restore_plan_locked(logical, NULL, &restore);
+    return restore;
+}
+
+static Tex *sample_restore_current_locked(VkTextureRestore *restore, TextureSourceStamp *latest) {
+    if (rc_registry_position_compare(vk_exec_resource_position(), restore->sample_read)) return NULL;
+    const TextureRegistration *record;
+    int native;
+    if (texture_registration_resolve(restore->sample_logical, &record, &native) != VK_TEXTURE_REGISTRATION_CURRENT ||
+        native != restore->sample_native) return NULL;
+    VkTextureReadKey key = {.registration = restore->sample_registration, .native_slot = native, .canonical = 1};
+    const TexSlot *slot = texture_read_key_slot(key);
+    if (!slot || slot->finalized) return NULL;
+    Tex *e = texture_registration_source(slot);
+    if (!sample_entry_eligible(e) || e->released || e->retiring || e->material != restore->material ||
+        e->t.serial != slot->registration->descriptor.serial || !e->source_canonical || !source_private_sample(e)) return NULL;
+    TextureSourceObservation observation;
+    if (source_observe(e, &restore->sample_stamp, &observation) != TEX_SOURCE_CLEAN) return NULL;
+    if (latest) *latest = observation.stamp;
+    return e;
+}
+
+int vk_texture_sample_restore_current(void *context) {
+    VkTextureRestore *restore = context;
+    lock();
+    int current = sample_restore_current_locked(restore, NULL) != NULL;
+    unlock();
+    return current;
+}
+
+VkTextureSampleStatus vk_texture_sample_restore_install_locked(VkTextureRestore *restore, VkTextureSample *out) {
+    *out = (VkTextureSample){0};
+    TextureSourceStamp latest;
+    Tex *e = sample_restore_current_locked(restore, &latest);
+    TextureMaterial *m = restore->material;
+    if (!e || !restore->use.instance || m->resident.instance != restore->use.instance) return VK_TEXTURE_SAMPLE_CANONICAL_REFUSED;
+    if (!e->pub.image && !content_adopt_residency(e, m, &latest)) return VK_TEXTURE_SAMPLE_CANONICAL_REFUSED;
+    if (e->pub.image != restore->picture.image || !source_permission_current(e)) return VK_TEXTURE_SAMPLE_CANONICAL_REFUSED;
+    unsigned native = restore->sample_native;
+    TexSlot *slot = &tslots[native];
+    e->checked = submit_epoch;
+    e->checked_authority = rc_registry_authority_epoch(rc_registry_runtime());
+    if (slot->cepoch != submit_epoch) round_checks++;
+    slot->cepoch = submit_epoch;
+    slot->cheld = slot->cwant = 0;
+    slot->absent_mapping = slot->absent_protection = 0;
+    sample_result(native, e, out);
+    return VK_TEXTURE_SAMPLE_READY;
+}
+
+
+struct VkTextureHistorical3D {
+    VkTextureRegistrationScope *scope;
+    RcRegistryHandle registration;
+    RcRegistryPosition read;
+    TextureUseNode source_use;
+    VkTexImage source;
+    VkImageCreateInfo recipe;
+    TextureFlat3D *output;
+    uint32_t layer;
+    int logical;
+};
+
+static int flat3d_history_ready(const TextureRegistration *record, const TextureMaterialInstance *source,
+                                RcRegistryPosition read) {
+    const TextureFlat3D *copy = record->flat3d;
+    if (!copy || !copy->material || copy->image.gone || copy->source_instance != source->value.id ||
+        copy->source != record->exact.image || copy->layer != texture_registration_exact_layer(record) ||
+        !rc_registry_position_valid(read) || rc_registry_position_compare(copy->position, read) > 0) return 0;
+    return copy->position.scene == read.scene || rc_registry_position_handed(rc_registry_runtime(), copy->position);
+}
+
+VkTextureSampleStatus vk_texture_history_flat3d_locked(int logical, const VkTexImage **image,
+                                                       VkTextureHistorical3D **plan) {
+    if (image) *image = NULL;
+    const TextureRegistration *record;
+    const TextureUseNode *owner;
+    int history = texture_registration_resolve_owner(logical, &record, NULL, &owner);
+    if (history == VK_TEXTURE_REGISTRATION_CURRENT) return VK_TEXTURE_SAMPLE_FALLBACK;
+    if (history == VK_TEXTURE_REGISTRATION_ABSENT) return VK_TEXTURE_SAMPLE_ABSENT;
+    if (history != VK_TEXTURE_REGISTRATION_EXACT) return VK_TEXTURE_SAMPLE_GONE;
+    uint32_t layer = texture_registration_exact_layer(record);
+    VkImageCreateInfo recipe;
+    if (!(record->exact.usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) || !flat3d_recipe(&record->exact, layer, &recipe))
+        return VK_TEXTURE_SAMPLE_GONE;
+    TextureMaterialInstance *source = owner->use.instance;
+    RcRegistryPosition read = vk_exec_resource_position();
+    if (flat3d_history_ready(record, source, read)) {
+        if (image) *image = &record->flat3d->image;
+        return VK_TEXTURE_SAMPLE_READY;
+    }
+    if (!plan || !rc_registry_position_valid(read)) return VK_TEXTURE_SAMPLE_PREPARE;
+    VkTextureHistorical3D *input = calloc(1, sizeof *input);
+    if (!input || !(input->output = calloc(1, sizeof *input->output))) {
+        free(input);
+        return VK_TEXTURE_SAMPLE_UNAVAILABLE;
+    }
+    input->scope = vk_texture_registration_scope_retain(vk_exec_texture_registration_scope());
+    input->registration = record->handle;
+    input->read = read;
+    input->source = record->exact;
+    input->recipe = recipe;
+    input->layer = layer;
+    input->logical = logical;
+    if (texture_use_retain_instance(&input->source_use, source, &owner->use) != RC_LIFETIME_OK) {
+        vk_texture_history_flat3d_cancel(input);
+        return VK_TEXTURE_SAMPLE_GONE;
+    }
+    *plan = input;
+    return VK_TEXTURE_SAMPLE_PREPARE;
+}
+
+int vk_texture_history_flat3d_installed_locked(int logical, const TextureImagePublication *set_images,
+                                              uint32_t descriptor, VkImage expected) {
+    const TextureRegistration *record;
+    if (texture_registration_resolve(logical, &record, NULL) != VK_TEXTURE_REGISTRATION_EXACT) return 0;
+    const TextureFlat3D *copy = record->flat3d;
+    const TextureMaterialInstance *installed = texture_publication_image_locked(set_images, descriptor, expected);
+    return copy && !copy->image.gone && copy->image.image == expected && copy->material &&
+        installed && installed == copy->material->resident.instance;
+}
+
+static TextureRegistration *flat3d_history_record(const VkTextureHistorical3D *plan) {
+    const TextureRegistration *record;
+    const TextureUseNode *owner;
+    if (plan->scope != vk_exec_texture_registration_scope() ||
+        rc_registry_position_compare(plan->read, vk_exec_resource_position()) ||
+        texture_registration_resolve_owner(plan->logical, &record, NULL, &owner) != VK_TEXTURE_REGISTRATION_EXACT ||
+        record->handle.id != plan->registration.id || record->handle.index != plan->registration.index ||
+        record->exact.image != plan->source.image || owner->use.instance != plan->source_use.use.instance) return NULL;
+    return (TextureRegistration *)record;
+}
+
+int vk_texture_history_flat3d_current(void *opaque) {
+    const VkTextureHistorical3D *plan = opaque;
+    lock();
+    int current = flat3d_history_record(plan) != NULL;
+    unlock();
+    return current;
+}
+
+VkResult vk_texture_history_flat3d_prepare(void *opaque, RcVmaDependency *dependency) {
+    VkTextureHistorical3D *plan = opaque;
+    TextureFlat3D *copy = plan->output;
+    if (copy->image.image) return VK_SUCCESS;
+    copy->image = plan->source;
+    copy->image.image = VK_NULL_HANDLE;
+    RcVmaRequest request = {.producer = RC_BUDGET_TEXTURE, .required = 1, .dependency = dependency};
+    VmaAllocationCreateInfo placement = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    return resource_core_vma_create_image(&request, vk_ctx()->vma, &plan->recipe, &placement, &copy->image.image,
+                                         &copy->allocation, NULL, NULL);
+}
+
+int vk_texture_history_flat3d_record_locked(VkTextureHistorical3D *plan, VkCommandBuffer cb) {
+    TextureRegistration *record = flat3d_history_record(plan);
+    TextureMaterialInstance *source = plan->source_use.use.instance;
+    if (!record || !cb) return 0;
+    if (flat3d_history_ready(record, source, plan->read)) return 1;
+    TextureFlat3D *copy = plan->output;
+    if (!copy || !copy->image.image || !flat3d_material_attach(source->value.id, copy, &plan->recipe)) return 0;
+    texture_use_scene_material_locked(source, &plan->source_use.use);
+    texture_use_scene_material_locked(copy->material->resident.instance, NULL);
+    flat3d_record(&plan->source, copy, &plan->recipe, plan->layer, cb, plan->read);
+    if (record->flat3d) flat3d_retire(record->flat3d);
+    record->flat3d = copy;
+    plan->output = NULL;
+    return 1;
+}
+
+void vk_texture_history_flat3d_cancel(VkTextureHistorical3D *plan) {
+    if (!plan) return;
+    if (plan->output) {
+        if (plan->output->image.image)
+            resource_core_vma_destroy_image(vk_ctx()->vma, plan->output->image.image, plan->output->allocation);
+        free(plan->output);
+    }
+    lock();
+    TextureMaterialInstance *source = plan->source_use.use.instance;
+    if (source) {
+        texture_use_unlink(&plan->source_use);
+        texture_material_require(texture_material_use_cancel(&plan->source_use.use));
+        texture_uses.nodes--;
+        content_defer_instance(source);
+    }
+    vk_texture_registration_scope_end(plan->scope);
+    unlock();
+    free(plan);
+}
+
+typedef struct {
+    TexSlot *slot;
+    Tex *entry;
+    int associated;
+} TextureSlotSelection;
+
+static TextureSlotSelection texture_slot_select_locked(int native, int private_output);
+static void texture_slot_selected_view(const TextureSlotSelection *, view_t *, int *has_view);
+static const VkTexImage *texture_slot_refresh_locked(TextureSlotSelection, view_t *, int *,
+    VkTextureSampleStatus *, VkTextureSampleRefusal *);
+static TextureSlotSelection texture_storage_select_locked(int native, int exact, int private_output,
+                                                           int refresh, view_t *, int *has_view);
+
+static const VkTexImage *texture_by_slot_locked(int id, view_t *view, int *has_view, VkTextureSampleStatus *status,
+                                                 VkTextureSampleRefusal *refused);
+
+VkTextureSampleStatus vk_texture_resolve_sample_report_locked(int logical, unsigned flags, VkTextureSample *out,
+                                                               VkTextureSampleRefusal *refused) {
+    *out = (VkTextureSample){.native_slot = -1};
+    if (refused) *refused = (VkTextureSampleRefusal){0};
+    int native;
+    int historical = texture_history_sample_locked(logical, out, &native, 1);
+    if (historical) {
+        out->historical = historical;
+        if (historical == VK_TEXTURE_REGISTRATION_EXACT) return VK_TEXTURE_SAMPLE_READY;
+        if (historical == VK_TEXTURE_REGISTRATION_GONE) return VK_TEXTURE_SAMPLE_GONE;
+        return VK_TEXTURE_SAMPLE_ABSENT;
+    }
+    if (native < 0) return VK_TEXTURE_SAMPLE_ABSENT;
+    VkTextureSampleStatus result = VK_TEXTURE_SAMPLE_FALLBACK;
+    const unsigned legacy = flags & (VK_TEXTURE_READ_FORCE_COMPAT | VK_TEXTURE_READ_EXACT_DETAIL);
+    if (!legacy) {
+        result = vk_texture_sample_query_locked(native, out);
+        if (result == VK_TEXTURE_SAMPLE_PREPARE)
+            result = texture_sample_prepare_locked(native, out, !(flags & VK_TEXTURE_READ_REQUIRED), refused);
+        if (result == VK_TEXTURE_SAMPLE_READY) {
+            vk_texture_sample_use_locked(out);
+        }
+    }
+    const char *depth_gate = NULL;
+    if (result == VK_TEXTURE_SAMPLE_FALLBACK && (flags & VK_TEXTURE_READ_REQUIRED) &&
+        !(flags & VK_TEXTURE_READ_FORCE_COMPAT) &&
+        texture_projected_sample_report_locked(&tslots[native], native, VK_NULL_HANDLE, out, NULL,
+                                                refused ? &depth_gate : NULL))
+        return VK_TEXTURE_SAMPLE_READY;
+    if (result == VK_TEXTURE_SAMPLE_FALLBACK) {
+        out->image = texture_by_slot_locked(native, &out->view, &out->has_view, &result, refused);
+        if (result == VK_TEXTURE_SAMPLE_READY) out->registration = texture_slot_registration(native);
+        out->canonical = out->registration && out->image && out->image->image &&
+                         !legacy && texture_registration_source_attach(&tslots[native], (Tex *)out->image);
+        if (refused && depth_gate && result != VK_TEXTURE_SAMPLE_READY && !refused->stage) {
+            sample_refusal_record(refused, &tslots[native], (const Tex *)out->image, depth_gate);
+            refused->position = vk_exec_resource_position();
+        }
+    }
+    out->native_slot = native;
+    return result;
+}
+
+VkTextureSampleStatus vk_texture_resolve_sample_locked(int logical, unsigned flags, VkTextureSample *out) {
+    return vk_texture_resolve_sample_report_locked(logical, flags, out, NULL);
+}
+
+int vk_texture_sample_wait_gpa_locked(VkExec *ex, int logical) {
+    if (tex_deferred) return 0;
+    const TextureRegistration *history;
+    int native;
+    if (texture_registration_resolve(logical, &history, &native) != VK_TEXTURE_REGISTRATION_CURRENT) return 0;
+    const Tex *e = texture_source_entry_locked(native);
+    if (!e || !tslots[native].registration || e->source_refusal != SOURCE_REFUSAL_AUTHORITY ||
+        e->source_refusal_result != RC_REGISTRY_BLOCKED || !source_private_sample(e) ||
+        !source_mapping_domain_current(e) || !mem_backing_current(e->source_mapping->lease)) return 0;
+    RcRegistryPosition read = vk_exec_resource_position();
+    if (!rc_registry_position_valid(read) || rc_registry_position_compare(read, e->source_refusal_position)) return 0;
+    const TextureSourceMapping *mapped = e->source_mapping;
+    for (uint32_t i = 0; i < mapped->count; i++) {
+        RcRegistryReadBlocker blocker;
+        const RcInterval *interval = &mapped->intervals[i];
+        if (!rc_registry_diagnose_read_blocker(rc_registry_runtime(), interval->range, read, &blocker)) continue;
+        if (blocker.guard_reason != RC_REGISTRY_GUARD_GPA_PROJECTION ||
+            blocker.reason != RC_REGISTRY_DIAG_SOURCE_PENDING_BUFFER ||
+            !vk_exec_request_gpa_prefix(ex, blocker.sample.writer, blocker.sample.position, read, *interval)) return 0;
+        tex_deferred = 1;
+        return 1;
+    }
+    return 0;
+}
 
 void vk_texture_lock(void) { lock(); }
 void vk_texture_unlock(void) { unlock(); }
@@ -5093,21 +15321,1599 @@ void vk_texture_bucket_stats(char *out, size_t n) {
     if (used < n)
         snprintf(out + used, n - used, "; pool slots hold %d entries, %d of them GPU-owned (stamped in each submission "
                  "checked by list)", held, gown);
-    used = strlen(out);
-    if (used < n)
-        snprintf(out + used, n - used, "; resource path query/ready/prepare/defer/unavailable/fallback/use %llu/%llu/%llu/%llu/%llu/%llu/%llu; "
-                 "live visits %llu, avoided capacity visits %llu, dependency detaches %llu",
-                 (unsigned long long)resource_path.queries, (unsigned long long)resource_path.ready,
-                 (unsigned long long)resource_path.prepared, (unsigned long long)resource_path.deferred,
-                 (unsigned long long)resource_path.unavailable, (unsigned long long)resource_path.fallback,
-                 (unsigned long long)resource_path.used, (unsigned long long)resource_path.live_visits,
-                 (unsigned long long)resource_path.avoided_visits, (unsigned long long)resource_path.dependency_detach);
-    memset(&resource_path, 0, sizeof resource_path);
     n_bumps = n_undone = n_pool_checks = n_pool_skips = n_presnap_q = 0;
     memset(n_pool_miss, 0, sizeof n_pool_miss);
     memset(n_site, 0, sizeof n_site);
     memset(bump_count, 0, sizeof bump_count);
     unlock();
+}
+
+int vk_texture_image_live_locked(const VkTexImage *captured) {
+    if (!captured || !captured->image) return 0;
+    for (const Tex *e = nvn_hm_get(&by_addr, &captured->addr); e; e = e->next_at)
+        if (e->pub.image == captured->image && !e->pub.gone) return 1;
+    return 0;
+}
+
+int vk_texture_effect_sample(int id, int exact, VkTexImage *out, view_t *view, int *has_view, uint64_t *source_size) {
+    *out = (VkTexImage){0}; *view = (view_t){0}; *has_view = 0; *source_size = 0;
+    lock();
+    const VkTexImage *img = NULL;
+    int historical=vk_texture_registration_image_locked(id,&img,view,has_view,source_size);
+    if (historical) {
+        if (historical>0) *out=*img;
+        unlock();
+        return historical>0;
+    }
+    id = vk_texture_pool_slot_locked(vk_exec_texture_pool(), id);
+    img = vk_texture_by_id_locked(id, view, has_view);
+    if (img && img->skip && exact) img = vk_texture_exact_by_id_locked(id, view, has_view);
+    int result = tex_deferred ? -1 : img && img->image && !img->gone ? 1 : 0;
+    if (result == 1) {
+        Tex *e = (Tex *)img;
+        if (from_storage(e) && !e->pub.gpu_owned && (!e->uploaded || e->up_retry)) result = 0;
+        else {
+            *out = *img; *source_size = e->t.L.size;
+            touch(e);
+            // Preserve the exact read instance through this scene without converting it to writable ownership.
+            // Nonmaterial images retain the backend's recording-fence deferral, as in writable capture below.
+            vk_texture_use_images(&img->image, 1);
+        }
+    }
+    unlock();
+    return result;
+}
+
+typedef struct {
+    TextureRecoveryCopy copy;
+    VkPreparedStaging staging;
+    RcBudgetTicket workspace;
+    RcRegistryGpuCapture source;
+    TextureSourceStamp stamp;
+    uint32_t references, range_count;
+    int recorded;
+    RcSourceRange ranges[];
+} TextureStorageCpuLoad;
+
+struct VkTextureStorageTarget {
+    TexKey key, registration_key;
+    RcRegistryPosition read;
+    VkImage image;
+    VkMemoryImageHold *hold;
+    const tex_t *host_pin;
+    uint64_t host_layout;
+    TextureStorageCpuLoad *host_cpu;
+    uint64_t pool, registration, serial, revision, registration_serial, size;
+    int logical, native, has_view;
+    view_t view;
+    VkImageSubresourceRange volume_mip, word_alias_plane;
+    VkTextureBoundRelocation *bound_plan;
+    uint8_t bound_relocated, cold_replacement;
+    uint32_t mapping_count;
+    RcInterval mapping[];
+};
+
+static int storage_target_shape(const Tex *e) {
+    const VkImageUsageFlags usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    VkTextureAliasLayout layout;
+    return e && !e->pin_owned && !e->material && !e->pub.mirrored && !e->pub.skip &&
+        (e->pub.type == VK_IMAGE_TYPE_2D || storage_volume_shape(e)) && e->pub.aspect == VK_IMAGE_ASPECT_COLOR_BIT &&
+        (e->pub.usage & usage) == usage && nvn_gpu_only(e->pub.addr) && image_alias_material_layout(e, &layout);
+}
+
+static int storage_target_volume_view(const Tex *entry, const view_t *view, int has_view, VkImageSubresourceRange *range) {
+    if (entry->pub.type != VK_IMAGE_TYPE_3D) return 1;
+    if (has_view && (view->set_layers || view->set_dsmode ||
+        (view->set_target && view->target != NVN_TEXTURE_TARGET_3D) ||
+        (view->set_format && view->format != entry->t.d.format))) return 0;
+    const uint32_t mip = has_view && view->set_levels ? view->base_level : 0;
+    *range = (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, mip, 1, 0, 1};
+    return storage_volume_mip(&entry->pub, range);
+}
+
+static int storage_target_identity_current(const Tex *e) {
+    return e && !e->released && !e->retiring && !e->superseded && !e->overwritten && !e->pub.gone && e->pub.image;
+}
+
+static int storage_word_view_plane(const view_t *view, int has_view, const VkTexImage *image,
+    VkImageSubresourceRange *plane) {
+    if (!has_view || !view->set_format || view->format != NVN_FORMAT_R32UI || view->set_dsmode ||
+        (view->set_target && view->target != NVN_TEXTURE_TARGET_2D)) return 0;
+    const uint32_t mip = view->set_levels ? view->base_level : 0;
+    const uint32_t layer = view->set_layers ? view->min_layer : 0;
+    if (mip >= image->levels || layer >= image->layers) return 0;
+    *plane = (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, mip, 1, layer, 1};
+    return 1;
+}
+
+static int storage_word_format(int guest, const TexVkFormat *format) {
+    int bw, bh;
+    return format->vk != VK_FORMAT_UNDEFINED && format->vk == format->ideal &&
+        !format->depth && !format->stencil && !format->expand_rgb && !format->alpha_one && !format->chan[0] &&
+        !format->astc_bw && !format->astc_bc && nvn_fmt_bpb(guest, &bw, &bh) == 4 && bw == 1 && bh == 1;
+}
+
+static int storage_word_alias_initialized(Tex *entry, VkImageSubresourceRange plane, RcRegistryPosition read) {
+    uint32_t count = 0;
+    const RcInterval *demand = image_alias_plane_demand(entry, &plane, &count);
+    return image_alias_resident_current(entry, demand, count, read);
+}
+
+static int storage_word_alias_capture(const TextureRegistration *record, const TexKey *registration_key,
+    const TextureSlotSelection *selected, const view_t *view, int has_view, RcRegistryPosition read,
+    VkImageSubresourceRange *plane) {
+    Tex *entry = selected->entry;
+    const VkTexImage *image = &entry->pub;
+    const tex_t *declared = &record->descriptor;
+    if (selected->associated || !storage_target_identity_current(entry) || !storage_target_shape(entry) ||
+        !image->gpu_owned || image->bound || image->view_type != VK_IMAGE_VIEW_TYPE_2D || image->type != VK_IMAGE_TYPE_2D ||
+        image->format != entry->f.vk || image->aspect != VK_IMAGE_ASPECT_COLOR_BIT || image->samples != 1 ||
+        !(entry->ik.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) ||
+        declared->d.target != NVN_TEXTURE_TARGET_2D || declared->d.format == entry->key.d.format ||
+        storage_target_identity_current(nvn_hm_get(&by_key, registration_key)) ||
+        !image_alias_source_current(entry)) return 0;
+    // A common integer storage view does not change the independently registered color interpretation.
+    // Require the same guest word coordinates and the original live placement before using that view.
+    TexKey words = *registration_key;
+    words.d.format = entry->key.d.format;
+    const nvn_texlayout *a = &declared->L, *b = &entry->t.L;
+    TexVkFormat format;
+    VkImageSubresourceRange registered;
+    return same_but_swizzle(&words, &entry->key) &&
+        a->size == b->size && a->layer_size == b->layer_size && a->align == b->align &&
+        a->layers == b->layers && a->bpb == b->bpb && a->tileH == b->tileH && a->tileD == b->tileD &&
+        tex_vk_format(declared->d.format, &format) && storage_word_format(declared->d.format, &format) &&
+        storage_word_format(entry->t.d.format, &entry->f) &&
+        storage_word_view_plane(&record->view, record->has_view, image, &registered) &&
+        storage_word_view_plane(view, has_view, image, plane) &&
+        registered.baseMipLevel == plane->baseMipLevel && registered.baseArrayLayer == plane->baseArrayLayer &&
+        storage_word_alias_initialized(entry, *plane, read);
+}
+
+// The initialized ordinary image contains its own native texels. The host
+// backing is its write and visibility obligation, not a GPU raw recipe.
+static int storage_host_initialized(const Tex *entry, RcRegistryPosition read) {
+    if (!entry->host_storage_init || !entry->sample_general_revision) return 0;
+    // Ordinary replay flushes this exact preceding upload before handing off the
+    // part (including a split part). This is ordering, not transfer completion.
+    if (entry->sample_general_upload)
+        return entry->sample_general_upload <= vk_upload_dependency();
+    const RcRegistryPosition initialized = entry->sample_general_inline;
+    const TextureUsePartDisposition *part = entry->host_storage_init_part;
+    if (!part || !rc_registry_position_valid(initialized) || rc_registry_position_compare(initialized, read) >= 0)
+        return 0;
+    const uint32_t state = __atomic_load_n(&part->handover, __ATOMIC_ACQUIRE);
+    if (state == TEXTURE_BATCH_HANDED) return 1;
+    if (state != TEXTURE_BATCH_RECORDING || initialized.scene != read.scene) return 0;
+    const TextureUseBatch *active = texture_use_active(read.scene, 0);
+    return active && active->part == part;
+}
+
+static const RcInterval *storage_host_mapping(const Tex *entry, uint32_t *count) {
+    *count = 0;
+    if (!entry->alloc || entry->material || entry->bound_to || entry->pub.bound || entry->pin_detached ||
+        entry->pending_write || entry->image_device_count || entry->image_private_mapping_count ||
+        !mem_backing_current(entry->image_host_backing)) return NULL;
+    return mem_backing_intervals(entry->image_host_backing, count);
+}
+
+static void storage_host_cpu_load_release(void *opaque) {
+    TextureStorageCpuLoad *load = opaque;
+    if (!load || __atomic_sub_fetch(&load->references, 1, __ATOMIC_ACQ_REL)) return;
+    if (load->source.id && rc_registry_gpu_capture_end(rc_registry_runtime(), &load->source) != RC_REGISTRY_OK)
+        rt_fatal("vk: mirrored storage load lost its CPU observation");
+    texture_cpu_copy_rollback(&load->copy, &load->staging, &load->workspace);
+    free(load);
+}
+
+static void storage_host_cpu_load_cancel(void *opaque, int may_have_executed) {
+    (void)may_have_executed;
+    storage_host_cpu_load_release(opaque);
+}
+
+static int storage_host_cpu_candidate(const Tex *entry) {
+    return entry->pub.mirrored && !entry->pub.gpu_owned && !entry->gpu_dirty && !entry->image_authority.id &&
+        !entry->image_mapped_holds && !entry->snap && !fills_no_page(entry) && !entry->pin_owned && !entry->pin_detached &&
+        !entry->material && !entry->pending_write && !entry->bound_to && !entry->pub.bound &&
+        entry->pub.type == VK_IMAGE_TYPE_2D && entry->sample_general_revision && entry->sample_general_upload &&
+        entry->sample_general_upload <= vk_upload_dependency();
+}
+
+static int storage_host_cpu_load_current(const Tex *entry, const TextureStorageCpuLoad *load, RcRegistryPosition read) {
+    if (!load || !texture_source_stamp_valid(&load->stamp) || !storage_host_cpu_candidate(entry) ||
+        !mem_backing_current(entry->image_host_backing) ||
+        !mem_mapping_range_unchanged(entry->pub.addr, entry->t.L.size, load->stamp.mapping) ||
+        !mem_protection_range_unchanged(entry->pub.addr, entry->t.L.size, load->stamp.protection) ||
+        rc_registry_gpu_capture_read_at(rc_registry_runtime(), load->source, load->ranges, load->range_count, read) != RC_REGISTRY_OK)
+        return 0;
+    // The live write watch can see a late store hidden by the submit's memoized source observation.
+    // Keep the generation paired with the copied data, including across revalidation.
+    uint32_t now;
+    return vk_mem_changed(entry->pub.addr, entry->t.L.size, load->stamp.generation, &now) == 0;
+}
+
+static TextureStorageCpuLoad *storage_host_cpu_load(Tex *entry, RcRegistryPosition read,
+    const RcInterval *mapping, uint32_t count) {
+    TextureRecoveryCopy copy = {0};
+    if (!count || (size_t)count > (SIZE_MAX - sizeof(TextureStorageCpuLoad)) / sizeof(RcSourceRange) ||
+        !storage_host_cpu_candidate(entry) || !recovery_copy_layout(entry, &copy) ||
+        vk_mem_canonical_source_qualify(entry->image_host_backing, entry->pub.addr, entry->t.L.size) != RC_REGISTRY_OK)
+        return NULL;
+    TextureStorageCpuLoad *load = calloc(1, sizeof *load + count * sizeof *load->ranges);
+    if (!load) return NULL;
+    *load = (TextureStorageCpuLoad){.copy = copy, .references = 1, .range_count = count};
+    for (uint32_t i = 0; i < count; i++) load->ranges[i] = mapping[i].range;
+    const TextureSourceSpan whole = {0, entry->t.L.size};
+    TextureSourceObservation observed;
+    vk_mem_observe_subresources(entry->pub.addr, entry->t.L.size, NULL, submit_epoch, &whole, 1, &observed);
+    load->stamp = observed.stamp;
+    RcRegistry *registry = rc_registry_runtime();
+    if (!texture_source_stamp_valid(&load->stamp) ||
+        rc_registry_gpu_capture_begin(registry, load->ranges, count, &load->source) != RC_REGISTRY_OK ||
+        !storage_host_cpu_load_current(entry, load, read)) goto failed;
+
+    return load;
+failed:
+    storage_host_cpu_load_release(load);
+    return NULL;
+}
+
+static int storage_host_shape(const Tex *entry, const view_t *view, int has_view, VkImageSubresourceRange *plane) {
+    const VkTexImage *image = &entry->pub;
+    const nvn_texdesc *desc = &entry->t.d;
+    const VkImageUsageFlags usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    if (image->aspect != VK_IMAGE_ASPECT_COLOR_BIT || image->format != entry->f.ideal ||
+        image->format != entry->f.vk || entry->f.expand_rgb || entry->f.astc_bw || format_compressed(image->format) ||
+        image->skip || image->block_views || image->scale > 1 || image->samples != 1 || image->layers != 1 ||
+        image->preserve_pool_bytes || image->fb_learned || (image->usage & usage) != usage ||
+        !image->width || !image->height || !image->levels || nvn_tex_is_linear(desc)) return 0;
+    if (image->type == VK_IMAGE_TYPE_3D)
+        return storage_volume_shape(entry) && storage_target_volume_view(entry, view, has_view, plane);
+    if (image->type != VK_IMAGE_TYPE_2D || image->view_type != VK_IMAGE_VIEW_TYPE_2D ||
+        desc->target != NVN_TEXTURE_TARGET_2D || image->depth != 1 || entry->t.L.layers != 1 ||
+        image->width != (uint32_t)desc->width || image->height != (uint32_t)desc->height ||
+        image->levels != (uint32_t)desc->levels) return 0;
+    if (has_view && (view->set_dsmode || (view->set_target && view->target != desc->target) ||
+        (view->set_format && view->format != desc->format) ||
+        (view->set_layers && (view->min_layer || view->nlayers > 1)))) return 0;
+    const uint32_t mip = has_view && view->set_levels ? view->base_level : 0;
+    if (mip >= image->levels) return 0;
+    *plane = (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, mip, 1, 0, 1};
+    return 1;
+}
+
+static int storage_host_planes_match(const Tex *entry, const VkTextureStorageTarget *target,
+    const VkImageSubresourceRange *planes) {
+    VkImageSubresourceRange current = {0};
+    return target->host_layout && target->host_layout == entry->sample_general_revision &&
+        storage_host_shape(entry, &target->view, target->has_view, &current) && planes &&
+        !memcmp(planes, &current, sizeof current);
+}
+
+static int storage_host_planes_current(const Tex *entry, const VkTextureStorageTarget *target,
+    const VkImageSubresourceRange *planes) {
+    return storage_host_planes_match(entry, target, planes) &&
+        (target->host_cpu ? target->host_cpu->staging.buffer &&
+                            storage_host_cpu_load_current(entry, target->host_cpu, target->read) :
+                            storage_host_initialized(entry, target->read));
+}
+
+static const char *storage_target_shape_refusal(const Tex *entry) {
+    if (entry->pin_owned) return "storage-target-pinned";
+    if (entry->material) return "storage-target-material";
+    if (entry->bound_to || entry->pub.bound) return "storage-target-bound";
+    return storage_target_shape(entry) ? NULL : "storage-target-layout";
+}
+
+static int write_target_storage_current_locked(const VkTextureWriteTarget *target) {
+    const TextureWriteStorageSelection *choice = &target->storage;
+    Tex *entry = target->entry;
+    if (choice->pool != vk_exec_texture_pool() || rc_registry_position_compare(choice->read, vk_exec_resource_position()) ||
+        !storage_target_identity_current(entry) || entry->pin_detached || entry->pub.image != target->selected ||
+        !mem_backing_current(entry->image_host_backing)) return 0;
+    const TextureRegistration *history;
+    int native;
+    if (texture_registration_resolve(choice->logical, &history, &native) != VK_TEXTURE_REGISTRATION_CURRENT ||
+        native != choice->native) return 0;
+    TexSlot *slot = &tslots[native];
+    const TextureRegistration *record = slot->registration;
+    if (!record || slot->finalized || record->handle.id != choice->registration ||
+        record->descriptor.serial != entry->t.serial || record->descriptor.L.size != entry->t.L.size) return 0;
+    TexKey key;
+    make_key(&record->descriptor, &key);
+    if (memcmp(&key, &entry->key, sizeof key) || nvn_hm_get(&by_key, &key) != entry) return 0;
+    if (target->source_use.instance && (!source_mapping_domain_current(entry) ||
+        !source_permission_at(entry, choice->read, NULL))) return 0;
+    if (target->cpu_seed && (!source_mapping_domain_current(entry) ||
+        !rc_registry_source_proofs_current(rc_registry_runtime(), target->cpu_seed->proofs,
+                                          target->cpu_seed->proof_count, choice->read))) return 0;
+    Tex *owned = texture_registration_source(slot);
+    // Adoption changes the placement and bumps this slot's cache generation under the texture lock.
+    // Later use in the same operation keeps the already-adopted entry and validates the retained view.
+    Tex *current = entry->pending_write == target ? texture_binding_entry(slot, native) : (owned ? owned : slot->ce);
+    if (current != entry) return 0;
+    view_t view;
+    int has_view;
+    const TextureSlotSelection selection = {.slot = slot, .entry = entry, .associated = owned != NULL};
+    texture_slot_selected_view(&selection, &view, &has_view);
+    return has_view == choice->has_view && (!has_view || !memcmp(&view, &choice->view, offsetof(view_t, pad1)));
+}
+
+// The caller has already made the only logical slot selection. A private replacement is legal only
+// when the current physical image can supply all of its earlier meaningful contents.
+static int storage_target_capture_bound_locked(int logical, int native, const TextureRegistration *record,
+    const TextureSlotSelection *selected, const TexKey *registration_key, const view_t *view, int has_view,
+    VkTextureStorageTarget **out, const char **reason) {
+    const RcRegistryPosition read = vk_exec_resource_position();
+    Tex *entry = selected->entry;
+    const VkTexImage *image = &entry->pub;
+    const VkImageUsageFlags usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    *reason = "storage-target-bound-layout";
+    if (!entry->bound_to || !image->bound || !nvn_gpu_only(image->addr) || !storage_target_identity_current(entry) ||
+        entry->pin_owned || entry->material || image->mirrored || image->skip || image->fb_learned ||
+        image->aspect != VK_IMAGE_ASPECT_COLOR_BIT || (image->usage & usage) != usage ||
+        (image->type != VK_IMAGE_TYPE_2D && image->type != VK_IMAGE_TYPE_3D))
+        return VK_TEXTURE_STORAGE_CAPTURE_UNSUPPORTED;
+    VkImageSubresourceRange volume_mip = {0};
+    if (!storage_target_volume_view(entry, view, has_view, &volume_mip) ||
+        (image->type == VK_IMAGE_TYPE_3D && (image->view_type != VK_IMAGE_VIEW_TYPE_3D ||
+         entry->t.d.target != NVN_TEXTURE_TARGET_3D || nvn_tex_is_linear(&entry->t.d) ||
+         image->depth != entry->t.d.depth || image->layers != 1 || entry->t.L.layers != 1)))
+        return VK_TEXTURE_STORAGE_CAPTURE_UNSUPPORTED;
+
+    *reason = "storage-target-bound-original-contents";
+    const uint32_t count = entry->image_device_count;
+    if (!entry->bound_alias_whole || !count || count != entry->image_mapped_hold_count ||
+        entry->image_device_size != entry->t.L.size)
+        return VK_TEXTURE_STORAGE_CAPTURE_UNSUPPORTED;
+    *reason = "storage-target-bound-placement";
+    if (selected->slot->ce != entry || texture_binding_entry(selected->slot, native) != entry ||
+        nvn_hm_get(&by_key, &entry->key) != entry ||
+        !image_alias_guest_mapping_current(image->addr, entry->t.L.size, entry->image_device_intervals, count))
+        return VK_TEXTURE_STORAGE_CAPTURE_INVALIDATED;
+
+    *reason = "storage-target-bound-capacity";
+    if ((size_t)count > (SIZE_MAX - sizeof(VkTextureStorageTarget)) / sizeof(RcInterval))
+        return VK_TEXTURE_STORAGE_CAPTURE_INVALIDATED;
+    VkTextureStorageTarget *target = calloc(1, sizeof *target + count * sizeof *target->mapping);
+    VkTextureBoundRelocation *plan = calloc(1, sizeof *plan);
+    if (!target || !plan) {
+        free(target);
+        free(plan);
+        return VK_TEXTURE_STORAGE_CAPTURE_INVALIDATED;
+    }
+    plan->read = read;
+    plan->destination = image->addr;
+    plan->destination_size = entry->t.L.size;
+    plan->owners = plan->count = 1;
+    plan->destination_count = count;
+    plan->destination_intervals = malloc(count * sizeof *plan->destination_intervals);
+    if (plan->destination_intervals)
+        memcpy(plan->destination_intervals, entry->image_device_intervals, count * sizeof *plan->destination_intervals);
+    if (!plan->destination_intervals || !bound_relocation_capture_one(&plan->images[0], entry) ||
+        !bound_relocation_current_locked(plan)) {
+        bound_relocation_release(plan);
+        free(target);
+        *reason = "storage-target-bound-producer-unavailable";
+        return VK_TEXTURE_STORAGE_CAPTURE_INVALIDATED;
+    }
+    *target = (VkTextureStorageTarget){.key = entry->key, .registration_key = *registration_key,
+        .read = read, .image = image->image, .hold = vk_mem_image_hold(image->image), .pool = vk_exec_texture_pool(),
+        .registration = record->handle.id, .serial = entry->t.serial, .revision = entry->content_revision,
+        .registration_serial = record->descriptor.serial, .size = record->descriptor.L.size,
+        .logical = logical, .native = native, .has_view = has_view, .view = *view, .volume_mip = volume_mip,
+        .bound_plan = plan, .mapping_count = count};
+    if (!target->hold) {
+        bound_relocation_release(plan);
+        free(target);
+        return VK_TEXTURE_STORAGE_CAPTURE_INVALIDATED;
+    }
+    memcpy(target->mapping, entry->image_device_intervals, count * sizeof *target->mapping);
+    *out = target;
+    *reason = NULL;
+    return VK_TEXTURE_STORAGE_CAPTURE_BOUND;
+}
+
+typedef struct {
+    RcRegistryPosition read;
+    uint64_t pool, registration, serial;
+    VkImage image;
+    int logical;
+} TextureStorageRefusalKey;
+
+typedef struct {
+    TextureStorageRefusalKey key;
+    VkTexImage image;
+    uint64_t registration_serial, registration_addr, registration_bytes, bytes, revision;
+    int native, associated, has_view, key_relation, material, pinned, detached, pending, bound;
+    int uploaded, released, retiring, superseded, overwritten, host_init;
+    const char *refresh_stage, *refresh_state;
+    VkTextureSampleRefusal refresh_source;
+    uint64_t effective_registration, effective_serial, effective_revision;
+    VkImage effective_image, returned_image;
+    view_t effective_descriptor_view;
+    int returned_selected, effective, effective_view, effective_key_relation, effective_material, effective_uploaded,
+        effective_gpu_owned, effective_host_init;
+} TextureStorageRefusal;
+
+static int storage_trace_key_relation(const TexKey *registration, const TexKey *selected) {
+    if (!memcmp(registration, selected, sizeof *registration)) return 1;
+    return same_but_swizzle(registration, selected) ? 2 : 0;
+}
+
+static void storage_trace_refresh_result(TextureStorageRefusal *trace, const char *stage,
+    const VkTexImage *expected, const VkTexImage *refreshed, int deferred) {
+    trace->refresh_stage = stage;
+    trace->returned_selected = !deferred && refreshed && refreshed == expected;
+    trace->refresh_state = deferred ? "deferred" : !refreshed ? "refused" :
+        refreshed != expected ? "different-entry" : "returned";
+}
+
+static void storage_trace_effective(TextureStorageRefusal *trace, uint64_t registration, const TexKey *key,
+    const Tex *entry, const view_t *view, int has_view) {
+    trace->effective = 1;
+    trace->effective_registration = registration;
+    trace->effective_serial = entry->t.serial;
+    trace->effective_revision = entry->content_revision;
+    trace->effective_image = entry->pub.image;
+    trace->effective_view = has_view;
+    if (has_view) trace->effective_descriptor_view = *view;
+    trace->effective_key_relation = storage_trace_key_relation(key, &entry->key);
+    trace->effective_material = !!entry->material;
+    trace->effective_uploaded = entry->uploaded;
+    trace->effective_gpu_owned = entry->pub.gpu_owned;
+    trace->effective_host_init = entry->host_storage_init;
+}
+
+// The texture lock protects deduplication, including repeated attempts at the same original read.
+static void storage_target_trace_refusal(const TextureStorageRefusal *t, int result, const char *reason) {
+    static TextureStorageRefusalKey seen[128];
+    static unsigned count;
+    if (count == sizeof seen / sizeof *seen) return;
+    const TextureStorageRefusalKey *key = &t->key;
+    for (unsigned i = 0; i < count; ++i) {
+        const TextureStorageRefusalKey *prior = &seen[i];
+        if (!rc_registry_position_compare(prior->read, key->read) && prior->pool == key->pool &&
+            prior->logical == key->logical && prior->registration == key->registration &&
+            prior->serial == key->serial && prior->image == key->image) return;
+    }
+    seen[count++] = *key;
+    const VkTexImage *image = &t->image;
+    rt_log("vk: selected storage refusal read=%llu/%llu output=%llu/%llu unissued=1 status=%d reason=%s "
+           "pool=%#llx logical=%d native-slot=%d registration=%llu registration-serial=%llu "
+           "registration-addr=%#llx registration-bytes=%#llx selected-serial=%llu key-relation=%d "
+           "associated=%d has-view=%d image=%p addr=%#llx bytes=%#llx extent=%ux%ux%u type=%u format=%u "
+           "usage=%#x aspect=%#x mips=%u layers=%u samples=%u scale=%u revision=%llu "
+           "bound=%d mirrored=%d material=%d pinned=%d detached=%d pending=%d host-init=%d "
+           "uploaded=%d gpu-owned=%d gone=%d released=%d retiring=%d superseded=%d overwritten=%d "
+           "refresh-stage=%s refresh-state=%s refresh-source=%s refresh-source-recorded=%u refresh-result=%d "
+            "refresh-image=%p returned-image=%p effective=%d effective-registration=%llu effective-serial=%llu "
+           "effective-image=%p effective-revision=%llu effective-has-view=%d effective-key-relation=%d "
+           "effective-material=%d effective-uploaded=%d effective-gpu-owned=%d effective-host-init=%d "
+           "effective-view-mips=%u/%u/%u effective-view-layers=%u/%u/%u effective-view-format=%u/%u",
+           (unsigned long long)key->read.scene, (unsigned long long)key->read.ordinal,
+           (unsigned long long)key->read.scene, (unsigned long long)(key->read.ordinal | 1), result, reason,
+           (unsigned long long)key->pool, key->logical, t->native, (unsigned long long)key->registration,
+           (unsigned long long)t->registration_serial, (unsigned long long)t->registration_addr,
+           (unsigned long long)t->registration_bytes, (unsigned long long)key->serial, t->key_relation,
+           t->associated, t->has_view, (void *)key->image, (unsigned long long)image->addr,
+           (unsigned long long)t->bytes, image->width, image->height, image->depth, (unsigned)image->type,
+           (unsigned)image->format, image->usage, image->aspect, image->levels, image->layers, image->samples,
+           image->scale, (unsigned long long)t->revision, t->bound, image->mirrored, t->material, t->pinned,
+           t->detached, t->pending, t->host_init, t->uploaded, image->gpu_owned, image->gone, t->released,
+           t->retiring, t->superseded, t->overwritten, t->refresh_stage ? t->refresh_stage : "none",
+           t->refresh_state ? t->refresh_state : "not-attempted", t->refresh_source.stage ? t->refresh_source.stage : "none",
+           (unsigned)t->refresh_source.recorded, t->refresh_source.result, (void *)t->refresh_source.image,
+           (void *)t->returned_image, t->effective, (unsigned long long)t->effective_registration,
+           (unsigned long long)t->effective_serial,
+           (void *)t->effective_image, (unsigned long long)t->effective_revision, t->effective_view,
+           t->effective_key_relation, t->effective_material, t->effective_uploaded, t->effective_gpu_owned,
+           t->effective_host_init, t->effective_descriptor_view.set_levels, t->effective_descriptor_view.base_level,
+           t->effective_descriptor_view.nlevels, t->effective_descriptor_view.set_layers,
+           t->effective_descriptor_view.min_layer, t->effective_descriptor_view.nlayers,
+           t->effective_descriptor_view.set_format, t->effective_descriptor_view.format);
+}
+
+// Cache lifetime and guest contents are independent. A dormant allocation can remain a donor
+// for already recorded reads or prior normalized planes, but cannot be selected as today's target.
+static int storage_stale_predecessor(const Tex *old, const TexSlot *slot, int native, const TexKey *key) {
+    if (!old || (!old->released && !old->overwritten && !old->superseded) ||
+        old->pub.gone || old->pub.fb_learned || old->pending_write || old->bound_to || old->pub.bound ||
+        old->pin_owned || old->material || old->image_authority.id ||
+        memcmp(&old->key, key, sizeof *key) || nvn_hm_get(&by_key, key) != old ||
+        texture_registration_source(slot) || texture_binding_entry(slot, native) != old)
+        return 0;
+    // Projected earlier bytes need the independent native owner to survive eviction.
+    return (!old->image_mapped_holds && !old->alias_fragment_owner) ||
+        (old->native_output && old->alloc && old->image_mapped_holds &&
+         (old->native_output->possible || old->alias_fragment_owner) &&
+         old->image_mapped_hold_count == old->image_private_mapping_count);
+}
+
+static Tex *storage_target_replace_stale_locked(Tex *old, TexSlot *slot, int native,
+    const TextureRegistration *record, const TexKey *key) {
+    if (!storage_stale_predecessor(old, slot, native, key)) return NULL;
+    // A different texture object can reuse the same key. The requested registration and current
+    // normalized mapping authorize the new allocation independently of the previous object.
+    const uint64_t bytes = record->descriptor.L.size;
+    VkMemSpan span;
+    RcInterval *mapping = NULL;
+    const uint32_t count = vk_mem_lookup(key->addr, bytes, &span) ?
+        vk_mem_device_intervals(&span, key->addr, bytes, &mapping) : 0;
+    if (!count) {
+        free(mapping);
+        return NULL;
+    }
+    const VkImage previous = old->pub.image;
+    const uint64_t revision = old->content_revision;
+    const uint64_t registration = record->handle.id;
+    int capacity_failure;
+    Tex *fresh = create_tex(&record->descriptor, key, 1, TEX_PRIVATE_STORAGE_OUTPUT, &capacity_failure);
+    int exact = fresh && fresh->image_private_mapping_count == count;
+    for (uint32_t i = 0; exact && i < count; ++i) {
+        const RcInterval before = mapping[i], after = fresh->image_private_mapping[i];
+        exact = before.address == after.address && before.mapping == after.mapping &&
+            rc_range_equal(before.range, after.range);
+    }
+    free(mapping);
+    if (!fresh) return NULL;
+    if (!exact || slot->finalized || slot->registration != record || record->handle.id != registration ||
+        !storage_stale_predecessor(old, slot, native, key) || old->pub.image != previous ||
+        old->content_revision != revision || storage_target_shape_refusal(fresh) ||
+        !fresh->pub.preserve_pool_bytes || !storage_seed_cold(fresh) || fresh->pub.image == previous ||
+        !image_alias_placement_current(fresh)) {
+        gwin_remove(fresh);
+        free_tex(fresh, 0);
+        return NULL;
+    }
+
+    // The fresh allocation is a placement only. It cannot be read without original plane
+    // coverage and can only be written after the normal predecessor seed or full-store proof.
+    // Evict before inserting: old retirement has no authority over the new key's entry.
+    fresh->storage_registration_owned = 1;
+    init_new(fresh);
+    destroy_tex(old);
+    origin_made(fresh);
+    perf_count(PERF_CNT_TEX_NEW);
+    flight_ev(fresh, FLIGHT_TEX_NEW, fresh->og_start, 0);
+    fresh->next_at = nvn_hm_get(&by_addr, &key->addr);
+    nvn_hm_put(&by_addr, &key->addr, fresh);
+    nvn_hm_put(&by_key, key, fresh);
+    n_site[1]++;
+    tex_gen_bump(key->addr);
+    touch(fresh);
+    slot->ce = fresh;
+    int has_view;
+    slot_result_view(slot, fresh, &slot->cview, &has_view);
+    slot->chas_view = (uint8_t)has_view;
+    slot->cgen = agen[sinfo[native] & 0xffff];
+    slot->cepoch = 0;
+    slot->cheld = 0;
+    return fresh;
+}
+
+int vk_texture_effect_storage_capture(int logical, int exact, VkTexImage *out, view_t *view, int *has_view,
+    uint64_t *size, VkTextureStorageTarget **held, VkTextureWriteTarget **material, int written, int allow_bound, const char **reason) {
+    if (reason) *reason = "storage-target-order";
+    const RcRegistryPosition read = vk_exec_resource_position();
+    if (!held || *held || (material && *material) || !rc_registry_position_valid(read) || (read.ordinal & 1))
+        return VK_TEXTURE_STORAGE_CAPTURE_INVALIDATED;
+    lock();
+    const TextureRegistration *history;
+    int native;
+    const uint64_t pool = vk_exec_texture_pool();
+    const int status = texture_registration_resolve(logical, &history, &native);
+    TexSlot *slot = status == VK_TEXTURE_REGISTRATION_CURRENT && native >= 0 ? &tslots[native] : NULL;
+    const TextureRegistration *record = slot && !slot->finalized ? slot->registration : NULL;
+    int result = VK_TEXTURE_STORAGE_CAPTURE_ABSENT;
+    const char *why = "storage-target-absent-registration";
+    TextureStorageRefusal trace;
+    int trace_selected = 0, cold_replacement = 0;
+    if (status == VK_TEXTURE_REGISTRATION_EXACT || status == VK_TEXTURE_REGISTRATION_GONE) {
+        result = VK_TEXTURE_STORAGE_CAPTURE_UNSUPPORTED;
+        why = "storage-target-historical-registration";
+        goto done;
+    }
+    if (!record || !record->descriptor.mem || !record->descriptor.serial || !record->descriptor.L.size) goto done;
+
+    const uint64_t registration = record->handle.id;
+    const uint64_t registration_serial = record->descriptor.serial, registration_bytes = record->descriptor.L.size;
+    const int gpu_only = nvn_gpu_only((uintptr_t)record->descriptor.mem);
+    TexKey registration_key;
+    make_key(&record->descriptor, &registration_key);
+    TextureSlotSelection selected = texture_storage_select_locked(native, exact,
+        gpu_only ? TEX_PRIVATE_STORAGE_OUTPUT : 0, 0, view, has_view);
+    Tex *entry = selected.entry;
+    if (allow_bound && reason && entry && resource_effects_image_trace_enabled()) {
+        trace_selected = 1;
+        trace = (TextureStorageRefusal){
+            .key = {read, pool, registration, entry->t.serial, entry->pub.image, logical}, .image = entry->pub,
+            .registration_serial = registration_serial, .registration_addr = registration_key.addr,
+            .registration_bytes = registration_bytes, .bytes = entry->t.L.size, .revision = entry->content_revision,
+            .native = native, .associated = selected.associated, .has_view = *has_view,
+            .key_relation = storage_trace_key_relation(&registration_key, &entry->key),
+            .material = !!entry->material, .pinned = entry->pin_owned, .detached = entry->pin_detached,
+            .pending = entry->pending_write != NULL, .bound = entry->bound_to || entry->pub.bound,
+            .uploaded = entry->uploaded, .released = entry->released, .retiring = entry->retiring,
+            .superseded = entry->superseded, .overwritten = entry->overwritten, .host_init = entry->host_storage_init};
+    }
+    if (tex_deferred || slot->finalized || slot->registration != record || slot->registration->handle.id != registration) {
+        result = VK_TEXTURE_STORAGE_CAPTURE_INVALIDATED;
+        why = tex_deferred ? "storage-target-deferred" : "storage-target-registration-changed";
+        goto done;
+    }
+    if (written && gpu_only && !selected.associated && entry && !storage_target_identity_current(entry)) {
+        Tex *replacement = storage_target_replace_stale_locked(entry, slot, native, record, &registration_key);
+        if (replacement) {
+            cold_replacement = 1;
+            selected.entry = entry = replacement;
+            texture_slot_selected_view(&selected, view, has_view);
+            if (trace_selected) storage_trace_effective(&trace, registration, &registration_key, entry, view, *has_view);
+        }
+    }
+    // Cold mirrored storage can acquire an immutable resident material through ordinary preparation.
+    // Complete that work on the already selected registration before choosing its writable owner.
+    const int selected_host_mirror = !gpu_only && material && entry && entry->pub.mirrored &&
+        !entry->pub.gpu_owned && !entry->material &&
+        !entry->pin_owned && !entry->pending_write && !entry->pin_detached && !entry->bound_to && !entry->pub.bound &&
+        entry->pub.type == VK_IMAGE_TYPE_2D && (entry->pub.usage & VK_IMAGE_USAGE_STORAGE_BIT) &&
+        entry->t.serial == record->descriptor.serial && entry->t.L.size == record->descriptor.L.size &&
+        !memcmp(&entry->key, &registration_key, sizeof registration_key);
+    const int cold_host_mirror = selected_host_mirror && !content_image_eligible(entry);
+    if (selected_host_mirror && !cold_host_mirror) {
+        result = VK_TEXTURE_STORAGE_CAPTURE_INVALIDATED;
+        why = "storage-target-host-refresh";
+        const VkTexImage *expected = &entry->pub;
+        const VkTexImage *refreshed = texture_slot_refresh_locked(selected, view, has_view, NULL,
+            trace_selected ? &trace.refresh_source : NULL);
+        if (trace_selected) storage_trace_refresh_result(&trace, "mirrored-prep", expected, refreshed, tex_deferred);
+        if (refreshed != expected || tex_deferred || slot->registration != record || slot->finalized ||
+            record->handle.id != registration || !storage_target_identity_current(entry) ||
+            texture_binding_entry(slot, native) != entry || nvn_hm_get(&by_key, &registration_key) != entry) goto done;
+        if (trace_selected) storage_trace_effective(&trace, registration, &registration_key, entry, view, *has_view);
+    }
+    const int host_private = !gpu_only && entry && !entry->material;
+    if (!gpu_only && material && entry && entry->pub.mirrored && entry->material) {
+        result = VK_TEXTURE_STORAGE_CAPTURE_UNSUPPORTED;
+        why = "storage-target-material-bound";
+        if (entry->bound_to || entry->pub.bound || entry->image_device_count || entry->image_private_mapping_count) goto done;
+        why = "storage-target-material-pinned";
+        if (entry->pin_owned) goto done;
+        why = "storage-target-material-cold";
+        if (!entry->pub.image || !entry->uploaded || entry->up_retry) goto done;
+        why = "storage-target-material-identity";
+        if (record->descriptor.serial != entry->t.serial || record->descriptor.L.size != entry->t.L.size ||
+            memcmp(&registration_key, &entry->key, sizeof registration_key)) goto done;
+        why = "storage-target-material-view";
+        if (*has_view && (view->set_dsmode || (view->set_format && view->format != entry->t.d.format))) goto done;
+        why = "storage-target-material-shape";
+        if (!(entry->pub.usage & VK_IMAGE_USAGE_STORAGE_BIT) || !write_target_material_candidate(entry, 0)) goto done;
+        result = VK_TEXTURE_STORAGE_CAPTURE_INVALIDATED;
+        why = "storage-target-material-placement";
+        if (!storage_target_identity_current(entry) || texture_binding_entry(slot, native) != entry ||
+            nvn_hm_get(&by_key, &registration_key) != entry || !mem_backing_current(entry->image_host_backing)) goto done;
+        const tex_t *pin = nvn_texture_pin_acquire(&record->descriptor);
+        VkTextureWriteTarget *target = NULL;
+        const int captured = write_target_capture(pin, &entry->pub, &target, 1, entry);
+        nvn_texture_pin_release(pin);
+        if (captured != 1) {
+            result = captured < 0 ? VK_TEXTURE_STORAGE_CAPTURE_INVALIDATED : VK_TEXTURE_STORAGE_CAPTURE_UNSUPPORTED;
+            why = "storage-target-material-source";
+            goto done;
+        }
+        target->storage = (TextureWriteStorageSelection){.read = read, .pool = pool, .registration = registration,
+            .logical = logical, .native = native, .has_view = *has_view, .view = *view};
+        if (!write_target_current_locked(target)) {
+            vk_texture_write_target_cancel(target);
+            goto done;
+        }
+        *out = entry->pub;
+        *size = entry->t.L.size;
+        *material = target;
+        result = VK_TEXTURE_STORAGE_CAPTURE_COW;
+        why = NULL;
+        goto done;
+    }
+    if (!entry || !entry->pub.image) {
+        VkMemSpan backing;
+        if (gpu_only && vk_mem_lookup(registration_key.addr, record->descriptor.L.size, &backing)) {
+            result = VK_TEXTURE_STORAGE_CAPTURE_INVALIDATED;
+            why = "storage-target-placement-unavailable";
+        } else why = "storage-target-absent-placement";
+        goto done;
+    }
+    result = VK_TEXTURE_STORAGE_CAPTURE_UNSUPPORTED;
+    why = "storage-target-source-class";
+    if (!gpu_only && !host_private) goto done;
+    why = "storage-target-ambiguous-alias";
+    VkImageSubresourceRange word_alias_plane = {0};
+    if (!same_but_swizzle(&registration_key, &entry->key)) {
+        if (!gpu_only || !allow_bound ||
+            !storage_word_alias_capture(record, &registration_key, &selected, view, *has_view, read, &word_alias_plane))
+            goto done;
+    }
+    if (entry->t.L.size != record->descriptor.L.size ||
+        (entry->t.serial != record->descriptor.serial && (host_private || selected.associated))) goto done;
+    if (allow_bound && gpu_only && (entry->bound_to || entry->pub.bound)) {
+        result = storage_target_capture_bound_locked(logical, native, record, &selected, &registration_key,
+                                                     view, *has_view, held, &why);
+        if (result == VK_TEXTURE_STORAGE_CAPTURE_BOUND) {
+            *out = entry->pub;
+            *size = entry->t.L.size;
+        }
+        goto done;
+    }
+
+    VkImageSubresourceRange volume_mip = {0};
+    if (host_private) {
+        const int adopted = entry->pin_owned && entry->host_storage_init == HOST_STORAGE_COW;
+        why = "storage-target-host-private-class";
+        if ((!adopted && (entry->pin_owned || (entry->pub.mirrored && !cold_host_mirror))) || entry->pending_write ||
+            entry->pin_detached || entry->bound_to || entry->pub.bound) goto done;
+        why = "storage-target-host-private-view";
+        VkImageSubresourceRange plane = {0};
+        if (!storage_host_shape(entry, view, *has_view, &plane)) goto done;
+        if (entry->pub.type == VK_IMAGE_TYPE_3D) volume_mip = plane;
+        if (!cold_host_mirror && from_storage(entry) && !entry->pub.gpu_owned) {
+            // Preserve the original ordinary binding's CPU-backed refresh. Full native initialization
+            // is independent of whether this read also updates the image with current guest content.
+            result = VK_TEXTURE_STORAGE_CAPTURE_INVALIDATED;
+            why = "storage-target-host-private-refresh";
+            const VkTexImage *expected = &entry->pub;
+            const VkTexImage *refreshed = texture_slot_refresh_locked(selected, view, has_view, NULL,
+                trace_selected ? &trace.refresh_source : NULL);
+            if (trace_selected) storage_trace_refresh_result(&trace, "host-private", expected, refreshed, tex_deferred);
+            if (!refreshed || tex_deferred || slot->registration != record || slot->finalized ||
+                record->handle.id != registration) goto done;
+            if (trace_selected && trace.returned_selected) trace.returned_image = refreshed->image;
+            result = VK_TEXTURE_STORAGE_CAPTURE_UNSUPPORTED;
+        }
+        why = "storage-target-host-private-initialization";
+        if (!cold_host_mirror && !storage_host_initialized(entry, read)) goto done;
+    } else {
+        why = storage_target_shape_refusal(entry);
+        if (why) goto done;
+        why = "storage-target-view";
+        if (!storage_target_volume_view(entry, view, *has_view, &volume_mip)) goto done;
+    }
+
+    result = VK_TEXTURE_STORAGE_CAPTURE_INVALIDATED;
+    why = "storage-target-placement-changed";
+    if (!storage_target_identity_current(entry) || nvn_hm_get(&by_key, &entry->key) != entry) goto done;
+    uint32_t count = entry->image_private_mapping_count;
+    const RcInterval *mapping = entry->image_private_mapping;
+    if (host_private) {
+        mapping = storage_host_mapping(entry, &count);
+        if (!mapping || !count) goto done;
+    } else if (!image_alias_placement_current(entry)) goto done;
+    if (texture_binding_entry(slot, native) != entry) goto done;
+    if (trace_selected && trace.returned_selected && !trace.effective)
+        storage_trace_effective(&trace, registration, &registration_key, entry, view, *has_view);
+    why = "storage-target-capacity";
+    if ((size_t)count > (SIZE_MAX - sizeof(VkTextureStorageTarget)) / sizeof(RcInterval)) goto done;
+    VkTextureStorageTarget *target = malloc(sizeof *target + count * sizeof *target->mapping);
+    if (!target) goto done;
+    TextureStorageCpuLoad *host_cpu = cold_host_mirror ? storage_host_cpu_load(entry, read, mapping, count) : NULL;
+    if (cold_host_mirror && !host_cpu) {
+        free(target);
+        result = VK_TEXTURE_STORAGE_CAPTURE_UNSUPPORTED;
+        why = "storage-target-host-private-source";
+        goto done;
+    }
+    const tex_t *pin = host_private && entry->pin_owned ?
+        nvn_texture_pin_retain_attachment(entry->t.serial, entry) : NULL;
+    if (host_private && entry->pin_owned && !pin) {
+        free(target);
+        why = "storage-target-host-private-pin";
+        goto done;
+    }
+    *target = (VkTextureStorageTarget){.key = entry->key, .registration_key = registration_key,
+        .read = read, .image = entry->pub.image, .hold = vk_mem_image_hold(entry->pub.image), .pool = pool,
+        .registration = registration, .serial = entry->t.serial, .revision = entry->content_revision,
+        .host_pin = pin, .host_layout = host_private ? entry->sample_general_revision : 0, .host_cpu = host_cpu,
+        .registration_serial = record->descriptor.serial, .size = record->descriptor.L.size,
+        .logical = logical, .native = native, .has_view = *has_view, .view = *view,
+        .volume_mip = volume_mip, .word_alias_plane = word_alias_plane, .cold_replacement = cold_replacement,
+        .mapping_count = count};
+    if (word_alias_plane.aspectMask && !target->hold) {
+        free(target);
+        why = "storage-target-alias-hold";
+        goto done;
+    }
+    memcpy(target->mapping, mapping, count * sizeof *target->mapping);
+    *out = entry->pub;
+    *size = target->size;
+    *held = target;
+    result = VK_TEXTURE_STORAGE_CAPTURE_READY;
+    why = NULL;
+done:
+    if (result < 0 && why && trace_selected) storage_target_trace_refusal(&trace, result, why);
+    if (cold_replacement && result != VK_TEXTURE_STORAGE_CAPTURE_READY) destroy_tex(entry);
+    if (reason) *reason = why;
+    unlock();
+    return result;
+}
+
+int vk_texture_effect_independent_storage(int logical, int exact, int written, VkTexImage *out, view_t *view, int *has_view,
+    uint64_t *size, VkTextureStorageTarget **held, const char **reason) {
+    return vk_texture_effect_storage_capture(logical, exact, out, view, has_view, size, held, NULL, written, 0, reason);
+}
+
+static TexSlot *storage_target_registration_locked(const VkTextureStorageTarget *target) {
+    if (!target || target->pool != vk_exec_texture_pool() ||
+        rc_registry_position_compare(target->read, vk_exec_resource_position()) || vk_mem_image_hold_retired(target->hold))
+        return NULL;
+    const TextureRegistration *history;
+    int native;
+    if (texture_registration_resolve(target->logical, &history, &native) != VK_TEXTURE_REGISTRATION_CURRENT ||
+        native != target->native) return NULL;
+    TexSlot *slot = &tslots[native];
+    const TextureRegistration *record = slot->registration;
+    if (!record || slot->finalized || record->handle.id != target->registration ||
+        record->descriptor.serial != target->registration_serial || record->descriptor.L.size != target->size) return NULL;
+    TexKey registration_key;
+    make_key(&record->descriptor, &registration_key);
+    if (memcmp(&registration_key, &target->registration_key, sizeof registration_key)) return NULL;
+    return slot;
+}
+
+static Tex *storage_target_current_locked(const VkTextureStorageTarget *target, int issued) {
+    TexSlot *slot = storage_target_registration_locked(target);
+    if (!slot || target->bound_plan) return NULL;
+    Tex *owned = texture_registration_source(slot);
+    // A checked relocation changes only the physical image; another prepared member may also bump its
+    // cache bucket after issue. In either case this receipt still requires the originally selected entry.
+    Tex *entry = issued || target->bound_relocated ? (owned ? owned : slot->ce) :
+        texture_binding_entry(slot, target->native);
+    if (!storage_target_identity_current(entry) || nvn_hm_get(&by_key, &target->key) != entry ||
+        entry->pub.image != target->image || entry->t.serial != target->serial || entry->t.L.size != target->size ||
+        entry->content_revision != target->revision || (owned && target->serial != target->registration_serial))
+        return NULL;
+    if (target->word_alias_plane.aspectMask) {
+        // Reuse only the exact selected donor. A new exact owner or lost predecessor must not turn
+        // this into a new association or a copy from a later producer.
+        if (owned || storage_target_identity_current(nvn_hm_get(&by_key, &target->registration_key)) ||
+            !storage_word_alias_initialized(entry, target->word_alias_plane, target->read))
+            return NULL;
+    } else if (!same_but_swizzle(&target->registration_key, &entry->key)) return NULL;
+    uint32_t count = entry->image_private_mapping_count;
+    const RcInterval *mapping = entry->image_private_mapping;
+    if (target->host_layout) {
+        mapping = storage_host_mapping(entry, &count);
+        if (!mapping || entry->sample_general_revision != target->host_layout ||
+            (!!target->host_pin != !!entry->pin_owned) ||
+            (target->host_pin && nvn_texture_pin_attachment(target->host_pin) != entry)) return NULL;
+    } else if (!image_alias_guest_mapping_current(entry->pub.addr, target->size, target->mapping, target->mapping_count))
+        return NULL;
+    if (count != target->mapping_count) return NULL;
+    view_t view;
+    int has_view;
+    const TextureSlotSelection selected = {.slot = slot, .entry = entry, .associated = owned != NULL};
+    texture_slot_selected_view(&selected, &view, &has_view);
+    if (has_view != target->has_view || (has_view && memcmp(&view, &target->view, offsetof(view_t, pad1)))) return NULL;
+    for (uint32_t i = 0; i < target->mapping_count; ++i) {
+        const RcInterval stored = target->mapping[i], current = mapping[i];
+        if (stored.mapping != current.mapping || stored.address != current.address ||
+            !rc_range_equal(stored.range, current.range)) return NULL;
+    }
+    return entry;
+}
+
+VkTextureBoundRelocation *vk_texture_storage_target_bound_plan(VkTextureStorageTarget *target) {
+    return target ? target->bound_plan : NULL;
+}
+
+int vk_texture_storage_target_bound_commit(VkTextureStorageTarget *target, VkTexImage *out) {
+    if (!target || !target->bound_plan || !out) return 0;
+    lock();
+    TexSlot *slot = storage_target_registration_locked(target);
+    Tex *entry = slot ? texture_binding_entry(slot, target->native) : NULL;
+    VkTextureBoundRelocation *plan = target->bound_plan;
+    const TextureSlotSelection selected = {.slot = slot, .entry = entry,
+        .associated = slot && texture_registration_source(slot) != NULL};
+    int ready = storage_target_identity_current(entry) && slot->ce == entry &&
+        entry->pub.image == target->image && entry->t.serial == target->serial &&
+        entry->content_revision == target->revision && bound_relocation_current_locked(plan);
+    if (ready) {
+        view_t view;
+        int has_view;
+        texture_slot_selected_view(&selected, &view, &has_view);
+        ready = has_view == target->has_view &&
+            (!has_view || !memcmp(&view, &target->view, offsetof(view_t, pad1)));
+    }
+    if (ready) ready = vk_texture_bound_relocation_commit(plan);
+    if (ready) {
+        // The submitted clone is the same guest version at the same position. The old VkImage and its
+        // physical-memory hold remain with any earlier recorded users. Only this prepared receipt moves.
+        VkMemoryImageHold *hold = vk_mem_image_hold(entry->pub.image);
+        vk_mem_image_release(target->hold);
+        target->hold = hold;
+        target->image = entry->pub.image;
+        target->bound_plan = NULL;
+        target->bound_relocated = 1;
+        ready = hold && storage_target_current_locked(target, 0) == entry;
+        if (ready) *out = entry->pub;
+    } else plan = NULL;
+    unlock();
+    vk_texture_bound_relocation_cancel(plan);
+    return ready;
+}
+
+int vk_texture_storage_target_current(const VkTextureStorageTarget *target) {
+    lock();
+    const int exact = storage_target_current_locked(target, 0) != NULL;
+    unlock();
+    return exact;
+}
+
+int vk_texture_storage_target_load_current(const VkTextureStorageTarget *target, const VkImageSubresourceRange *planes) {
+    if (!planes) return 0;
+    lock();
+    Tex *entry = storage_target_current_locked(target, 0);
+    int current = 0;
+    if (entry) {
+        if (target->word_alias_plane.aspectMask)
+            current = !memcmp(planes, &target->word_alias_plane, sizeof *planes);
+        else if (target->host_layout)
+            current = storage_host_planes_current(entry, target, planes);
+        else
+            current = image_alias_load_current(entry, planes, target->read);
+    }
+    unlock();
+    return current;
+}
+
+VkResult vk_texture_storage_target_prepare_host_cpu(VkTextureStorageTarget *target, RcVmaDependency *dependency) {
+    *dependency = (RcVmaDependency){0};
+    TextureStorageCpuLoad *load = target ? target->host_cpu : NULL;
+    if (!load) return VK_ERROR_INITIALIZATION_FAILED;
+    lock();
+    Tex *entry = storage_target_current_locked(target, 0);
+    const int current = entry && !load->recorded && storage_host_cpu_load_current(entry, load, target->read);
+    unlock();
+    if (!current) return VK_ERROR_INITIALIZATION_FAILED;
+    if (load->staging.buffer) return VK_SUCCESS;
+
+    VkResult result = texture_cpu_copy_peak(&load->copy, &load->staging, &dependency->peak);
+    if (result != VK_SUCCESS) goto failed;
+    dependency->selected = 1;
+    resource_core_budget_readiness(1, &dependency->before);
+    RcBudgetTicket reservation = {0};
+    const RcAdmissionStatus status = resource_core_budget_reserve(RC_BUDGET_TEXTURE, 1, &dependency->peak, &reservation);
+    if (status != RC_ADMISSION_OK) {
+        if (status == RC_ADMISSION_NO_RECORDS) dependency->before.records_available = 0;
+        result = status == RC_ADMISSION_REFUSED || status == RC_ADMISSION_NO_RECORDS ?
+            VK_NOT_READY : VK_ERROR_INITIALIZATION_FAILED;
+        goto failed;
+    }
+    result = texture_cpu_copy_allocate(&load->copy, &load->staging, &load->workspace, &reservation);
+    if (reservation.token.ledger && resource_core_budget_cancel(&reservation) != RC_ADMISSION_OK)
+        rt_fatal("vk: mirrored storage load lost its staging reservation");
+    if (result != VK_SUCCESS) goto failed;
+
+    lock();
+    entry = storage_target_current_locked(target, 0);
+    int copied = 0;
+    if (entry && recovery_copy_layout(entry, &load->copy) && storage_host_cpu_load_current(entry, load, target->read) &&
+        mem_backing_read_hold(entry->image_host_backing)) {
+        Tex recipe = {.t = entry->t, .f = entry->f, .source_copy = entry->t.mem};
+        copied = recovery_copy_fill(&recipe, &load->copy, load->staging.map);
+        mem_read_release();
+        copied = copied && storage_host_cpu_load_current(entry, load, target->read);
+    }
+    unlock();
+    result = copied ? vmaFlushAllocation(vk_ctx()->vma, load->staging.allocation, 0, load->copy.bytes) :
+                     VK_ERROR_INITIALIZATION_FAILED;
+    if (result == VK_SUCCESS) return result;
+failed:
+    texture_cpu_copy_rollback(&load->copy, &load->staging, &load->workspace);
+    return result;
+}
+
+int vk_texture_storage_target_replaced_stale(const VkTextureStorageTarget *target) {
+    return target && target->cold_replacement;
+}
+
+int vk_texture_storage_target_host_mirror(const VkTextureStorageTarget *target) {
+    return target && target->host_cpu != NULL;
+}
+
+int vk_texture_storage_targets_disjoint(const VkTextureStorageTarget *a, const VkTextureStorageTarget *b) {
+    if (!a || !b || a == b) return 0;
+    lock();
+    const Tex *first = storage_target_current_locked(a, 0);
+    const Tex *second = storage_target_current_locked(b, 0);
+    int disjoint = first && second && first->pub.image != second->pub.image &&
+        first->alloc && second->alloc && first->alloc != second->alloc && !first->bound_to && !second->bound_to;
+    // Separate Vulkan placements can still write overlapping bytes through different guest mappings.
+    for (uint32_t i = 0; disjoint && i < a->mapping_count; ++i) {
+        const RcSourceRange left = a->mapping[i].range;
+        disjoint = rc_range_valid(left);
+        for (uint32_t j = 0; disjoint && j < b->mapping_count; ++j) {
+            const RcSourceRange right = b->mapping[j].range;
+            disjoint = rc_range_valid(right) && !rc_range_overlap(left, right);
+        }
+    }
+    unlock();
+    return disjoint;
+}
+
+static int texture_placement_disjoint(VmaAllocation output, VkImageMemoryPlacement input) {
+    if (!input.memory) return 1;
+    VkImageMemoryPlacement written;
+    return input.size && input.size <= UINT64_MAX - input.offset && texture_image_placement(output, &written) &&
+        (written.memory != input.memory || written.offset + written.size <= input.offset ||
+         input.offset + input.size <= written.offset);
+}
+
+int vk_texture_write_target_disjoint_placement(const VkTextureWriteTarget *target, VkImageMemoryPlacement input) {
+    if (!input.memory) return 1;
+    lock();
+    const int disjoint = target && write_target_current_locked(target) &&
+        texture_placement_disjoint(target->image ? target->allocation : target->entry->alloc, input);
+    unlock();
+    return disjoint;
+}
+
+int vk_texture_storage_target_disjoint_input(const VkTextureStorageTarget *target,
+    const RcInterval *input, uint32_t input_count, VkImageMemoryPlacement input_placement) {
+    if (!target || !input || !input_count) return 0;
+    lock();
+    const Tex *output = storage_target_current_locked(target, 0);
+    int disjoint = output && target->mapping_count && texture_placement_disjoint(output->alloc, input_placement);
+    for (uint32_t i = 0; disjoint && i < target->mapping_count; ++i) {
+        const RcSourceRange written = target->mapping[i].range;
+        disjoint = rc_range_valid(written);
+        for (uint32_t j = 0; disjoint && j < input_count; ++j)
+            disjoint = rc_range_valid(input[j].range) && !rc_range_overlap(written, input[j].range);
+    }
+    unlock();
+    return disjoint;
+}
+
+VkImage vk_texture_storage_target_image(const VkTextureStorageTarget *target, const VkTextureAliasRead *seed) {
+    if (!target) return VK_NULL_HANDLE;
+    if (!seed) return target->image;
+    if (target->host_layout || target->word_alias_plane.aspectMask ||
+        !seed->storage_seed || !seed->uploaded || seed->target_replaced ||
+        __atomic_load_n(&seed->upload_canceled, __ATOMIC_ACQUIRE) || !seed->receiver ||
+        seed->receiver->serial != target->serial || seed->storage_revision != target->revision ||
+        (target->volume_mip.aspectMask && memcmp(&seed->load_planes, &target->volume_mip, sizeof target->volume_mip)) ||
+        rc_registry_position_compare(seed->read, target->read) || memcmp(&seed->key, &target->key, sizeof target->key))
+        return VK_NULL_HANDLE;
+    if (seed->predecessor)
+        return seed->predecessor == target->image && seed->allocation ? seed->result.image : VK_NULL_HANDLE;
+    return seed->target_hold && seed->result.image == target->image ? target->image : VK_NULL_HANDLE;
+}
+
+int vk_texture_storage_target_declare(const VkTextureStorageTarget *target, const VkTextureAliasRead *seed,
+    ResourceCommandEffects *effects) {
+    const VkImage image = vk_texture_storage_target_image(target, seed);
+    return image && vk_texture_storage_target_current(target) &&
+        resource_effects_add_pinned_image(effects, (uint64_t)(uintptr_t)image, target->mapping,
+                                         target->mapping_count) == RC_REGISTRY_OK;
+}
+
+int vk_texture_storage_target_use(const VkTextureStorageTarget *target, VkTextureAliasRead *seed,
+                                  uint64_t fence, VkCommandBuffer cb) {
+    Tex *entry = storage_target_current_locked(target, 0);
+    const VkImage image = vk_texture_storage_target_image(target, seed);
+    if (!entry || !image || fence != target->read.scene) return 0;
+    if (target->host_cpu) {
+        if (!cb || !target->host_cpu->staging.buffer || target->host_cpu->recorded ||
+            !storage_host_cpu_load_current(entry, target->host_cpu, target->read))
+            return 0;
+    } else if (target->host_layout) {
+        if (!storage_host_initialized(entry, target->read)) return 0;
+    } else if (!seed && target->volume_mip.aspectMask &&
+               !image_alias_load_current(entry, &target->volume_mip, target->read)) return 0;
+    TextureUseBatch *batch = texture_use_active(fence, 1);
+    if (!batch) return 0;
+    if (target->host_pin) texture_use_pin(entry, target->host_pin);
+    else if (image == target->image)
+        texture_native_use_batch(batch, &(TextureNativeUse){.hold = target->hold, .image = image});
+    else
+        texture_native_use_batch(batch, &(TextureNativeUse){.alias = seed, .image = image});
+    resource_image_prepare_pinned((uint64_t)(uintptr_t)image, entry->pub.addr, entry->t.L.size,
+                                  target->mapping, target->mapping_count, 0);
+    TextureStorageCpuLoad *load = target->host_cpu;
+    if (load) {
+        // The existing image is already in GENERAL. Record this initializer after all earlier scene users
+        // on the exact command body that will run the retained writer.
+        __atomic_add_fetch(&load->references, 1, __ATOMIC_RELAXED);
+        vk_completion_add_owned(fence, storage_host_cpu_load_release, storage_host_cpu_load_cancel, load);
+        barrier(cb, ALL_RW, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        vkCmdCopyBufferToImage(cb, load->staging.buffer, image, VK_IMAGE_LAYOUT_GENERAL, load->copy.count, load->copy.regions);
+        barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
+        load->recorded = 1;
+    }
+    return 1;
+}
+
+int vk_texture_storage_target_read_use(const VkTextureStorageTarget *target, const VkImageSubresourceRange *planes,
+                                       uint64_t fence) {
+    Tex *entry = storage_target_current_locked(target, 0);
+    if (!entry || !planes || fence != target->read.scene || (target->volume_mip.aspectMask &&
+        memcmp(planes, &target->volume_mip, sizeof *planes))) return 0;
+    if (target->host_layout ? !storage_host_planes_current(entry, target, planes) :
+        !image_alias_load_current(entry, planes, target->read)) return 0;
+    TextureUseBatch *batch = texture_use_active(fence, 1);
+    if (!batch) return 0;
+    if (target->host_pin) texture_use_pin(entry, target->host_pin);
+    else texture_native_use_batch(batch, &(TextureNativeUse){.hold = target->hold, .image = target->image});
+    return 1;
+}
+
+static void image_alias_replacement_part_dispose(void *part, void *owner, int known_unhanded) {
+    VkTextureAliasRead *seed = owner;
+    if (known_unhanded) {
+        lock();
+        Tex *entry = nvn_hm_get(&by_key, &seed->key);
+        // Keep the detached predecessor and its live readers. Invalidate only this unhanded allocation.
+        // An independently published later image at the same key still owns its registration.
+        if (entry && entry->pub.image == seed->result.image && entry->t.serial == seed->receiver->serial)
+            destroy_tex(entry);
+        unlock();
+    }
+    image_alias_release(seed);
+    texture_use_part_release(part);
+}
+
+static void cancel_fresh_mirrored_authority(Tex *entry) {
+    const int cpu_visible = mem_backing_current(entry->image_host_backing);
+    RcRegistry *registry = rc_registry_runtime();
+    if (cpu_visible && entry->image_mapped_hold_count &&
+        rc_registry_image_hold_release_extents(registry, entry->image_mapped_holds,
+            entry->image_mapped_hold_count, 1) == RC_REGISTRY_OK) {
+        free(entry->image_mapped_holds);
+        entry->image_mapped_holds = NULL;
+        entry->image_mapped_hold_count = 0;
+    }
+    if (cpu_visible && entry->image_authority.id &&
+        rc_registry_hold_release(registry, entry->image_authority, 1) == RC_REGISTRY_OK)
+        entry->image_authority = (RcRegistryWrite){0};
+}
+
+static void mirrored_color_write_dispose(void *part, void *opaque, int known_unhanded) {
+    MirroredColorWrite *write = opaque;
+    lock();
+    Tex *entry = nvn_hm_get(&by_key, &write->key);
+    if (entry && entry->mirrored_color_write == write) {
+        entry->mirrored_color_write = NULL;
+        if (known_unhanded && entry->t.serial == write->serial && entry->pub.image == write->image &&
+            entry->content_revision == write->revision && !entry->pin_owned) {
+            if (write->fresh_authority) cancel_fresh_mirrored_authority(entry);
+            if (!write->gpu_owned) destroy_tex(entry);
+            else {
+                // The native commands in this part never ran. Previous authority and the physical
+                // image still exist. Revoke captures of the canceled revision instead of reusing it.
+                if (!++entry->content_revision) rt_fatal("vk: texture content revision exhausted");
+                entry->native_write = write->native_write;
+                entry->wr_fence = write->wr_fence;
+                entry->gpu_dirty = write->gpu_dirty;
+                entry->gpu_gen = write->gpu_gen;
+                entry->gpu_seq = write->gpu_seq;
+                entry->gpu_fence = write->gpu_fence;
+                entry->gw_frame = write->gw_frame;
+                entry->run_frame = write->run_frame;
+                entry->run = write->run;
+                entry->chash_ok = write->chash_ok;
+                entry->upload_mapping = write->upload_mapping;
+                entry->snap_color_texels = write->snap_color_texels;
+                free(entry->snap);
+                entry->snap = write->snap;
+                write->snap = NULL;
+            }
+        }
+    }
+    unlock();
+    free(write->snap);
+    free(write);
+    texture_use_part_release(part);
+}
+
+static void mirrored_color_write_recorded(Tex *entry, VkTextureProjectedTransfer *target) {
+    TextureUseBatch *batch = texture_use_active(target->read.scene, 1);
+    if (!batch) rt_fatal("vk: issued mirrored color copy has no recording part");
+    MirroredColorWrite *write = entry->mirrored_color_write;
+    if (!write || write->batch != batch->id || write->revision != entry->content_revision) {
+        write = target->host_color;
+        target->host_color = NULL;
+        *write = (MirroredColorWrite){.key = entry->key, .image = entry->pub.image, .serial = entry->t.serial,
+            .batch = batch->id, .native_write = entry->native_write, .wr_fence = entry->wr_fence,
+            .gpu_owned = entry->pub.gpu_owned, .gpu_dirty = entry->gpu_dirty, .gpu_gen = entry->gpu_gen,
+            .gpu_seq = entry->gpu_seq, .gpu_fence = entry->gpu_fence, .run_frame = entry->run_frame,
+            .run = entry->run, .gw_frame = entry->gw_frame, .upload_mapping = entry->upload_mapping,
+            .fresh_authority = target->host_ranges != NULL,
+            .chash_ok = entry->chash_ok, .snap_color_texels = entry->snap_color_texels, .snap = entry->snap};
+        entry->snap = NULL;
+        entry->mirrored_color_write = write;
+        resource_effects_retain_part_disposition(texture_use_part_retain(batch), texture_use_part_known_unhanded,
+            write, mirrored_color_write_dispose);
+    } else free(entry->snap);
+    entry->snap = target->host_color_snapshot;
+    target->host_color_snapshot = NULL;
+    entry->snap_color_texels = entry->snap != NULL;
+    gpu_written_prepared_at(entry, &target->host_stamp.generation);
+    write->revision = entry->content_revision;
+}
+
+typedef struct {
+    TexKey key;
+    VkImage image;
+    uint64_t serial, revision;
+} FirstMirroredWrite;
+
+static void first_mirrored_write_dispose(void *part, void *opaque, int known_unhanded) {
+    const FirstMirroredWrite *write = opaque;
+    if (known_unhanded) {
+        lock();
+        Tex *entry = nvn_hm_get(&by_key, &write->key);
+        if (entry && entry->pub.image == write->image && entry->t.serial == write->serial &&
+            entry->content_revision == write->revision && !entry->pin_owned) {
+            cancel_fresh_mirrored_authority(entry);
+            destroy_tex(entry);
+        }
+        unlock();
+    }
+    free(opaque);
+    texture_use_part_release(part);
+}
+
+static void first_mirrored_write_recorded(Tex *entry, RcRegistryPosition read, uint32_t host_generation) {
+    TextureUseBatch *batch = texture_use_active(read.scene, 1);
+    if (!batch) rt_fatal("vk: issued first mirrored image write has no recording part");
+    FirstMirroredWrite *write = malloc(sizeof *write);
+    if (!write) rt_fatal("vk: allocating mirrored image write disposition");
+    gpu_written_prepared_at(entry, &host_generation);
+    *write = (FirstMirroredWrite){entry->key, entry->pub.image, entry->t.serial, entry->content_revision};
+    resource_effects_retain_part_disposition(texture_use_part_retain(batch), texture_use_part_known_unhanded,
+        write, first_mirrored_write_dispose);
+}
+
+typedef struct {
+    TexKey key;
+    VkImage image;
+    uint64_t serial, revision;
+} StoragePlacementWrite;
+
+static void storage_placement_write_dispose(void *part, void *opaque, int known_unhanded) {
+    const StoragePlacementWrite *write = opaque;
+    if (known_unhanded) {
+        lock();
+        Tex *entry = nvn_hm_get(&by_key, &write->key);
+        // A later record at this key or revision may already hold a different placement.
+        // Removing this unhanded placement must not remove it or the earlier detached donor.
+        if (entry && entry->pub.image == write->image && entry->t.serial == write->serial &&
+            entry->content_revision == write->revision)
+            destroy_tex(entry);
+        unlock();
+    }
+    free(opaque);
+    texture_use_part_release(part);
+}
+
+static void storage_placement_write_retain(const Tex *entry, RcRegistryPosition read) {
+    TextureUseBatch *part = texture_use_active(read.scene, 0);
+    StoragePlacementWrite *write = malloc(sizeof *write);
+    if (!part || !write) rt_fatal("vk: recording has no independent storage placement receipt");
+    *write = (StoragePlacementWrite){entry->key, entry->pub.image, entry->t.serial, entry->content_revision};
+    resource_effects_retain_part_disposition(texture_use_part_retain(part), texture_use_part_known_unhanded,
+        write, storage_placement_write_dispose);
+}
+
+int vk_texture_storage_target_written(const VkTextureStorageTarget *target, VkTextureAliasRead *seed,
+    const VkImageSubresourceRange *defined_planes) {
+    Tex *entry = storage_target_current_locked(target, 1);
+    const VkImage image = vk_texture_storage_target_image(target, seed);
+    if (!entry || !image || (seed && (!defined_planes || memcmp(defined_planes, &seed->load_planes, sizeof *defined_planes))))
+        return 0;
+    if (target->host_layout) {
+        if (target->host_cpu) {
+            if (!target->host_cpu->recorded || !storage_host_planes_match(entry, target, defined_planes)) return 0;
+            if (rc_registry_gpu_capture_end(rc_registry_runtime(), &target->host_cpu->source) != RC_REGISTRY_OK)
+                rt_fatal("vk: issued mirrored storage write lost its source observation");
+            first_mirrored_write_recorded(entry, target->read, target->host_cpu->stamp.generation);
+            return 1;
+        }
+        if (!storage_host_planes_current(entry, target, defined_planes)) return 0;
+        if (target->host_pin) explicit_written(entry);
+        else {
+            resource_image_written((uint64_t)(uintptr_t)image, entry->pub.addr);
+            vk_texture_storage_bound_locked(&entry->pub);
+        }
+        return 1;
+    }
+    const int volume = target->volume_mip.aspectMask != 0;
+    if (volume && (!defined_planes || memcmp(defined_planes, &target->volume_mip, sizeof *defined_planes))) return 0;
+    if (image != target->image) {
+        resource_effects_image_trace_details(NULL, (uint64_t)(uintptr_t)image,
+            (ResourceImageTraceDetails){.replacement = 1});
+        image_alias_promote_target_locked(seed, entry);
+        // Unseeded planes remain with prior producers. Legacy whole-image binds must prove coverage
+        // before using this placement.
+        if (!image_alias_whole_range(&entry->pub, &seed->load_planes)) entry->pub.preserve_pool_bytes = 1;
+        image_alias_replacement_record_part(seed, texture_use_active(target->read.scene, 0));
+    }
+    if (volume && !image_alias_whole_range(&entry->pub, defined_planes)) entry->pub.preserve_pool_bytes = 1;
+    resource_image_written((uint64_t)(uintptr_t)image, entry->pub.addr);
+    vk_texture_storage_bound_locked(&entry->pub);
+    if (target->cold_replacement && image == target->image) storage_placement_write_retain(entry, target->read);
+    if (volume) {
+        RcRegistryPosition output = target->read;
+        output.ordinal |= 1;
+        return image_alias_private_planes_written_locked(entry, defined_planes, output);
+    }
+    return !defined_planes || image_alias_planes_written_locked(entry, defined_planes);
+}
+
+static void storage_preserving_part_release(void *part, void *owner, int known_unhanded) {
+    (void)owner;
+    (void)known_unhanded;
+    texture_use_part_release(part);
+}
+
+static int storage_target_written_preserving(const VkTextureStorageTarget *target,
+    const VkImageSubresourceRange *planes, int selected_descriptor) {
+    Tex *entry = storage_target_current_locked(target, 1);
+    TextureUseBatch *part = entry ? texture_use_active(target->read.scene, 0) : NULL;
+    int initialized = 0, exact_projection_layout = 0;
+    if (part && planes && entry->pub.aspect == VK_IMAGE_ASPECT_COLOR_BIT && entry->pub.type == VK_IMAGE_TYPE_2D &&
+        !target->host_layout && !target->bound_relocated && !target->volume_mip.aspectMask &&
+        !(target->read.ordinal & 1) &&
+        planes->aspectMask == entry->pub.aspect && planes->levelCount == 1 && planes->layerCount == 1 &&
+        planes->baseMipLevel == (target->has_view && target->view.set_levels ? (uint32_t)target->view.base_level : 0u) &&
+        planes->baseArrayLayer == (target->has_view && target->view.set_layers ? (uint32_t)target->view.min_layer : 0u) &&
+        image_alias_source_current(entry) && entry->image_mapped_hold_count == entry->image_private_mapping_count) {
+        uint32_t count = 0;
+        const RcInterval *demand = image_alias_plane_demand(entry, planes, &count);
+        initialized = texture_projected_color_current(entry, demand, count, target->read);
+        VkImageSubresourceRange word_plane;
+        // The bound R32_UINT view changes native words. The transfer interpretation, original
+        // registration and complete one-plane byte layout still belong to the selected native image.
+        exact_projection_layout = initialized && selected_descriptor && entry->pub.samples == 1 &&
+            entry->pub.levels == 1 && entry->pub.layers == 1 && entry->pub.format == entry->f.vk &&
+            storage_word_format(entry->t.d.format, &entry->f) &&
+            storage_word_view_plane(&target->view, target->has_view, &entry->pub, &word_plane) &&
+            word_plane.baseMipLevel == planes->baseMipLevel &&
+            word_plane.baseArrayLayer == planes->baseArrayLayer;
+    }
+    if (!vk_texture_storage_target_written(target, NULL, NULL)) return 0;
+    if (initialized) {
+        // A split can have handed an earlier prefix while this storage dispatch is still an unhanded tail.
+        resource_effects_retain_part_disposition(texture_use_part_retain(part), texture_use_part_known_unhanded,
+            part, storage_preserving_part_release);
+        RcRegistryPosition output = target->read;
+        output.ordinal |= 1;
+        resource_effects_image_preserved_intervals((uint64_t)(uintptr_t)entry->pub.image,
+            entry->image_private_mapping, entry->image_mapped_holds, entry->image_mapped_hold_count, output,
+            exact_projection_layout);
+    }
+    return 1;
+}
+
+int vk_texture_storage_target_written_preserving(const VkTextureStorageTarget *target,
+    const VkImageSubresourceRange *planes) {
+    return storage_target_written_preserving(target, planes, 1);
+}
+
+int vk_texture_storage_target_picture_written(const VkTextureStorageTarget *target, VkTextureAliasRead *seed,
+    const VkImageSubresourceRange *planes, int preserving, VkImage descriptor_image) {
+    const VkImage image = vk_texture_storage_target_image(target, seed);
+    Tex *entry = descriptor_image == image ? storage_target_current_locked(target, 1) : NULL;
+    const int written = preserving ? storage_target_written_preserving(target, planes, entry != NULL) :
+        vk_texture_storage_target_written(target, seed, planes);
+    if (written && entry) packed_storage_owner_issued_locked(entry, image, target->read);
+    return written;
+}
+
+void vk_texture_storage_target_release(VkTextureStorageTarget *target) {
+    if (!target) return;
+    if (target->cold_replacement) {
+        lock();
+        Tex *entry = nvn_hm_get(&by_key, &target->key);
+        if (entry && entry->pub.image == target->image && entry->t.serial == target->serial &&
+            entry->content_revision == target->revision && storage_seed_cold(entry))
+            destroy_tex(entry);
+        unlock();
+    }
+    vk_texture_bound_relocation_cancel(target->bound_plan);
+    if (target->hold) vk_mem_image_release(target->hold);
+    nvn_texture_pin_release(target->host_pin);
+    storage_host_cpu_load_release(target->host_cpu);
+    free(target);
+}
+
+static int effect_image_retain_pin(Tex *e, VkPinnedTextureWrite *capture) {
+    if (!capture || !e->pin_owned || !e->pub.image || e->pub.gone || !e->pub.gpu_owned || e->material) return 0;
+    const tex_t *pin = nvn_texture_pin_retain_attachment(e->t.serial, e);
+    if (!pin) rt_fatal("vk: selected storage image lost its recorded texture owner");
+    *capture = (VkPinnedTextureWrite){pin, e->pub.image};
+    return 1;
+}
+
+static VkTextureWriteTarget *write_plan_find(const VkTextureWritePlan *plan, uint64_t serial) {
+    for (uint32_t i = 0; i < plan->count; i++) {
+        VkTextureWriteTarget *owner = plan->targets[i];
+        if (owner->pin->serial == serial && write_target_current_locked(owner)) return owner;
+    }
+    return NULL;
+}
+
+VkTextureStorageResult vk_texture_effect_ordered_image(int logical, int written, const VkTextureWritePlan *plan,
+    VkTexImage *out, view_t *view, int *has_view, uint64_t *size, VkPinnedTextureWrite *pinned,
+    VkTextureWriteTarget **target) {
+    lock();
+    const TextureRegistration *history;
+    int native;
+    int status = texture_registration_resolve(logical, &history, &native);
+    TexSlot *slot = status == VK_TEXTURE_REGISTRATION_CURRENT && native >= 0 ? &tslots[native] : NULL;
+    const TextureRegistration *record = slot ? slot->registration : NULL;
+    VkTextureStorageResult result = VK_TEXTURE_STORAGE_GONE;
+    const Tex *entry = NULL;
+    if (record && record->descriptor.mem && record->descriptor.serial) {
+        Tex *ready = !slot->finalized && slot->cgen == agen[sinfo[native] & 0xffff] ? slot->ce : NULL;
+        if (ready && ready->t.serial == record->descriptor.serial && !ready->released && !ready->pin_detached &&
+            mem_backing_current(ready->image_host_backing) && effect_image_retain_pin(ready, pinned)) {
+            *out = ready->pub;
+            *view = slot->cview;
+            *has_view = slot->chas_view;
+            *size = ready->t.L.size;
+            result = VK_TEXTURE_STORAGE_PINNED;
+        } else {
+            *target = write_plan_find(plan, record->descriptor.serial);
+            if (*target) {
+                entry = (*target)->entry;
+                result = VK_TEXTURE_STORAGE_TARGET;
+            }
+            if (!entry && written) {
+                const tex_t *pin = nvn_texture_pin_acquire(&record->descriptor);
+                const Tex *candidate = write_target_candidate(pin, 0);
+                if (candidate && candidate->material && (candidate->pub.usage & VK_IMAGE_USAGE_STORAGE_BIT) &&
+                    write_target_capture(pin, &candidate->pub, target, 1, NULL) > 0) {
+                    entry = candidate;
+                    result = VK_TEXTURE_STORAGE_NEW_TARGET;
+                }
+                nvn_texture_pin_release(pin);
+            }
+        }
+    }
+    if (entry) {
+        *out = entry->pub;
+        *view = record->view;
+        *has_view = record->has_view;
+        *size = record->descriptor.L.size;
+    }
+    unlock();
+    return result;
+}
+
+int vk_texture_effect_ordered_sample(int logical, const VkTextureWritePlan *plan, VkTexImage *out, view_t *view,
+                                    int *has_view, VkTextureWriteTarget **target, VkTexturePresentSource **hold) {
+    lock();
+    const TextureRegistration *history;
+    const TextureUseNode *owner;
+    int native;
+    int status = texture_registration_resolve_owner(logical, &history, &native, &owner);
+    const VkTexImage *image = NULL;
+    if (status == VK_TEXTURE_REGISTRATION_EXACT) {
+        *hold = texture_history_sample_retain(owner);
+        if (*hold) {
+            *out = history->exact;
+            *view = history->exact_view;
+            *has_view = history->has_exact_view;
+        }
+        unlock();
+        return *hold != NULL;
+    }
+    if (status == VK_TEXTURE_REGISTRATION_CURRENT && native >= 0) {
+        const TextureRegistration *record = tslots[native].registration;
+        if (record) *target = write_plan_find(plan, record->descriptor.serial);
+        if (*target) {
+            *out = (*target)->entry->pub;
+            *view = record->view;
+            *has_view = record->has_view;
+            unlock();
+            return 1;
+        }
+        VkTextureSample sample;
+        if (vk_texture_sample_query_locked(native, &sample) == VK_TEXTURE_SAMPLE_READY && sample.canonical) {
+            int disjoint = 1;
+            for (uint32_t i = 0; disjoint && i < plan->count; i++)
+                disjoint = write_targets_disjoint(plan->targets[i]->entry, (const Tex *)sample.image);
+            if (disjoint) {
+                image = sample.image;
+                *view = sample.view;
+                *has_view = sample.has_view;
+            }
+        }
+    }
+    TextureMaterialInstance *instance = image ? content_use_image_find(image->image) : NULL;
+    if (instance) {
+        VkTexturePresentSource *source = calloc(1, sizeof *source);
+        if (!source) rt_fatal("vk: exact storage peer sample capture allocation failed");
+        if (texture_use_retain_instance(&source->material, instance, NULL) == RC_LIFETIME_OK) {
+            *out = *image;
+            *hold = source;
+        } else free(source);
+    }
+    unlock();
+    return *hold != NULL;
+}
+
+static void texture_color_blit_capture(const Tex *e, const view_t *view, int has_view, VkTextureColorBlitSource *out) {
+    *out = (VkTextureColorBlitSource){.image = e->pub.image, .hold = vk_mem_image_hold(e->pub.image),
+        .read = vk_exec_resource_position(), .address = e->pub.addr, .bytes = e->t.L.size, .serial = e->t.serial,
+        .format = e->pub.format, .extent = {e->pub.width, e->pub.height}};
+    VkTextureAliasLayout layout;
+    const uint32_t count = e->image_private_mapping_count;
+    if (!nvn_gpu_only(e->pub.addr) || e->pub.type != VK_IMAGE_TYPE_2D || e->pub.aspect != VK_IMAGE_ASPECT_COLOR_BIT ||
+        e->pub.levels != 1 || e->pub.layers != 1 || e->pub.skip || e->t.d.target != NVN_TEXTURE_TARGET_2D ||
+        e->t.d.width != e->pub.width || e->t.d.height != e->pub.height ||
+        !count || count > VK_TEXTURE_COLOR_BLIT_MAPPINGS || !image_alias_material_layout(e, &layout) ||
+        !rc_registry_position_valid(out->read) ||
+        (has_view && ((view->set_format && view->format != e->t.d.format) ||
+                     (view->set_levels && (view->base_level || view->nlevels != 1)) ||
+                     (view->set_layers && (view->min_layer || view->nlayers != 1)) ||
+                     (view->set_target && view->target != e->t.d.target) || view->set_swizzle || view->set_dsmode)))
+        return;
+    out->mapping_count = count;
+    memcpy(out->mapping, e->image_private_mapping, count * sizeof *out->mapping);
+}
+
+static int texture_effect_image(int id, int exact, VkTexImage *out, view_t *view, int *has_view,
+                                uint64_t *source_size, VkPinnedTextureWrite *capture, VkTextureColorBlitSource *color) {
+    *out = (VkTexImage){0}; *view = (view_t){0}; *has_view = 0; *source_size = 0;
+    lock();
+    const VkTexImage *img = vk_texture_storage_binding_locked(id, exact, view, has_view);
+    int pinned = img && !tex_deferred && effect_image_retain_pin((Tex *)img, capture);
+    if (img && !pinned) img = vk_texture_writable_locked(img);
+    int result = tex_deferred ? -1 : img && img->image ? 1 : 0;
+    if (result == 1) {
+        Tex *e = (Tex *)img;
+        *out = *img; *source_size = e->t.L.size;
+        touch(e);
+        // Material captures use the explicit scene batch. Nonordinary writable images retain the backend's
+        // actual recording-fence deferral; no worker may substitute a newer descriptor under this old range proof.
+        if (!pinned) vk_texture_use_images(&img->image, 1);
+        if (color) texture_color_blit_capture(e, view, *has_view, color);
+    }
+    unlock();
+    return result;
+}
+
+int vk_texture_effect_image(int id, int exact, VkTexImage *out, view_t *view, int *has_view,
+                            uint64_t *source_size, VkPinnedTextureWrite *capture) {
+    return texture_effect_image(id, exact, out, view, has_view, source_size, capture, NULL);
+}
+
+int vk_texture_effect_color_blit(int id, VkTexImage *out, view_t *view, int *has_view, uint64_t *source_size,
+                                VkTextureColorBlitSource *color) {
+    *color = (VkTextureColorBlitSource){0};
+    return texture_effect_image(id, 0, out, view, has_view, source_size, NULL, color);
+}
+
+// Metadata only: declaring an image writer must not allocate or refresh the image it will later bind.
+int vk_texture_effect_range(int id, uint64_t *addr, uint64_t *size, uint64_t *token) {
+    int valid = 0;
+    *addr = *size = *token = 0;
+    lock();
+    if (vk_texture_registration_expected_locked(id, NULL) != VK_TEXTURE_REGISTRATION_CURRENT) {
+        unlock();
+        return 0;
+    }
+    id = vk_texture_pool_slot_locked(vk_exec_texture_pool(), id);
+    if (id >= 0 && id < ntslots && tslots[id].used) {
+        const tex_t *t = &tslots[id].t;
+        uint64_t a = (uint64_t)(uintptr_t)t->mem;
+        if (a && t->L.size && a <= UINT64_MAX - t->L.size) {
+            *addr = a, *size = t->L.size, *token = vk_texture_slot_token(id);
+            valid = *token != 0;
+        }
+    }
+    unlock();
+    return valid;
 }
 
 uint64_t vk_texture_slot_token(int id) {
@@ -5117,99 +16923,281 @@ uint64_t vk_texture_slot_token(int id) {
     return v ? (v >> 16) << 32 | __atomic_load_n(&agen[v & 0xffff], __ATOMIC_ACQUIRE) : 0;
 }
 uint32_t vk_sampler_gen(void) { return __atomic_load_n(&samp_gen, __ATOMIC_RELAXED); }
-int vk_texture_slot_count_locked(void) { return ntslots; }
+int vk_texture_slot_group_locked(int id) {
+    return id >= 0 && id < ntslots && tslots[id].used && slot_grp ? slot_grp[id] : -1;
+}
 int vk_sampler_slot_count_locked(void) { return nsslots; }
+int vk_sampler_slot_registered_locked(int id) { return id >= 0 && id < nsslots && sslots[id].used; }
+int vk_sampler_slot_comparison_locked(int id) {
+    return vk_sampler_slot_registered_locked(id) && sslots[id].p.cmp_mode;
+}
+
+int vk_sampler_slot_compare_state_locked(int id, unsigned *mode, unsigned *function) {
+    if (!vk_sampler_slot_registered_locked(id)) return 0;
+    *mode = sslots[id].p.cmp_mode;
+    *function = sslots[id].p.cmp_func;
+    return 1;
+}
+
+int vk_sampler_pool_comparison_locked(void) {
+    return sampler_comparison_slots == (1 << 12);
+}
 
 const VkTexImage *vk_texture_by_id(int id, view_t *view, int *has_view) {
     lock();
-    const VkTexImage *r = vk_texture_by_id_locked(id, view, has_view);
+    const VkTexImage *r = NULL;
+    if (vk_texture_registration_image_locked(id, &r, view, has_view, NULL) == VK_TEXTURE_REGISTRATION_CURRENT)
+        r = vk_texture_current_registration_locked(id, view, has_view);
     unlock();
     return r;
 }
 
-const VkTexImage *vk_texture_by_id_locked(int id, view_t *view, int *has_view) {
-    if (id < 0 || id >= ntslots || !tslots[id].used) return NULL;
+const VkTexImage *vk_texture_current_registration_locked(int logical, view_t *view, int *has_view) {
+    return vk_texture_current_registration_read_locked(logical, view, has_view, NULL);
+}
+
+const VkTexImage *vk_texture_current_registration_read_locked(int logical, view_t *view, int *has_view, VkTextureReadKey *key) {
+    if (key) *key = (VkTextureReadKey){0};
+    const TextureRegistration *history;
+    int native;
+    if (texture_registration_resolve(logical, &history, &native) != VK_TEXTURE_REGISTRATION_CURRENT) return NULL;
+    const VkTexImage *image = vk_texture_by_id_locked(native, view, has_view);
+    if (key && image && native >= 0) {
+        VkTextureReadKey selected = {.registration = texture_slot_registration(native), .native_slot = native, .canonical = 1};
+        const TexSlot *slot = texture_read_key_slot(selected);
+        if (slot && texture_read_key_source(slot, image->image)) *key = selected;
+    }
+    return image;
+}
+
+static TextureSlotSelection texture_slot_select_locked(int id, int private_output) {
+    if (id < 0 || id >= ntslots || !tslots[id].used) return (TextureSlotSelection){0};
     TexSlot *s = &tslots[id];
-    uint32_t g = agen[sinfo[id] & 0xffff];
+    Tex *owned = texture_registration_source(s);
+    uint32_t g = owned ? 0 : agen[sinfo[id] & 0xffff];
     // resolved again: an entry at its address was created, dropped or released, or the slot registered (s->ce
     // cleared); an empty result is not kept, as image creation may succeed later, except a held one for the pool
     // refresh (cheld): the pool walks every slot each submission, and the hold ends with a generation bump
-    if ((!s->ce || s->cgen != g) && !(s->cheld && s->cgen == g && pool_ctx) &&
+    if (!owned && (!s->ce || s->cgen != g) && !(s->cheld && s->cgen == g && pool_ctx) &&
         !(pool_ctx && slot_absence_valid(s, g))) {
         view_t v;
         int hv;
         resolve_held = 0;
         in_lookup = 1;
         s->sample_owned = 0;
-        s->ce = slot_resolve(s, &v, &hv);   // entry_of may create an entry and bump g: g read before it
+        const TextureRegistration *record = s->registration;
+        uint32_t installed = 0;
+        Tex *entry = slot_resolve(s, &v, &hv, private_output, &installed);
         in_lookup = 0;
+        s->ce = entry;
         s->cview = v, s->chas_view = (uint8_t)hv;
-        s->cgen = g;
+        // Private GPU placement retains its existing role-specific checks at handoff.
+        s->cgen = private_output && entry ? agen[sinfo[id] & 0xffff] : g;
+        // Creation or revival reports its own publication. A warm alias lookup cannot adopt an
+        // unrelated bucket advance, and copied slot metadata cannot certify a different owner.
+        if (installed && installed == agen[sinfo[id] & 0xffff] && record &&
+            s->registration == record && !s->finalized && storage_target_identity_current(entry) &&
+            entry->t.serial == record->descriptor.serial && entry->t.L.size == record->descriptor.L.size) {
+            TexKey key;
+            make_key(&record->descriptor, &key);
+            if (!memcmp(&key, &entry->key, sizeof key) && nvn_hm_get(&by_key, &key) == entry &&
+                (nvn_gpu_only(key.addr) || mem_backing_current(entry->image_host_backing)))
+                s->cgen = installed;
+        }
         s->cepoch = 0;
         s->cheld = (uint8_t)(!s->ce && resolve_held);
     }
-    Tex *e = s->ce;
+    return (TextureSlotSelection){.slot = s, .entry = owned ? owned : s->ce, .associated = owned != NULL};
+}
+
+static void texture_slot_selected_view(const TextureSlotSelection *selected, view_t *view, int *has_view) {
+    if (selected->associated) slot_result_view(selected->slot, selected->entry, view, has_view);
+    else {
+        *view = selected->slot->cview;
+        *has_view = selected->slot->chas_view;
+    }
+}
+
+static const VkTexImage *texture_slot_refresh_locked(TextureSlotSelection selected, view_t *view, int *has_view,
+    VkTextureSampleStatus *status, VkTextureSampleRefusal *refused) {
+    TexSlot *s = selected.slot;
+    if (!s) return NULL;
+    Tex *e = selected.entry;
+    const int owned = selected.associated;
+    if (e && !preserve_pool_contents_current(e)) {
+        sample_refusal_record(refused, s, e, "preserved-source");
+        if (status) *status = VK_TEXTURE_SAMPLE_UNAVAILABLE;
+        return NULL;
+    }
+    if (e) content_use(e);
     // a draw binding: the texture is in use, whether or not the pool's refresh checked it first in this submission
     // (by list that check is no lookup, vk_texture_pool_fresh_locked, so the stamp of the use is left here too)
     if (e && !pool_ctx) touch(e);
-    // Bindings of one submit share one check, answered from the submit's write-watch snapshot (guest writes during a
-    // replay race the GPU read on hardware too). After one check an entry is either uploaded or never uploads (not
-    // mirrored, GPU-owned or no CPU layout), so a slot that checked its entry in this submit has nothing left to do. A
-    // held slot counts as checked for look_round: the textures evicted by disuse are registered slots all the same.
-    if ((e || s->cheld) && s->cepoch != submit_epoch) {
+    // Memory observations are shared within a submit, while already-declared GPU writers bound reuse within it.
+    // A crossed boundary requires actual preparation even when no new authority event changed the global epoch.
+    // A held slot still counts as checked for look_round, just as registered slots evicted by disuse do.
+    uint64_t authority = rc_registry_authority_epoch(rc_registry_runtime());
+    int current = !e || e->released || (!source_mapping_due(e) && source_binding_ready(e));
+    uint32_t checked = owned ? e->checked : s->cepoch;
+    if ((e || s->cheld) && (checked != submit_epoch || !current)) {
         round_checks++;
         // a released entry here is a finalized slot's own (stale_kept): the storage may be the game's to free or reuse
-        if (e && !e->released && (!e->uploaded || e->checked != submit_epoch)) {
-            if (!pool_deps_certificate(e)) make_fresh_snap(e);
-            if (tex_deferred) return NULL;
+        if (e && !e->released && (!e->uploaded || e->checked != submit_epoch || !current)) {
+            if (!current || !pool_deps_certificate(e)) make_fresh_snap(e);
+            if (tex_deferred) {
+                if (status) *status = VK_TEXTURE_SAMPLE_DEFERRED;
+                return NULL;
+            }
             e->checked = submit_epoch;
+            e->checked_authority = authority;
             touch(e);
         }
         s->cepoch = submit_epoch;
     }
-    if (view) *view = has_view ? s->cview : s->v;
-    if (has_view) *has_view = view ? s->chas_view : s->has_view;
+    if (e && !e->released && e->source_canonical && !e->pub.gpu_owned &&
+        (e->source_blocked || !source_permission_current(e) || !e->uploaded || e->up_retry)) {
+        int missing = !e->uploaded || e->up_retry;
+        source_note_refusal(e, missing ? SOURCE_REFUSAL_UPLOAD : SOURCE_REFUSAL_PERMISSION,
+                            missing ? RC_REGISTRY_UNSUPPORTED : RC_REGISTRY_BLOCKED);
+        sample_refusal_record(refused, s, e, missing ? "upload-unavailable" : "binding-permission");
+        if (status) *status = VK_TEXTURE_SAMPLE_CANONICAL_REFUSED;
+        return NULL;
+    }
+    if (status && e && !e->released && e->source_canonical && !e->pub.gpu_owned) {
+        *status = VK_TEXTURE_SAMPLE_READY;
+        resource_bridge.canonical_ready++;
+    }
+    if (owned && texture_registration_source_attach(s, e)) {
+        if (view && has_view) slot_result_view(s, e, view, has_view);
+        else if (view) *view = s->registration->view;
+        else if (has_view) *has_view = s->registration->has_view;
+    } else {
+        if (view) *view = has_view ? s->cview : s->v;
+        if (has_view) *has_view = view ? s->chas_view : s->has_view;
+    }
     return e ? &e->pub : NULL;
 }
 
-// Texture detail: the texture slot id resolves to was made without its top levels, and a shader binding reads its
-// texels by position or asks for its size (vk_exec_draw.c tex_info_full, GfxShaderRes.exact). Its key joins exact, the
-// entry goes and the lookup makes it again whole, uploaded from its storage as a texture seen for the first time. A
-// lookup that is out of its creation budget leaves the stand-in for now, as for any new texture. Texture lock held.
+static const VkTexImage *texture_by_slot_locked(int id, view_t *view, int *has_view, VkTextureSampleStatus *status,
+    VkTextureSampleRefusal *refused) {
+    return texture_slot_refresh_locked(texture_slot_select_locked(id, 0), view, has_view, status, refused);
+}
+
+const VkTexImage *vk_texture_by_id_locked(int id, view_t *view, int *has_view) {
+    return texture_by_slot_locked(id, view, has_view, NULL, NULL);
+}
+
+// Detail-reduced storage is replaced explicitly before a command can retain its selected placement.
+static void texture_require_exact_locked(Tex *entry) {
+    if (exact.n >= EXACT_MAX) nvn_hm_clear(&exact, NULL);
+    nvn_hm_put(&exact, &entry->key, (void *)(uintptr_t)1);
+    n_exact++;
+    static volatile int32_t n_logged;
+    log_limited(&n_logged, "texture detail: texture %#llx (fmt %#x %ux%u, %u levels) is read by texel position or its "
+                "size is asked for: made whole again (%llu so far)", (unsigned long long)entry->pub.addr,
+                entry->t.d.format, entry->t.d.width, entry->t.d.height, entry->pub.levels + entry->pub.skip,
+                (unsigned long long)n_exact);
+    drop_tex(entry, DROP_EXACT);
+}
+
 const VkTexImage *vk_texture_exact_by_id_locked(int id, view_t *view, int *has_view) {
     if (id < 0 || id >= ntslots || !tslots[id].used) return NULL;
-    TexSlot *s = &tslots[id];
-    Tex *e = s->ce && s->cgen == agen[sinfo[id] & 0xffff] ? s->ce : NULL;   // what the caller's lookup just resolved
-    if (e && e->pub.skip) {
-        if (exact.n >= EXACT_MAX) nvn_hm_clear(&exact, NULL);   // never seen; they would be found again one by one
-        nvn_hm_put(&exact, &e->key, (void *)(uintptr_t)1);
-        n_exact++;
-        static volatile int32_t n_logged;
-        log_limited(&n_logged, "texture detail: texture %#llx (fmt %#x %ux%u, %u levels) is read by texel position or its "
-                    "size is asked for: made whole again (%llu so far)", (unsigned long long)e->pub.addr, e->t.d.format,
-                    e->t.d.width, e->t.d.height, e->pub.levels + e->pub.skip, (unsigned long long)n_exact);
-        drop_tex(e, DROP_EXACT);
-    }
+    Tex *entry = texture_binding_entry(&tslots[id], id);
+    if (entry && entry->pub.skip) texture_require_exact_locked(entry);
     return vk_texture_by_id_locked(id, view, has_view);
 }
 
+static TextureSlotSelection texture_storage_select_locked(int native, int exact, int private_output,
+    int refresh, view_t *view, int *has_view) {
+    TextureSlotSelection selected = texture_slot_select_locked(native, private_output);
+    if (refresh && !texture_slot_refresh_locked(selected, view, has_view, NULL, NULL)) selected.entry = NULL;
+    if (selected.entry && selected.entry->pub.skip && exact) {
+        texture_require_exact_locked(selected.entry);
+        selected = texture_slot_select_locked(native, private_output);
+        if (refresh && !texture_slot_refresh_locked(selected, view, has_view, NULL, NULL)) selected.entry = NULL;
+    }
+    if (!refresh && selected.entry) texture_slot_selected_view(&selected, view, has_view);
+    return selected;
+}
+
+const VkTexImage *vk_texture_storage_binding_locked(int logical, int exact, view_t *view, int *has_view) {
+    const TextureRegistration *history;
+    int native;
+    if (texture_registration_resolve(logical, &history, &native) != VK_TEXTURE_REGISTRATION_CURRENT) return NULL;
+    const TextureSlotSelection selected = texture_storage_select_locked(native, exact, 0, 1, view, has_view);
+    return selected.entry ? &selected.entry->pub : NULL;
+}
+
 // vk_dump: the swizzle selectors of the descriptor registered in slot id; 0 when the slot is empty.
-int vk_texture_slot_swz(int id, uint8_t swz[4]) {
+int vk_texture_slot_swz(int logical, uint8_t swz[4]) {
     lock();
-    int ok = id >= 0 && id < ntslots && tslots[id].used;
-    if (ok) {
-        const nvn_texdesc *d = &tslots[id].t.d;
+    const TextureRegistration *history;
+    int historical = texture_registration_resolve(logical, &history, NULL);
+    int id = vk_texture_pool_slot_locked(vk_exec_texture_pool(), logical);
+    const nvn_texdesc *d = history ? &history->descriptor.d :
+        !historical && id >= 0 && id < ntslots && tslots[id].used ? &tslots[id].t.d : NULL;
+    int present = d != NULL;
+    if (present) {
         swz[0] = (uint8_t)d->swizzle_r, swz[1] = (uint8_t)d->swizzle_g, swz[2] = (uint8_t)d->swizzle_b;
         swz[3] = (uint8_t)d->swizzle_a;
     }
     unlock();
-    return ok;
+    return present;
 }
 
 uint32_t vk_texture_epoch(void) { return __atomic_load_n(&submit_epoch, __ATOMIC_RELAXED); }
 
+static unsigned texture_budget_reclaim(void *unused, const RcAdmissionVector *deficit) {
+    (void)unused;
+    if (!vk_ctx() || vk_sync_stopping() || vk_device_is_lost()) return RC_BUDGET_RECLAIM_NONE;
+    if (!plat_rmutex_trylock(&tex_lock)) return RC_BUDGET_RECLAIM_BUSY;
+    unsigned outcome = RC_BUDGET_RECLAIM_NONE;
+    const uint64_t scene = vk_sync_fence_done();
+    uint64_t submitted, completed;
+    vk_upload_progress(&submitted, &completed);
+    int gpu_demand = 0;
+    for (uint32_t domain = RC_BUDGET_GPU_FIRST; domain < RC_ADMISSION_MAX_DOMAINS; ++domain) {
+        const uint64_t requested = deficit->amount[domain];
+        if (!requested) continue;
+        gpu_demand = 1;
+        if (vram_pressure > 0)
+            outcome |= content_reclaim_completed(requested, tex_evict > 0, domain, scene, completed);
+    }
+    const uint64_t ram = deficit->amount[RC_BUDGET_RAM], commit = deficit->amount[RC_BUDGET_COMMIT];
+    const uint64_t host = ram > commit ? ram : commit;
+    if (host && content_drop_providers_pressure(host, gpu_demand))
+        outcome |= RC_BUDGET_RECLAIM_DESTROYED;
+    if (outcome & RC_BUDGET_RECLAIM_DESTROYED) content_collect(MATERIAL_RECLAIM_SCAN);
+    plat_rmutex_unlock(&tex_lock);
+    // Compatibility allocations still require an idle replay. A parked required request may reclaim only
+    // completed exact material owners, so it cannot wait for destruction stamped with its own unsent scene.
+    if (gpu_demand && !outcome && vk_sync_try_provider_idle()) {
+        for (uint32_t domain = RC_BUDGET_GPU_FIRST; domain < RC_ADMISSION_MAX_DOMAINS; ++domain)
+            if (deficit->amount[domain]) outcome |= vk_texture_reclaim_heap(domain, deficit->amount[domain]);
+        vk_sync_end_provider_idle();
+    }
+    return outcome;
+}
+
+static void texture_budget_register(void *unused) {
+    (void)unused;
+    const uint32_t gpu = ((1u << RC_BUDGET_GPU_HEAPS) - 1u) << RC_BUDGET_GPU_FIRST;
+    const uint32_t host = (1u << RC_BUDGET_RAM) | (1u << RC_BUDGET_COMMIT);
+    if (resource_core_budget_register_reclaimer(RC_BUDGET_TEXTURE, gpu | host, texture_budget_reclaim, NULL) != RC_ADMISSION_OK)
+        rt_fatal("vk: could not register shared texture giveback");
+}
+
 void vk_texture_new_submit(void) {
+    static PlatOnce reclaim_once = PLAT_ONCE_INIT;
+    plat_once(&reclaim_once, texture_budget_register, NULL);
     lock();
+    if (packed_storage_count || packed_storage_suspended) {
+        const uint64_t frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+        if (packed_storage_collect_frame != frame) packed_storage_collect(frame);
+    }
+    content_collect(64);
+    rc_registry_collect(rc_registry_runtime(), 64);
+    native_texture_output_collect(32);
     // the last one walked the pool, or checked its entries by list
     if (pool_by_list || (round_checks && (uint64_t)round_checks * 2 >= pool_slots)) look_round++;
     round_checks = 0, pool_by_list = 0;
@@ -5314,13 +17302,243 @@ void vk_texture_new_submit(void) {
                material_stats.copied_bytes / 1048576.0, material_stats.copy_ns / 1e6,
                material_stats.avoided_texels / 1e6, (unsigned long long)material_stats.collisions);
         rt_log("tex-material: early %llu certificate %llu snapshot %.3f MiB refused %llu; COW %llu %.3f MiB; "
-               "physical %.3f MiB live %.3f MiB retained %.3f MiB retired %.3f MiB",
+               "physical %.3f MiB live %.3f MiB retained %.3f MiB retired %.3f MiB; "
+               "evicted %llu %.3f MiB restored %llu %.3f MiB; providers %.3f MiB dropped %.3f MiB; "
+               "pending %.3f MiB deferred %.3f MiB",
                (unsigned long long)material_stats.early_hits, (unsigned long long)material_stats.certificate_hits,
                material_stats.snapshot_bytes / 1048576.0, (unsigned long long)material_stats.snapshot_refused,
                (unsigned long long)material_stats.cow, material_stats.cow_bytes / 1048576.0,
                material_ledger.resident_bytes / 1048576.0, material_ledger.live_bytes / 1048576.0,
-               material_ledger.retained_bytes / 1048576.0, material_stats.retired_bytes / 1048576.0);
+               material_ledger.retained_bytes / 1048576.0, material_stats.retired_bytes / 1048576.0,
+               (unsigned long long)material_stats.evicted, material_stats.evicted_bytes / 1048576.0,
+               (unsigned long long)material_stats.restored, material_stats.restored_bytes / 1048576.0,
+               material_ledger.provider_bytes / 1048576.0, material_stats.provider_dropped / 1048576.0,
+               material_ledger.pending_bytes / 1048576.0, material_ledger.deferred_bytes / 1048576.0);
         memset(&material_stats, 0, sizeof material_stats);
+        // These are adapter calls, not unique textures or shader fetches. Retained bindless sets also capture
+        // material instances through their publications without calling the sampled adapter again.
+        rt_log("resource-core samples: frame %llu query/ready/prepare/defer/unavailable/fallback %llu/%llu/%llu/%llu/%llu/%llu; "
+               "adapter use calls %llu (material %llu ordered-version %llu); "
+               "live visits %llu avoided capacity visits %llu dependency detaches %llu",
+               (unsigned long long)f * 60, (unsigned long long)resource_path.queries,
+               (unsigned long long)resource_path.ready, (unsigned long long)resource_path.prepared,
+               (unsigned long long)resource_path.deferred, (unsigned long long)resource_path.unavailable,
+               (unsigned long long)resource_path.fallback, (unsigned long long)resource_path.used,
+               (unsigned long long)resource_path.material_used, (unsigned long long)resource_path.versioned_used,
+               (unsigned long long)resource_path.live_visits, (unsigned long long)resource_path.avoided_visits,
+               (unsigned long long)resource_path.dependency_detach);
+        memset(&resource_path, 0, sizeof resource_path);
+        // One outcome per actual binding-receipt query, including successful null/unused slots. These counters
+        // distinguish pool member rejection from the smaller number of actual compatibility preparations.
+        rt_log("resource-core binding receipts: calls %llu; ready absent %llu direct/GPU %llu finalized %llu "
+               "ordinary %llu compatibility %llu same-operation %llu; refused invalid slot %llu stale slot %llu "
+               "image/gone %llu not-ready %llu ordinary proof %llu compatibility %llu",
+               (unsigned long long)binding_path.calls, (unsigned long long)binding_path.absent,
+               (unsigned long long)binding_path.direct_gpu, (unsigned long long)binding_path.finalized,
+               (unsigned long long)binding_path.ordinary, (unsigned long long)binding_path.compatibility,
+               (unsigned long long)binding_path.same_operation, (unsigned long long)binding_path.invalid_slot,
+               (unsigned long long)binding_path.stale_slot, (unsigned long long)binding_path.image_mismatch,
+               (unsigned long long)binding_path.not_ready, (unsigned long long)binding_path.ordinary_refused,
+               (unsigned long long)binding_path.compatibility_refused);
+        memset(&binding_path, 0, sizeof binding_path);
+        rt_log("resource-core ordinary refusals: unordered %llu position %llu unchecked %llu stamp %llu feedback %llu material %llu "
+               "mapping %llu protection %llu registry %llu backwards %llu scope %llu race %llu",
+               (unsigned long long)ordinary_path.unordered, (unsigned long long)ordinary_path.position,
+               (unsigned long long)ordinary_path.unchecked, (unsigned long long)ordinary_path.stamp,
+               (unsigned long long)ordinary_path.feedback, (unsigned long long)ordinary_path.material,
+               (unsigned long long)ordinary_path.mapping, (unsigned long long)ordinary_path.protection,
+               (unsigned long long)ordinary_path.registry, (unsigned long long)ordinary_path.backwards,
+               (unsigned long long)ordinary_path.scope, (unsigned long long)ordinary_path.race);
+        memset(&ordinary_path, 0, sizeof ordinary_path);
+        rt_log("resource-core compatibility preparation: begin %llu ready %llu new leases %llu; refused position %llu "
+               "physical/virtual source %llu other invalid source %llu registration %llu feedback %llu serial %llu registry %llu; "
+               "source path handled %llu without ordered proof %llu",
+               (unsigned long long)compatibility_path.begins, (unsigned long long)compatibility_path.begin_ready,
+               (unsigned long long)compatibility_path.acquired,
+               (unsigned long long)compatibility_path.begin_position, (unsigned long long)compatibility_path.begin_alias_pool,
+               (unsigned long long)compatibility_path.begin_no_source, (unsigned long long)compatibility_path.begin_registration,
+               (unsigned long long)compatibility_path.begin_feedback,
+               (unsigned long long)compatibility_path.begin_serial, (unsigned long long)compatibility_path.begin_registry,
+               (unsigned long long)compatibility_path.source_handled, (unsigned long long)compatibility_path.source_unordered);
+        rt_log("resource-core compatibility commit: calls %llu ready %llu; refused unready %llu unbracketed %llu "
+               "mapping %llu protection %llu registry %llu",
+               (unsigned long long)compatibility_path.commits, (unsigned long long)compatibility_path.commit_ready,
+               (unsigned long long)compatibility_path.commit_unready, (unsigned long long)compatibility_path.commit_unbracketed,
+               (unsigned long long)compatibility_path.commit_mapping, (unsigned long long)compatibility_path.commit_protection,
+               (unsigned long long)compatibility_path.commit_registry);
+        rt_log("resource-core compatibility use: calls %llu ready %llu; refused empty %llu position %llu "
+               "prepared epoch %llu image/bytes %llu feedback %llu mapping %llu protection %llu "
+               "scope/scene %llu backwards %llu producer edge %llu registry %llu",
+               (unsigned long long)compatibility_path.uses, (unsigned long long)compatibility_path.use_ready,
+               (unsigned long long)compatibility_path.use_empty, (unsigned long long)compatibility_path.use_position,
+               (unsigned long long)compatibility_path.use_epoch, (unsigned long long)compatibility_path.use_identity,
+               (unsigned long long)compatibility_path.use_feedback, (unsigned long long)compatibility_path.use_mapping,
+               (unsigned long long)compatibility_path.use_protection, (unsigned long long)compatibility_path.use_scope,
+               (unsigned long long)compatibility_path.use_backwards, (unsigned long long)compatibility_path.use_edge,
+               (unsigned long long)compatibility_path.use_registry);
+        rt_log("resource-core image binding: begin %llu ready %llu changed during preparation %llu",
+               (unsigned long long)compatibility_path.image_begins,
+               (unsigned long long)compatibility_path.image_ready,
+               (unsigned long long)compatibility_path.image_commit_changed);
+        memset(&compatibility_path, 0, sizeof compatibility_path);
+        RcRegistryStats registry = rc_registry_stats(rc_registry_runtime());
+        RcRegistryDiagnostics diagnostics;
+        rc_registry_diagnostics(rc_registry_runtime(), &diagnostics);
+        static uint64_t diagnostic_logged[RC_REGISTRY_DIAG_COUNT];
+        for (unsigned reason = 0; reason < RC_REGISTRY_DIAG_COUNT; ++reason) {
+            if (!diagnostics.counts[reason]) continue;
+            const char *name = rc_registry_diagnostic_name((RcRegistryDiagnosticReason)reason);
+            rt_log("resource authority diagnostic: %s total %llu", name,
+                (unsigned long long)diagnostics.counts[reason]);
+            for (unsigned sample = 0; sample < diagnostics.sample_count[reason]; ++sample) {
+                const RcRegistryDiagnosticSample *d = &diagnostics.samples[reason][sample];
+                if (d->sequence <= diagnostic_logged[reason]) continue;
+                diagnostic_logged[reason] = d->sequence;
+                rt_log("resource authority sample: %s seq %llu writer %llu/%u state %u kind %u flags %#x "
+                    "range %llu:%#llx+%#llx at %llu/%llu submit %llu image %#llx; "
+                    "request %llu:%#llx+%#llx at %llu/%llu image %#llx hold %llu/%u",
+                    name, (unsigned long long)d->sequence, (unsigned long long)d->writer.id, d->writer.index,
+                    d->state, d->kind, d->flags, (unsigned long long)d->range.backing,
+                    (unsigned long long)d->range.offset, (unsigned long long)d->range.size,
+                    (unsigned long long)d->position.scene, (unsigned long long)d->position.ordinal,
+                    (unsigned long long)d->submission, (unsigned long long)d->writer_image,
+                    (unsigned long long)d->requested.backing, (unsigned long long)d->requested.offset,
+                    (unsigned long long)d->requested.size, (unsigned long long)d->read_position.scene,
+                    (unsigned long long)d->read_position.ordinal, (unsigned long long)d->selected.image,
+                    (unsigned long long)d->selected.hold.id, d->selected.hold.index);
+                rt_log("resource authority sample producer: seq %llu count %u position %llu/%llu refs %u "
+                    "unresolved %u active %u unknown %u prefix bad %u image %#llx hold %llu/%u prepared %u",
+                    (unsigned long long)d->sequence, d->producer_count,
+                    (unsigned long long)d->producer_position.scene, (unsigned long long)d->producer_position.ordinal,
+                    d->producer_refs, d->producer_unresolved, d->producer_active, d->producer_unknown, d->prefix_bad,
+                    (unsigned long long)d->producer_image.image, (unsigned long long)d->producer_image.hold.id,
+                    d->producer_image.hold.index, d->prepared_actuals);
+            }
+        }
+        rt_log("resource-core image producers: positions %u peak %u capacity refusals %llu",
+               registry.image_positions, registry.image_position_peak,
+               (unsigned long long)registry.image_position_refusals);
+        RcBudgetSnapshot budget;
+        resource_core_budget_snapshot(&budget);
+        // This summary uses the same sample as the existing resource line. Required progress headroom and
+        // optional preparation headroom differ; a positive required allowance does not admit a source snapshot.
+        rt_log("resource budget: frame %llu sample age %.1f ms known %#x; RAM free/total %.1f/%.1f MiB "
+               "required/optional %.1f/%.1f MiB reserved/unobserved %.1f/%.1f MiB; "
+               "commit free/total %.1f/%.1f MiB required/optional %.1f/%.1f MiB reserved/unobserved %.1f/%.1f MiB",
+               (unsigned long long)f * 60, budget.sample_age_ns / 1e6, budget.sample.known_mask,
+               budget.sample.free.amount[RC_BUDGET_RAM] / 1048576.0,
+               budget.sample.total.amount[RC_BUDGET_RAM] / 1048576.0,
+               budget.available.amount[RC_BUDGET_RAM] / 1048576.0,
+               budget.optional_available.amount[RC_BUDGET_RAM] / 1048576.0,
+               budget.reserved.amount[RC_BUDGET_RAM] / 1048576.0,
+               budget.unobserved.amount[RC_BUDGET_RAM] / 1048576.0,
+               budget.sample.free.amount[RC_BUDGET_COMMIT] / 1048576.0,
+               budget.sample.total.amount[RC_BUDGET_COMMIT] / 1048576.0,
+               budget.available.amount[RC_BUDGET_COMMIT] / 1048576.0,
+               budget.optional_available.amount[RC_BUDGET_COMMIT] / 1048576.0,
+               budget.reserved.amount[RC_BUDGET_COMMIT] / 1048576.0,
+               budget.unobserved.amount[RC_BUDGET_COMMIT] / 1048576.0);
+        static struct {
+            uint64_t admitted, refused, domain[RC_ADMISSION_MAX_DOMAINS];
+        } budget_previous[RC_BUDGET_PRODUCERS];
+        static const char *const budget_names[RC_BUDGET_PRODUCERS] = {
+            [RC_BUDGET_TEXTURE] = "texture", [RC_BUDGET_BUFFER] = "buffer", [RC_BUDGET_STAGE] = "staging",
+            [RC_BUDGET_PIPELINE] = "pipeline", [RC_BUDGET_SNAPSHOT] = "snapshot", [RC_BUDGET_OTHER] = "other"
+        };
+        for (unsigned p = 1; p < RC_BUDGET_PRODUCERS; p++) {
+            const RcBudgetProducerStats *s = &budget.producer[p];
+            uint64_t admitted = s->admitted >= budget_previous[p].admitted
+                ? s->admitted - budget_previous[p].admitted : s->admitted;
+            uint64_t refused = s->refused >= budget_previous[p].refused
+                ? s->refused - budget_previous[p].refused : s->refused;
+            uint32_t mask = 0;
+            char domains[384] = "";
+            size_t length = 0;
+            for (unsigned d = 0; d < RC_ADMISSION_MAX_DOMAINS; d++) {
+                uint64_t count = s->refused_domain[d] >= budget_previous[p].domain[d]
+                    ? s->refused_domain[d] - budget_previous[p].domain[d] : s->refused_domain[d];
+                budget_previous[p].domain[d] = s->refused_domain[d];
+                if (!count) continue;
+                mask |= 1u << d;
+                int n;
+                if (d < RC_BUDGET_GPU_FIRST) {
+                    const char *name = d == RC_BUDGET_RAM ? "RAM" : d == RC_BUDGET_COMMIT ? "commit" : "staging";
+                    n = snprintf(domains + length, sizeof domains - length, "%s%s=%llu", length ? " " : "", name,
+                                 (unsigned long long)count);
+                } else {
+                    n = snprintf(domains + length, sizeof domains - length, "%sheap%u=%llu", length ? " " : "",
+                                 d - RC_BUDGET_GPU_FIRST, (unsigned long long)count);
+                }
+                if (n > 0) length += (size_t)n < sizeof domains - length ? (size_t)n : sizeof domains - length - 1;
+            }
+            budget_previous[p].admitted = s->admitted;
+            budget_previous[p].refused = s->refused;
+            if (admitted || refused)
+                rt_log("resource budget producer %s: admitted %llu refused %llu; refusal domains %#x [%s]",
+                       budget_names[p], (unsigned long long)admitted, (unsigned long long)refused, mask, domains);
+            if (refused) {
+                const RcBudgetRefusal *why = &s->last_refusal;
+                rt_log("resource budget last refusal %s: status %d required %d capacity/unknown/stale %#x/%#x/%#x; "
+                       "RAM requested/available %.3f/%.3f MiB commit requested/available %.3f/%.3f MiB",
+                       budget_names[p], (int)why->status, why->required, why->capacity_mask, why->unknown_mask, why->stale_mask,
+                       why->request.amount[RC_BUDGET_RAM] / 1048576.0, why->available.amount[RC_BUDGET_RAM] / 1048576.0,
+                       why->request.amount[RC_BUDGET_COMMIT] / 1048576.0, why->available.amount[RC_BUDGET_COMMIT] / 1048576.0);
+            }
+        }
+        rt_log("resource-core: source observations %llu blocked %llu notifications %llu rebuilds %llu; "
+               "registry records %u writers %u peak %u failed %d; sources %u descriptors %u history %u leases %u; "
+               "writers pending %u submitted %u holds %u foreign %u; refusals records %llu writers %llu; "
+               "live material capture nodes %u (recording and publications), batches %u publications %u; "
+               "material pending %.3f MiB; commit reserved %.3f MiB pending %.3f MiB available %.3f MiB",
+               (unsigned long long)resource_bridge.observed, (unsigned long long)resource_bridge.blocked,
+               (unsigned long long)resource_bridge.notifications, (unsigned long long)resource_bridge.rebuilds,
+               registry.records, registry.writers, registry.writer_peak, registry.fail_closed,
+               registry.live_sources, registry.live_descriptors, registry.retired_records, registry.source_leases,
+               registry.writer_pending, registry.writer_submitted, registry.writer_holds, registry.writer_foreign,
+               (unsigned long long)registry.record_refusals, (unsigned long long)registry.writer_refusals,
+               texture_uses.nodes, texture_uses.batches, texture_uses.publications,
+               material_ledger.pending_bytes / 1048576.0,
+               budget.reserved.amount[RC_BUDGET_COMMIT] / 1048576.0,
+               budget.pending.amount[RC_BUDGET_COMMIT] / 1048576.0,
+               budget.available.amount[RC_BUDGET_COMMIT] / 1048576.0);
+        rt_log("resource-core observations: source capacity %llu stale %llu other %llu; "
+               "authority blocked %llu stale %llu other %llu; changed during observation %llu",
+               (unsigned long long)resource_bridge.source_capacity, (unsigned long long)resource_bridge.source_stale,
+               (unsigned long long)resource_bridge.source_other, (unsigned long long)resource_bridge.observe_authority,
+               (unsigned long long)resource_bridge.observe_stale, (unsigned long long)resource_bridge.observe_other,
+               (unsigned long long)resource_bridge.raced);
+        rt_log("resource-core canonical source: %llu newly eligible, %llu excluded mappings, %llu blocked observations, "
+               "%llu ready texture selections",
+               (unsigned long long)resource_bridge.canonical_eligible, (unsigned long long)resource_bridge.canonical_excluded,
+               (unsigned long long)resource_bridge.canonical_blocked, (unsigned long long)resource_bridge.canonical_ready);
+        rt_log("resource-core authority totals: first blocker pending %llu submitted %llu foreign %llu held %llu; "
+               "image %llu buffer %llu unknown %llu failed %llu; visibility proofs %llu applied %llu "
+               "foreign removed %llu retained %llu; reconcile busy %llu capacity %llu",
+               (unsigned long long)registry.blocked_pending, (unsigned long long)registry.blocked_submitted,
+               (unsigned long long)registry.blocked_foreign, (unsigned long long)registry.blocked_held,
+               (unsigned long long)registry.blocked_image, (unsigned long long)registry.blocked_buffer,
+               (unsigned long long)registry.blocked_unknown, (unsigned long long)registry.blocked_fail_closed,
+               (unsigned long long)registry.visibility_proofs, (unsigned long long)registry.visibility_applied,
+               (unsigned long long)registry.visibility_removed, (unsigned long long)registry.visibility_retained,
+               (unsigned long long)registry.reconcile_busy, (unsigned long long)registry.reconcile_capacity);
+        rt_log("resource-core ordered: observations %llu blocked %llu future writers ignored %llu; "
+               "exact versions %llu late declarations %llu completion refusals %llu",
+               (unsigned long long)registry.ordered_observations, (unsigned long long)registry.ordered_blocked,
+               (unsigned long long)registry.future_writers_ignored, (unsigned long long)registry.read_versions,
+               (unsigned long long)registry.late_declarations, (unsigned long long)registry.completion_range_refusals);
+        rt_log("resource-core renewal: ordinary unchanged %llu schedule queries %llu; compatibility unchanged %llu schedule queries %llu",
+               (unsigned long long)registry.read_renew_fast, (unsigned long long)registry.read_renew_queries,
+               (unsigned long long)registry.binding_renew_fast, (unsigned long long)registry.binding_renew_queries);
+        rt_log("resource-core compatibility totals: begin %llu ready %llu; first refusal unknown hold %llu "
+               "unordered unknown foreign %llu image alias %llu unpositioned producer %llu read edge %llu "
+               "stale source %llu closed prefix %llu failed registry %llu",
+               (unsigned long long)registry.binding_begins, (unsigned long long)registry.binding_ready,
+               (unsigned long long)registry.binding_unknown_held, (unsigned long long)registry.binding_unordered_foreign,
+               (unsigned long long)registry.binding_image_alias,
+               (unsigned long long)registry.binding_unpositioned, (unsigned long long)registry.binding_edge,
+               (unsigned long long)registry.binding_stale, (unsigned long long)registry.binding_closed,
+               (unsigned long long)registry.binding_failed);
+        memset(&resource_bridge, 0, sizeof resource_bridge);
         n_cap_drops = n_pressure_drops = n_commit_drops = n_commit_past = n_evict = n_evict_bytes = 0;
         n_commit_back = n_commit_held = 0;
         n_disuse = n_disuse_bytes = n_disuse_back = n_retire_freed = n_retire_cancel = 0;
@@ -5377,13 +17595,61 @@ static int region_of(const tex_t *t, const view_t *v, const NVNcopyRegion *r, ui
 // Pool bytes <-> caller rows of the region alone (nvn_texels_box), not through a
 // linear copy of the whole level: for a small region of a large texture that cost tens of milliseconds while the guest
 // thread held its virtual core and the caller the texture lock (monsters2 replay, frames 765-790).
-static int storage_texels(const tex_t *t, const Region *g, const NVNcopyRegion *r, uint8_t *mem, int write) {
+typedef struct {
+    const MemBackingCapture *mapping;
+    uint64_t address, size;
+    RcRegistryVisibility overwritten;
+    RcSourceRange *ranges;
+    uint32_t count, capacity;
+    int collect;
+} TextureCpuWrites;
+
+static void texel_overwrite_begin(TextureCpuWrites *writes) {
+    if (writes->mapping && rc_registry_visibility_begin(rc_registry_runtime(), RC_REGISTRY_VISIBILITY_COMPLETED,
+                                                       &writes->overwritten) == RC_REGISTRY_OK)
+        writes->overwritten.writer_kinds = 1u << RC_REGISTRY_IMAGE;
+}
+
+static void notify_texel_store(void *context, uint64_t offset, uint64_t size) {
+    TextureCpuWrites *writes = context;
+    if (offset > writes->size || size > writes->size - offset)
+        rt_fatal("vk: a stored texel is outside its captured texture");
+    uint64_t address = writes->address + offset;
+    RcSourceRange raw = {RC_GUEST_COMPATIBILITY_BACKING, address, size};
+    RcRegistry *registry = rc_registry_runtime();
+    rc_registry_cpu_changed(registry, raw);
+    if (writes->overwritten.horizon) rc_registry_visibility_apply(registry, &writes->overwritten, raw);
+    mem_backing_cpu_changed_held(writes->mapping, address, size, &writes->overwritten);
+    vk_mem_cpu_result_written(address, size);
+    if (!writes->collect) return;
+    if (writes->count == writes->capacity) {
+        if (writes->capacity > UINT32_MAX / 2) {
+            writes->collect = 0;
+            return;
+        }
+        uint32_t capacity = writes->capacity ? writes->capacity * 2 : 16;
+        RcSourceRange *ranges = realloc(writes->ranges, (size_t)capacity * sizeof *ranges);
+        if (!ranges) {
+            writes->collect = 0;
+            return;
+        }
+        writes->ranges = ranges;
+        writes->capacity = capacity;
+    }
+    writes->ranges[writes->count++] = raw;
+}
+
+static int storage_texels(const tex_t *t, const Region *g, const NVNcopyRegion *r, uint8_t *mem,
+                          TextureCpuWrites *writes) {
     for (int z = 0; z < g->nz; z++) {
         unsigned layer = g->is3d ? 0 : g->layer0 + (unsigned)r->zoffset + (unsigned)z;
         uint32_t slice = g->is3d ? (uint32_t)(r->zoffset + z) : 0;
         if (nvn_texels_box(&t->d, g->level, layer, (uint32_t)g->x0, (uint32_t)g->y0, slice, (uint32_t)g->wb,
-                           (uint32_t)g->hb, t->mem, mem + (size_t)z * g->img, g->row, !write))
+                           (uint32_t)g->hb, t->mem, mem + (size_t)z * g->img, g->row, !writes))
             return 0;
+        if (writes && nvn_texels_box_ranges(&t->d, g->level, layer, (uint32_t)g->x0, (uint32_t)g->y0, slice,
+                (uint32_t)g->wb, (uint32_t)g->hb, notify_texel_store, writes))
+            rt_fatal("vk: stored texels no longer match their layout");
     }
     return 1;
 }
@@ -5443,9 +17709,7 @@ static int texels_read_record(Tex *e, const Region *g, const NVNcopyRegion *r, T
     return 1;
 }
 
-static void texels_read_take(const Tex *e, const Region *g, const TexRead *t, uint8_t *mem) {
-    VkCtx *c = vk_ctx();
-    vmaInvalidateAllocation(c->vma, t->sa, 0, VK_WHOLE_SIZE);
+static void texels_read_copy_rows(const Tex *e, const Region *g, const TexRead *t, uint8_t *mem) {
     for (int z = 0; z < g->nz; z++) {
         const uint8_t *s = t->stg + t->slice * (size_t)z;
         uint8_t *m = mem + (size_t)z * g->img;
@@ -5454,12 +17718,27 @@ static void texels_read_take(const Tex *e, const Region *g, const TexRead *t, ui
             else memcpy(m + y * g->row, s + y * g->wb, g->wb);
         }
     }
-    vmaDestroyBuffer(c->vma, t->sb, t->sa);
+}
+
+static void texels_read_take(const Tex *e, const Region *g, const TexRead *t, uint8_t *mem) {
+    VkCtx *c = vk_ctx();
+    vmaInvalidateAllocation(c->vma, t->sa, 0, VK_WHOLE_SIZE);
+    texels_read_copy_rows(e, g, t, mem);
+    resource_core_vma_destroy_buffer(c->vma, t->sb, t->sa);
 }
 
 // Image <-> caller rows through a staging buffer; the GPU copy is waited for.
 static int image_texels(Tex *e, const Region *g, const NVNcopyRegion *r, uint8_t *mem, int write) {
-    if (write) { e->material_writable = 1; content_write_begin(e, 1); content_image_forget(e); }
+    if (write) {
+        texture_registration_source_clear(e);
+        e->material_writable = 1;
+        if (!content_write_begin(e, 1)) {
+            // WriteTexels is synchronous and has no replay continuation that can retry this required update.
+            rt_fatal("vk: WriteTexels cannot preserve the prior contents of texture %#llx", (unsigned long long)e->pub.addr);
+            return 0;
+        }
+        content_image_forget(e);
+    }
     static volatile int32_t n_astc, n_ds;
     VkCtx *c = vk_ctx();
     VkImageAspectFlags aspect;
@@ -5510,6 +17789,9 @@ static int image_texels(Tex *e, const Region *g, const NVNcopyRegion *r, uint8_t
                                     .imageOffset = {r->xoffset, r->yoffset, g->is3d ? r->zoffset + z : 0},
                                     .imageExtent = {w, h, 1}};
     }
+    ResourceImageScope image_writes = {0};
+    resource_image_scope_begin(&image_writes, 0);
+    tex_image_prepare(e, e->t.L.size);
     VkCommandBuffer cb = vk_upload_begin();
     vmaFlushAllocation(c->vma, sa, 0, VK_WHOLE_SIZE);
     barrier(cb, ALL_RW, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
@@ -5533,12 +17815,340 @@ static int image_texels(Tex *e, const Region *g, const NVNcopyRegion *r, uint8_t
     if (!agpu) vkCmdCopyBufferToImage(cb, sb, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, (uint32_t)g->nz, rg);
     else if (done <= 0) log_limited(&n_astc, "WriteTexels of ASTC texture %#llx not decoded on the GPU: left as it was",
                                 (unsigned long long)e->pub.addr);
+    if (!agpu || done > 0) {
+        resource_image_written((uint64_t)(uintptr_t)e->pub.image, e->pub.addr);
+        if (!++e->content_revision) rt_fatal("vk: texture content revision exhausted");
+    }
     barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
     vk_upload_end();
-    vk_upload_flush(1);
+    uint64_t upload = vk_upload_flush(1);
+    if (upload && (!agpu || done > 0) && !vk_device_is_lost()) {
+        if (e->pub.gpu_owned) own_add(e);
+        else image_hold_mapped(e);
+    }
+    resource_image_scope_end_upload(&image_writes);
     free(rg);
-    vmaDestroyBuffer(c->vma, sb, sa);
+    resource_core_vma_destroy_buffer(c->vma, sb, sa);
     return 1;
+}
+
+typedef struct {
+    VkImage image;
+    RcRegistryPosition writer;
+    uint64_t serial, revision, layout;
+} TextureCpuReadSource;
+
+static int cpu_texel_region(const tex_t *t, const view_t *v, const NVNcopyRegion *r,
+    uint64_t row, uint64_t img, Region *g, size_t *span) {
+    if (r->width <= 0 || r->height <= 0 || r->xoffset < 0 || r->yoffset < 0 || r->zoffset ||
+        r->depth < 0 || r->depth > 1 || r->width > t->d.width || r->height > t->d.height ||
+        r->xoffset > t->d.width - r->width || r->yoffset > t->d.height - r->height ||
+        !region_of(t, v, r, row, img, g) || g->level || g->layer0 || g->row < g->wb ||
+        g->hb - 1 > (SIZE_MAX - g->wb) / g->row) return 0;
+    *span = (g->hb - 1) * g->row + g->wb;
+    return 1;
+}
+
+static int cpu_texel_layout_handed(const Tex *entry, RcRegistryPosition output) {
+    if (entry->sample_general_upload) {
+        uint64_t submitted = 0;
+        vk_upload_progress(&submitted, NULL);
+        return entry->sample_general_upload <= submitted;
+    }
+    const RcRegistryPosition initialized = entry->sample_general_inline;
+    return rc_registry_position_valid(initialized) && rc_registry_position_compare(initialized, output) <= 0 &&
+        rc_registry_position_handed(rc_registry_runtime(), initialized);
+}
+
+static int cpu_texel_source_current(const Tex *entry, const TextureCpuReadSource *selected) {
+    const RcRegistryPosition writer = entry ? entry->native_write : (RcRegistryPosition){0};
+    return entry && entry->t.serial == selected->serial && entry->pub.image == selected->image &&
+        entry->content_revision == selected->revision && entry->sample_general_revision == selected->layout &&
+        entry->wr_fence == selected->writer.scene && !rc_registry_position_compare(writer, selected->writer) &&
+        !entry->pending_write && !entry->pin_detached && preserve_pool_contents_handed(entry);
+}
+
+int vk_texture_cpu_read_candidate(const tex_t *t, const view_t *v) {
+    return t && t->mem && nvn_gpu_only((uintptr_t)t->mem) && t->d.target == NVN_TEXTURE_TARGET_2D &&
+        t->d.levels == 1 && t->L.layers == 1 && t->d.samples <= 1 &&
+        (t->d.format == NVN_FORMAT_R8 || t->d.format == NVN_FORMAT_RGBA8) &&
+        (!v || (!v->set_target && !v->set_dsmode && (!v->set_format || v->format == t->d.format)));
+}
+
+static int cpu_texel_cut_current(RcRegistryPosition cut) {
+    return rc_registry_position_valid(cut) && cut.scene <= vk_sync_issued() &&
+        cut.scene <= vk_sync_handed_fence() &&
+        !rc_registry_position_compare(cut, rc_registry_handed_cutoff(rc_registry_runtime()));
+}
+
+static VkTextureAliasRead *cpu_texel_alias_capture_locked(const tex_t *t, const NVNcopyRegion *box,
+    const Region *region, RcRegistryPosition cut) {
+    const uint64_t address = (uintptr_t)t->mem, bytes = t->L.size;
+    VkMemSpan span;
+    RcInterval *map = NULL;
+    if (!bytes || bytes > VK_TEXTURE_ALIAS_MAX_BYTES || bytes > UINT64_MAX - address ||
+        !vk_mem_lookup(address, bytes, &span) || span.cls != VK_MCLS_DEVICE) return NULL;
+    uint32_t maps = vk_mem_device_intervals(&span, address, bytes, &map);
+    if (!maps) { free(map); return NULL; }
+    VkTextureAliasRead *alias = calloc(1, sizeof *alias);
+    if (!alias) { free(map); return NULL; }
+    *alias = (VkTextureAliasRead){.read = cut, .owners = 1, .result.addr = address, .guest_bytes = bytes,
+        .workspace_bytes = bytes, .raw_source = span, .raw_output = 1, .cpu_handed = 1,
+        .receiver_mapping = map, .mapping_count = maps};
+    const uint32_t limit = IMAGE_ALIAS_MAX_WRITE_FRAGMENTS;
+    alias->demands = malloc((size_t)limit * sizeof *alias->demands);
+    alias->fragments = malloc((size_t)limit * sizeof *alias->fragments);
+    if (alias->demands && alias->fragments &&
+        texture_alias_demand_box(&t->d, box, (uint32_t)region->bpb, map, maps, address, bytes,
+            alias->demands, limit, &alias->demand_count)) return alias;
+    image_alias_release(alias);
+    return NULL;
+}
+
+static RcRegistryResult cpu_texel_alias_sources_locked(VkTextureAliasRead *alias, const Region *region) {
+    const uint32_t count = alias->fragment_count;
+    if (!count) return RC_REGISTRY_BLOCKED;
+    alias->current = malloc((size_t)count * sizeof *alias->current);
+    alias->slices = malloc((size_t)count * sizeof *alias->slices);
+    if (!alias->current || !alias->slices) return RC_REGISTRY_CAPACITY;
+    RcRegistryResult selected = image_alias_capture_sources(alias, 1, NULL);
+    if (selected != RC_REGISTRY_OK) return selected;
+    alias->upload_offset = (alias->stage_bytes + 15) & ~UINT64_C(15);
+    if (alias->upload_offset >= VK_TEXTURE_ALIAS_MAX_BYTES ||
+        region->hb > (VK_TEXTURE_ALIAS_MAX_BYTES - alias->upload_offset) / region->wb)
+        return RC_REGISTRY_CAPACITY;
+    // The tail is CPU-only tight rows; it remains private until all sources and the guest destination are current.
+    alias->stage_bytes = alias->upload_offset + region->hb * region->wb;
+    return RC_REGISTRY_OK;
+}
+
+static int cpu_texel_alias_layouts_handed_locked(const VkTextureAliasRead *alias) {
+    for (uint32_t i = 0; i < alias->source_count; ++i) {
+        const VkImage image = alias->sources[i].image.image;
+        const NativeTextureOutput *owner = nvn_hm_get(&alias_fragment_owners, &image);
+        if (!owner || !owner->entry || !cpu_texel_layout_handed(owner->entry, alias->read)) return 0;
+    }
+    return 1;
+}
+
+static VkResult cpu_texel_alias_stage(VkTextureAliasRead *alias) {
+    VkTextureAliasStagingProgress progress;
+    RcVmaDependency native;
+    VkResult ready = vk_texture_alias_read_prepare(&alias, 1, 1, 0, &progress, &native);
+    if (ready == VK_NOT_READY && progress.upload && vk_staging_prepare_wait(progress.upload) &&
+        image_alias_read_current_at(alias, alias->read))
+        ready = vk_texture_alias_read_prepare(&alias, 1, 1, progress.upload, &progress, &native);
+    return ready;
+}
+
+static VkTextureCpuReadResult cpu_texel_read_composed(const tex_t *t, const view_t *v, const NVNcopyRegion *box,
+    uint8_t *dst, uint64_t row, uint64_t img, int replay_ordered, int required, uint64_t *selected_fence) {
+    const tex_t original = *t;
+    const uint64_t address = (uintptr_t)dst;
+    const int guest = address < RT_ADDRESS_LIMIT;
+    const VkTextureCpuReadResult declined = required ? VK_TEXTURE_CPU_READ_REFUSED : VK_TEXTURE_CPU_READ_OUTSIDE;
+    Region region;
+    size_t span;
+    if (!replay_ordered || !original.serial || !dst || !cpu_texel_region(&original, v, box, row, img, &region, &span) ||
+        span > UINTPTR_MAX - (uintptr_t)dst || (guest && span > RT_ADDRESS_LIMIT - address))
+        return declined;
+
+    MemBackingCapture *destination = NULL;
+    const uint64_t protection = guest ? mem_protection_serial() : 0;
+    const int destination_captured = !guest || mem_backing_capture(address, span, &destination) == RC_BACKING_OK;
+    VkTextureCpuReadResult result = declined;
+    VkTextureAliasRead *alias = NULL;
+
+    // Close positively accepted older uploads and held scenes before choosing an inclusive CPU cutoff.
+    // Registry handoff alone closes recording, while the sync counters prove the queue took the scene.
+    vk_upload_flush(0);
+    vk_queue_lock();
+    const RcRegistryPosition cut = rc_registry_handed_cutoff(rc_registry_runtime());
+    const int accepted = cpu_texel_cut_current(cut);
+    vk_queue_unlock();
+    if (!rc_registry_position_valid(cut) || vk_sync_stopping() || vk_device_is_lost()) goto release;
+
+    lock();
+    alias = cpu_texel_alias_capture_locked(&original, box, &region, cut);
+    if (!alias) { unlock(); goto release; }
+    const uint32_t limit = IMAGE_ALIAS_MAX_WRITE_FRAGMENTS;
+    RcRegistryResult snapshot = image_alias_snapshot(alias, NULL, 0, cut, alias->fragments, limit, &alias->fragment_count);
+    const int required_coverage = rc_registry_native_image_handed_requires_coverage(rc_registry_runtime(),
+        alias->demands, alias->demand_count, cut);
+    if (snapshot == RC_REGISTRY_OK || required_coverage) result = VK_TEXTURE_CPU_READ_REFUSED;
+    if (!accepted) { unlock(); goto release; }
+    uint64_t raw_fill = 0;
+    if (snapshot == RC_REGISTRY_BLOCKED) {
+        const RcRegistryResult raw = vk_mem_image_alias_baseline_capture_handed(alias->result.addr, alias->guest_bytes,
+            alias->receiver_mapping, alias->mapping_count, cut, &alias->baseline, &raw_fill);
+        if (raw != RC_REGISTRY_OK) snapshot = raw;
+    }
+    unlock();
+    if (alias->baseline) result = VK_TEXTURE_CPU_READ_REFUSED;
+    if (!destination_captured) goto release;
+
+    if (alias->baseline) {
+        if (!raw_fill || !vk_staging_prepare_wait(raw_fill)) goto release;
+        lock();
+        uint32_t spans_count;
+        const RcRegistryBufferSpan *spans = vk_mem_image_alias_baseline_spans(alias->baseline, &spans_count);
+        if (!spans_count || !vk_mem_image_alias_baseline_current(alias->baseline) ||
+            !image_alias_guest_mapping_current(alias->result.addr, alias->guest_bytes, alias->receiver_mapping,
+                alias->mapping_count)) snapshot = RC_REGISTRY_STALE;
+        else snapshot = image_alias_snapshot(alias, spans, spans_count, cut, alias->fragments, limit, &alias->fragment_count);
+        unlock();
+    }
+    if (snapshot != RC_REGISTRY_OK) goto release;
+
+    lock();
+    const RcRegistryResult sources = cpu_texel_alias_sources_locked(alias, &region);
+    unlock();
+    if (sources != RC_REGISTRY_OK || !cpu_texel_cut_current(cut) ||
+        (vk_sync_fence_done() < cut.scene && !vk_sync_fence_wait(cut.scene, UINT64_MAX)) ||
+        !image_alias_read_current_at(alias, cut)) goto release;
+    const VkResult staged = cpu_texel_alias_stage(alias);
+    if (staged != VK_SUCCESS) {
+        if (staged == VK_ERROR_DEVICE_LOST) vk_device_lost_check(staged, "ReadTexels mixed staging");
+        goto release;
+    }
+
+    lock();
+    if (vk_sync_stopping() || vk_device_is_lost() || !image_alias_read_current_at(alias, cut) ||
+        !cpu_texel_alias_layouts_handed_locked(alias)) {
+        unlock();
+        goto release;
+    }
+    VkCommandBuffer command = vk_upload_begin();
+    const uint64_t sequence = vk_upload_recording_sequence(command);
+    if (!sequence) rt_fatal("vk: ReadTexels readback has no upload sequence");
+    image_alias_record_copies(alias, command);
+    vk_upload_end();
+    const uint64_t flushed = vk_upload_flush(1);
+    uint64_t submitted = 0, completed = 0;
+    vk_upload_progress(&submitted, &completed);
+    if (flushed < sequence || submitted < sequence || completed < sequence) {
+        vk_upload_defer_release(sequence, image_alias_release, alias);
+        alias = NULL;
+        unlock();
+        goto release;
+    }
+    VkResult visible = vmaInvalidateAllocation(vk_ctx()->vma, alias->staging.allocation, 0, alias->upload_offset);
+    if (visible == VK_ERROR_DEVICE_LOST) vk_device_lost_check(visible, "ReadTexels mixed invalidate");
+    uint8_t *const rows = alias->staging.map + alias->upload_offset;
+    if (visible == VK_SUCCESS && !vk_sync_stopping() && !vk_device_is_lost() &&
+        image_alias_compose_guest(alias) &&
+        !nvn_texels_box(&original.d, 0, 0, (uint32_t)region.x0, (uint32_t)region.y0, 0, (uint32_t)region.wb,
+            (uint32_t)region.hb, alias->workspace, rows, region.wb, 1) &&
+        image_alias_read_current_at(alias, cut)) {
+        const int held = guest && mem_backing_write_hold(destination);
+        if (!guest || (held && mem_protection_range_unchanged(address, span, protection))) {
+            for (size_t y = 0; y < region.hb; ++y) memcpy(dst + y * region.row, rows + y * region.wb, region.wb);
+            *selected_fence = cut.scene;
+            result = VK_TEXTURE_CPU_READ_READY;
+        }
+        if (held) mem_read_release();
+    }
+    unlock();
+
+release:
+    if (alias) image_alias_release(alias);
+    mem_backing_release(&destination);
+    return result != VK_TEXTURE_CPU_READ_READY && (vk_sync_stopping() || vk_device_is_lost()) ?
+        VK_TEXTURE_CPU_READ_STOPPED : result;
+}
+
+VkTextureCpuReadResult vk_texture_cpu_read_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r,
+    uint8_t *dst, uint64_t row, uint64_t img, int replay_ordered, uint64_t *selected_fence) {
+    if (!vk_texture_cpu_read_candidate(t, v)) return VK_TEXTURE_CPU_READ_OUTSIDE;
+    if (vk_sync_stopping() || vk_device_is_lost()) return VK_TEXTURE_CPU_READ_STOPPED;
+
+    const NVNcopyRegion requested = *r;
+    TexKey key;
+    make_key(t, &key);
+    lock();
+    const Tex *entry = nvn_hm_get(&by_key, &key);
+    const VkFormat format = t->d.format == NVN_FORMAT_R8 ? VK_FORMAT_R8_UNORM : VK_FORMAT_R8G8B8A8_UNORM;
+    const int projected = entry && entry->alias_fragment_owner && entry->alias_full_count &&
+        entry->pub.format == format && entry->pub.aspect == VK_IMAGE_ASPECT_COLOR_BIT &&
+        entry->pub.type == VK_IMAGE_TYPE_2D && entry->pub.scale == 1 && !entry->pub.skip &&
+        entry->pub.samples == 1 && entry->pub.levels == 1 && entry->pub.layers == 1 && !entry->pub.fb_learned &&
+        (entry->pub.usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    if (!entry || (projected && rc_registry_position_handed(rc_registry_runtime(), entry->native_write) &&
+            !preserve_pool_contents_handed(entry))) {
+        unlock();
+        return cpu_texel_read_composed(t, v, &requested, dst, row, img, replay_ordered, projected, selected_fence);
+    }
+    if (!projected) {
+        unlock();
+        return VK_TEXTURE_CPU_READ_OUTSIDE;
+    }
+    if (!replay_ordered) {
+        unlock();
+        return VK_TEXTURE_CPU_READ_REFUSED;
+    }
+    const TextureCpuReadSource selected = {.image = entry->pub.image, .writer = entry->native_write,
+        .serial = t->serial, .revision = entry->content_revision, .layout = entry->sample_general_revision};
+    Region g;
+    size_t span;
+    const uint64_t address = (uintptr_t)dst;
+    const int guest = address < RT_ADDRESS_LIMIT;
+    if (!dst || !cpu_texel_region(t, v, &requested, row, img, &g, &span) ||
+        span > UINTPTR_MAX - (uintptr_t)dst || (guest && span > RT_ADDRESS_LIMIT - address) ||
+        !t->serial || entry->t.serial != selected.serial || !selected.image || !selected.revision || !selected.layout ||
+        !rc_registry_position_valid(selected.writer) || selected.writer.scene != entry->wr_fence ||
+        entry->pub.width != (uint32_t)t->d.width || entry->pub.height != (uint32_t)t->d.height ||
+        !image_alias_source_current(entry)) {
+        unlock();
+        return VK_TEXTURE_CPU_READ_REFUSED;
+    }
+    VkMemoryImageHold *hold = vk_mem_image_hold(selected.image);
+    const uint64_t protection = guest ? mem_protection_serial() : 0;
+    MemBackingCapture *destination = NULL;
+    const int destination_captured = !guest ||
+        mem_backing_capture(address, span, &destination) == RC_BACKING_OK;
+    unlock();
+
+    VkTextureCpuReadResult result = VK_TEXTURE_CPU_READ_REFUSED;
+    const uint64_t fence = selected.writer.scene;
+    if (!destination_captured || vk_sync_stopping() || vk_device_is_lost() || fence > vk_sync_issued() ||
+        (vk_sync_fence_done() < fence && !vk_sync_fence_wait(fence, UINT64_MAX))) goto release;
+
+    lock();
+    Tex *current = nvn_hm_get(&by_key, &key);
+    RcRegistryPosition output = selected.writer;
+    output.ordinal |= 1;
+    // The CPU request owns the originally selected producer, even if later recording updates this address.
+    // Wait by its exact scene, then prove the same image and coverage before reading from the queue.
+    if (!vk_sync_stopping() && !vk_device_is_lost() && !vk_mem_image_hold_retired(hold) &&
+        rc_registry_position_handed(rc_registry_runtime(), output) && cpu_texel_source_current(current, &selected) &&
+        cpu_texel_layout_handed(current, output)) {
+        TexRead data;
+        if (texels_read_record(current, &g, &requested, &data)) {
+            const uint64_t submitted = vk_upload_flush(1);
+            const int source_current = submitted && !vk_sync_stopping() && !vk_device_is_lost() &&
+                cpu_texel_source_current(current, &selected);
+            const VkResult visibility = source_current ? vmaInvalidateAllocation(vk_ctx()->vma,
+                data.sa, 0, VK_WHOLE_SIZE) : VK_NOT_READY;
+            if (visibility == VK_ERROR_DEVICE_LOST) vk_device_lost_check(visibility, "ReadTexels staging");
+            const int held = guest && visibility == VK_SUCCESS && mem_backing_write_hold(destination);
+            if (visibility == VK_SUCCESS && (!guest ||
+                (held && mem_protection_range_unchanged(address, span, protection)))) {
+                texels_read_copy_rows(current, &g, &data, dst);
+                *selected_fence = fence;
+                result = VK_TEXTURE_CPU_READ_READY;
+            }
+            if (held) mem_read_release();
+            if (submitted) resource_core_vma_destroy_buffer(vk_ctx()->vma, data.sb, data.sa);
+            else vk_defer_buffer(data.sb, data.sa);
+        }
+    }
+    unlock();
+
+release:
+    mem_backing_release(&destination);
+    vk_mem_image_release(hold);
+    return result == VK_TEXTURE_CPU_READ_REFUSED && (vk_sync_stopping() || vk_device_is_lost()) ?
+        VK_TEXTURE_CPU_READ_STOPPED : result;
 }
 
 static void zero_rows(const Region *g, uint8_t *dst) {
@@ -5574,7 +18184,7 @@ void vk_read_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uin
     lock();
     Tex *e = entry_of(t);
     int ok = 0;
-    if (e && e->pub.mirrored && !e->pub.gpu_owned) ok = storage_texels(t, &g, r, dst, 0);
+    if (e && e->pub.mirrored && !e->pub.gpu_owned) ok = storage_texels(t, &g, r, dst, NULL);
     else if (e) {
         make_fresh(e);
         ok = image_texels(e, &g, r, dst, 0);
@@ -5597,14 +18207,45 @@ void vk_write_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r, co
     Tex *e = entry_of(t);
     if (e) content_image_forget(e);
     if (e && e->pub.mirrored) {
-        if (!storage_texels(t, &g, r, (uint8_t *)src, 1))
+        uint64_t address = (uintptr_t)t->mem, cutoff = mem_mapping_serial();
+        MemBackingCapture *mapping = NULL;
+        mem_backing_capture(address, t->L.size, &mapping);
+        int held = mapping ? mem_backing_read_hold(mapping) : mem_read_hold(address, t->L.size);
+        int written = 0;
+        if (held && mem_mapping_range_unchanged(address, t->L.size, cutoff)) {
+            TextureCpuWrites writes = {.mapping = mapping, .address = address, .size = t->L.size};
+            texel_overwrite_begin(&writes);
+            written = storage_texels(t, &g, r, (uint8_t *)src, &writes);
+        }
+        if (held) mem_read_release();
+        mem_backing_release(&mapping);
+        if (!written)
             log_limited(&n_bad, "WriteTexels: region outside level %u of texture %#llx", g.level, (unsigned long long)e->pub.addr);
-        vk_guest_written((uintptr_t)t->mem, t->L.size);
         if (e->pub.gpu_owned) image_texels(e, &g, r, (uint8_t *)src, 1);
         else if (e->uploaded) e->wt_n++;
     } else if (e) {
         image_texels(e, &g, r, (uint8_t *)src, 1);
     }
+    unlock();
+}
+
+void vk_write_packaged_texture(const tex_t *t, const void *src) {
+    if (!t->L.size) return;
+    uint64_t address = (uintptr_t)t->mem;
+    // Hold texture selection and the mapped destination across the store. Completion after the cutoff, active
+    // GPU writers and detached mappings cannot be reconciled by this CPU replacement.
+    lock();
+    MemBackingCapture *mapping = NULL;
+    mem_backing_capture(address, t->L.size, &mapping);
+    int held = mem_backing_read_hold(mapping);
+    TextureCpuWrites writes = {.mapping = mapping, .address = address, .size = t->L.size};
+    if (held) texel_overwrite_begin(&writes);
+    memcpy(t->mem, src, (size_t)t->L.size);
+    if (held) {
+        notify_texel_store(&writes, 0, t->L.size);
+        mem_read_release();
+    } else vk_guest_written(address, t->L.size);
+    mem_backing_release(&mapping);
     unlock();
 }
 
@@ -5631,10 +18272,61 @@ static int write_back_storage_valid(const tex_t *t, const Region *g, const NVNco
     for (int z = 0; z < g->nz; z++) {
         unsigned layer = g->is3d ? 0 : g->layer0 + (unsigned)r->zoffset + (unsigned)z;
         uint32_t slice = g->is3d ? (uint32_t)(r->zoffset + z) : 0;
-        if (nvn_texels_box(&t->d, g->level, layer, (uint32_t)xend, (uint32_t)yend, slice, 0, 0,
-                          NULL, NULL, g->row, 1)) return 0;
+        if (nvn_texels_box_ranges(&t->d, g->level, layer, (uint32_t)g->x0, (uint32_t)g->y0, slice,
+                                  (uint32_t)g->wb, (uint32_t)g->hb, NULL, NULL)) return 0;
     }
     return 1;
+}
+
+static int visible_texel_range_order(const void *left, const void *right) {
+    uint64_t a = ((const RcSourceRange *)left)->offset, b = ((const RcSourceRange *)right)->offset;
+    return a == b ? 0 : a < b ? -1 : 1;
+}
+
+static void readback_image_holds(Tex *e, TextureCpuWrites *writes) {
+    uint32_t mapped = !e->image_device_count && e->image_host_backing ? e->image_mapped_hold_count : 0;
+    uint32_t total = mapped + !!e->image_authority.id;
+    RcRegistry *core = rc_registry_runtime();
+    if (total && writes->collect && writes->count) {
+        qsort(writes->ranges, writes->count, sizeof *writes->ranges, visible_texel_range_order);
+        uint32_t merged = 0;
+        for (uint32_t i = 0; i < writes->count; i++) {
+            RcSourceRange span = writes->ranges[i];
+            RcSourceRange *last = merged ? &writes->ranges[merged - 1] : NULL;
+            if (last && span.offset <= last->offset + last->size) {
+                uint64_t end = span.offset + span.size;
+                if (end > last->offset + last->size) last->size = end - last->offset;
+            } else writes->ranges[merged++] = span;
+        }
+        RcRegistryImageWriteExtent local[4];
+        RcRegistryImageWriteExtent *targets = total <= sizeof local / sizeof *local ? local : calloc(total, sizeof *targets);
+        if (targets) {
+            uint32_t count;
+            const RcInterval *intervals = image_backing_intervals(e, &count);
+            if (mapped && count != mapped) rt_fatal("vk: image readback lost its typed mapping");
+            for (uint32_t i = 0; i < mapped; i++)
+                targets[i] = (RcRegistryImageWriteExtent){intervals[i], e->image_mapped_holds[i]};
+            if (e->image_authority.id)
+                targets[mapped] = (RcRegistryImageWriteExtent){
+                    {e->pub.addr, 0, {RC_GUEST_COMPATIBILITY_BACKING, e->pub.addr, e->t.L.size}}, e->image_authority};
+            RcRegistryResult result = rc_registry_image_hold_readback(core, (uint64_t)(uintptr_t)e->pub.image,
+                                                                      targets, total, writes->ranges, merged);
+            if (targets != local) free(targets);
+            if (result == RC_REGISTRY_OK) {
+                e->image_authority = (RcRegistryWrite){0};
+                if (mapped) {
+                    free(e->image_mapped_holds);
+                    e->image_mapped_holds = NULL;
+                    e->image_mapped_hold_count = 0;
+                }
+            }
+        }
+    }
+    if (e->image_authority.id) {
+        rc_registry_hold_release(core, e->image_authority, 0);
+        e->image_authority = (RcRegistryWrite){0};
+    }
+    image_holds_end(e);
 }
 
 static void write_back_n(Tex **v, int n) {
@@ -5670,10 +18362,13 @@ static void write_back_n(Tex **v, int n) {
     if (np) vk_upload_flush(1);
     for (int i = 0; i < n; i++) {
         Tex *e = v[i];
-        int held = !state[i].failed && state[i].count && mem_read_hold(e->pub.addr, e->t.L.size);
+        int held = !state[i].failed && state[i].count &&
+            (e->image_host_backing ? mem_backing_read_hold(e->image_host_backing) : mem_read_hold(e->pub.addr, e->t.L.size));
         // Mapping changes while the GPU read-back ran mean these bytes no longer belong to this image. Keep the
         // image authoritative and drain its staging without overwriting replacement memory or claiming success.
-        int copy = held && mem_mapping_range_unchanged(e->pub.addr, e->t.L.size, state[i].mapping);
+        uint64_t cutoff = e->image_host_backing ? state[i].mapping : e->image_host_cutoff;
+        int copy = held && cutoff && mem_mapping_range_unchanged(e->pub.addr, e->t.L.size, cutoff);
+        TextureCpuWrites writes = {.mapping = e->image_host_backing, .address = e->pub.addr, .size = e->t.L.size, .collect = 1};
         for (int k = state[i].first, end = k + state[i].count; k < end; k++) {
             WbPart *q = &p[k];
             uint8_t *buf = malloc(q->g.img * (size_t)q->g.nz);
@@ -5681,17 +18376,16 @@ static void write_back_n(Tex **v, int n) {
             texels_read_take(q->e, &q->g, &q->t, buf);
             // All immutable layout checks passed before the first store, and the mapping is held across every
             // slice. Failure here is an internal contradiction, not recoverable mapping churn.
-            if (copy && !storage_texels(&q->e->t, &q->g, &q->r, buf, 1))
+            if (copy && !storage_texels(&q->e->t, &q->g, &q->r, buf, &writes))
                 rt_fatal("vk: validated texture write-back layout changed");
             free(buf);
         }
-        if (held) mem_read_release();
-        // Unlike a buffer mirror write-back, these bytes have changed only in guest memory. Stamp both CPU and
-        // texture consumers explicitly: this submission may already have consumed the operating system's bits.
         if (copy) {
-            vk_guest_written(e->pub.addr, e->t.L.size);
+            readback_image_holds(e, &writes);
             e->gpu_dirty = 0;
         }
+        if (held) mem_read_release();
+        free(writes.ranges);
     }
     free(p);
     free(state);
@@ -5722,6 +18416,9 @@ const VkTexImage *vk_texture_at_locked(const VkTexImage *img, VkFormat format) {
 void vk_texture_storage_bound_locked(const VkTexImage *img) {
     vk_dlaa_hud_write(img->image);
     Tex *e = (Tex *)img;   // pub is the first member
+    texture_registration_source_clear(e);
+    e->native_write = vk_exec_resource_position();
+    if (!++e->content_revision) rt_fatal("vk: texture content revision exhausted");
     e->material_writable = 1;
     content_image_forget(e);
     e->chash_ok = 0;
@@ -5732,20 +18429,109 @@ void vk_texture_storage_bound_locked(const VkTexImage *img) {
     // Preserve compute's existing CPU refresh/write-back policy. A dirty page cannot prove that the CPU replaced
     // every texel the shader wrote. These mixed-authority images and their overlapping aliases stay outside the
     // immutable source/material path until that finer ownership is represented explicitly.
-    if (!nvn_gpu_only(e->pub.addr)) own_add(e);
+    own_add(e);
+    image_bound_written(e);
 }
 
 // A draw retains only value identifiers while preparing other bindings. A pool can retire its texture meanwhile;
 // never dereference a saved Tex pointer or transfer the old command's authority to a replacement at that address.
-void vk_texture_storage_written(VkImage image, uint64_t addr) {
+static int texture_color_blit_complete(const Tex *e, const VkTextureColorBlitSource *source, const VkImageBlit *blit) {
+    if (!source->hold || !source->mapping_count || e->pub.gone || e->pub.image != source->image ||
+        e->pub.addr != source->address || e->t.serial != source->serial || e->t.L.size != source->bytes ||
+        e->pub.format != source->format || e->pub.width != source->extent.width || e->pub.height != source->extent.height ||
+        e->image_private_mapping_count != source->mapping_count || e->image_mapped_hold_count != source->mapping_count ||
+        rc_registry_position_compare(source->read, vk_exec_resource_position())) return 0;
+    VkImageSubresourceLayers subresource = blit->dstSubresource;
+    if (subresource.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT || subresource.mipLevel || subresource.baseArrayLayer ||
+        subresource.layerCount != 1 || blit->dstOffsets[0].x || blit->dstOffsets[0].y || blit->dstOffsets[0].z ||
+        blit->dstOffsets[1].x != (int32_t)source->extent.width ||
+        blit->dstOffsets[1].y != (int32_t)source->extent.height || blit->dstOffsets[1].z != 1) return 0;
+    for (uint32_t i = 0; i < source->mapping_count; ++i) {
+        const RcInterval expected = source->mapping[i], current = e->image_private_mapping[i];
+        if (expected.address != current.address || expected.mapping != current.mapping ||
+            !rc_range_equal(expected.range, current.range)) return 0;
+    }
+    return 1;
+}
+
+static void texture_storage_written(VkImage image, uint64_t addr,
+                                    const VkTextureColorBlitSource *output, const VkImageBlit *blit) {
     if (!image) return;
     lock();
     for (Tex *e = nvn_hm_get(&by_addr, &addr); e; e = e->next_at) {
         if (e->pub.image != image) continue;
         vk_texture_storage_bound_locked(&e->pub);
+        if (output && texture_color_blit_complete(e, output, blit)) {
+            const VkImageSubresourceRange color = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            image_alias_planes_written_locked(e, &color);
+        } else {
+            resource_effects_image_trace_details(NULL, (uint64_t)(uintptr_t)image,
+                (ResourceImageTraceDetails){.format = e->pub.format, .projection = RESOURCE_IMAGE_TRACE_LEGACY_WRITE,
+                                            .placement = texture_trace_placement(e)});
+        }
         break;
     }
     unlock();
+}
+
+void vk_texture_storage_written(VkImage image, uint64_t addr) {
+    texture_storage_written(image, addr, NULL, NULL);
+}
+
+void vk_texture_storage_blit_written(const VkTextureColorBlitSource *output, const VkImageBlit *blit) {
+    texture_storage_written(output->image, output->address, output, blit);
+}
+
+int vk_texture_image_effect(VkImage image, uint64_t addr, RcSourceRange *range, RcRegistryImageBinding *owner) {
+    if (!range || !owner) return 0;
+    *range = (RcSourceRange){0}; *owner = (RcRegistryImageBinding){0};
+    if (!image) return 0;
+    lock();
+    for (Tex *e = nvn_hm_get(&by_addr, &addr); e; e = e->next_at) {
+        if (e->pub.image != image || e->pub.gone || e->pub.addr != addr) continue;
+        RcSourceRange exact = {1, addr, e->t.L.size};
+        if (!rc_range_valid(exact)) break;
+        *range = exact;
+        if (e->image_authority.id && rc_registry_image_hold_covers(rc_registry_runtime(), e->image_authority, exact))
+            *owner = (RcRegistryImageBinding){(uint64_t)(uintptr_t)image, e->image_authority};
+        touch(e);
+        vk_texture_use_images(&image, 1);
+        break;
+    }
+    unlock();
+    return range->size != 0;
+}
+
+int vk_texture_image_binding(VkImage image, uint64_t addr, uint64_t size, RcRegistryImageBinding *out,
+                             RcRegistryImageWriteExtent **extents, uint32_t *count) {
+    if (!out || !extents || !count) return 0;
+    *out = (RcRegistryImageBinding){0};
+    *extents = NULL;
+    *count = 0;
+    if (!image || !size) return 0;
+    lock();
+    for (Tex *e = nvn_hm_get(&by_addr, &addr); e; e = e->next_at) {
+        if (e->pub.image != image || e->pub.gone || e->pub.addr != addr || e->t.L.size != size) continue;
+        RcRegistryImageBinding binding = {(uint64_t)(uintptr_t)image, e->image_authority};
+        // A live range owner can retain this write obligation even when its older typed image identity was
+        // revoked. The producer registry independently checks exact image identity before authorizing reuse.
+        if (rc_registry_image_hold_covers(rc_registry_runtime(), e->image_authority,
+                                         (RcSourceRange){1, addr, size})) *out = binding;
+        uint32_t extent_count;
+        const RcInterval *intervals = image_backing_intervals(e, &extent_count);
+        RcRegistryImageWriteExtent *copy = extent_count ? calloc(extent_count, sizeof *copy) : NULL;
+        if (copy) {
+            for (uint32_t i = 0; i < extent_count; i++) {
+                copy[i].interval = intervals[i];
+                if (e->image_mapped_holds && i < e->image_mapped_hold_count) copy[i].hold = e->image_mapped_holds[i];
+            }
+            *extents = copy;
+            *count = extent_count;
+        }
+        break;
+    }
+    unlock();
+    return out->image != 0;
 }
 
 uint64_t vk_texture_last_write(const tex_t *t) {
@@ -6021,8 +18807,9 @@ void vk_sampler_register(int id, const samp_par *s) {
         memset(p + nsslots, 0, sizeof *p * (size_t)(n - nsslots));
         sslots = p, nsslots = n;
     }
+    sampler_comparison_slots += (s->cmp_mode != 0) - vk_sampler_slot_comparison_locked(id);
     sslots[id].p = *s;
-    sslots[id].s = sslots[id].sp = sslots[id].sc = sslots[id].sd[0] = sslots[id].sd[1] = VK_NULL_HANDLE;
+    sslots[id].s = sslots[id].sp = sslots[id].sc = sslots[id].so = sslots[id].sd[0] = sslots[id].sd[1] = VK_NULL_HANDLE;
     sslots[id].used = 1;
     samp_gen++;
     unlock();
@@ -6045,7 +18832,7 @@ void vk_sampler_dlss_bias(float b) {
                dlss_bias);
         dlss_bias = b;
         for (int i = 0; i < nsslots; i++)   // looked up again (the key moves)
-            sslots[i].s = sslots[i].sp = sslots[i].sc = sslots[i].sd[0] = sslots[i].sd[1] = VK_NULL_HANDLE;
+            sslots[i].s = sslots[i].sp = sslots[i].sc = sslots[i].so = sslots[i].sd[0] = sslots[i].sd[1] = VK_NULL_HANDLE;
         samp_gen++;
     }
     unlock();
@@ -6067,7 +18854,7 @@ void vk_sampler_aniso_live(void) {
         sf.aniso = a;
         aniso_log();
         for (int i = 0; i < nsslots; i++)   // looked up again (the key moves)
-            sslots[i].s = sslots[i].sp = sslots[i].sc = sslots[i].sd[0] = sslots[i].sd[1] = VK_NULL_HANDLE;
+            sslots[i].s = sslots[i].sp = sslots[i].sc = sslots[i].so = sslots[i].sd[0] = sslots[i].sd[1] = VK_NULL_HANDLE;
         samp_gen++;
     }
     unlock();
@@ -6137,17 +18924,23 @@ VkSampler vk_sampler_compare_by_id_locked(int id) {
     static int on = -1;
     if (on < 0) on = cfg_int("NX2NAVI_SHADOW_COMPARE") != 0;
     if (s->p.cmp_mode || !on) return vk_sampler_by_id_locked(id);
-    if (!s->sc) {
+    return vk_sampler_pool_by_id_locked(id, 1);
+}
+
+VkSampler vk_sampler_pool_by_id_locked(int id, int comparison) {
+    VkCtx *c = vk_ctx();
+    if (!c || !vk_sampler_slot_registered_locked(id)) return VK_NULL_HANDLE;
+    SampSlot *s = &sslots[id];
+    if (!!s->p.cmp_mode == comparison) return vk_sampler_by_id_locked(id);
+    VkSampler *variant = comparison ? &s->sc : &s->so;
+    if (!*variant) {
         samp_par k = s->p;
-        k.cmp_mode = 1;
-        if (k.cmp_func < NVN_COMPARE_FUNC_NEVER || k.cmp_func > NVN_COMPARE_FUNC_ALWAYS) k.cmp_func = NVN_COMPARE_FUNC_LEQUAL;
-        static int told;
-        if (told++ < 8)
-            rt_log("vk: a depth-compare read through sampler slot %d without a compare (function %u): compared with %u", id,
-                   (unsigned)s->p.cmp_func, (unsigned)k.cmp_func);
-        s->sc = sampler_for(c, &k);
+        k.cmp_mode = comparison;
+        if (comparison && (k.cmp_func < NVN_COMPARE_FUNC_NEVER || k.cmp_func > NVN_COMPARE_FUNC_ALWAYS))
+            k.cmp_func = NVN_COMPARE_FUNC_LEQUAL;
+        *variant = sampler_for(c, &k);
     }
-    return s->sc;
+    return *variant;
 }
 
 // Texture detail: a texture made without its top `skip` levels has the game's level i + skip at its level i, and the
@@ -6339,8 +19132,13 @@ void vk_texture_census_log(uint64_t frame) {
 
 void vk_texture_shutdown(void) {
     VkCtx *c = vk_ctx();
+    nvn_texture_pin_attachments_clear();
     lock();
+    while (packed_storage_count) packed_storage_write_drop(packed_storage_count - 1);
+    packed_storage_suspended = 0;
     stream_images_stop(c);
+    texture_registration_shutdown();
+    texture_pool_names_shutdown();
     Tex **list = malloc(sizeof *list * (size_t)(by_key.n + 1));
     int n = 0;
     for (uint32_t i = 0; i < by_key.cap; i++)
@@ -6348,6 +19146,20 @@ void vk_texture_shutdown(void) {
     for (int i = 0; i < n; i++) drop_tex(list[i], DROP_SHUTDOWN);
     free(list);
     content_shutdown();
+    while (detached_output_head) {
+        NativeTextureOutput *owner = detached_output_head;
+        detached_output_head = owner->next;
+        if (rc_registry_image_hold_release_extents(rc_registry_runtime(), owner->holds, owner->hold_count, 0) != RC_REGISTRY_OK)
+            rc_registry_fail_closed(rc_registry_runtime());
+        native_texture_output_retire(owner);
+    }
+    detached_output_tail = NULL;
+    if (alias_fragment_owners.n) rt_fatal("vk: native alias producers remain at texture shutdown");
+    free(alias_fragment_owners.keys), free(alias_fragment_owners.vals);
+    alias_fragment_owners = (nvn_hmap){.klen = sizeof(VkImage)};
+    if (bound_alias_owners.n) rt_fatal("vk: native bound texture owners remain at shutdown");
+    free(bound_alias_owners.keys), free(bound_alias_owners.vals);
+    bound_alias_owners = (nvn_hmap){.klen = sizeof(VkImage)};
     for (uint32_t i = 0; i < samplers.cap; i++)
         if (samplers.vals[i] && c) vkDestroySampler(c->device, (VkSampler)samplers.vals[i], NULL);
     free(by_key.keys), free(by_key.vals), free(by_addr.keys), free(by_addr.vals), free(samplers.keys), free(samplers.vals);
@@ -6359,12 +19171,18 @@ void vk_texture_shutdown(void) {
     reuse = (nvn_hmap){.klen = sizeof(ImgKey)};
     samplers = (nvn_hmap){.klen = sizeof(samp_par)};
     free(tslots), free(sslots);
-    tslots = NULL, sslots = NULL, ntslots = nsslots = 0, nreleased = 0, pool_slots = 0;
+    tslots = NULL, sslots = NULL, ntslots = nsslots = sampler_comparison_slots = 0, nreleased = 0, pool_slots = 0;
     rel_head = rel_tail = reclaim_at = overwritten_at = NULL, rel_bytes = 0;
     reclaim_gpu_phase = reclaim_cpu_seen = 0;
     memset(material_slots, 0, sizeof material_slots);
     memset(&material_stats, 0, sizeof material_stats);
     if (sinfo) memset(sinfo, 0, sizeof *sinfo << 20);   // no slot is registered: tokens 0
+    unlock();
+}
+
+void vk_texture_retire_drain(void) {
+    lock();
+    content_collect(UINT64_MAX);
     unlock();
 }
 

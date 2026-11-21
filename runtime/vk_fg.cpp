@@ -36,6 +36,7 @@ namespace {
 struct {
     VkQueue present = VK_NULL_HANDLE, acquire = VK_NULL_HANDLE;
     ffxContext sc = nullptr;   // the swapchain context
+    VkSwapchainKHR handle = VK_NULL_HANDLE;
     ffxContext fg = nullptr;   // the frame generation context
     VkExtent2D fg_ext = {0, 0};
     VkExtent2D fg_max = {0, 0};   // the context's largest render size
@@ -134,7 +135,11 @@ extern "C" VkResult vk_fg_create_swapchain(const VkSwapchainCreateInfoKHR *ci, V
         if (r == VK_SUCCESS || vk_fg4_active()) return r;
         // it failed before its swapchain existed and said so (use4 is 0 from here on): the FSR 3.1 library's below
     }
-    if (F.sc) return F.fn.pOutCreateSwapchainFFXAPI(vk_ctx()->device, ci, nullptr, sc, F.sc);
+    if (F.sc) {
+        VkResult r = F.fn.pOutCreateSwapchainFFXAPI(vk_ctx()->device, ci, nullptr, sc, F.sc);
+        if (r == VK_SUCCESS) F.handle = *sc;
+        return r;
+    }
     if (!vk_fg_wanted() || F.failed || !F.present || !vk_ffx_load()) return VK_ERROR_FEATURE_NOT_PRESENT;
     const VkCtx *c = vk_ctx();
     ffxCreateContextDescFrameGenerationSwapChainVK d = {};
@@ -161,7 +166,7 @@ extern "C" VkResult vk_fg_create_swapchain(const VkSwapchainCreateInfoKHR *ci, V
         fail("the swapchain functions", 0);
         return VK_ERROR_INITIALIZATION_FAILED;
     }
-    *sc = none;
+    *sc = F.handle = none;
     rt_log("fg: AMD FSR 3.1 frame generation swapchain, %ux%u", ci->imageExtent.width, ci->imageExtent.height);
     return VK_SUCCESS;
 }
@@ -169,6 +174,7 @@ extern "C" VkResult vk_fg_create_swapchain(const VkSwapchainCreateInfoKHR *ci, V
 extern "C" void vk_fg_destroy_swapchain(VkSwapchainKHR sc) {
     if (vk_fg4_active()) return vk_fg4_destroy_swapchain(sc);
     if (F.sc && sc) F.fn.pOutDestroySwapchainFFXAPI(vk_ctx()->device, sc, nullptr, F.sc);
+    if (sc == F.handle) F.handle = VK_NULL_HANDLE;
 }
 
 extern "C" VkResult vk_fg_get_images(VkSwapchainKHR sc, uint32_t *n, VkImage *img) {
@@ -317,9 +323,31 @@ extern "C" void vk_fg_frame(VkCommandBuffer cb, VkSwapchainKHR sc, VkFormat fmt,
                (unsigned long long)F.no_hudless);
 }
 
+extern "C" VkResult vk_fg_finish_inputs(VkSwapchainKHR sc) {
+    if (vk_device_is_lost()) return VK_ERROR_DEVICE_LOST;
+    if (vk_fg4_active()) return vk_fg4_finish_inputs(sc);
+    if (!F.sc || !sc || sc != F.handle) return VK_ERROR_INITIALIZATION_FAILED;
+    if (F.fg) {
+        ffxConfigureDescFrameGeneration cfg = {};
+        cfg.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
+        cfg.swapChain = (void *)sc;
+        cfg.frameID = F.frame;
+        // Empty HUDLessColor and callbacks also revoke a tag whose graphics work was never submitted.
+        if (vk_ffx_configure(&F.fg, &cfg.header) != FFX_API_RETURN_OK)
+            return vk_device_is_lost() ? VK_ERROR_DEVICE_LOST : VK_ERROR_INITIALIZATION_FAILED;
+        __atomic_store_n(&F.on, 0, __ATOMIC_RELAXED);
+    }
+    ffxDispatchDescFrameGenerationSwapChainWaitForPresentsVK wait = {};
+    wait.header.type = FFX_API_DISPATCH_DESC_TYPE_FGSWAPCHAIN_WAIT_FOR_PRESENTS_VK;
+    if (vk_ffx_dispatch(&F.sc, &wait.header) != FFX_API_RETURN_OK)
+        return vk_device_is_lost() ? VK_ERROR_DEVICE_LOST : VK_ERROR_INITIALIZATION_FAILED;
+    return vk_device_is_lost() ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
+}
+
 extern "C" void vk_fg_release(void) {
     vk_fg4_release();
     if (F.fg) vk_ffx_destroy(&F.fg), F.fg = nullptr;
     if (F.sc) vk_ffx_destroy(&F.sc), F.sc = nullptr;
+    F.handle = VK_NULL_HANDLE;
     __atomic_store_n(&F.on, 0, __ATOMIC_RELAXED);
 }

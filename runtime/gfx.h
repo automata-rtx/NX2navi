@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include "host.h"
 #include "nvn_obj.h"
+#include "resource_core_effects.h"
 
 // ---- moved from ov.h
 enum { OE_MSG_FOCUS_STATE_CHANGED = 15, OE_MSG_OPERATION_MODE_CHANGED = 30, OE_MSG_PERFORMANCE_MODE_CHANGED = 31 };
@@ -30,6 +31,41 @@ int gfx_window_focused(void);
 int vk_hdr_native(void);   // NX2NAVI_HDR = native: the game's own HDR picture (vk_hdr.c)
 int gfx_picture_rect(float out[4]);   // where the last present put the picture, fractions of the swapchain (x, y, w, h); 0 before one
 void gfx_game_picture_size(unsigned *w, unsigned *h);   // game pixels before window fitting, zero until the first game frame
+typedef struct {
+    uint64_t generation, frame, guest_texture_serial;
+    uint32_t source_width, source_height, output_width, output_height;
+} GfxOrdinaryPresentSize;
+// An accepted guest frame on the current usable ordinary swapchain. Match the
+// frame and generations to the Apply cut and check both actual extents. A guest
+// texture serial is an incarnation receipt, so this query cannot retain an image.
+int gfx_ordinary_present_size(GfxOrdinaryPresentSize *size);
+
+typedef struct {
+    uint64_t window_texture_serial, source_texture_serial;
+    uint64_t window_image, image;
+    uint64_t handed_scene, handed_ordinal;
+    uint32_t width, height, format;
+} GfxPresentPictureSource;
+
+enum {
+    GFX_PICTURE_COLOR_GRADED = 1 << 0,
+    GFX_PICTURE_HDR_ENCODED = 1 << 1,
+    GFX_PICTURE_FSR_ENLARGED = 1 << 2,
+    GFX_PICTURE_FSR_SHRUNK = 1 << 3,
+    GFX_PICTURE_MOVIE_LAYER = 1 << 4,
+    GFX_PICTURE_MENU_LAYER = 1 << 5,
+};
+typedef struct {
+    GfxOrdinaryPresentSize size;
+    GfxPresentPictureSource source;
+    uint64_t composition, image;
+    uint32_t image_index, format, effects;
+    int32_t source_rect[4], output_rect[4];
+} GfxOrdinaryPicture;
+// Exact recorded picture accepted by ordinary WSI in the current usable generation.
+// Image values identify native objects at composition. They convey no right to use them.
+// The handed cutoff is the producer watermark at capture. A substituted source can lack a guest serial.
+int gfx_ordinary_picture(GfxOrdinaryPicture *picture);
 
 // ---- shader service client (gfx_shader.c)
 enum { GFX_STAGE_VS, GFX_STAGE_TCS, GFX_STAGE_TES, GFX_STAGE_GS, GFX_STAGE_FS, GFX_STAGE_CS,
@@ -140,7 +176,35 @@ typedef struct {
 } GfxShaderRes;
 typedef struct { uint8_t type, comps, packed; } GfxShaderIo;   // GFX_TYPE_*, components, 1 with a Component decoration
 int gfx_shader_stage(const GfxShader *s);                   // GFX_STAGE_VS, GFX_STAGE_FS or GFX_STAGE_CS
+enum { GFX_SHADER_POOL_INDEX_LIMIT = 48 };
+// The read callback and evaluation return 0 for refusal, 1 for current values, and 2 for a known deferred read.
+typedef struct { uint16_t type; uint32_t index; } GfxShaderPoolIndex;
+enum { GFX_POOL_SAMPLER_COMPARE = 1, GFX_POOL_SAMPLER_ORDINARY = 2 };
+typedef struct { uint64_t compare[4096 / 64], ordinary[4096 / 64]; } GfxShaderPoolSamplers;
+typedef int (*GfxShaderPoolReadWord)(void *, int kind, const GfxShaderRes *, uint32_t byte_offset, uint32_t *);
+int gfx_shader_has_pool_index_plan(const GfxShader *);
+int gfx_shader_has_pool_index_domain(const GfxShader *);
+int gfx_shader_has_pool_comparison_domain(const GfxShader *);
+unsigned gfx_shader_pool_sampler_modes(const GfxShader *);
+typedef int (*GfxShaderPoolReadDomain)(void *, const GfxShaderRes *, const uint8_t **, uint32_t *);
+int gfx_shader_pool_indices(const GfxShader *, GfxShaderPoolReadWord, void *,
+                            GfxShaderPoolIndex *, uint32_t capacity, uint32_t *count);
+int gfx_shader_pool_domain_indices(const GfxShader *, GfxShaderPoolReadDomain, GfxShaderPoolReadWord, void *,
+                                   GfxShaderPoolIndex *, uint32_t capacity, uint32_t *count,
+                                   int *comparison_sampler_zero);
+// Positive means all pooled image/sampler accesses are unreachable at the captured original read.
+int gfx_shader_pool_inactive(const GfxShader *, GfxShaderPoolReadWord, void *);
+int gfx_shader_pool_inactive_source(const GfxShader *, const uint32_t *, uint64_t, uint32_t set, uint32_t binding_offset);
+int gfx_shader_pool_domain_comparison_indices(const GfxShader *, GfxShaderPoolReadDomain, GfxShaderPoolReadWord,
+    void *, GfxShaderPoolIndex *, uint32_t capacity, uint32_t *count, GfxShaderPoolSamplers *);
+int gfx_shader_pool_comparison_indices(const GfxShader *, GfxShaderPoolReadWord, void *, GfxShaderPoolIndex *,
+    uint32_t capacity, uint32_t *count, GfxShaderPoolSamplers *);
 int gfx_shader_resources(const GfxShader *s, int kind, const GfxShaderRes **res);   // count of GFX_RES_* kind; array in *res
+const RcEffectProgram *gfx_shader_effects(const GfxShader *s); // borrowed immutable write-effect program, NULL means unproved
+uint32_t gfx_shader_guest_writes(const GfxShader *s); // cached RC_EFFECT_WRITES_*; NULL is UNKNOWN, zero proves readonly
+void gfx_shader_slot_dependencies(const GfxShader *s,uint32_t *textures,uint32_t *images);
+int gfx_shader_write_inventory_complete(const GfxShader *s); // every semantic destination covered by writable reflection
+int gfx_shader_indirect_image_rmw_binding(const GfxShader *s); // source-only eligibility, -1 if unavailable
 uint32_t gfx_shader_exact_seen(void);   // shaders loaded so far with a GfxShaderRes.exact texture (the texture census line)
 uint32_t gfx_shader_slot_mask(const GfxShader *s);                    // texture/image slots whose type its translation read
 uint32_t gfx_shader_inputs(const GfxShader *s, GfxShaderIo io[32]);    // Input Locations (VS attributes, FS varyings) as a mask
@@ -152,10 +216,11 @@ void gfx_shader_local_size(const GfxShader *s, uint32_t local[3]);     // CS: th
 // ---- back end (gfx_null.c, vk_*.c). Called by the NVN front end (nvn_api_*.c, nvn_ext.c) on guest threads.
 typedef struct {
     const char *name;
-    int  (*pool_init)(pool_t *p);                          // 0 fails MemoryPoolInitialize
+    int  (*pool_init)(pool_t *p, const pool_t *setup);     // setup is published to p only after success
     void (*pool_fini)(pool_t *p);
     int  (*pool_map_virtual)(pool_t *v, int n, const void *requests);   // NVNmappingRequest[n], 0x28 bytes each
-    void (*texture_register)(int id, const tex_t *t, const view_t *v);
+    void (*texture_register)(uint64_t pool, int id, const tex_t *t, const view_t *v);
+    void (*texture_pool_release)(uint64_t pool);
     void (*sampler_register)(int id, const samp_par *s);
     void (*texture_release)(const tex_t *t);
     void (*program_release)(const prog_t *p);
@@ -175,6 +240,7 @@ typedef struct {
     void (*finish)(void);
     void (*read_texels)(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uint8_t *dst, uint64_t row, uint64_t img);
     void (*write_texels)(const tex_t *t, const view_t *v, const NVNcopyRegion *r, const uint8_t *src, uint64_t row, uint64_t img);
+    void (*write_packaged_texture)(const tex_t *t, const void *src); // stores every byte of the native layout
     void (*guest_written)(uint64_t addr, uint64_t size);   // host wrote pool storage (3.2)
     void (*guest_read)(uint64_t addr, uint64_t size);      // the CPU reads pool storage: GPU-written texels go there first
     // The CPU waited for fence: small render targets written by work up to it go to their storage (vk_texture.c

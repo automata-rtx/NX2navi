@@ -40,6 +40,8 @@ xfer = xfer_path.read_text()
 prefix = xfer[:xfer.index('// ---- event order check')]
 extra = ['report_counter', 'counter_word', 'last_type', 'cond_enabled',
          'vk_exec_xfer_front', 'xfer_worker', 'op_xfer_impl']
+if 'pending_current' in xfer:
+    extra.insert(extra.index('counter_word'), 'pending_current')
 stubbed = ['copy_b2b', 'copy_buffer_image', 'copy_t2t', 'clear_tex', 'signal_event', 'clear_buf']
 generated = '// ' + marker + '\n' + prefix + '\n'
 generated += '\n'.join('#define ' + name + ' unexpected_transfer' for name in stubbed) + '\n'
@@ -51,8 +53,15 @@ replay_hash = hashlib.sha256(replay_path.read_bytes()).hexdigest()
 replay = replay_path.read_text()
 chunk = re.search(r'^#define CHUNK_DRAWS\s+\d+.*$', replay, re.M)
 assert chunk
+leader = function(replay, 'pool_leader_run')
+prepared_leader = 'prepare_ordered_graphics(' in leader
+leader_support = ''
+if prepared_leader:
+    boundary = re.search(r'enum \{ GRAPHICS_BOUNDARY_NONE[^}]+\};', replay)
+    assert boundary
+    leader_support = boundary[0] + '\n' + function(replay, 'graphics_opcode') + '\n'
 (work / 'query_leader_under_test.h').write_text('// ' + marker + '\n' + chunk[0] + '\n' +
-    function(replay, 'pool_leader_draw') + '\n' + function(replay, 'pool_leader_run'))
+    leader_support + function(replay, 'pool_leader_draw') + '\n' + leader)
 cc = Path(os.environ['CC'])
 exe = work / 'query_order_check.exe'
 command = [str(cc), '-std=gnu11', '-O1', '-g', '-Wall', '-Wextra', '-Werror',
@@ -60,8 +69,20 @@ command = [str(cc), '-std=gnu11', '-O1', '-g', '-Wall', '-Wextra', '-Werror',
            '-fsanitize=undefined', '-fsanitize-trap=all', '-ffunction-sections', '-fdata-sections',
            '-I', str(source / 'runtime'), '-I', str(work), '-I', str(cc.parent.parent / 'include/vma'),
            str(root / 'tests/query_order_check.c'), '-Wl,--gc-sections', '-o', str(exe)]
+if prepared_leader:
+    command.insert(1, '-DQUERY_PREPARED_LEADER=1')
+if 'buffer_transfer_record(' in generated:
+    command.insert(1, '-DQUERY_PREPARED_TRANSFER=1')
 if args.require_counter_prefix:
     command.insert(1, '-DREQUIRE_COUNTER_PREFIX=1')
+if 'CpuResultTarget' in prefix:
+    command[1:1] = ['-DQUERY_NORMALIZED_RESULTS=1', '-DRC_REGISTRY_SINGLE_THREADED']
+    command[-4:-4] = [str(source / 'runtime/resource_host_write.c'),
+                      str(source / 'runtime/resource_core_registry.c')]
+    if 'resource_effects_buffer_result_take' in prefix:
+        command.remove('-DRC_REGISTRY_SINGLE_THREADED')
+        command.insert(1, '-DQUERY_POSITIONED_RESULTS=1')
+        command[-4:-4] = [str(source / 'runtime/resource_command_effects.c')]
 env = dict(os.environ, PATH=str(cc.parent) + os.pathsep + os.environ.get('PATH', ''))
 subprocess.run(command, env=env, check=True)
 result = subprocess.run([str(exe)], env=env, text=True, capture_output=True)

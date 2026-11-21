@@ -38,7 +38,7 @@ typedef struct { NVNdevice *dev; void *mem; uint64_t size; uint32_t flags; } poo
 // game_mem/host/span: NX2NAVI host-owned VM storage for physical/virtual pools (nx2navi_vpool.c); host is NULL for game-backed pools.
 typedef struct { uint32_t magic, flags; uint8_t *mem; uint64_t size; uint8_t *game_mem, *host; uint64_t span; } pool_t; FITS(pool_t, NVNmemoryPool);
 
-typedef struct { const pool_t *pool; int64_t off; int32_t n; } dpool_t;                       // Texture / sampler descriptor pool
+typedef struct { const pool_t *pool; int64_t off; int32_t n; uint64_t incarnation; } dpool_t; // Texture / sampler descriptor pool
 FITS(dpool_t, NVNtexturePool); FITS(dpool_t, NVNsamplerPool);
 
 typedef struct {
@@ -157,7 +157,7 @@ typedef struct { int32_t x, y, z; uint64_t caller; } p_dispatch;
 // NVN2 DrawMeshTasks(first, count) and DrawMeshTasksIndirect(indirect, x2, x3, x4) (vk_exec_draw.c op_draw_mesh)
 typedef struct { uint32_t first, count; uint64_t caller; } p_draw_mesh;
 typedef struct { uint64_t ind, a3; uint32_t a2, a4; uint64_t caller; } p_draw_mesh_ind;   // caller: return address of the game call site (to locate the dispatcher)
-typedef struct { const dpool_t *pool; } p_set_pool;
+typedef struct { const dpool_t *pool; uint64_t incarnation; int32_t count; } p_set_pool;
 typedef struct { uint64_t src; const tex_t *tex; view_t view; uint8_t has_view; NVNcopyRegion r; int32_t flags; } p_copy_b2t;
 typedef struct { const tex_t *src, *dst; view_t sv, dv; uint8_t has_sv, has_dv; NVNcopyRegion sr, dr; int32_t flags; } p_copy_t2t;   // Reused for T2B: src stores the destination buffer address
 typedef struct { const tex_t *tex; view_t view; uint8_t has_view, is_uint; NVNcopyRegion r; int32_t mask; union { float f[4]; uint32_t u[4]; } c; } p_clear_tex;

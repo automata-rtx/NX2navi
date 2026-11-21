@@ -1,0 +1,19 @@
+#version 450
+
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 1, std140) uniform Snapshot {
+    uvec4 words[256];
+} snapshot;
+layout(set = 0, binding = 2, std430) readonly buffer ReadonlyData {
+    uvec4 words[];
+} direct_read;
+layout(set = 0, binding = 3, std430) writeonly buffer Result {
+    uvec4 words[];
+} result;
+
+void main()
+{
+    uint index = gl_GlobalInvocationID.x;
+    result.words[index] = snapshot.words[index];
+    result.words[256u + index] = direct_read.words[index];
+}

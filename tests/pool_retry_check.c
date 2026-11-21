@@ -31,7 +31,7 @@ static struct {
     uint64_t n_ep_ent,n_unres_walks,unres_ns,n_ep,ep_ns,n_fresh,n_slots,n_full,full_ns,dirty_pos,sync_ns,catch_ns;
     uint64_t n_gwalk,n_gnouni,n_grep,n_gchanged,n_gskip,n_gskip_slots,n_gchk_pending,n_gchk_writes,n_gchk_bad,n_gchk_groups;
     uint32_t kinds,gen,epoch,sgen,unres_mg;
-    int ready,all,retry,nunres,unres_more,gmode,cur,sealed,layout,publication_exhausted;
+    int ready,all,retry,nunres,unres_more,gmode,cur,sealed,layout,publication_exhausted,wanted_reconcile;
     uint8_t unres_on[VK_POOL_TEX],unres_in[VK_POOL_TEX];
     int unres[VK_POOL_TEX];
     VkSampler samp[VK_POOL_SAMP];
@@ -95,6 +95,11 @@ static int pool_fill(VkExec *ex,uint32_t id,uint32_t mask,uint64_t tok){
 typedef struct { VkExec *ex; uint32_t used; int n,retry,spent; } PoolDirty;
 static void pool_sync_entries(VkExec *ex);
 static void pool_sync(VkExec *ex);
+// Pressure reconstruction is exercised with the real helper by pool_pressure_publication_check.py.
+// These ordinary retry fixtures must never enter that separately requested operation.
+static void pool_reconcile_wanted(VkExec *ex,uint32_t used,int n,int spent) {
+    (void)ex;(void)used;(void)n;(void)spent;assert(0);
+}
 #include "pool_under_test.h"
 
 static void reset(void){

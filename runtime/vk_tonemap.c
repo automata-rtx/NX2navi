@@ -31,6 +31,21 @@ static struct {
     uint32_t ow, oh;
 } TM;
 
+void vk_tonemap_shutdown(void) {
+    VkCtx *c = vk_ctx();
+    if (!c || vk_device_is_lost()) return;
+    for (int i = 0; i < TM.nviews; ++i) vkDestroyImageView(c->device, TM.views[i].view, NULL);
+    if (TM.out) {
+        vkDestroyImageView(c->device, TM.out_view, NULL);
+        vmaDestroyImage(c->vma, TM.out, TM.out_alloc);
+    }
+    if (TM.pipe) vkDestroyPipeline(c->device, TM.pipe, NULL);
+    if (TM.sampler) vkDestroySampler(c->device, TM.sampler, NULL);
+    if (TM.layout) vkDestroyPipelineLayout(c->device, TM.layout, NULL);
+    if (TM.dsl) vkDestroyDescriptorSetLayout(c->device, TM.dsl, NULL);
+    memset(&TM, 0, sizeof TM);
+}
+
 // The output image at w x h, made again when the size changes (the old one is left to the deferred release).
 static int tm_out(VkCommandBuffer cb, uint32_t w, uint32_t h) {
     if (TM.out && TM.ow == w && TM.oh == h) return 1;
@@ -101,7 +116,7 @@ static int tm_init(void) {
     return TM.ok = ok;
 }
 
-// Views of the scratch images the pass samples, kept for the process (the scratch images live as long).
+// Views of native inputs. The fallback scratch owner supplies its own sampled view.
 static VkImageView tm_view(VkImage img, VkFormat f) {
     for (int i = 0; i < TM.nviews; i++)
         if (TM.views[i].img == img && TM.views[i].f == f) return TM.views[i].view;
@@ -116,11 +131,11 @@ static VkImageView tm_view(VkImage img, VkFormat f) {
 
 // Records the pass from src (sampled) into the pass's own RGBA16F image of dw x dh and returns it (the caller blits it
 // into the target); VK_NULL_HANDLE when it cannot (the caller blits the source instead).
-VkImage vk_tonemap_record(VkCommandBuffer cb, VkImage src, VkFormat sf, uint32_t dw, uint32_t dh) {
+VkImage vk_tonemap_record(VkCommandBuffer cb, VkImage src, VkImageView source_view, VkFormat sf, uint32_t dw, uint32_t dh) {
     static int disp = -1;   // NX2NAVI_TM_DISPATCH=0: everything but the dispatch, =2: not at all (diagnosis)
     if (disp < 0) disp = rt_knob("TM_DISPATCH", "1");
     if (disp == 2 || !tm_init() || !tm_out(cb, dw, dh)) return VK_NULL_HANDLE;
-    VkImageView sv = tm_view(src, sf), dv = TM.out_view;
+    VkImageView sv = source_view ? source_view : tm_view(src, sf), dv = TM.out_view;
     if (!sv) return VK_NULL_HANDLE;
     VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                            .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,

@@ -57,7 +57,7 @@ static void stream_image_worker(void *arg) {
         slot->image = VK_NULL_HANDLE;
         slot->allocation = NULL;
         plat_mutex_unlock(&stream_images.lock);
-        if (old) vmaDestroyImage(c->vma, old, allocation);
+        if (old) resource_core_vma_destroy_image(c->vma, old, allocation);
         allocation = NULL;
         // Speculation can only occupy free space in existing device blocks.
         VkImage image = suballoc_image_limit(c, &ci, &allocation, STREAM_IMAGE_LIMIT,
@@ -151,7 +151,7 @@ static void stream_images_stop(VkCtx *c) {
         plat_thread_join(stream_images.thread);
         for (unsigned i = 0; i < STREAM_SLOTS; i++)
             if (stream_images.slots[i].image)
-                vmaDestroyImage(c->vma, stream_images.slots[i].image, stream_images.slots[i].allocation);
+                resource_core_vma_destroy_image(c->vma, stream_images.slots[i].image, stream_images.slots[i].allocation);
         rt_log("stream images: %llu requests, %llu allocations used, %llu unavailable",
                (unsigned long long)stream_images.requests, (unsigned long long)stream_images.hits,
                (unsigned long long)stream_images.failures);

@@ -135,6 +135,7 @@ static void prepared_forget(DrawCtx *cx, PreparedBindings *p) {
         }
     }
     prepared_watch_recipe(cx, p, 0);
+    vk_texture_publication_release(p->images);
     PreparedSlot *slot = p->slot;
     VkDescSlot *desc = p->desc;
     uint32_t capacity = p->capacity;
@@ -257,9 +258,12 @@ static PreparedBindings *prepared_promote(VkExec *ex, PreparedBindings *cold, Pr
 // allocated because their worker objects still name them; their optional residency storage is released here too.
 static void prepared_dispose(DrawCtx *cx) {
     prepared_directory_init(cx);
+    vk_texture_publication_release(cx->bind_manifest);
+    cx->bind_manifest = NULL;
     for (uint32_t i = 0; i < PREP_N + PREP_DORMANT_N; i++) {
         PreparedBindings *p = i < PREP_N ? cx->prep_hot[i] : cx->prep_dormant[i - PREP_N];
         if (!p) continue;
+        vk_texture_publication_release(p->images);
         free(p->slot), free(p->desc);
         if (p->heap_owned) free(p);
     }
@@ -356,6 +360,9 @@ resident:;
         if (b->capture != capture) { PC_COUNT(cx, PC_CAPTURE_RESET); RWT_COUNT(RWT_COUNT_CAPTURE_RESET, 1); }
         PC_ADD(cx, PC_RESET_DESCRIPTORS, b->recipe->n_desc);
         RWT_COUNT(RWT_COUNT_RESET_DESCRIPTORS, b->recipe->n_desc);
+        // Native ownership turnover revokes cached permissions, not the exact selected instance holds. The
+        // manifest survives until a successful replacement or eviction; nonordinary providers still resolve
+        // against their backend lifetime rather than inheriting ordinary-material capture semantics.
         for (uint32_t i = 0; i < b->recipe->n_desc; i++) b->slot[i].valid = b->slot[i].texture.valid = 0;
         for (uint32_t s = 0; s < 2; s++) {
             b->set[s].packet = NULL, b->set[s].allocated = VK_NULL_HANDLE;
@@ -392,6 +399,7 @@ static int prepared_buffer_valid(VkExec *ex, const VkBindRecipeInput *in, const 
     const p_bind_buf *b = prepared_buffer(ex, in);
     if (b && (s->input[0] != b->addr || s->input[1] != b->size)) return 0;
     if (s->lease.capture) return vk_usnap_lease_valid(&s->lease);
+    if (s->shadow_part && s->shadow_part != ex->cb) return 0;
     if (s->mem_gen != vk_mem_gen() || s->snap_gen != vk_usnap_gen()) return 0;
     if (in->reuse == VK_BR_CONSTANT && (s->prog != ex->prog || s->prog_serial != (ex->prog ? ex->prog->serial : 0)))
         return 0;
@@ -411,6 +419,12 @@ static void prepared_buffer_begin(VkExec *ex, const VkBindRecipeInput *in, Prepa
 static void prepared_buffer_end(VkExec *ex, const VkBindRecipeInput *in, PreparedSlot *s) {
     ex->dc->pb_cap = NULL, ex->dc->prep_capture = NULL;
     s->valid = in->reuse != VK_BR_ALWAYS && !ex->dc->pb_spoiled && !ex->dc->mo_ovr_on;
+    s->shadow_part = VK_NULL_HANDLE;
+    // The aligned raw resolve registers the shadow with this part's prologue. Submission consumes
+    // that registration even when the next part uses the same native buffer and descriptor bytes.
+    if (s->valid && in->reuse == VK_BR_STORAGE && s->count.has && s->count.use == VK_MUSE_SSBO &&
+        s->count.cls >= VK_MCLS_HOST_NOACC && s->count.cls <= VK_MCLS_HOST_CACHED && vk_mem_shadow_storage())
+        s->shadow_part = ex->cb;
     vk_exec_frame.bind_resolved++;
     ex->dc->prep_stats.resolved++;
 }
@@ -494,22 +508,7 @@ static void prepared_refresh_record(PreparedBindings *p, const VkBindRecipeOp *o
 static void prepared_support(VkExec *ex, const VkBindRecipeOp *op, PreparedBindings *p, int check) {
     (void)check;
     VkDescSlot before = p->desc[op->first];
-    DrawCtx *cx = ex->dc;
-    float in[3];
-    support_in(ex, in);
-    if (!cx->B.sup_valid || memcmp(in, cx->B.sup_in, sizeof in)) {
-        uint8_t tmp[SUPPORT_BYTES];
-        support_fill(tmp, in[0], in[1], in[2]);
-        memcpy(cx->B.sup_in, in, sizeof in);
-        if (!cx->B.sup_valid || memcmp(tmp, cx->B.support, SUPPORT_BYTES)) {
-            VkBuffer sb;
-            VkDeviceSize so;
-            memcpy(scratch(ex, SUPPORT_BYTES, &sb, &so), tmp, SUPPORT_BYTES);
-            memcpy(cx->B.support, tmp, SUPPORT_BYTES);
-            cx->B.sup_buf = sb, cx->B.sup_off = so, cx->B.sup_valid = 1;
-        }
-    }
-    p->desc[op->first].buffer = (VkDescriptorBufferInfo){cx->B.sup_buf, cx->B.sup_off, SUPPORT_BYTES};
+    p->desc[op->first].buffer = support_descriptor(ex);
     prepared_changed(p, op, op->first, &before);
 }
 
@@ -528,7 +527,7 @@ static void prepared_uniforms(VkExec *ex, const VkBindRecipeOp *op, PreparedBind
         prepared_refresh_record(p, op, j);
         prepared_buffer_begin(ex, in, s);
         if (in->reuse == VK_BR_UNIFORM && !ex->dc->mo_ovr_on) ex->dc->prep_capture = &s->lease;
-        out->buffer = ubo_info(ex, op->stage, in->slot);
+        out->buffer = ubo_info(ex, op->binding, op->stage, in->slot);
         prepared_buffer_end(ex, in, s);
         prepared_check(ex, op, p, j, check && hit && s->valid, &prior, &before, out);
         prepared_changed(p, op, j, &before);
@@ -550,13 +549,24 @@ static void prepared_storage(VkExec *ex, const VkBindRecipeOp *op, PreparedBindi
         if (check && hit) prior = *s;
         prepared_refresh_record(p, op, j);
         prepared_buffer_begin(ex, in, s);
-        out->buffer = ssbo_info(ex, op->stage, op->binding->res, op->binding->res->flags & 1);
+        out->buffer = op->binding->res->flags & 1
+            ? ex->dc->storage_buffers[op->binding-p->recipe->info->bindings]
+            : ssbo_info(ex, op->stage, op->binding, 0);
         prepared_buffer_end(ex, in, s);
         prepared_check(ex, op, p, j, check && hit && s->valid, &prior, &before, out);
         prepared_changed(p, op, j, &before);
         if (in->reuse == VK_BR_ALWAYS) ex->dc->prep_stats.ordered++;
     }
     vk_exec_frame.bind_buf_ns += bt_now() - start;
+}
+
+static int prepared_sample_matches(TexMemo *memo, uint64_t pool, uint64_t handle, uint32_t epoch,
+                                   uint32_t samplers, uint64_t authority, uint32_t generation) {
+    if (!memo->valid || memo->pool != pool || memo->h != handle || memo->ep != epoch || memo->sg != samplers) return 0;
+    // The typed selection is revalidated under the texture lock before use. Compatibility selections need the
+    // identity captured before their legacy resolution, including its publication and slot token safeguards.
+    return memo->selected.canonical || (authority && memo->authority == authority &&
+                                       slot_still(&memo->gen, memo->tok, handle, generation));
 }
 
 static void prepared_images(VkExec *ex, const VkBindRecipeOp *op, PreparedBindings *p, int check) {
@@ -576,16 +586,18 @@ static void prepared_images(VkExec *ex, const VkBindRecipeOp *op, PreparedBindin
         // visible to the next member even when this call already holds the recursive texture lock.
         uint32_t gen = reusable ? vk_texture_slots_gen() : 0, epoch = reusable ? vk_texture_epoch() : 0;
         uint32_t samplers = reusable ? vk_sampler_gen() : 0;
-        int hit = reusable && m->valid && m->h == h && m->ep == epoch && m->sg == samplers &&
-                  slot_still(&m->gen, m->tok, h, gen);
-        if (check && hit && !locked) {
+        uint64_t authority = rc_registry_authority_epoch(rc_registry_runtime());
+        int hit = reusable && prepared_sample_matches(m, ex->tex_pool, h, epoch, samplers, authority, gen);
+        if (hit && !locked) {
             // The oracle resolves under the lock. A table change while waiting makes the earlier hit ineligible
             // for comparison; it must be tested again against the same table state the resolver will observe.
             vk_texture_lock(), locked = 1;
             gen = vk_texture_slots_gen(), epoch = vk_texture_epoch(), samplers = vk_sampler_gen();
-            hit = m->valid && m->h == h && m->ep == epoch && m->sg == samplers &&
-                  slot_still(&m->gen, m->tok, h, gen);
+            authority = rc_registry_authority_epoch(rc_registry_runtime());
+            hit = prepared_sample_matches(m, ex->tex_pool, h, epoch, samplers, authority, gen);
         }
+        if (hit && h) hit = m->selected.registration ? vk_texture_resolved_receipt_locked(m->selected, m->image, NULL) :
+            vk_texture_binding_current_locked(registered_slot_locked(NVN_HANDLE_TEX(h)), m->image);
         VkDescSlot before = *out, expected = *out;
         PreparedSlot prior;
         if (check && hit) prior = *s;
@@ -607,14 +619,26 @@ static void prepared_images(VkExec *ex, const VkBindRecipeOp *op, PreparedBindin
             vk_texture_lock(), locked = 1;
             gen = reusable ? vk_texture_slots_gen() : 0, epoch = reusable ? vk_texture_epoch() : 0;
             samplers = reusable ? vk_sampler_gen() : 0;
+            authority = rc_registry_authority_epoch(rc_registry_runtime());
         }
         VkImage image = VK_NULL_HANDLE;
+        VkTextureReadKey selected;
         uint64_t token = reusable ? token_of(h) : 0;
-        tex_info(ex, r, h, storage, r->separate, &out->image, &image);
+        tex_info(ex, op->stage, k, r, h, storage, r->separate, &out->image, &image, &selected, NULL);
         out->w[2] = (uint32_t)out->image.imageLayout;
         int incomplete = vk_texture_deferred();
-        *m = (TexMemo){.h = h, .tok = token, .gen = gen, .ep = epoch, .sg = samplers,
-                       .valid = (uint8_t)(reusable && token && !incomplete), .image = image, .out = out->image};
+        if (!incomplete) {
+            // tex_info selected this provider while the texture lock is held. Capture it before any later
+            // descriptor can allocate/reclaim or change residency; publication at use transfers these exact
+            // holds instead of rediscovering instances from the stored VkImage values.
+            if (!p->images) p->images = vk_texture_publication_create_indexed(p->recipe->n_desc);
+            vk_texture_publication_update(p->images, j, image);
+        }
+        *m = (TexMemo){.h = h, .tok = token, .authority = authority, .pool = ex->tex_pool,
+                       .gen = gen, .ep = epoch, .sg = samplers,
+                       .valid = (uint8_t)(reusable && (selected.canonical || token) && !incomplete),
+                       .image = image, .selected = selected,
+                       .out = out->image};
         // The worker retries a deferred draw in stream order. Its temporary result is neither an oracle nor a
         // reusable binding; retaining it could let the retry skip the resolution it originally deferred.
         prepared_check(ex, op, p, j, check && hit && !incomplete, &prior, &expected, out);
@@ -624,6 +648,16 @@ static void prepared_images(VkExec *ex, const VkBindRecipeOp *op, PreparedBindin
     }
     if (locked) vk_texture_unlock();
     vk_exec_frame.bind_tex_ns += bt_now() - start;
+}
+
+static void prepared_publish_images(VkExec *ex, PreparedBindings *p) {
+    if (vk_texture_deferred()) rt_fatal("vk: publishing an incomplete prepared image manifest");
+    CbRes *owner = cb_res(ex);
+    if (!owner->images) owner->images = vk_texture_publication_create(NULL, 0, NULL);
+    vk_texture_publication_capture(owner->images, p->images);
+    // A replaced selection remains captured until the native owner has acquired the incoming exact instances.
+    // Earlier installed packets and recording parts retain their independent ownership in the owner and batch.
+    if (p->images) vk_texture_publication_commit_updates(p->images);
 }
 
 static void prepared_texels(VkExec *ex, const VkBindRecipeOp *op, PreparedBindings *p, int check) {
@@ -638,16 +672,21 @@ static void prepared_texels(VkExec *ex, const VkBindRecipeOp *op, PreparedBindin
     }
 }
 
-enum { PREP_LIVE = 1, PREP_TEXTURE = 2, PREP_PROGRAM = 4, PREP_SNAPSHOT = 8 };
+enum { PREP_LIVE = 1, PREP_TEXTURE = 2, PREP_PROGRAM = 4, PREP_SNAPSHOT = 8, PREP_QUALIFIED_TEXTURE = 16,
+    PREP_SHADOW_PART = 32
+};
 
 static PreparedStamp prepared_stamp(const VkExec *ex, unsigned group) {
     PreparedStamp s = {0};
     s.mem = vk_mem_gen();
+    s.authority = rc_registry_authority_epoch(rc_registry_runtime());
     if (group == VK_BR_GROUP_BUFFER) {
         s.snapshot = vk_usnap_gen();
+        s.part = ex->cb;
         s.program = ex->prog, s.program_serial = ex->prog ? ex->prog->serial : 0;
     } else {
         s.texture_pool = ex->tex_pool, s.sampler_pool = ex->samp_pool;
+        s.registrations = vk_texture_registration_publication();
         s.textures = vk_texture_slots_gen(), s.texture_epoch = vk_texture_epoch(), s.samplers = vk_sampler_gen();
         s.nfbl = ex->nfbl;
         if (s.nfbl > 0 && s.nfbl <= 9) memcpy(s.feedback, ex->fbl_img, (size_t)s.nfbl * sizeof *s.feedback);
@@ -657,35 +696,50 @@ static PreparedStamp prepared_stamp(const VkExec *ex, unsigned group) {
 
 static int prepared_stamp_equal(const PreparedStamp *a, const PreparedStamp *b, uint32_t flags) {
     if ((flags & PREP_LIVE) && (a->mem != b->mem || a->snapshot != b->snapshot)) return 0;
+    if ((flags & PREP_SHADOW_PART) && a->part != b->part) return 0;
     if ((flags & PREP_PROGRAM) && (a->program != b->program || a->program_serial != b->program_serial)) return 0;
     if (flags & PREP_TEXTURE) {
-        if (a->mem != b->mem || a->textures != b->textures || a->texture_epoch != b->texture_epoch ||
+        if (!a->authority || a->authority != b->authority || a->mem != b->mem || a->textures != b->textures || a->texture_epoch != b->texture_epoch ||
             a->samplers != b->samplers || a->texture_pool != b->texture_pool || a->sampler_pool != b->sampler_pool ||
             a->nfbl != b->nfbl || a->nfbl < 0 || a->nfbl > 9) return 0;
         if (a->nfbl && memcmp(a->feedback, b->feedback, (size_t)a->nfbl * sizeof *a->feedback)) return 0;
     }
+    if ((flags & PREP_QUALIFIED_TEXTURE) && a->registrations != b->registrations) return 0;
     return 1;
 }
 
 static int prepared_texture_reusable(const VkExec *ex) {
-    return td_mode() == 1 && !vk_dlaa_swap_img && !twin_dispatch && !ex->dc->mo_ovr_on;
+    return rc_registry_authority_epoch(rc_registry_runtime()) && td_mode() == 1 && !vk_dlaa_swap_img && !twin_dispatch && !ex->dc->mo_ovr_on;
 }
 
 // Sealing may follow an ordered op that changed state after an earlier contribution was skipped. Revalidate each
 // retained memo against current inputs/tokens, not merely its valid bit. This walk occurs only when building a proof.
-static int prepared_texture_valid(VkExec *ex, const VkBindRecipeInput *in, PreparedSlot *slot,
-                                  const VkDescSlot *descriptor) {
+static int prepared_texture_receipt(VkExec *ex, const VkBindRecipeInput *in, PreparedSlot *slot,
+                                    const VkDescSlot *descriptor, RcRegistryPosition *next_write) {
+    if (next_write) *next_write = (RcRegistryPosition){0};
     TexMemo *m = &slot->texture;
     uint64_t handle = prepared_handle(ex, in);
-    if (!prepared_texture_reusable(ex) || !m->valid || m->h != handle || m->ep != vk_texture_epoch() ||
-        m->sg != vk_sampler_gen() || !slot_still(&m->gen, m->tok, handle, vk_texture_slots_gen())) return 0;
+    if (!prepared_texture_reusable(ex) || !prepared_sample_matches(m, ex->tex_pool, handle, vk_texture_epoch(),
+        vk_sampler_gen(), rc_registry_authority_epoch(rc_registry_runtime()), vk_texture_slots_gen())) return 0;
+    if (handle) {
+        vk_texture_lock();
+        int current = m->selected.registration ? vk_texture_resolved_receipt_locked(m->selected, m->image, next_write) :
+            vk_texture_binding_receipt_locked(registered_slot_locked(NVN_HANDLE_TEX(handle)), m->image, next_write);
+        current = current && m->sg == vk_sampler_gen();
+        vk_texture_unlock();
+        if (!current) return 0;
+    }
     VkImageLayout layout = m->image && ex->nfbl && in_fbl(ex, m->image)
         ? VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT : VK_IMAGE_LAYOUT_GENERAL;
     return descriptor->image.sampler == m->out.sampler && descriptor->image.imageView == m->out.imageView &&
            descriptor->image.imageLayout == layout && descriptor->w[2] == (uint32_t)layout;
 }
+static int prepared_texture_valid(VkExec *ex, const VkBindRecipeInput *in, PreparedSlot *slot,
+                                  const VkDescSlot *descriptor) {
+    return prepared_texture_receipt(ex, in, slot, descriptor, NULL);
+}
 
-static int prepared_group_valid(VkExec *ex, PreparedGroup *s) {
+static int prepared_group_guard(VkExec *ex, PreparedGroup *s, int recheck_sources) {
     uint64_t prep_guard_start = PC_NOW(ex->dc);
     if (!s->sealed) PC_GUARD_RETURN(ex, PC_GUARD_UNSEALED, 0);
     if (ex->dc->mo_ovr_on) PC_GUARD_RETURN(ex, PC_GUARD_OVERRIDE, 0);
@@ -693,18 +747,73 @@ static int prepared_group_valid(VkExec *ex, PreparedGroup *s) {
     const PreparedStamp *saved = &s->stamp;
     if ((s->flags & (PREP_LIVE | PREP_TEXTURE)) && saved->mem != vk_mem_gen()) PC_GUARD_RETURN(ex, PC_GUARD_MEMORY, 0);
     if ((s->flags & PREP_LIVE) && saved->snapshot != vk_usnap_gen()) PC_GUARD_RETURN(ex, PC_GUARD_SNAPSHOT, 0);
+    if ((s->flags & PREP_SHADOW_PART) && saved->part != ex->cb) PC_GUARD_RETURN(ex, PC_GUARD_MEMORY, 0);
     if ((s->flags & PREP_PROGRAM) &&
         (saved->program != ex->prog || saved->program_serial != (ex->prog ? ex->prog->serial : 0))) PC_GUARD_RETURN(ex, PC_GUARD_PROGRAM, 0);
     if (s->flags & PREP_TEXTURE) {
-        if (saved->textures != vk_texture_slots_gen()) PC_GUARD_RETURN(ex, PC_GUARD_TEXTURES, 0);
+        uint64_t authority = rc_registry_authority_epoch(rc_registry_runtime());
+        if (!saved->authority || !authority || (!recheck_sources && saved->authority != authority))
+            PC_GUARD_RETURN(ex, PC_GUARD_EPOCH, 0);
+        if (!recheck_sources && saved->textures != vk_texture_slots_gen()) PC_GUARD_RETURN(ex, PC_GUARD_TEXTURES, 0);
+        if (!recheck_sources && (s->flags & PREP_QUALIFIED_TEXTURE) &&
+            saved->registrations != vk_texture_registration_publication()) PC_GUARD_RETURN(ex, PC_GUARD_TEXTURES, 0);
         if (saved->texture_epoch != vk_texture_epoch()) PC_GUARD_RETURN(ex, PC_GUARD_EPOCH, 0);
         if (saved->samplers != vk_sampler_gen()) PC_GUARD_RETURN(ex, PC_GUARD_SAMPLERS, 0);
         if (saved->texture_pool != ex->tex_pool || saved->sampler_pool != ex->samp_pool) PC_GUARD_RETURN(ex, PC_GUARD_POOLS, 0);
         if (saved->nfbl != ex->nfbl || ex->nfbl < 0 || ex->nfbl > 9) PC_GUARD_RETURN(ex, PC_GUARD_FEEDBACK, 0);
         if (ex->nfbl && memcmp(saved->feedback, ex->fbl_img, (size_t)ex->nfbl * sizeof *ex->fbl_img)) PC_GUARD_RETURN(ex, PC_GUARD_FEEDBACK, 0);
+        // The unchanged outer guards protect this aggregate's members. Their earliest declared future write is
+        // an additional boundary even when all producer declarations preceded this group's first use.
+        RcRegistryPosition now = vk_exec_resource_position();
+        if (rc_registry_position_valid(now) != rc_registry_position_valid(s->texture_position) ||
+            rc_registry_position_compare(now, s->texture_position) < 0 ||
+            (!recheck_sources && rc_registry_position_valid(s->texture_next_write) &&
+             rc_registry_position_compare(now, s->texture_next_write) >= 0) ||
+            s->texture_mapping != mem_mapping_serial() || s->texture_protection != mem_protection_serial())
+            PC_GUARD_RETURN(ex, PC_GUARD_TEXTURES, 0);
     }
     if ((s->flags & PREP_SNAPSHOT) && !vk_usnap_proof_valid(&s->proof)) PC_GUARD_RETURN(ex, PC_GUARD_PROOF, 0);
     PC_GUARD_RETURN(ex, PC_GUARD_OK, 1);
+}
+
+static int prepared_group_valid(VkExec *ex, PreparedGroup *s) {
+    return prepared_group_guard(ex, s, 0);
+}
+
+static int prepared_qualified_sample(const TexMemo *memo) {
+    return memo->selected.canonical && memo->selected.registration && memo->image;
+}
+
+// A coarse change asks this wholly qualified group to refresh permission for the images it already owns. It
+// cannot discard their exact registrations or trigger a new resource selection when their receipts still validate.
+static int prepared_group_current(VkExec *ex, PreparedBindings *p, uint32_t set, unsigned group) {
+    PreparedGroup *s = &p->set[set].group[group];
+    if (prepared_group_valid(ex, s)) return 1;
+    if (!(s->flags & PREP_QUALIFIED_TEXTURE) || !p->images || !prepared_group_guard(ex, s, 1)) return 0;
+    RcRegistryPosition position = vk_exec_resource_position(), edge = {0};
+    if (position.scene != s->texture_position.scene || !rc_registry_position_open(rc_registry_runtime(), position))
+        return 0;
+    PreparedStamp before = prepared_stamp(ex, group);
+    for (uint32_t i = p->recipe->sets[set].lo; i < p->recipe->sets[set].hi; i++) {
+        const VkBindRecipeOp *op = &p->recipe->op[i];
+        if (!op->stable || vk_bind_recipe_group(op) != group) continue;
+        for (uint32_t j = op->first; j < op->first + op->count; j++) {
+            PreparedSlot *slot = &p->slot[j];
+            RcRegistryPosition next;
+            if (!prepared_qualified_sample(&slot->texture) ||
+                !prepared_texture_receipt(ex, &p->recipe->input[j], slot, &p->desc[j], &next)) return 0;
+            if (rc_registry_position_valid(next) && (!rc_registry_position_valid(edge) ||
+                rc_registry_position_compare(next, edge) < 0)) edge = next;
+        }
+    }
+    PreparedStamp after = prepared_stamp(ex, group);
+    if (!prepared_stamp_equal(&before, &after, s->flags) || !prepared_group_guard(ex, s, 1) ||
+        rc_registry_position_compare(position, vk_exec_resource_position()) ||
+        !rc_registry_position_open(rc_registry_runtime(), position)) return 0;
+    s->stamp = after;
+    s->texture_position = position;
+    s->texture_next_write = edge;
+    return 1;
 }
 
 // The group's live proof already validates retained resources. A binding notification can concern another member
@@ -767,7 +876,11 @@ static inline int prepared_renew_member(VkExec *ex, PreparedBindings *p, uint32_
     ex->dc->prep_stats.proof_descriptors++;
     if (in->reuse == VK_BR_SAMPLED) {
         *flags |= PREP_TEXTURE;
-        if (!prepared_texture_valid(ex, in, slot, &p->desc[j])) return 0;
+        if (!prepared_qualified_sample(&slot->texture)) *flags &= ~PREP_QUALIFIED_TEXTURE;
+        RcRegistryPosition next;
+        if (!prepared_texture_receipt(ex, in, slot, &p->desc[j], &next)) return 0;
+        if (rc_registry_position_valid(next) && (!rc_registry_position_valid(census->texture_next_write) ||
+            rc_registry_position_compare(next, census->texture_next_write) < 0)) census->texture_next_write = next;
     } else if (in->reuse != VK_BR_ZERO) {
         if (!prepared_buffer_valid(ex, in, slot)) return 0;
         if (slot->previous_snapshot) {
@@ -779,6 +892,7 @@ static inline int prepared_renew_member(VkExec *ex, PreparedBindings *p, uint32_
             *flags |= PREP_SNAPSHOT;
             if (!vk_usnap_proof_add(proof, &slot->lease)) return 0;
         } else *flags |= PREP_LIVE;
+        if (slot->shadow_part) *flags |= PREP_SHADOW_PART;
         if (in->reuse == VK_BR_CONSTANT) *flags |= PREP_PROGRAM;
         const PbCount *old = &slot->previous_count, *now = &slot->count;
         if (old->has != now->has || (old->has &&
@@ -864,10 +978,14 @@ static void prepared_seal(VkExec *ex, PreparedBindings *p, uint32_t set, unsigne
     }
     PreparedGroup *s = &p->set[set].group[group];
     s->sealed = 0, s->flags = 0, s->ncounts = 0;
+    s->texture_position = vk_exec_resource_position();
+    s->texture_next_write = (RcRegistryPosition){0};
+    s->texture_mapping = mem_mapping_serial();
+    s->texture_protection = mem_protection_serial();
     if (ex->dc->mo_ovr_on) return;
     PC_COUNT(ex->dc, PC_FULL_SEAL);
     uint64_t prep_seal_start = PC_NOW(ex->dc);
-    int ok = 1;
+    int ok = 1, qualified = group == VK_BR_GROUP_TEXTURE && p->images;
 #if NX2NAVI_PREP_COMPILED_RESOLVE
     const VkBindRecipeMembers *members = &p->recipe->members[set][group];
     uint64_t remaining[2] = {members->ops[0], members->ops[1]};
@@ -895,7 +1013,11 @@ static void prepared_seal(VkExec *ex, PreparedBindings *p, uint32_t set, unsigne
             PreparedSlot *slot = &p->slot[j];
             if (in->reuse == VK_BR_SAMPLED) {
                 s->flags |= PREP_TEXTURE;
-                if (!prepared_texture_valid(ex, in, slot, &p->desc[j])) ok = 0;
+                qualified &= prepared_qualified_sample(&slot->texture);
+                RcRegistryPosition next;
+                if (!prepared_texture_receipt(ex, in, slot, &p->desc[j], &next)) ok = 0;
+                if (rc_registry_position_valid(next) && (!rc_registry_position_valid(s->texture_next_write) ||
+                    rc_registry_position_compare(next, s->texture_next_write) < 0)) s->texture_next_write = next;
             } else if (in->reuse != VK_BR_ZERO) {
                 if (!prepared_buffer_valid(ex, in, slot)) ok = 0;
                 if (slot->lease.capture) {
@@ -903,6 +1025,7 @@ static void prepared_seal(VkExec *ex, PreparedBindings *p, uint32_t set, unsigne
                     s->flags |= PREP_SNAPSHOT;
                     if (!vk_usnap_proof_add(proof, &slot->lease)) ok = 0;
                 } else s->flags |= PREP_LIVE;
+                if (slot->shadow_part) s->flags |= PREP_SHADOW_PART;
                 if (in->reuse == VK_BR_CONSTANT) s->flags |= PREP_PROGRAM;
             }
             if (slot->count.has && in->reuse != VK_BR_SAMPLED && in->reuse != VK_BR_ZERO) {
@@ -917,9 +1040,12 @@ static void prepared_seal(VkExec *ex, PreparedBindings *p, uint32_t set, unsigne
             }
         }
     }
+    if (ok && qualified && (s->flags & PREP_TEXTURE)) s->flags |= PREP_QUALIFIED_TEXTURE;
     int snapshot_ok = !(s->flags & PREP_SNAPSHOT) || vk_usnap_proof_end_into(proof, &s->proof);
     PreparedStamp after = prepared_stamp(ex, group);
     if (!ok || !prepared_stamp_equal(before, &after, s->flags) ||
+        ((s->flags & PREP_TEXTURE) && (s->texture_mapping != mem_mapping_serial() ||
+         s->texture_protection != mem_protection_serial())) ||
         ((s->flags & PREP_SNAPSHOT) && !snapshot_ok)) {
         PC_TIME(ex->dc, PCT_FULL_SEAL, prep_seal_start);
         PC_COUNT(ex->dc, PC_SEAL_FAIL);
@@ -962,7 +1088,7 @@ static void prepared_resolve(VkExec *ex, PreparedBindings *p, int check) {
         unsigned group_bit = 1u << (s * VK_BR_GROUPS + g);
         (void)group_bit;
         uint32_t bit = 1u << (p->index * 2 + s);
-        int valid = prepared_group_valid(ex, &p->set[s].group[g]);
+        int valid = prepared_group_current(ex, p, s, g);
         if (promoted && valid) cx->prep_residency.promoted_valid_groups++;
         if (NX2NAVI_PREP_PARTIAL_REUSE && valid) PG_SET(reusable_proof, s, g, group_bit);
         if (!(cx->prep_dirty[g] & bit) && valid) PG_SET(fast, s, g, group_bit);
@@ -997,7 +1123,7 @@ static void prepared_resolve(VkExec *ex, PreparedBindings *p, int check) {
         // past this op: a failed guard takes the ordinary per-slot path for the rest of this group on this draw.
         // Dirty groups need this recheck only when this op could reuse a retained binding. Ordered or changed
         // inputs still execute their ordinary resolver, which makes the guard pending again before later reuse.
-        if ((PG_GET(fast, s, g, group_bit) || partial) && PG_GET(guard_pending, s, g, group_bit) && !prepared_group_valid(ex, &p->set[s].group[g])) {
+        if ((PG_GET(fast, s, g, group_bit) || partial) && PG_GET(guard_pending, s, g, group_bit) && !prepared_group_current(ex, p, s, g)) {
             PG_CLEAR(fast, s, g, group_bit);
             PG_CLEAR(reusable_proof, s, g, group_bit);
             partial = 0;

@@ -31,14 +31,17 @@ def main():
     work = ROOT / 'build' / 'test' / 'resource-preparation'
     work.mkdir(parents=True, exist_ok=True)
     flags = ['-std=gnu11', '-O1', '-g', '-ffunction-sections', '-fdata-sections',
-             '-fuse-ld=lld', '-Wl,--gc-sections', '-Wall', '-Wextra', '-Werror',
+             '-Wl,--gc-sections', '-Wall', '-Wextra', '-Werror',
              '-I' + str(ROOT / 'runtime'), '-I' + str(ROOT / 'include'), '-I' + str(vma)]
     if args.ubsan:
         flags += ['-fsanitize=undefined', '-fsanitize-trap=undefined']
     for name in ('command_index_check', 'usnap_lease_check'):
         exe = work / (name + ('-ubsan' if args.ubsan else '') + ('.exe' if os.name == 'nt' else ''))
-        subprocess.run([str(cc), *flags, str(ROOT / 'tests' / (name + '.c')), '-o', str(exe)], env=env, check=True)
-        subprocess.run([str(exe)], env=env, check=True)
+        try:
+            subprocess.run([str(cc), *flags, str(ROOT / 'tests' / (name + '.c')), '-o', str(exe)], env=env, check=True)
+            subprocess.run([str(exe)], env=env, check=True)
+        finally:
+            exe.unlink(missing_ok=True)
 
 
 if __name__ == '__main__':

@@ -17,13 +17,15 @@
 #include "host.h"
 #include "nvn_api.h"
 #include "vk.h"
+#include "resource_core_vma.h"
+#include "vk_texture_lifetime.h"
 #include "replay_phase_trace.h"
 #include "replay_work_trace.h"
 #include "platform/platform.h"
 
 #define WEAK __attribute__((weak))
 
-typedef struct { uint64_t fence; void (*fn)(void *); void *arg; } Pending;
+typedef struct { uint64_t fence; void (*fn)(void *); void *arg; void (*cancel)(void *, int); } Pending;
 typedef struct { VkCommandBuffer cb; uint64_t fence; } CmdSlot;   // reusable once the timeline reached fence
 
 static PlatMutex start_lock = PLAT_MUTEX_INIT;
@@ -32,6 +34,39 @@ static PlatThread *completion_thread;
 
 // Submissions: one at a time, so timeline values are signalled in the order they are handed out.
 static PlatMutex sub_lock = PLAT_MUTEX_INIT;
+static PlatCond recorder_resumed = PLAT_COND_INIT;
+static int recorder_parked;          // sub_lock
+static int stopped_recording;        // sub_lock, terminal recording cancellation
+static _Thread_local uint64_t recording_scene;
+static int mirror_pressure_active;   // sub_lock
+static PlatCond mirror_pressure_done = PLAT_COND_INIT;
+// Pressure adapters may detach a native provider without overlapping scene recording. They never wait for it.
+int vk_sync_try_provider_idle(void) {
+    if (!plat_mutex_trylock(&sub_lock)) return 0;
+    if (!recorder_parked) return 1;
+    plat_mutex_unlock(&sub_lock);
+    return 0;
+}
+void vk_sync_end_provider_idle(void) { plat_mutex_unlock(&sub_lock); }
+static void submit_lock(void) {
+    plat_mutex_lock(&sub_lock);
+    while (recorder_parked) plat_cond_wait(&recorder_resumed, &sub_lock);
+}
+static uint64_t recorder_park(void) {
+    uint64_t scene = recording_scene;
+    recording_scene = 0;
+    recorder_parked = 1;
+    plat_mutex_unlock(&sub_lock);
+    return scene;
+}
+static void recorder_resume(uint64_t scene) {
+    plat_mutex_lock(&sub_lock);
+    recorder_parked = 0;
+    recording_scene = scene;
+    plat_cond_broadcast(&recorder_resumed);
+}
+static volatile int32_t submission_stopping;
+int vk_sync_stopping(void) { return __atomic_load_n(&submission_stopping, __ATOMIC_ACQUIRE); }
 static VkCommandPool cmd_pool;
 static CmdSlot *slots;
 static int nslots;
@@ -50,6 +85,13 @@ static PlatCond cv_done = PLAT_COND_INIT;   // done advanced
 static uint64_t issued, done;     // newest submitted value; newest value whose side effects ran
 static uint64_t reserved;         // asynchronous replay: newest value handed out before its submission (>= issued)
 static int stop;
+void vk_sync_stop_submissions(void) {
+    __atomic_store_n(&submission_stopping, 1, __ATOMIC_RELEASE);
+    resource_core_budget_progress();
+    plat_mutex_lock(&st_lock);
+    plat_cond_broadcast(&cv_done); // unissued reserved values are canceled, not completed
+    plat_mutex_unlock(&st_lock);
+}
 static Pending *queue;            // side effects in the order they were added
 static int qhead, qn, qcap;
 // The side effects the game's CPU reads (vk_completion_add_result: occlusion counts, counter reports, event values),
@@ -60,10 +102,11 @@ static int rqhead, rqn, rqcap;
 static PlatMutex res_lock = PLAT_MUTEX_INIT;   // the runner; taken before st_lock
 static void results_run(uint64_t upto);
 enum { RESULT_BATCH = 64 };
-// Only the submitting thread records these results. They must be visible to a guest
-// waiter before any queue submission can signal the associated executed timeline value.
-static _Thread_local struct { uint64_t fence; unsigned n; Pending items[RESULT_BATCH]; } recording_results;
+// Result ownership stays with the current part until that part is closed for handoff. Publication precedes
+// its guest executed signal. An abandoned tail's results have a separate, never-handed cancellation path.
+static _Thread_local struct { uint64_t fence; int n, cap; Pending *items; } recording_results;
 static void publish_recording_results(void);
+static void cancel_recording_results(void);
 
 // ---- submit batching
 // Every game submission used to be its own vkQueueSubmit2, about 150 a frame, each a trip into the driver on the render
@@ -83,12 +126,16 @@ static struct {
     VkSubmitInfo2 si[HOLD_CAP];
     VkCommandBufferSubmitInfo cbi[HOLD_CAP][PART_CBS + 2];   // the prologue and the part's command buffers
     VkSemaphoreSubmitInfo sig[HOLD_CAP][2];
+    TextureUseBatch *uses[HOLD_CAP]; // sealed recordings, submitted only after actual queue hand-over
+    uint64_t scene[HOLD_CAP]; // includes split parts that do not signal their scene's final timeline value
     uint64_t last;                    // the newest timeline value a held submission signals, 0 none
     uint64_t batches, subs;           // vkQueueSubmit2 calls and the submissions they carried
 } H;
 static volatile int32_t held_n;       // H.n, for readers without the lock
 static volatile uint64_t held_t0;     // when the oldest held submission was held (kern_now_ns)
 static volatile uint64_t queued_v;    // the newest timeline value handed to the queue
+static volatile uint64_t handed_scene_v; // greatest scene with any command buffers actually handed to the queue
+static volatile uint64_t uncertain_scene_v; // greatest scene whose queue hand-over failed at the driver
 static int hold_max = -1;
 
 // Diagnostic identities do not affect ordering or lifetime. Ready identities are assigned under sub_lock;
@@ -164,6 +211,9 @@ static uint64_t tl_held_ready[HOLD_CAP];
 // values, which fits a reset to the base copy's value.
 // NX2NAVI_WB_SPLIT=2 keeps the split with shadow storage too, to measure that fault.
 static VkSemaphore exec_tl;
+static VkSemaphore progress_tl;       // independent of either guest fence timeline
+static uint64_t progress_next;       // sub_lock, monotonically ordered native part receipts
+static uint64_t ordinary_parts, covered_ordinary_parts;  // within the recording scene, under sub_lock
 static uint64_t exec_sig;             // sub_lock: the newest value a submitted part signals on exec_tl
 static int wb_split = -1;
 static int wb_results;                // the wait on exec_tl also runs the results the game reads (not with 3)
@@ -243,16 +293,21 @@ static int lost_at_due(void) {
     return at && ++calls == at;   // queue lock held
 }
 
-static void hold_flush_locked(VkCtx *c) {
-    if (!H.n) return;
+static int hold_flush_locked(VkCtx *c) {
+    if (!H.n) return 0;
     if (vk_device_is_lost()) {   // the run is ending: the held submissions are dropped, nothing reaches the queue
+        for (int i = 0; i < H.n; ++i) {
+            TextureUseBatch *uses = H.uses[i]; H.uses[i] = NULL;
+            vk_texture_uses_abandon(uses);
+        }
         H.n = 0, H.last = 0;
         __atomic_store_n(&held_n, 0, __ATOMIC_RELEASE);
-        return;
+        return 0;
     }
     uint64_t tl_batch = tl_recording() ? ++tl_batch_next : 0;
     uint64_t tl_call_begin = tl_batch ? plat_now_ns() : 0;
-    VkResult r = lost_at_due() ? VK_ERROR_DEVICE_LOST : vkQueueSubmit2(c->gfx_queue, (uint32_t)H.n, H.si, VK_NULL_HANDLE);
+    int injected_loss = lost_at_due();
+    VkResult r = injected_loss ? VK_ERROR_DEVICE_LOST : vkQueueSubmit2(c->gfx_queue, (uint32_t)H.n, H.si, VK_NULL_HANDLE);
     uint64_t tl_call_end = tl_batch ? plat_now_ns() : 0;
     if (tl_batch) {
         // Record after the call so diagnostic member notes do not extend the ready-to-call interval.
@@ -261,14 +316,40 @@ static void hold_flush_locked(VkCtx *c) {
         gfx_tl_note('b', tl_call_end, tl_batch, (uint64_t)(int64_t)r);
     }
     if (r != VK_SUCCESS) {
+        int count = H.n;
+        uint64_t value = H.last;
+        if (!injected_loss) {
+            // Keep the sealed texture batches and completion owners if the driver saw the submission.
+            // Only a successful call can publish a normal hand-over or signal proof.
+            uint64_t uncertain = __atomic_load_n(&uncertain_scene_v, __ATOMIC_RELAXED);
+            for (int i = 0; i < H.n; ++i) {
+                if (H.scene[i] > uncertain) uncertain = H.scene[i];
+                H.uses[i] = NULL;
+            }
+            __atomic_store_n(&uncertain_scene_v, uncertain, __ATOMIC_RELEASE);
+            rc_registry_runtime_native_handoff(__atomic_load_n(&queued_v, __ATOMIC_RELAXED),
+                __atomic_load_n(&handed_scene_v, __ATOMIC_RELAXED), uncertain);
+            H.n = 0, H.last = 0;
+            __atomic_store_n(&held_n, 0, __ATOMIC_RELEASE);
+        }
         vk_device_lost_check(r, "the submit of the replay's command buffers");
-        rt_fatal("vk: vkQueueSubmit2 of %d held submissions up to value %llu failed (%d)", H.n,
-                 (unsigned long long)H.last, (int)r);
+        rt_fatal("vk: vkQueueSubmit2 of %d held submissions up to value %llu failed (%d)", count,
+                 (unsigned long long)value, (int)r);
     }
+    for (int i = 0; i < H.n; ++i) {
+        TextureUseBatch *uses = H.uses[i]; H.uses[i] = NULL;
+        vk_texture_uses_handed(uses); // leaf publication: no texture lock under the queue lock
+        if (H.scene[i] > __atomic_load_n(&handed_scene_v, __ATOMIC_RELAXED))
+            __atomic_store_n(&handed_scene_v, H.scene[i], __ATOMIC_RELEASE);
+    }
+    // Completion cannot publish this value until every associated material batch has its actual hand-over proof.
     if (H.last) __atomic_store_n(&queued_v, H.last, __ATOMIC_RELEASE);
+    rc_registry_runtime_native_handoff(__atomic_load_n(&queued_v, __ATOMIC_RELAXED),
+        __atomic_load_n(&handed_scene_v, __ATOMIC_RELAXED), __atomic_load_n(&uncertain_scene_v, __ATOMIC_RELAXED));
     H.batches++, H.subs += (uint64_t)H.n;
     H.n = 0, H.last = 0;
     __atomic_store_n(&held_n, 0, __ATOMIC_RELEASE);
+    return 1;
 }
 
 void vk_sync_flush_held(void) {
@@ -277,8 +358,9 @@ void vk_sync_flush_held(void) {
     if (c) hold_flush_locked(c);
 }
 
-// The replay's submission si (signalling value, 0 for a part without a signal), held or handed to the queue.
-static void queue_submit(VkCtx *c, const VkSubmitInfo2 *si, uint64_t value) {
+// A part without a guest fence value goes straight to the queue. Return whether this call handed it over.
+static int queue_submit(VkCtx *c, const VkSubmitInfo2 *si, uint64_t value, uint64_t scene, TextureUseBatch *uses,
+                        int stop_before_submit) {
     if (hold_max < 0) {
         const char *e = cfg_get("NX2NAVI_SUBMIT_BATCH");
         int v = e && *e ? atoi(e) : 4;
@@ -293,8 +375,15 @@ static void queue_submit(VkCtx *c, const VkSubmitInfo2 *si, uint64_t value) {
     vk_queue_lock_raw();
     if (tl_ready_current) gfx_tl_note('l', 0, tl_ready_current, 0);
     perf_end(PERF_FENCE, p0);
+    if (stop_before_submit && (vk_sync_stopping() || vk_device_is_lost())) {
+        vk_texture_uses_abandon(uses);
+        vk_queue_unlock();
+        return 0;
+    }
     if (H.n == HOLD_CAP) hold_flush_locked(c);
     int i = H.n++;
+    H.uses[i] = uses;
+    H.scene[i] = scene;
     tl_held_ready[i] = tl_ready_current;
     H.si[i] = *si;
     if (si->commandBufferInfoCount)
@@ -311,8 +400,11 @@ static void queue_submit(VkCtx *c, const VkSubmitInfo2 *si, uint64_t value) {
     if (tl_ready_current) gfx_tl_note('E', now, tl_ready_current, value);
     // A part of a long submission (no value) goes at once with whatever is held: parts exist to start the GPU early.
     // So do held submissions that have waited HOLD_NS, and a full batch.
-    if (H.n >= hold_max || !value || now - __atomic_load_n(&held_t0, __ATOMIC_ACQUIRE) >= HOLD_NS) hold_flush_locked(c);
+    int handed = 0;
+    if (H.n >= hold_max || !value || now - __atomic_load_n(&held_t0, __ATOMIC_ACQUIRE) >= HOLD_NS)
+        handed = hold_flush_locked(c);
     vk_queue_unlock();
+    return handed;
 }
 
 // Hands the held submissions to the queue when value is among them (a waiter needs it) or they have waited HOLD_NS
@@ -775,9 +867,43 @@ static void gpu_stats(PerfGpu *g) {
     g->mirror_ns = (uint64_t)plat_xchg64(&ts_mirror_ns, 0);
 }
 
+// A build without the draw recorder needs no fixed draw buffers or descriptors.
+WEAK int vk_exec_draw_fixed_ready(void) { return 1; }
+WEAK VkResult vk_exec_draw_fixed_prepare(RcAdmissionVector *peak) {
+    *peak = (RcAdmissionVector){{0}};
+    return VK_SUCCESS;
+}
+WEAK void vk_exec_draw_fixed_shutdown(void) {}
+
+int vk_exec_held_ready_locked(void);
+void vk_exec_discard_held_locked(void);
+WEAK int vk_exec_held_ready_locked(void) { return 0; }
+WEAK void vk_exec_discard_held_locked(void) {}
+
+int vk_exec_held_ready(void) {
+    submit_lock();
+    int ready = !vk_sync_stopping() && !vk_device_is_lost() && vk_exec_held_ready_locked();
+    plat_mutex_unlock(&sub_lock);
+    return ready;
+}
+
+void vk_exec_discard_held(void) {
+    submit_lock();
+    vk_exec_discard_held_locked();
+    plat_mutex_unlock(&sub_lock);
+}
+
 // Weak stand-in for vk_exec.c's replay: only empty recordings ({OP_BEGIN, OP_END}) can be submitted.
-WEAK int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t fence) {
-    (void)cb, (void)fence;
+WEAK VkResult vk_exec_snapshot_preflight(const uint64_t *handles, int n, VkUsnapCapture **capture,
+                                         VkExecReadiness **readiness, VkReplayCaptureWait *wait) {
+    (void)handles; (void)n; (void)capture; (void)readiness;
+    *wait = (VkReplayCaptureWait){0};
+    return VK_SUCCESS;
+}
+WEAK void vk_exec_readiness_discard(VkExecReadiness *readiness) { (void)readiness; }
+WEAK int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t fence,
+                        VkReplayCaptureBundle *bundle, const VkExecReadiness *readiness) {
+    (void)cb; (void)fence; (void)bundle; (void)readiness;
     for (int i = 0; i < n; i++) {
         const op_hdr *h = handles[i] ? nvn_op_first(handles[i]) : NULL;
         if (!h || h->op != OP_BEGIN || h->size < sizeof *h || nvn_op_next(h)->op != OP_END)
@@ -824,6 +950,8 @@ static void completion_main(void *arg) {
             if (reached > __atomic_load_n(&done, __ATOMIC_ACQUIRE)) vk_device_lost_poll();
             plat_mutex_lock(&st_lock);
             if (reached > issued) reached = issued;
+            uint64_t handed = __atomic_load_n(&queued_v, __ATOMIC_ACQUIRE);
+            if (reached > handed) reached = handed;
         }
         // Another thread saw the device lost (vk_lost): no value counts from here on and no callback runs. Theirs is
         // work that never finished: frees of what the GPU may still hold, records handed out again, counter reports.
@@ -869,6 +997,9 @@ static void completion_main(void *arg) {
             __atomic_store_n(&done, reached, __ATOMIC_RELEASE);
             plat_cond_broadcast(&cv_done);
             plat_mutex_unlock(&st_lock);
+            uint64_t upload_submitted, upload_completed;
+            vk_upload_progress(&upload_submitted, &upload_completed);
+            vk_texture_uses_complete(reached, upload_completed);
             vk_mem_collect();
             plat_mutex_lock(&st_lock);
         }
@@ -899,6 +1030,9 @@ void vk_sync_start(void) {
         }
         plat_mutex_lock(&st_lock);
         issued = done = now;
+        __atomic_store_n(&queued_v, now, __ATOMIC_RELEASE);
+        __atomic_store_n(&handed_scene_v, now, __ATOMIC_RELEASE);
+        rc_registry_runtime_native_handoff(now, now, __atomic_load_n(&uncertain_scene_v, __ATOMIC_RELAXED));
         if (reserved < now) reserved = now;
         stop = 0;
         plat_mutex_unlock(&st_lock);
@@ -907,6 +1041,14 @@ void vk_sync_start(void) {
                                         .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE, .initialValue = now};
         VkSemaphoreCreateInfo ei = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &et};
         if (vkCreateSemaphore(c->device, &ei, NULL, &exec_tl) != VK_SUCCESS) exec_tl = VK_NULL_HANDLE;
+        et.initialValue = 0;
+        VkResult progress_created = vkCreateSemaphore(c->device, &ei, NULL, &progress_tl);
+        if (progress_created != VK_SUCCESS) {
+            vk_device_lost_check(progress_created, "initializing replay progress");
+            progress_tl = VK_NULL_HANDLE;
+        }
+        progress_next = 0;
+        stopped_recording = 0;
         exec_sig = now;
         vk_mem_note_submit(now);
         completion_thread = plat_thread_new(completion_main, c, "vk completion");
@@ -957,7 +1099,7 @@ static VkCommandBuffer prologue(VkCtx *c, uint64_t fence) {
                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     vkBeginCommandBuffer(cb, &bi);
     int pair = ts_open(cb);
-    vk_mem_mirror_prologue(cb);
+    vk_mem_mirror_prologue(cb, fence);
     ts_close(cb, pair, fence, 1);
     vkEndCommandBuffer(cb);
     return cb;
@@ -1057,12 +1199,14 @@ VkCommandBuffer vk_sync_worker_begin(int w) {
 
 void vk_sync_worker_end(VkCommandBuffer cb) { vkEndCommandBuffer(cb); }
 
-static VkCommandBuffer split_part(int exec);
-VkCommandBuffer vk_sync_split(void) { return split_part(0); }
-// The part that ends here is the last with the submission's own commands: it signals the executed timeline.
-VkCommandBuffer vk_sync_split_exec(void) { return split_part(1); }
+static int progress_stopped(void) { return vk_sync_stopping() || vk_device_is_lost(); }
 
-static VkCommandBuffer split_part(int exec) {
+static VkCommandBuffer split_part(int exec, uint64_t progress, uint64_t keep_open_ordinal);
+VkCommandBuffer vk_sync_split(void) { return split_part(0, 0, 0); }
+// The part that ends here is the last with the submission's own commands: it signals the executed timeline.
+VkCommandBuffer vk_sync_split_exec(void) { return split_part(1, 0, 0); }
+
+static VkCommandBuffer split_part(int exec, uint64_t progress, uint64_t keep_open_ordinal) {
     VkCtx *c = vk_ctx();
     VkCommandBuffer cb = slots[cur_slot].cb;
     vk_gpu_passes_part(cb, 1);
@@ -1073,6 +1217,7 @@ static VkCommandBuffer split_part(int exec) {
     gfx_tl_note('X', 0, 2, cur_fence);
     vk_upload_flush(0);   // the uploads this part asked for precede it in queue order
     gfx_tl_note('Y', 0, 2, cur_fence);
+    if (keep_open_ordinal && progress_stopped()) return VK_NULL_HANDLE;
     gfx_tl_note('X', 0, 3, cur_fence);
     VkCommandBuffer pro = prologue(c, cur_fence);
     gfx_tl_note('Y', 0, 3, cur_fence);
@@ -1086,8 +1231,26 @@ static VkCommandBuffer split_part(int exec) {
         recording_results.fence = 0;
         si.signalSemaphoreInfoCount = 1, si.pSignalSemaphoreInfos = &esig, exec_sig = cur_fence;
     }
+    if (progress) {
+        esig.semaphore = progress_tl;
+        esig.value = progress;
+        si.signalSemaphoreInfoCount = 1;
+        si.pSignalSemaphoreInfos = &esig;
+    }
     ts_submitted();
-    queue_submit(c, &si, 0);         // held or handed to the queue (submit batching)
+    uint64_t upload_submitted, upload_completed;
+    vk_upload_progress(&upload_submitted, &upload_completed);
+    TextureUseBatch *uses = vk_texture_uses_seal(cur_fence, upload_submitted);
+    if (keep_open_ordinal) vk_exec_resource_handoff_before(cur_fence, keep_open_ordinal);
+    else vk_exec_resource_handoff(cur_fence);
+    int handed = queue_submit(c, &si, 0, cur_fence, uses, keep_open_ordinal != 0);
+    if (keep_open_ordinal && !handed) return VK_NULL_HANDLE;
+    if (!exec && !progress && !vk_device_is_lost() &&
+        cur_fence == __atomic_load_n(&handed_scene_v, __ATOMIC_ACQUIRE))
+        ordinary_parts++;
+    // A later loss does not cancel the results of a part that reached the queue.
+    if (handed) publish_recording_results();   // The executed-signal part already published its results.
+    else cancel_recording_results();
     vk_mem_lazy_handed();
     vk_mem_note_submit(cur_fence);   // objects destroyed from here on may be in use by the part just submitted
     CmdSlot *s = take_slot(c, cur_fence);   // the submitted part keeps its slot until the value is reached
@@ -1099,6 +1262,165 @@ static VkCommandBuffer split_part(int exec) {
     rec_begin(s->cb, cur_fence);
     vk_gpu_passes_part(s->cb, 0);
     return s->cb;
+}
+
+VkSyncProgressResult vk_sync_progress_prepare_pipeline(int (*prepare)(void *), void *context) {
+    if (progress_stopped()) return VK_SYNC_PROGRESS_STOPPED;
+    if (!recording_scene || !prepare) return VK_SYNC_PROGRESS_UNAVAILABLE;
+    uint64_t scene = recorder_park();
+    // Only earlier sealed submissions can be held here. Hand them over so their retirements can free capacity.
+    hold_release(scene, 0, 0);
+    int complete = !progress_stopped() && prepare(context);
+    recorder_resume(scene);
+    return complete && !progress_stopped() ? VK_SYNC_PROGRESS_COMPLETE : VK_SYNC_PROGRESS_STOPPED;
+}
+
+VkSyncProgressResult vk_sync_progress_wait_upload_staging(uint64_t handed_upload) {
+    if (progress_stopped()) return VK_SYNC_PROGRESS_STOPPED;
+    if (!recording_scene || !handed_upload) return VK_SYNC_PROGRESS_UNAVAILABLE;
+    uint64_t scene = recorder_park();
+    // The upload queue already accepted this supplier. Held graphics submissions remain independent.
+    const int retired = !progress_stopped() && vk_staging_prepare_wait(handed_upload);
+    recorder_resume(scene);
+    if (progress_stopped()) return VK_SYNC_PROGRESS_STOPPED;
+    return retired ? VK_SYNC_PROGRESS_COMPLETE : VK_SYNC_PROGRESS_UNAVAILABLE;
+}
+
+WEAK void vk_exec_draw_update_prefix_completed(struct VkExec *ex, uint64_t scene) { (void)ex; (void)scene; }
+void vk_exec_pool_registration_prefix_complete(uint64_t fence);
+
+static void progress_marker(VkCtx *c, uint64_t value) {
+    VkSemaphoreSubmitInfo signal = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = progress_tl,
+        .value = value, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+    VkSubmitInfo2 submit = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+        .signalSemaphoreInfoCount = 1, .pSignalSemaphoreInfos = &signal};
+    queue_submit(c, &submit, 0, 0, NULL, 0);
+}
+
+static VkSyncProgressResult progress_split(struct VkExec *ex, VkCommandBuffer *resume, int empty_tail,
+                                           uint64_t keep_open_ordinal) {
+    if (!resume) return VK_SYNC_PROGRESS_UNAVAILABLE;
+    *resume = VK_NULL_HANDLE;
+    if (progress_stopped()) return VK_SYNC_PROGRESS_STOPPED;
+    if (!ex || !recording_scene || !progress_tl || progress_next == UINT64_MAX) return VK_SYNC_PROGRESS_UNAVAILABLE;
+    if (empty_tail && (npart_cbs || ordinary_parts == covered_ordinary_parts ||
+                       recording_scene != __atomic_load_n(&handed_scene_v, __ATOMIC_ACQUIRE)))
+        return VK_SYNC_PROGRESS_UNAVAILABLE;
+    uint64_t value = ++progress_next;
+    VkCtx *c = vk_ctx();
+    if (empty_tail) progress_marker(c, value);
+    else {
+        *resume = split_part(0, value, keep_open_ordinal);
+        if (!*resume) return VK_SYNC_PROGRESS_STOPPED;
+    }
+    uint64_t scene = recorder_park();
+    VkSemaphoreWaitInfo wait = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1,
+                                .pSemaphores = &progress_tl, .pValues = &value};
+    VkSyncProgressResult result = empty_tail ? VK_SYNC_PROGRESS_STOPPED : VK_SYNC_PROGRESS_STOPPED_AFTER_CUT;
+    while (!progress_stopped()) {
+        VkResult status = vkWaitSemaphores(c->device, &wait, UINT64_C(100000000));
+        if (status == VK_SUCCESS) {
+            vk_device_lost_poll();
+            if (!progress_stopped()) {
+                covered_ordinary_parts = ordinary_parts;
+                vk_exec_draw_update_prefix_completed(ex, scene);
+                vk_exec_pool_registration_prefix_complete(scene);
+                result = VK_SYNC_PROGRESS_COMPLETE;
+            }
+            break;
+        }
+        if (status != VK_TIMEOUT) {
+            vk_device_lost_check(status, "waiting for the actual replay prefix");
+            rt_fatal("vk: replay prefix completion wait failed (%d)", (int)status);
+        }
+    }
+    recorder_resume(scene);
+    return result;
+}
+
+VkSyncProgressResult vk_sync_progress_split(struct VkExec *ex, VkCommandBuffer *resume, int empty_tail) {
+    return progress_split(ex, resume, empty_tail, 0);
+}
+
+VkSyncProgressResult vk_sync_progress_split_before(struct VkExec *ex, VkCommandBuffer *resume,
+                                                  uint64_t keep_open_ordinal) {
+    if (keep_open_ordinal < 2 || (keep_open_ordinal & 1)) {
+        if (resume) *resume = VK_NULL_HANDLE;
+        return VK_SYNC_PROGRESS_UNAVAILABLE;
+    }
+    return progress_split(ex, resume, 0, keep_open_ordinal);
+}
+
+int vk_sync_mirror_publication_safe(uint64_t scene) {
+    return scene && scene == recording_scene && scene == cur_fence && !progress_stopped() &&
+        !npart_cbs && ordinary_parts == covered_ordinary_parts && exec_sig < scene &&
+        !__atomic_load_n(&held_n, __ATOMIC_ACQUIRE) &&
+        __atomic_load_n(&done, __ATOMIC_ACQUIRE) >= __atomic_load_n(&issued, __ATOMIC_ACQUIRE);
+}
+
+static int progress_capacity_ready(const RcVmaDependency *dependency, int (*spare_ready)(void *), void *context) {
+    if (spare_ready && spare_ready(context)) return 1;
+    if (!dependency || !dependency->selected) return 0;
+    RcBudgetReadiness now;
+    resource_core_budget_readiness(1, &now);
+    return resource_core_vma_dependency_ready(dependency, &now);
+}
+
+VkSyncProgressResult vk_sync_progress_wait_capacity(const RcVmaDependency *dependency,
+                                                   int (*compatible_spare_ready)(void *), void *context) {
+    if (progress_stopped()) return VK_SYNC_PROGRESS_STOPPED;
+    if (!recording_scene || ((!dependency || !dependency->selected) && !compatible_spare_ready))
+        return VK_SYNC_PROGRESS_UNAVAILABLE;
+    uint64_t scene = recorder_park();
+    VkSyncProgressResult result = VK_SYNC_PROGRESS_STOPPED;
+    while (!progress_stopped()) {
+        if (progress_capacity_ready(dependency, compatible_spare_ready, context)) {
+            result = VK_SYNC_PROGRESS_COMPLETE;
+            break;
+        }
+        const RcAdmissionVector empty = {{0}};
+        RcBudgetProgress progress;
+        resource_core_budget_service(1, dependency && dependency->selected ? &dependency->peak : &empty, &progress);
+        if (progress_stopped()) break;
+        if (progress_capacity_ready(dependency, compatible_spare_ready, context)) {
+            result = VK_SYNC_PROGRESS_COMPLETE;
+            break;
+        }
+        resource_core_budget_wait_since(progress.event, 100);
+    }
+    recorder_resume(scene);
+    return result;
+}
+
+int vk_sync_prepare_draw(void) {
+    while (!progress_stopped()) {
+        if (vk_exec_draw_fixed_ready()) return 1;
+        RcBudgetReadiness before;
+        resource_core_budget_readiness(1, &before);
+        RcAdmissionVector peak;
+        VkResult result = vk_exec_draw_fixed_prepare(&peak);
+        if (progress_stopped()) return 0;
+        if (result == VK_SUCCESS) return 1;
+        if (result == VK_ERROR_DEVICE_LOST) {
+            vk_device_lost_check(result, "preparing fixed draw resources");
+            return 0;
+        }
+        if (result != VK_NOT_READY) rt_fatal("vk: fixed draw resource preparation failed (%d)", (int)result);
+
+        // Give handed-off work a chance to finish and return capacity before measuring the refused peak.
+        vk_queue_lock();
+        vk_queue_unlock();
+        if (progress_stopped()) return 0;
+        RcBudgetProgress progress;
+        resource_core_budget_service(1, &peak, &progress);
+        if (progress_stopped()) return 0;
+        if (vk_exec_draw_fixed_ready()) return 1;
+        RcBudgetReadiness now;
+        resource_core_budget_readiness(1, &now);
+        if (!resource_core_budget_peak_progress(&peak, &before, &now))
+            resource_core_budget_wait_since(progress.event, 100);
+    }
+    return 0;
 }
 
 // Asynchronous replay (vk_backend.c): the value the next queued submission or present will signal. Values are handed
@@ -1118,20 +1440,100 @@ typedef struct {
     void *arg;
 } OwnCommands;
 
-static uint64_t submit(const uint64_t *handles, int n, const OwnCommands *own) {
+static void shutdown_present_tail(VkCommandBuffer cb, void *arg) { (void)cb; (void)arg; }
+
+static void discard_readiness(VkExecReadiness **readiness) {
+    vk_exec_readiness_discard(*readiness);
+}
+
+static uint64_t submit(const uint64_t *handles, int n, VkReplayCaptureBundle *provided, const OwnCommands *own, int present_tail) {
+    const OwnCommands tail = {shutdown_present_tail, NULL};
+    VkReplayCaptureBundle bundle = provided ? *provided : (VkReplayCaptureBundle){0};
+    if (provided) *provided = (VkReplayCaptureBundle){0};
+    VkExecReadiness *readiness __attribute__((cleanup(discard_readiness))) = NULL;
     RP_SCOPE(rp_submit, RP_SUBMIT);
     RP_VALUE(RPK_HANDLES, n);
     vk_sync_start();
     // The run is ending (vk_device.c vk_device_lost_check): nothing is recorded or submitted and no value is issued.
     // The value returned is the last one issued; a wait for it sleeps until the process ends.
-    if (vk_device_is_lost()) return __atomic_load_n(&issued, __ATOMIC_ACQUIRE);
+    if (vk_device_is_lost() || (vk_sync_stopping() && !present_tail)) {
+        vk_usnap_queue_bundle_cancel(&bundle);
+        return __atomic_load_n(&issued, __ATOMIC_ACQUIRE);
+    }
+    if (!own && n > 0 && !vk_sync_prepare_draw()) {
+        vk_usnap_queue_bundle_cancel(&bundle);
+        return __atomic_load_n(&issued, __ATOMIC_ACQUIRE);
+    }
     VkCtx *c = vk_ctx();
-    RP_CALL(RP_SUBMIT_LOCK, plat_mutex_lock(&sub_lock));
+    RP_CALL(RP_SUBMIT_LOCK, submit_lock());
+    if (vk_sync_stopping() && present_tail) own = &tail;
+    if (vk_device_is_lost() || (vk_sync_stopping() && !present_tail)) {
+        plat_mutex_unlock(&sub_lock);
+        vk_usnap_queue_bundle_cancel(&bundle);
+        return __atomic_load_n(&issued, __ATOMIC_ACQUIRE);
+    }
+    if (!own && !provided) {
+        for (;;) {
+            VkReplayCaptureWait wait;
+            VkResult prepared = vk_exec_snapshot_preflight(handles, n, &bundle.snapshot, &readiness, &wait);
+            if (prepared == VK_SUCCESS) break;
+            // Nothing has been recorded or copied. The refused plan and capture have been disposed, so
+            // reacquiring the lock builds a new cohort from the current queues and event values.
+            plat_mutex_unlock(&sub_lock);
+            if (prepared != VK_NOT_READY) {
+                vk_usnap_queue_bundle_cancel(&bundle);
+                rt_fatal("vk: snapshot preflight failed (%d)", (int)prepared);
+            }
+            // Recorded batches may retain the snapshots needed for this request. Flush without sub_lock;
+            // completion and provider giveback can then progress independently of this submission.
+            vk_queue_lock();
+            vk_queue_unlock();
+            if (wait.kind == VK_REPLAY_CAPTURE_WAIT_PRODUCER) {
+                vk_usnap_wait_producer(wait.producer_epoch, 100);
+            } else if (wait.kind == VK_REPLAY_CAPTURE_WAIT_BUDGET) {
+                RcBudgetProgress progress;
+                resource_core_budget_service(1, &wait.peak, &progress);
+                if (!(progress.reclaim & RC_BUDGET_RECLAIM_DESTROYED))
+                    resource_core_budget_wait_since(progress.event, 100);
+            } else {
+                rt_fatal("vk: missing synchronous snapshot wait cause (%d)", (int)wait.kind);
+            }
+            if (vk_device_is_lost() || (vk_sync_stopping() && !present_tail)) {
+                vk_usnap_queue_bundle_cancel(&bundle);
+                return __atomic_load_n(&issued, __ATOMIC_ACQUIRE);
+            }
+            submit_lock();
+            if (vk_sync_stopping() && present_tail) { own = &tail; break; }
+            if (vk_device_is_lost() || vk_sync_stopping()) {
+                plat_mutex_unlock(&sub_lock);
+                vk_usnap_queue_bundle_cancel(&bundle);
+                return __atomic_load_n(&issued, __ATOMIC_ACQUIRE);
+            }
+        }
+    }
+    if (vk_sync_stopping() && present_tail) own = &tail;
+    if (present_tail && stopped_recording && !vk_device_is_lost()) {
+        // The present worker already handed its blit over. Retire it without signaling the abandoned guest scene.
+        VkResult idle = vk_device_wait_idle();
+        if (idle != VK_SUCCESS) {
+            vk_device_lost_check(idle, "retiring a present after its scene stopped");
+            rt_fatal("vk: could not retire the last present (%d)", (int)idle);
+        }
+        plat_mutex_unlock(&sub_lock);
+        vk_usnap_queue_bundle_cancel(&bundle);
+        return __atomic_load_n(&issued, __ATOMIC_ACQUIRE);
+    }
+    if (vk_device_is_lost() || (vk_sync_stopping() && !present_tail)) {
+        plat_mutex_unlock(&sub_lock);
+        vk_usnap_queue_bundle_cancel(&bundle);
+        return __atomic_load_n(&issued, __ATOMIC_ACQUIRE);
+    }
     RP_REPLAY_RESET();
     RP_SCOPE(rp_slot, RP_SLOT_BEGIN);
     vk_mem_dirty_submit();   // NX2NAVI_TRACE=perf: what a mirror would upload before this submit
     uint64_t fence = __atomic_load_n(&issued, __ATOMIC_ACQUIRE) + 1;
     cur_fence = fence;
+    ordinary_parts = covered_ordinary_parts = 0;
     CmdSlot *s = take_slot(c, fence);
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
@@ -1150,12 +1552,36 @@ static uint64_t submit(const uint64_t *handles, int n, const OwnCommands *own) {
     int recorded = 1;
     recording_results.fence = fence;
     if (own) own->record(s->cb, own->arg);
-    else recorded = vk_exec_record(s->cb, handles, n, fence);
+    else {
+        recording_scene = fence;
+        recorded = vk_exec_record(s->cb, handles, n, fence, &bundle, readiness);
+        recording_scene = 0;
+    }
+    vk_exec_readiness_discard(readiness);
+    readiness = NULL;
+    vk_usnap_queue_bundle_cancel(&bundle); // Recording clears each pointer it consumes.
+    s = &slots[cur_slot];   // the last part (vk_sync_split)
+    if (recorded == VK_EXEC_RECORD_STOPPED) {
+        int required_resource_missing = vk_exec_recording_missing_resource();
+        stopped_recording = 1;
+        vk_sync_stop_submissions();
+        rec_end();  // Drain recorder CPU packets. The unhanded buffer can still be inside rendering.
+        ts_drop();
+        cancel_recording_results();
+        recording_results.fence = 0;
+        // The sealed prefixes stay with their actual handover state. The active batch and part list belong
+        // only to this unhanded tail. Generic Pending owners are disposed after retirement proof at shutdown.
+        vk_texture_uses_cancel(fence);
+        npart_cbs = 0;
+        s->fence = 0;
+        plat_mutex_unlock(&sub_lock);
+        if (required_resource_missing) rt_fatal("vk: submission stopped because a required renderer resource is unavailable");
+        return __atomic_load_n(&issued, __ATOMIC_ACQUIRE);
+    }
     publish_recording_results();
     recording_results.fence = 0;
-    s = &slots[cur_slot];   // the last part (vk_sync_split)
     vk_gpu_passes_part(s->cb, 1);
-    if (recorded) ts_end(s->cb, fence);
+    if (recorded > 0) ts_end(s->cb, fence);
     else ts_drop();
     // The recorder is done with the part: the end-of-submission crumb, then the end, by the recorder when it records.
     gfx_tl_note('X', 0, 1, cur_fence);
@@ -1184,7 +1610,13 @@ static uint64_t submit(const uint64_t *handles, int n, const OwnCommands *own) {
                         .pCommandBufferInfos = cbi, .signalSemaphoreInfoCount = both ? 2u : 1u,
                         .pSignalSemaphoreInfos = sig};
     ts_submitted();
-    queue_submit(c, &si, fence);   // held or handed to the queue (submit batching)
+    uint64_t upload_submitted, upload_completed;
+    vk_upload_progress(&upload_submitted, &upload_completed);
+    // A failed/empty recording emitted no use of its current part. Previously sealed split parts remain owned.
+    if (!recorded) vk_texture_uses_cancel(fence);
+    TextureUseBatch *uses = vk_texture_uses_seal(fence, upload_submitted);
+    vk_exec_resource_handoff(fence);
+    queue_submit(c, &si, fence, fence, uses, 0);   // held or handed to the queue (submit batching)
     vk_mem_lazy_handed();
     s->fence = recorded ? fence : 0;
     vk_mem_note_submit(fence);
@@ -1199,16 +1631,36 @@ static uint64_t submit(const uint64_t *handles, int n, const OwnCommands *own) {
             rt_log("vk: submit batching: %llu submissions in %llu queue calls (%.2f each)", (unsigned long long)H.subs,
                    (unsigned long long)H.batches, H.batches ? (double)H.subs / (double)H.batches : 0.0);
     }
+    int service_mirrors = !mirror_pressure_active && !vk_sync_stopping() && vk_mem_mirror_pressure_waiting();
+    if (service_mirrors) mirror_pressure_active = 1;
     plat_mutex_unlock(&sub_lock);
+    if (service_mirrors) {
+        vk_mem_mirror_service_pressure();
+        plat_mutex_lock(&sub_lock);
+        mirror_pressure_active = 0;
+        plat_cond_broadcast(&mirror_pressure_done);
+        plat_mutex_unlock(&sub_lock);
+    }
     return fence;
 }
 
-uint64_t vk_sync_submit(const uint64_t *handles, int n) { return submit(handles, n, NULL); }
+uint64_t vk_sync_submit_bundle(const uint64_t *handles, int n, VkReplayCaptureBundle bundle) {
+    return submit(handles, n, &bundle, NULL, 0);
+}
+uint64_t vk_sync_submit_capture(const uint64_t *handles, int n, VkUsnapCapture *capture) {
+    return capture ? vk_sync_submit_bundle(handles, n, (VkReplayCaptureBundle){.snapshot = capture}) :
+        submit(handles, n, NULL, NULL, 0);
+}
+uint64_t vk_sync_submit(const uint64_t *handles, int n) { return vk_sync_submit_capture(handles, n, NULL); }
+
+// Only the presentation worker after its blit has started. During shutdown it emits an empty trailing fence,
+// not new replay or held work; that fence preserves the lifetime of GPU work already handed to the queue.
+uint64_t vk_sync_present_complete(void) { return submit(NULL, 0, NULL, NULL, 1); }
 
 // The upload batch is no place for a probe's commands: it is submitted before the memory prologue.
 uint64_t vk_sync_submit_own(void (*record)(VkCommandBuffer, void *), void *arg) {
     OwnCommands own = {record, arg};
-    return submit(NULL, 0, &own);
+    return submit(NULL, 0, NULL, &own, 0);
 }
 
 // st_lock held: p at the end of the queue *q.
@@ -1227,13 +1679,47 @@ static void pending_push(Pending **q, int *head, int *n, int *cap, Pending p) {
     (*q)[*head + (*n)++] = p;
 }
 
-void vk_completion_add(uint64_t fence, void (*fn)(void *), void *arg) {
+void vk_completion_add_owned(uint64_t fence, void (*fn)(void *), void (*cancel)(void *, int), void *arg) {
     plat_mutex_lock(&st_lock);
-    pending_push(&queue, &qhead, &qn, &qcap, (Pending){fence, fn, arg});
+    pending_push(&queue, &qhead, &qn, &qcap, (Pending){fence, fn, arg, cancel});
     // The completion thread sleeps only while nothing is issued beyond done: a callback for a later value (the replay's,
     // for the submission it records: counter reports, freed resources) becomes due through the submit, which wakes it.
     if (fence <= done) plat_cond_broadcast(&cv_work);
     plat_mutex_unlock(&st_lock);
+}
+void vk_completion_add(uint64_t fence, void (*fn)(void *), void *arg) {
+    vk_completion_add_owned(fence, fn, NULL, arg);
+}
+
+// Shutdown only, after the recorder and completion runner stopped. A successful idle wait can prove physical
+// retirement of a partially submitted scene, but cannot prove that every command in its callback owner executed.
+static int pending_disposable(Pending p, uint64_t completed, uint64_t handed, int drained) {
+    return p.fence <= completed || p.fence > handed || drained;
+}
+static void pending_dispose(Pending p, uint64_t completed, uint64_t handed) {
+    if (p.fence <= completed) p.fn(p.arg);
+    else if (p.cancel) p.cancel(p.arg, p.fence <= handed);
+}
+static void pending_dispose_queue(Pending **q, int *head, int *n, uint64_t completed, uint64_t handed, int drained) {
+    for (;;) {
+        plat_mutex_lock(&st_lock);
+        int at = 0;
+        while (at < *n && !pending_disposable((*q)[*head + at], completed, handed, drained)) at++;
+        if (at == *n) { plat_mutex_unlock(&st_lock); return; }
+        Pending p = (*q)[*head + at];
+        if (!at) (*head)++;
+        else memmove(*q + *head + at, *q + *head + at + 1, sizeof **q * (size_t)(*n - at - 1));
+        --*n;
+        if (!*n) *head = 0;
+        plat_mutex_unlock(&st_lock);
+        pending_dispose(p, completed, handed); // ownership callbacks never run under st_lock
+    }
+}
+static void pending_dispose_remaining(uint64_t completed, uint64_t handed, int drained) {
+    plat_mutex_lock(&res_lock);
+    pending_dispose_queue(&rqueue, &rqhead, &rqn, completed, handed, drained);
+    plat_mutex_unlock(&res_lock);
+    pending_dispose_queue(&queue, &qhead, &qn, completed, handed, drained);
 }
 
 // A side effect the game's CPU reads once the GPU has run submission fence's own commands: it runs before the other
@@ -1241,23 +1727,39 @@ void vk_completion_add(uint64_t fence, void (*fn)(void *), void *arg) {
 static void publish_recording_results(void) {
     if (!recording_results.n) return;
     plat_mutex_lock(&st_lock);
-    for (unsigned i = 0; i < recording_results.n; i++)
+    for (int i = 0; i < recording_results.n; i++)
         pending_push(&rqueue, &rqhead, &rqn, &rqcap, recording_results.items[i]);
     plat_mutex_unlock(&st_lock);
-    recording_results.n = 0;
+    free(recording_results.items);
+    recording_results.items = NULL;
+    recording_results.n = recording_results.cap = 0;
+}
+
+static void cancel_recording_results(void) {
+    Pending *items = recording_results.items;
+    int count = recording_results.n;
+    recording_results.items = NULL;
+    recording_results.n = recording_results.cap = 0;
+    for (int i = 0; i < count; i++)
+        if (items[i].cancel) items[i].cancel(items[i].arg, 0);
+    free(items);
+}
+
+void vk_completion_add_result_owned(uint64_t fence, void (*fn)(void *), void (*cancel)(void *, int), void *arg) {
+    Pending pending = {fence, fn, arg, cancel};
+    if (fence && recording_results.fence == fence) {
+        int head = 0;
+        pending_push(&recording_results.items, &head, &recording_results.n, &recording_results.cap, pending);
+        return;
+    }
+    plat_mutex_lock(&st_lock);
+    pending_push(&rqueue, &rqhead, &rqn, &rqcap, pending);
+    if (fence <= done) plat_cond_broadcast(&cv_work);
+    plat_mutex_unlock(&st_lock);
 }
 
 void vk_completion_add_result(uint64_t fence, void (*fn)(void *), void *arg) {
-    if (fence && recording_results.fence == fence) {
-        recording_results.items[recording_results.n++] = (Pending){fence, fn, arg};
-        if (recording_results.n == RESULT_BATCH) publish_recording_results();
-        return;
-    }
-    publish_recording_results();
-    plat_mutex_lock(&st_lock);
-    pending_push(&rqueue, &rqhead, &rqn, &rqcap, (Pending){fence, fn, arg});
-    if (fence <= done) plat_cond_broadcast(&cv_work);
-    plat_mutex_unlock(&st_lock);
+    vk_completion_add_result_owned(fence, fn, NULL, arg);
 }
 
 // Runs the results queued for the values up to upto, which the GPU has passed: on the completion thread for each
@@ -1275,8 +1777,12 @@ static void results_run(uint64_t upto) {
             rqn--;
         }
         plat_mutex_unlock(&st_lock);
-        for (unsigned i = 0; i < n && !vk_device_is_lost(); i++) {
+        for (unsigned i = 0; i < n; i++) {
             Pending p = items[i];
+            if (vk_device_is_lost()) {
+                if (p.cancel) p.cancel(p.arg, 1);
+                continue;
+            }
             __atomic_store_n(&cb_late, p.fence <= __atomic_load_n(&exw_value, __ATOMIC_ACQUIRE), __ATOMIC_RELAXED);
             p.fn(p.arg);
             __atomic_store_n(&cb_late, 0, __ATOMIC_RELAXED);
@@ -1307,6 +1813,7 @@ static int fence_wait_impl(uint64_t value, uint64_t timeout_ns) {
     } else {
         uint64_t t0 = kern_now_ns();
         while (done < value) {
+            if (vk_sync_stopping() && value > issued) break;
             if (timeout_ns < (1ull << 62)) {
                 uint64_t el = kern_now_ns() - t0;
                 if (el >= timeout_ns) break;
@@ -1319,6 +1826,42 @@ static int fence_wait_impl(uint64_t value, uint64_t timeout_ns) {
     }
     plat_mutex_unlock(&st_lock);
     return ok;
+}
+
+uint64_t vk_sync_handed_fence(void) { return __atomic_load_n(&queued_v, __ATOMIC_ACQUIRE); }
+
+VkSyncProgressResult vk_sync_progress_wait_prior(uint64_t issued_scene) {
+    if (progress_stopped()) return VK_SYNC_PROGRESS_STOPPED;
+    if (!recording_scene || !issued_scene || issued_scene >= recording_scene ||
+        issued_scene > __atomic_load_n(&issued, __ATOMIC_ACQUIRE) || issued_scene > vk_sync_handed_fence())
+        return VK_SYNC_PROGRESS_UNAVAILABLE;
+    uint64_t scene = recorder_park();
+    VkSyncProgressResult result = VK_SYNC_PROGRESS_STOPPED;
+    while (!progress_stopped())
+        if (fence_wait_impl(issued_scene, UINT64_C(100000000))) {
+            if (!progress_stopped()) result = VK_SYNC_PROGRESS_COMPLETE;
+            break;
+        }
+    recorder_resume(scene);
+    return result;
+}
+
+static VkResult wait_executed_signal(VkCtx *c, uint64_t value, uint64_t timeout_ns) {
+    VkSemaphoreWaitInfo wait = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1,
+                                .pSemaphores = &exec_tl, .pValues = &value};
+    uint64_t began = kern_now_ns(), left = timeout_ns;
+    for (;;) {
+        if (vk_device_is_lost() || (vk_sync_stopping() && value > __atomic_load_n(&issued, __ATOMIC_ACQUIRE)))
+            return VK_TIMEOUT;
+        uint64_t interval = left < UINT64_C(100000000) ? left : UINT64_C(100000000);
+        VkResult result = vkWaitSemaphores(c->device, &wait, interval);
+        if (result != VK_TIMEOUT || interval == left) return result;
+        if (timeout_ns != UINT64_MAX) {
+            uint64_t elapsed = kern_now_ns() - began;
+            if (elapsed >= timeout_ns) return VK_TIMEOUT;
+            left = timeout_ns - elapsed;
+        }
+    }
 }
 
 // The wait after a submit: the fence's (vk_sync_fence_wait), or with NX2NAVI_WB_SPLIT until the GPU has executed
@@ -1339,10 +1882,7 @@ int vk_sync_exec_wait(uint64_t value, uint64_t timeout_ns) {
     if (__atomic_load_n(&done, __ATOMIC_ACQUIRE) >= value) return 1;
     uint64_t p0 = perf_begin();
     hold_release(value, 0, 0);   // a held submission the waiter needs goes to the queue now
-    VkCtx *c = vk_ctx();
-    VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1,
-                              .pSemaphores = &exec_tl, .pValues = &value};
-    VkResult r = vkWaitSemaphores(c->device, &wi, timeout_ns);
+    VkResult r = wait_executed_signal(vk_ctx(), value, timeout_ns);
     if (r != VK_SUCCESS && r != VK_TIMEOUT) {
         vk_device_lost_check(r, "the wait for a submission's commands");
         rt_fatal("vk: the wait for a submission's commands failed (%d; device lost?)", (int)r);
@@ -1374,19 +1914,47 @@ void vk_sync_finish(void) {
 }
 
 void vk_sync_shutdown(void) {
+    vk_sync_stop_submissions();
     plat_mutex_lock(&start_lock);
     if (started) {
-        vk_sync_finish();
+        if (!vk_device_is_lost()) vk_sync_finish();
         plat_mutex_lock(&st_lock);
         stop = 1;
         plat_cond_broadcast(&cv_work);
         plat_mutex_unlock(&st_lock);
-        plat_thread_join(completion_thread);
+        if (completion_thread) plat_thread_join(completion_thread);
         completion_thread = NULL;
-        plat_mutex_lock(&st_lock);
-        qhead = qn = rqhead = rqn = 0;   // callbacks of values never submitted
-        plat_mutex_unlock(&st_lock);
-        plat_mutex_lock(&sub_lock);
+        submit_lock(); // Exclude any recorder, including one unwinding from a parked wait.
+        while (mirror_pressure_active) plat_cond_wait(&mirror_pressure_done, &sub_lock);
+        if (vk_device_is_lost()) {
+            // Device loss is normally terminal. Release only owners whose scene never reached the queue;
+            // every possibly executing owner and its command pool remain allocated without an idle proof.
+            vk_queue_lock_raw();
+            vk_sync_flush_held(); // loss abandons these held batches without issuing them
+            vk_queue_unlock();
+            uint64_t handed = __atomic_load_n(&handed_scene_v, __ATOMIC_ACQUIRE);
+            uint64_t uncertain = __atomic_load_n(&uncertain_scene_v, __ATOMIC_ACQUIRE);
+            if (uncertain > handed) handed = uncertain;
+            pending_dispose_remaining(__atomic_load_n(&done, __ATOMIC_ACQUIRE), handed, 0);
+            vk_texture_uses_cancel_unsubmitted(handed);
+            plat_mutex_unlock(&sub_lock);
+            plat_mutex_unlock(&start_lock);
+            return;
+        }
+        uint64_t completed = __atomic_load_n(&done, __ATOMIC_ACQUIRE);
+        uint64_t handed = __atomic_load_n(&handed_scene_v, __ATOMIC_ACQUIRE);
+        if (handed > completed || stopped_recording) {
+            VkResult idle = vk_device_wait_idle();
+            if (idle != VK_SUCCESS) {
+                vk_device_lost_check(idle, "draining an abandoned partial scene");
+                rt_fatal("vk: cannot retire an abandoned partial scene without an idle device (%d)", (int)idle);
+            }
+        }
+        pending_dispose_remaining(completed, handed, 1);
+        uint64_t upload_submitted, upload_completed;
+        vk_upload_progress(&upload_submitted, &upload_completed);
+        vk_texture_uses_idle(handed, upload_completed);
+        vk_texture_uses_shutdown();
         VkCtx *c = vk_ctx();
         if (c && cmd_pool) vkDestroyCommandPool(c->device, cmd_pool, NULL);
         for (int w = 0; w < SYNC_WORKERS; w++) {
@@ -1396,6 +1964,8 @@ void vk_sync_shutdown(void) {
         }
         if (c && exec_tl) vkDestroySemaphore(c->device, exec_tl, NULL);
         exec_tl = VK_NULL_HANDLE;
+        if (c && progress_tl) vkDestroySemaphore(c->device, progress_tl, NULL);
+        progress_tl = VK_NULL_HANDLE;
         perf_gpu_stats = NULL;
         if (c && ts_pool) vkDestroyQueryPool(c->device, ts_pool, NULL);
         ts_pool = VK_NULL_HANDLE;
@@ -1442,6 +2012,8 @@ static uint64_t probe_lost_advance(VkCtx *c, volatile int32_t *ran) {
     if (vkSignalSemaphore(c->device, &si) != VK_SUCCESS) return 0;
     plat_mutex_lock(&st_lock);
     __atomic_store_n(&issued, v, __ATOMIC_RELEASE);
+    __atomic_store_n(&queued_v, v, __ATOMIC_RELEASE); // this probe's host signal replaces a real queue hand-over
+    __atomic_store_n(&handed_scene_v, v, __ATOMIC_RELEASE);
     plat_cond_broadcast(&cv_work);
     plat_mutex_unlock(&st_lock);
     return v;

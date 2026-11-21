@@ -22,6 +22,7 @@
 #include "mesh_fb.h"
 #include "nvn_api.h"
 #include "nvn_tex.h"
+#include "tex.h"
 #include "vk.h"
 #include "vk_exec.h"
 #include "vk_mesh_fb.h"
@@ -31,6 +32,11 @@
 #include "meshfb_probe_m_spv.h"
 #include "meshfb_probe_t_spv.h"
 #include "meshfb_probe_tm_spv.h"
+#include "meshfb_storage_probe_f_spv.h"
+#include "meshfb_storage_probe_t_spv.h"
+#include "meshfb_storage_probe_tm_spv.h"
+#include "meshfb_task_pointer_probe_task_spv.h"
+#include "meshfb_task_pointer_probe_mesh_spv.h"
 
 #define TEX_W 256
 #define TEX_H 144
@@ -47,6 +53,22 @@
 void vk_exec_probe_shader(const uint8_t *ctl, const GfxShader *s);   // vk_exec_draw.c
 void vk_exec_draw_shutdown(void);
 void vk_exec_xfer_shutdown(void);
+
+static void meshfb_finish_probe(const GfxBackend *b) {
+    b->finish();
+    vk_pipeline_stop_preparation();
+    vk_exec_draw_mfb_stop();
+    // A recorded but unsubmitted scene can still own a pipeline revision after the last issued fence.
+    vk_sync_shutdown();
+    if (!vk_device_is_lost()) {
+        vk_pipeline_shutdown();
+        if (!vk_device_is_lost()) {
+            vk_exec_draw_shutdown();
+            vk_exec_xfer_shutdown();
+        }
+    }
+    vk_backend_shutdown();
+}
 
 // ---- module part
 
@@ -139,7 +161,7 @@ static int modules_part(const char *dir) {
                     uint64_t heap = 0;
                     CHECK(mem_set_heap_size(16ull << 20, &heap) == 0 && heap, "SetHeapSize 16 MiB");
                     pool.mem = pool.game_mem = (uint8_t *)(uintptr_t)heap + 0x100000, pool.size = 0x100000;
-                    CHECK(b->pool_init(&pool), "pool_init of a CPU-visible pool");
+                    CHECK(b->pool_init(&pool, &pool), "pool_init of a CPU-visible pool");
                     device = 1;
                 }
                 uint32_t top = 0;
@@ -182,11 +204,7 @@ static int modules_part(const char *dir) {
                n_pipe_fail);
         b->pool_fini(&pool);
         b->submit(NULL, 0);   // the pool's buffers go when a submission after their release has completed
-        b->finish();
-        vk_pipeline_shutdown();
-        vk_exec_draw_shutdown();
-        vk_exec_xfer_shutdown();
-        vk_backend_shutdown();
+        meshfb_finish_probe(b);
     }
     return n_fail != 0 || n_pipe_fail != 0;
 }
@@ -234,12 +252,38 @@ static prog_t *make_prog(const GfxShader *ms, const GfxShader *ts, const GfxShad
 }
 
 typedef struct { prog_t *prog; uint32_t count; int indirect; uint32_t grid[2]; float tint[4]; } MeshDraw;
+typedef struct {
+    uint64_t table, selected, verify;
+    p_copy_b2b seed[3];
+} MeshPointerProbe;
+typedef struct {
+    uint64_t task, mesh, final;
+    int skip_final;
+    const MeshPointerProbe *pointer;
+} MeshStorageProbe;
+
+void vk_exec_probe_mfb_storage_cancel_final(const void *);
+uint32_t vk_exec_probe_mfb_storage_canceled(void);
+uint32_t vk_exec_probe_mfb_pointer_phases(void);
+
+static void cancel_mesh_picture(VkExec *ex, void *opaque) {
+    (void)ex;
+    unsigned *pending = opaque;
+    *pending = vk_meshfb_probe_pending_reports();
+    vk_exec_cancel_temporal_preparation();
+}
 
 // Uniform data in the pool, 0x1000 apart per draw: the mesh stage's block at 0x90000, the task stage's at 0x98000; the
 // indirect records at 0xa0000.
-static int draw_picture(const GfxBackend *b, pool_t *pool, tex_t *color, const MeshDraw *d, int n, uint32_t *px) {
+static int draw_picture(const GfxBackend *b, pool_t *pool, tex_t *color, const MeshDraw *d, int n, uint32_t *px,
+                        int probe_partial, const MeshStorageProbe *storage) {
+    CHECK(!probe_partial || (n == 1 && d[0].indirect), "the overflow diagnostic must be one indirect draw");
+    CHECK(!storage || (n == 1 && !probe_partial), "the phase diagnostic must be one draw");
+    const void *partial_payload = NULL, *storage_payload = NULL;
     static _Alignas(8) uint8_t stream[16384];
     uint8_t *q = put(stream, OP_BEGIN, NULL, 0);
+    const MeshPointerProbe *pointer = storage ? storage->pointer : NULL;
+    if (pointer) for (unsigned i=0;i<3;++i) q=put(q,OP_COPY_B2B,&pointer->seed[i],sizeof pointer->seed[i]);
     p_set_rt rt;
     memset(&rt, 0, sizeof rt);
     rt.n = 1, rt.color[0] = color;
@@ -256,26 +300,74 @@ static int draw_picture(const GfxBackend *b, pool_t *pool, tex_t *color, const M
         uint8_t *mu = pool->mem + 0x90000 + 0x1000 * i, *tu = pool->mem + 0x98000 + 0x1000 * i;
         uint32_t *rec = (uint32_t *)(pool->mem + 0xa0000 + 0x100 * i);
         uint32_t grid[4] = {d[i].grid[0], d[i].grid[1], 0, 0}, shift[4] = {1, 0, 0, 0};
+        if (pointer) {
+            shift[1]=(uint32_t)pointer->selected;
+            shift[2]=(uint32_t)(pointer->selected>>32);
+        }
         memcpy(mu, d[i].tint, 16), memcpy(mu + 16, grid, 16), memcpy(tu, shift, 16);
+        if (pointer) {
+            b->guest_written((uintptr_t)mu,32);
+            b->guest_written((uintptr_t)tu,16);
+        }
         rec[0] = d[i].count, rec[1] = 0, rec[2] = 0;
         const p_bind_program bp = {d[i].prog, 0xc2};
         q = put(q, OP_BIND_PROGRAM, &bp, sizeof bp);
         const p_bind_buf bm = {7, 0, (uint64_t)(uintptr_t)mu, 256}, bt = {6, 0, (uint64_t)(uintptr_t)tu, 256};
         q = put(q, OP_BIND_UBO, &bm, sizeof bm);
         q = put(q, OP_BIND_UBO, &bt, sizeof bt);
+        if (pointer) {
+            const p_bind_buf writer={6,1,pointer->table,16}; // NVN task stage
+            const p_bind_buf reader={7,1,pointer->table,16}; // NVN mesh stage
+            q=put(q,OP_BIND_SSBO,&writer,sizeof writer);
+            q=put(q,OP_BIND_SSBO,&reader,sizeof reader);
+        } else if (storage) {
+            const p_bind_handles task_image = {.stage = 6, .n = 1, .h = {storage->task}};
+            const p_bind_handles mesh_images = {.stage = 7, .n = 2, .h = {storage->task, storage->mesh}};
+            const p_bind_handles final_image = {.stage = NVN_STAGE_FS, .n = 1, .h = {storage->final}};
+            q = put(q, OP_BIND_IMG, &task_image, sizeof task_image);
+            q = put(q, OP_BIND_IMG, &mesh_images, sizeof mesh_images);
+            q = put(q, OP_BIND_IMG, &final_image, sizeof final_image);
+            if (storage->skip_final) storage_payload = nvn_op_payload((const op_hdr *)q);
+        }
         if (d[i].indirect) {
             const p_draw_mesh_ind di = {(uint64_t)(uintptr_t)rec, 0, 0, 0, 0};
+            if (probe_partial) partial_payload = nvn_op_payload((const op_hdr *)q);
             q = put(q, OP_DRAW_MESH_IND, &di, sizeof di);
         } else {
             const p_draw_mesh dm = {0, d[i].count, 0};
             q = put(q, OP_DRAW_MESH, &dm, sizeof dm);
         }
     }
+    if (pointer) {
+        const p_copy_b2b verify={pointer->table,pointer->verify,8};
+        q=put(q,OP_COPY_B2B,&verify,sizeof verify);
+    }
     q = put(q, OP_END, NULL, 0);
     CHECK(q <= stream + sizeof stream, "op stream overflow");
     uint64_t handle = (uint64_t)(uintptr_t)stream;
+    if (!px) {
+        // This is the last submission in the probe. Stop after recording its mesh copy and before native handoff.
+        unsigned pending = 0;
+        uint64_t prior = vk_sync_issued(), short_before = vk_meshfb_short();
+        vk_exec_probe_pass_arm(cancel_mesh_picture, &pending);
+        vk_exec_probe_mesh_partial(partial_payload);
+        b->submit(&handle, 1);
+        b->finish();
+        vk_exec_probe_mesh_partial(NULL);
+        CHECK(pending == 1 && vk_sync_issued() == prior && !vk_meshfb_probe_pending_reports() &&
+              vk_meshfb_short() == short_before,
+              "the canceled mesh tail left a report (recorded %u pending, issued %llu to %llu)",
+              pending, (unsigned long long)prior, (unsigned long long)vk_sync_issued());
+        printf("probe-meshfb: recorded and canceled one unsubmitted statistics copy without publishing a report\n");
+        return 0;
+    }
+    if (partial_payload) vk_exec_probe_mesh_partial(partial_payload);
+    if (storage_payload) vk_exec_probe_mfb_storage_cancel_final(storage_payload);
     uint64_t f = b->submit(&handle, 1);
-    CHECK(b->fence_wait(f, 60000000000ull), "fence_wait of a mesh draw submission timed out");
+    int finished = b->fence_wait(f, 60000000000ull);
+    if (storage_payload) vk_exec_probe_mfb_storage_cancel_final(NULL);
+    if (partial_payload) vk_exec_probe_mesh_partial(NULL);
+    CHECK(finished, "fence_wait of a mesh draw submission timed out");
     NVNcopyRegion r = {0, 0, 0, TEX_W, TEX_H, 1};
     b->read_texels(color, NULL, &r, (uint8_t *)px, TEX_W * 4, TEX_W * TEX_H * 4);
     return 0;
@@ -303,10 +395,155 @@ static int differing(const uint32_t *a, const uint32_t *b, int *worst) {
     return n;
 }
 
+static int storage_draw_part(const GfxBackend *b, pool_t *pool, tex_t *color) {
+    static const char task_reflection[] = "{\"key\":\"probe-storage-task\",\"stage\":\"ts\","
+        "\"cbufs\":[{\"binding\":1,\"slot\":3}],\"sbufs\":[],\"images\":["
+        "{\"binding\":2,\"cbuf_slot\":2,\"handle\":72,\"type\":3,\"format\":\"R32Uint\",\"flags\":4}]}";
+    static const char mesh_reflection[] = "{\"key\":\"probe-storage-mesh\",\"stage\":\"ms\","
+        "\"cbufs\":[{\"binding\":1,\"slot\":3}],\"sbufs\":[],\"images\":["
+        "{\"binding\":2,\"cbuf_slot\":2,\"handle\":72,\"type\":3,\"format\":\"R32Uint\"},"
+        "{\"binding\":3,\"cbuf_slot\":2,\"handle\":74,\"type\":3,\"format\":\"R32Uint\",\"flags\":4}]}";
+    static const char final_reflection[] = "{\"key\":\"probe-storage-final\",\"stage\":\"ps\",\"cbufs\":[],"
+        "\"images\":[{\"binding\":1,\"cbuf_slot\":2,\"handle\":72,\"type\":3,"
+        "\"format\":\"R32Uint\",\"flags\":4}]}";
+    const GfxShader *ts = gfx_shader_own(meshfb_storage_probe_t_spv, sizeof meshfb_storage_probe_t_spv / 4, task_reflection);
+    const GfxShader *ms = gfx_shader_own(meshfb_storage_probe_tm_spv, sizeof meshfb_storage_probe_tm_spv / 4, mesh_reflection);
+    const GfxShader *fs = gfx_shader_own(meshfb_storage_probe_f_spv, sizeof meshfb_storage_probe_f_spv / 4, final_reflection);
+    CHECK(ts && ms && fs && gfx_shader_write_inventory_complete(ts) && gfx_shader_write_inventory_complete(ms) &&
+          gfx_shader_write_inventory_complete(fs), "real task, mesh and final storage shaders");
+    prog_t *program = make_prog(ms, ts, fs);
+    const MeshDraw draw = {program, 10, 0, {8, 5}, {1, 1, 1, 1}};
+    enum { SIDE = 32, PIXELS = SIDE * SIDE, TARGETS = 3 };
+    const NVNcopyRegion all = {0, 0, 0, SIDE, SIDE, 1};
+    const uint32_t seed = 0x04020010u;
+    static uint32_t picture[TEX_W * TEX_H];
+    uint32_t texels[PIXELS], read[PIXELS];
+    const uint32_t canceled = vk_exec_probe_mfb_storage_canceled();
+    tex_t fixtures[2][TARGETS];
+    for (unsigned round = 0; round < 2; ++round) {
+        tex_t *storage = fixtures[round];
+        for (unsigned t = 0; t < TARGETS; ++t) {
+            const uint64_t off = 0x100000 + round * 0x30000 + t * 0x10000;
+            storage[t] = (tex_t){.magic = NVN_TEX_MAGIC, .pool = pool, .pool_flags = pool->flags, .off = off,
+                .mem = pool->mem + off, .serial = nvn_new_serial()};
+            storage[t].d.target = NVN_TEXTURE_TARGET_2D;
+            storage[t].d.format = NVN_FORMAT_R32UI;
+            storage[t].d.flags = NVN_TEXTURE_FLAGS_IMAGE;
+            storage[t].d.width = storage[t].d.height = SIDE;
+            storage[t].d.depth = storage[t].d.levels = 1;
+            nvn_tex_layout(&storage[t].d, &storage[t].L);
+            for (unsigned i = 0; i < PIXELS; ++i) texels[i] = seed + t * PIXELS + i;
+            CHECK(!nvn_swizzle(&storage[t].d, 0, 0, texels, SIDE * 4, storage[t].mem), "pack storage target %u", t);
+            b->guest_written((uintptr_t)storage[t].mem, storage[t].L.size);
+        }
+    }
+    // Both rounds share one host write-watch region. Establish every immutable native seed before submitting either draw.
+    VkImage prior[2][TARGETS];
+    for (unsigned round = 0; round < 2; ++round) {
+        tex_t *storage = fixtures[round];
+        for (unsigned t = 0; t < TARGETS; ++t) {
+            b->read_texels(&storage[t], NULL, &all, (uint8_t *)read, SIDE * 4, sizeof read);
+            for (unsigned i = 0; i < PIXELS; ++i)
+                CHECK(read[i] == seed + t * PIXELS + i, "storage target %u original texel %u reached its native image", t, i);
+            const VkTexImage *image = vk_texture_get(&storage[t]);
+            CHECK(image && image->image && !image->gpu_owned && (image->usage & VK_IMAGE_USAGE_STORAGE_BIT),
+                  "storage round %u target %u starts immutable with real storage usage (image %p, owned %d, usage %#x)",
+                  round, t, image ? (void *)image->image : NULL, image ? image->gpu_owned : -1, image ? image->usage : 0);
+            prior[round][t] = image->image;
+        }
+    }
+    for (unsigned cancel = 0; cancel < 2; ++cancel) {
+        tex_t *storage = fixtures[cancel];
+        for (unsigned t = 0; t < TARGETS; ++t) vk_texture_register(30 + t, &storage[t], NULL);
+        const MeshStorageProbe inputs = {.task = 30, .mesh = 31, .final = 32, .skip_final = cancel != 0};
+        if (draw_picture(b, pool, color, &draw, 1, picture, 0, &inputs)) return 1;
+        const uint32_t canceled_now = vk_exec_probe_mfb_storage_canceled();
+        CHECK(canceled_now == canceled + cancel, "round %u exact unissued final cancellation witness", cancel);
+        printf("probe-meshfb: round %u finished native commands, independently canceled %u final phase\n",
+               cancel, canceled_now - canceled);
+        for (unsigned t = 0; t < TARGETS; ++t) {
+            const tex_t *pin = nvn_texture_pin_acquire(&storage[t]);
+            const VkTexImage *current = vk_texture_get(pin);
+            int detached = t < 2 || !cancel;
+            const void *attachment = nvn_texture_pin_attachment(pin);
+            CHECK(current && current->image && ((current->image != prior[cancel][t]) == detached) &&
+                  (!!attachment == detached), "round %u target %u expected detached %d old image %p current %p pin %p owning %d",
+                  cancel, t, detached, (void *)prior[cancel][t], current ? (void *)current->image : NULL,
+                  attachment, current ? current->gpu_owned : -1);
+            b->read_texels(pin, NULL, &all, (uint8_t *)read, SIDE * 4, sizeof read);
+            nvn_texture_pin_release(pin);
+            for (unsigned i = 0; i < PIXELS; ++i) {
+                uint32_t expected = seed + t * PIXELS + i;
+                if (t == 0 && i < draw.count) expected = 0x75000000u | i;
+                if (t == 1 && i < draw.count && (i * 3u + 1u) % 5u) expected = 0x76000000u | i;
+                if (t == 2 && !cancel && !i) expected |= 0x01000000u;
+                CHECK(read[i] == expected, "storage operation %u target %u pixel %u got %#x expected %#x",
+                      cancel, t, i, read[i], expected);
+            }
+            b->texture_release(&storage[t]);
+        }
+    }
+    printf("probe-meshfb: both real task and mesh dispatches shared the prepared storage image, "
+           "final-only cancellation preserved its image, and %u exact storage pixels matched\n", 2 * TARGETS * PIXELS);
+    return 0;
+}
+
+static int task_pointer_draw_part(const GfxBackend *b, uint8_t *guest, pool_t *pool, tex_t *color) {
+    const GfxShader *ts=gfx_shader_own(meshfb_task_pointer_probe_task_spv,sizeof meshfb_task_pointer_probe_task_spv/4,
+        "{\"key\":\"probe-task-pointer-write\",\"stage\":\"ts\",\"cbufs\":[{\"binding\":1,\"slot\":3}],"
+        "\"sbufs\":[{\"binding\":2,\"slot\":0,\"cb_slot\":0,\"cb_offset\":416,\"flags\":1}]}");
+    const GfxShader *ms=gfx_shader_own(meshfb_task_pointer_probe_mesh_spv,sizeof meshfb_task_pointer_probe_mesh_spv/4,
+        "{\"key\":\"probe-task-pointer-read\",\"stage\":\"ms\",\"cbufs\":[{\"binding\":1,\"slot\":3}],"
+        "\"sbufs\":[{\"binding\":2,\"slot\":0,\"cb_slot\":0,\"cb_offset\":480,\"flags\":0,\"ptr\":0}]}");
+    const GfxShader *fs=gfx_shader_own(meshfb_probe_f_spv,sizeof meshfb_probe_f_spv/4,RES_FS);
+    CHECK(ts && ms && fs && gfx_shader_write_inventory_complete(ts) && gfx_shader_write_inventory_complete(ms),
+          "own actual transformed pointer writer and reader shaders");
+    const MeshDraw draw={make_prog(ms,ts,fs),10,0,{8,5},{1,1,1,1}};
+    pool_t device={.magic=NVN_POOL_MAGIC,.flags=0x189,.mem=(uint8_t *)(uintptr_t)RT_GPU_VA_BASE,
+                   .game_mem=guest+0xa00000,.size=0x30000};
+    CHECK(b->pool_init(&device,&device),"create device pointer table and two device color sources");
+    const uint64_t table=(uintptr_t)device.mem, target[2]={table+0x10000,table+0x20000};
+    const uint32_t expected[2]={0xff0000ff,0xff00ff00};
+    uint8_t *stage=pool->mem+0xb0000;
+    uint64_t address=(uintptr_t)stage;
+    uint32_t colors[2][4]={{expected[0],0,0,0},{expected[1],0,0,0}};
+    memcpy(stage+0x10,colors,sizeof colors);
+    b->guest_written(address+0x10,sizeof colors);
+    static uint32_t picture[TEX_W*TEX_H];
+    const uint32_t before=vk_exec_probe_mfb_pointer_phases();
+    uint32_t rendered=0;
+    for (unsigned i=0;i<2;++i) {
+        uint64_t seed[2]={target[1-i],0};
+        memcpy(stage,seed,sizeof seed);
+        b->guest_written(address,sizeof seed);
+        const MeshPointerProbe pointer={.table=table,.selected=target[i],.verify=address+0x40,
+            .seed={{address,table,sizeof seed},{address+0x10,target[0],16},{address+0x20,target[1],16}}};
+        const MeshStorageProbe inputs={.pointer=&pointer};
+        if (draw_picture(b,pool,color,&draw,1,picture,0,&inputs)) return 1;
+        uint64_t actual;
+        memcpy(&actual,stage+0x40,sizeof actual);
+        CHECK(actual==target[i],"round %u transformed task wrote device table %#llx expected %#llx",i,
+              (unsigned long long)actual,(unsigned long long)target[i]);
+        CHECK(vk_exec_probe_mfb_pointer_phases()==before+i+1,"round %u used one actual task-prefix pointer readback",i);
+        unsigned pixels=0;
+        for (unsigned j=0;j<TEX_W*TEX_H;++j) if (picture[j]!=picture[0]) {
+            CHECK(picture[j]==expected[i],"round %u transformed mesh pixel %u is %08x, expected %08x",i,j,picture[j],expected[i]);
+            ++pixels;
+        }
+        CHECK(pixels>TEX_W*TEX_H/20,"round %u drew only %u pixels",i,pixels);
+        rendered+=pixels;
+    }
+    printf("probe-meshfb: two actual task-written device pointers selected %u exact mesh pixels through two completed private phases\n",rendered);
+    b->pool_fini(&device);
+    return 0;
+}
+
+
 static int draw_part(const GfxBackend *b, uint8_t *guest) {
-    pool_t pool = {.magic = NVN_POOL_MAGIC, .flags = 0x22, .mem = guest + 0x100000, .size = 0xC0000,
-                   .game_mem = guest + 0x100000};
-    CHECK(b->pool_init(&pool), "pool_init of a CPU-visible pool");
+    const int storage_only = rt_knob("PROBE_MFB_STORAGE_PHASES", "0") == 1;
+    pool_t pool = {.magic = NVN_POOL_MAGIC, .flags = 0x22, .mem = guest + 0x100000,
+                   .size = storage_only ? 0x200000 : 0xC0000, .game_mem = guest + 0x100000};
+    CHECK(b->pool_init(&pool, &pool), "pool_init of a CPU-visible pool");
     VkCtx *c = vk_ctx();
     CHECK(c, "no Vulkan device");
     static tex_t color;
@@ -317,6 +554,15 @@ static int draw_part(const GfxBackend *b, uint8_t *guest) {
     nvn_tex_layout(&color.d, &color.L);
     CHECK(color.L.size <= 0x80000, "the target exceeds its pool slot");
     color.pool = &pool, color.pool_flags = (uint16_t)pool.flags, color.off = 0, color.mem = pool.mem, color.serial = 4000;
+    if (storage_only || rt_knob("PROBE_MFB_TASK_POINTER", "0") == 1) {
+        int saved = c->mesh_fallback;
+        c->mesh_fallback = 1;
+        int failed = storage_only ? storage_draw_part(b, &pool, &color) : task_pointer_draw_part(b, guest, &pool, &color);
+        c->mesh_fallback = saved;
+        b->texture_release(&color);
+        b->pool_fini(&pool);
+        return failed;
+    }
 
     const GfxShader *fs = gfx_shader_own(meshfb_probe_f_spv, sizeof meshfb_probe_f_spv / 4, RES_FS);
     const GfxShader *ms = gfx_shader_own(meshfb_probe_m_spv, sizeof meshfb_probe_m_spv / 4, RES_MS);
@@ -340,10 +586,17 @@ static int draw_part(const GfxBackend *b, uint8_t *guest) {
     enum { CASES = sizeof cases / sizeof cases[0] };
     static uint32_t px[2][CASES][TEX_W * TEX_H];
     int native = c->has_mesh_shader, was = c->mesh_fallback;
+    // Submit the fallback picture before any other mesh draw can warm its conversion or pipelines.
+    static uint32_t cold_px[TEX_W * TEX_H];
+    vk_pipeline_async_enable();
+    c->mesh_fallback = 1;
+    int cold_failed = draw_picture(b, &pool, &color, cases[5], 2, cold_px, 0, NULL);
+    c->mesh_fallback = was;
+    if (cold_failed) return 1;
     for (int way = native ? 0 : 1; way < 2; way++) {
         c->mesh_fallback = way;
         for (int k = 0; k < CASES; k++)
-            if (draw_picture(b, &pool, &color, cases[k], cases[k][1].prog ? 2 : 1, px[way][k])) return 1;
+            if (draw_picture(b, &pool, &color, cases[k], cases[k][1].prog ? 2 : 1, px[way][k], 0, NULL)) return 1;
     }
     c->mesh_fallback = was;
     for (int k = 0; k < CASES; k++) {
@@ -361,6 +614,10 @@ static int draw_part(const GfxBackend *b, uint8_t *guest) {
         printf("probe-meshfb: %s: %d texels drawn by the mesh pipeline, %d by the fallback, %d differ (by %d of 255 at most)\n",
                names[k], nat, fb, diff, worst);
     }
+    int cold_worst;
+    CHECK(!differing(cold_px, px[1][5], &cold_worst),
+          "the first fallback submission differs from the warmed task + mesh picture (by %d of 255 at most)", cold_worst);
+    printf("probe-meshfb: the first fallback submission with background builds matched the warmed task + mesh picture\n");
     int w01, w23;
     CHECK(!differing(px[1][0], px[1][1], &w01) && !differing(px[1][2], px[1][3], &w23),
           "the fallback's direct and indirect pictures differ");
@@ -371,7 +628,7 @@ static int draw_part(const GfxBackend *b, uint8_t *guest) {
     const MeshDraw big = {plain, over, 1, {6, 4}, {1, 1, 1, 1}};
     static uint32_t bpx[TEX_W * TEX_H];
     c->mesh_fallback = 1;
-    int bad = draw_picture(b, &pool, &color, &big, 1, bpx);
+    int bad = draw_picture(b, &pool, &color, &big, 1, bpx, 1, NULL);
     c->mesh_fallback = was;
     if (bad) return 1;
     b->finish();
@@ -382,31 +639,12 @@ static int draw_part(const GfxBackend *b, uint8_t *guest) {
           (unsigned long long)vk_meshfb_short());
     printf("probe-meshfb: a draw of %u workgroups with room for %u: the picture of the first 24 is whole, the draw was counted\n",
            over, slots);
-    // As the game runs it: pipelines built in the background, and a program's modules made on the fallback's own
-    // thread. New shader objects of the same programs are drawn until the picture is whole: the draws before that are
-    // skipped, and none may leave a partial picture behind for good.
-    const GfxShader *fs2 = gfx_shader_own(meshfb_probe_f_spv, sizeof meshfb_probe_f_spv / 4, RES_FS);
-    const GfxShader *ms2 = gfx_shader_own(meshfb_probe_m_spv, sizeof meshfb_probe_m_spv / 4, RES_MS);
-    const GfxShader *ts2 = gfx_shader_own(meshfb_probe_t_spv, sizeof meshfb_probe_t_spv / 4, RES_TS);
-    const GfxShader *tm2 = gfx_shader_own(meshfb_probe_tm_spv, sizeof meshfb_probe_tm_spv / 4, RES_MS);
-    CHECK(fs2 && ms2 && ts2 && tm2, "a probe shader is malformed");
-    prog_t *plain2 = make_prog(ms2, NULL, fs2), *tasked2 = make_prog(tm2, ts2, fs2);
-    const MeshDraw again[2] = {{tasked2, 10, 0, {8, 5}, {1, 1, 1, 1}}, {plain2, 24, 0, {6, 4}, {1, 0.5f, 0.5f, 1}}};
-    vk_pipeline_async_enable();
     c->mesh_fallback = 1;
-    int tries = 0, left = -1, wa;
-    while (left && tries < 500) {
-        if (tries++) plat_sleep_ms(10);
-        if (draw_picture(b, &pool, &color, again, 2, bpx)) return 1;
-        left = differing(bpx, px[1][5], &wa);
-    }
+    bad = draw_picture(b, &pool, &color, &big, 1, NULL, 1, NULL);
     c->mesh_fallback = was;
-    CHECK(!left, "with background builds the picture still differs in %d texels after %d submissions", left, tries);
-    printf("probe-meshfb: with background builds the picture was whole at submission %d (the earlier ones skipped their draws)\n",
-           tries);
     b->texture_release(&color);
     b->pool_fini(&pool);
-    return 0;
+    return bad;
 }
 
 int probe_meshfb(void) {
@@ -417,11 +655,10 @@ int probe_meshfb(void) {
     uint64_t heap = 0;
     CHECK(mem_set_heap_size(16ull << 20, &heap) == 0 && heap, "SetHeapSize 16 MiB");
     int bad = draw_part(b, (uint8_t *)(uintptr_t)heap);
-    b->finish();
-    vk_pipeline_shutdown();
-    vk_exec_draw_shutdown();
-    vk_exec_xfer_shutdown();
-    vk_backend_shutdown();
+    meshfb_finish_probe(b);
+    CHECK(!vk_meshfb_mesh_words() && !vk_meshfb_buffer(MESHFB_CB_MESH).buffer && !vk_meshfb_probe_pending_reports(),
+          "backend shutdown left mesh fallback allocations or pending reports");
+    printf("probe-meshfb: checked backend shutdown retired the mesh fallback owner\n");
     long errors = vk_validation_errors_total();
     if (bad || errors) {
         printf("probe-meshfb: FAILED (%s, %ld validation errors)\n", bad ? "a draw check failed" : "checks passed", errors);

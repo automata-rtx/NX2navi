@@ -4,6 +4,11 @@
 #include <stdint.h>
 #include "resource_events.h"
 #include "texture_source.h"
+#include "resource_core_registry.h"
+#include "resource_core_backing.h"
+#include "rc_native_rmw_word.h"
+#include "rc_native_image_store.h"
+#include "resource_core_budget.h"
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wnullability-completeness"
 #include "vk_mem_alloc.h"
@@ -32,6 +37,7 @@ typedef struct VkCtx {
     VkDebugUtilsMessengerEXT messenger;
     volatile int32_t validation_errors;        // errors seen by the messenger (NX2NAVI_VK_VALIDATION=1)
     int validation;                         // layer active
+    int has_index_type_uint8;              // actual enabled KHR or EXT feature
     int has_custom_border_color, has_eds, has_eds2, has_eds3, has_vertex_input_dynamic_state,
         has_conditional_rendering, has_transform_feedback, has_provoking_vertex, has_device_fault, has_memory_budget,
         has_robustness2, has_buffer_device_address, has_fragment_shader_interlock, has_buffer_marker,
@@ -61,6 +67,9 @@ enum { VK_FEEDBACK_OFF, VK_FEEDBACK_RESTART, VK_FEEDBACK_LAYOUT };
 typedef struct {
     int float64;                       // shaderFloat64 enabled; 0: shaders are translated with softfloat64
     uint32_t sbuf_align;               // nonzero: storage buffers bind at their address rounded down to this
+    VkDeviceSize storage_write_alignment; // enabled robustBufferAccess2 descriptor-range rounding; 0 means no bounded-write proof
+    int robust_image_access;          // device-default robustImageAccess or robustImageAccess2 enabled at creation
+    uint8_t storage_image_format_support[VK_FORMAT_B10G11R11_UFLOAT_PACK32 + 1]; // device lifetime, indexed by VkFormat
     uint32_t sg_size;                  // requiredSubgroupSize on sg_pin_stages (32)
     VkShaderStageFlags sg_pin_stages;  // 0: no pin, stages run at the device's subgroupSize
     int gpl;                           // VK_EXT_graphics_pipeline_library enabled with fast linking (NX2NAVI_GPL=0/1; unset: off on AMD's driver for RDNA 2 and older)
@@ -151,6 +160,11 @@ void vk_gpu_passes_part(VkCommandBuffer cb, int end);
 void vk_gpu_gap_note(int kind, uint64_t units);
 void vk_gpu_gap_boundary(VkCommandBuffer cb);
 int vk_gpu_passes_capturing(void);
+uint64_t vk_gpu_passes_capture_id(void);
+void vk_gpu_passes_stop_capture(void);
+void vk_exec_mesh_counts_begin(uint64_t capture);
+void vk_exec_mesh_counts_end(uint64_t capture);
+uint32_t vk_exec_mesh_counts(uint64_t capture, const uint32_t **out, uint32_t *missing);
 // Pass marks wanted and possible (NX2NAVI_PASS_CRUMBS and the extensions): set by vk_crumbs_init.
 extern int vk_pass_marks_on;
 // vk_device.c create_device, before vkCreateDevice: 1 when NX2NAVI_PASS_CRUMBS asks for NVIDIA checkpoints.
@@ -179,7 +193,28 @@ void vk_pass_marks_report(void);    // vk_device.c device_fault_report: the AMD 
 void vk_present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int h, const int crop[4]);
 // vk_present_image split in two: vk_present_blit submits the blit and leaves the present waiting, vk_present_flip
 // queues it. The next blit or a swapchain rebuild queues a waiting present first.
-void vk_present_blit(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int h, const int crop[4]);
+typedef struct VkTexturePresentSource VkTexturePresentSource;
+typedef struct VkDlaaFgSizeUse VkDlaaFgSizeUse;
+typedef enum {
+    VK_PRESENT_SOURCE_UNSENT,
+    VK_PRESENT_SOURCE_GFX_SUBMITTED,
+    VK_PRESENT_SOURCE_UNCERTAIN,
+    VK_PRESENT_SOURCE_PENDING,
+} VkPresentSourceHandoff;
+typedef struct {
+    RcAdmissionVector peak;
+    uint64_t older_config;
+    VkFence older_graphics;
+    int reprepare;
+} VkPresentConfigRetry;
+typedef struct VkDlaaHudSource VkDlaaHudSource;
+// Submitted or uncertain graphics work takes the source and any reconstruction input it consumed.
+VkPresentSourceHandoff vk_present_blit(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int h,
+                                      const int crop[4], uint64_t frame, VkTexturePresentSource **source,
+                                      VkDlaaFgSizeUse **temporal, VkDlaaHudSource **hud,
+                                      VkPresentConfigRetry *retry);
+VkResult vk_present_config_drain(const VkPresentConfigRetry *retry);
+void vk_present_retire_temporal_inputs(void);
 // FSR 1 on the present (vk_fsr.c): records EASU (+ RCAS) of src's crop rectangle {x, y, w, h} into the rectangle out
 // {x, y, w, h} of dst, a swapchain image in TRANSFER_DST; src is in GENERAL and fmt its format. 1 = EASU enlarged it,
 // 2 = a bilinear blit shrank it and RCAS sharpened it (the picture is smaller than the crop), 0 = nothing recorded (the
@@ -253,21 +288,34 @@ void gfx_window_release_vk(void);                  // vk_shutdown calls it first
 long vk_validation_errors_total(void);             // validation errors since the first vk_init, across vk_shutdown
 
 // ---- memory and textures (vk_memory.c, vk_texture.c)
-// Guest or host threads; every call needs vk_init(). The first nine have the GfxBackend signatures of gfx.h; vk_backend.c builds
-// gfx_vulkan_backend from them.
+// Guest or host threads; every call needs vk_init(). vk_backend.c wires these into gfx_vulkan_backend.
 int  vk_pool_init(pool_t *p);              // CPU-visible: guest storage imported (VK_EXT_external_memory_host) as one
-                                           // VkBuffer; physical: device-local memory; virtual: a 64 KiB page table
+                                           // VkBuffer; physical: device-local memory; virtual: a canonical address map
+int  vk_pool_init_setup(pool_t *p, const pool_t *setup); // guest initialization preserves p until native setup succeeds
 void vk_pool_fini(pool_t *p);              // drops images cut from the pool; waits for the GPU if it used the pool
 int  vk_pool_map_virtual(pool_t *v, int n, const void *requests);   // nvn_mapping_t[n], checked by the front end
 void vk_texture_register(int id, const tex_t *t, const view_t *v);  // texture descriptor slot (copied)
+void vk_texture_register_in_pool(uint64_t pool, int id, const tex_t *t, const view_t *v);
+void vk_texture_pool_release(uint64_t pool);
+int vk_texture_register_in_pool_ordered(uint64_t pool, int id, const tex_t *t, const view_t *v, uint64_t queued_publication);
+int vk_texture_pool_release_ordered(uint64_t pool, uint64_t queued_publication);
+int vk_texture_finalize_registration_ordered(const tex_t *t, uint64_t queued_publication);
+void vk_texture_release_replayed(const tex_t *t);
 void vk_sampler_register(int id, const samp_par *s);                // sampler descriptor slot (copied)
 void vk_texture_release(const tex_t *t);   // TextureFinalize: the image stays for slots that still name its storage
+typedef enum {
+    VK_TEXTURE_CPU_READ_OUTSIDE, VK_TEXTURE_CPU_READ_READY, VK_TEXTURE_CPU_READ_STOPPED, VK_TEXTURE_CPU_READ_REFUSED,
+} VkTextureCpuReadResult;
+int vk_texture_cpu_read_candidate(const tex_t *, const view_t *);
+VkTextureCpuReadResult vk_texture_cpu_read_texels(const tex_t *, const view_t *, const NVNcopyRegion *,
+    uint8_t *dst, uint64_t row, uint64_t img, int replay_ordered, uint64_t *selected_fence);
 void vk_read_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uint8_t *dst, uint64_t row, uint64_t img);
 void vk_write_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r, const uint8_t *src, uint64_t row, uint64_t img);
+void vk_write_packaged_texture(const tex_t *t, const void *src);
 void vk_guest_written(uint64_t addr, uint64_t size);   // a host write write-watch may miss: textures there re-upload
 
 // GPU address -> backing (section 3.1). avail: bytes from offset that stay contiguous in buffer. alloc/alloc_offset:
-// the device-local memory behind physical and (through the page table) virtual pool addresses, NULL for imported pools.
+// the device-local memory behind physical and virtual pool addresses, NULL for imported pools.
 // cls: the pool class of the backing (VK_MCLS_*), for the traffic census.
 typedef struct {
     VkBuffer buffer;
@@ -316,33 +364,97 @@ extern int vk_mirror_on;
 void vk_mem_use(VkMemSpan *sp);
 void vk_mem_pick(VkMemSpan *sp);
 VkBuffer vk_mem_guest_twin(const VkMemSpan *sp);   // a VRAM mirror span: the pool's imported buffer (guest memory), same offset; else none
+int vk_mem_cpu_visible_span(const VkMemSpan *sp, uint64_t addr, uint64_t size); // exact captured buffer writes directly into guest storage
 #define VK_MEM_USE(sp) do { if (vk_mirror_on && (sp).pool) vk_mem_use(&(sp)); } while (0)
 #define VK_MEM_PICK(sp) do { if (vk_mirror_on && (sp).pool) vk_mem_pick(&(sp)); } while (0)
 void vk_mem_gpu_wrote(const VkMemSpan *sp, uint64_t size);
 // A shader's storage-buffer write: goes back through the write-back merge (vk_memory.c), which keeps the words the GPU
 // did not change.
+// Publish proved stores in the retained provider without widening or optional writeback policy.
+void vk_mem_gpu_wrote_exact(const VkMemSpan *sp, uint64_t size);
 void vk_mem_gpu_wrote_shader(const VkMemSpan *sp, uint64_t size);
-// Uniform blocks as of the submit call (vk_usnap.c): vk_exec_record copies the uniform ranges a submission binds before
-// it records, ubo bindings take the copy (0: not copied, bind memory), GPU writes of the replay drop the copies they touch.
-void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence);
-// NX2NAVI_REPLAY_ASYNC: the submitting thread takes the copy before it queues the submission; vk_usnap_begin on the
-// replay thread then uses it.
-void vk_usnap_take(const uint64_t *handles, int n);
+// Uniform snapshots are owned by the submission until recording consumes them. Replay never rebuilds a queued copy.
+typedef struct VkUsnapCapture VkUsnapCapture;
+typedef struct {
+    const uint64_t *handles;
+    int nhandles;
+    const p_bind_buf *inherited;
+    size_t ninherited;
+} VkUsnapInputs;
+typedef struct { p_bind_buf slots[8 * 18]; } VkUsnapBindingState;
+int vk_usnap_project(const uint64_t *handles, int n, VkUsnapBindingState *candidate);
+typedef struct VkDrawScratchCredit VkDrawScratchCredit;
+typedef struct {
+    VkUsnapCapture *snapshot;
+    VkDrawScratchCredit *scratch;
+} VkReplayCaptureBundle;
+enum { VK_REPLAY_WORKER_LIMIT = 16 };
+typedef enum {
+    VK_REPLAY_CAPTURE_WAIT_NONE, VK_REPLAY_CAPTURE_WAIT_BUDGET,
+    VK_REPLAY_CAPTURE_WAIT_PRODUCER, VK_REPLAY_CAPTURE_WAIT_DRAIN_OLDER
+} VkReplayCaptureWaitKind;
+typedef struct {
+    RcAdmissionVector peak;
+    RcBudgetReadiness before;
+    uint64_t producer_epoch;
+    VkReplayCaptureWaitKind kind;
+} VkReplayCaptureWait;
+// Replay metadata holds both RAM and commit until its owner frees the allocation.
+VkResult vk_replay_metadata_allocate(size_t bytes, int clear, RcBudgetProducer producer,
+                                     RcBudgetTicket *ticket, void **allocation);
+void vk_replay_metadata_free(void *allocation, RcBudgetTicket *ticket);
+int vk_replay_metadata_peak_add(RcAdmissionVector *peak, uint64_t bytes);
+size_t vk_exec_draw_update_credit_host_bytes(const VkDrawScratchCredit *credit);
+// The queue owns both outputs after success. A refusal leaves the bundle empty and reports retry evidence.
+VkResult vk_usnap_queue_bundle(const VkUsnapInputs *inputs, uint64_t max_update_bytes,
+                              VkReplayCaptureBundle *out, VkReplayCaptureWait *wait);
+void vk_usnap_queue_bundle_cancel(VkReplayCaptureBundle *bundle);
+VkUsnapCapture *vk_usnap_take(const VkUsnapInputs *inputs);
+VkResult vk_usnap_preflight(const VkUsnapInputs *inputs, VkUsnapCapture **capture, VkReplayCaptureWait *wait);
+void vk_usnap_wait_producer(uint64_t producer_epoch, uint32_t milliseconds);
+VkResult vk_usnap_begin(VkUsnapCapture **capture, int n, uint64_t fence);
+int vk_sync_stopping(void);
+int vk_sync_try_provider_idle(void);
+void vk_sync_end_provider_idle(void);
+void vk_sync_stop_submissions(void);
+uint64_t vk_sync_present_complete(void);
+void vk_usnap_cancel(VkUsnapCapture *capture);
+uint64_t vk_usnap_reclaim_reusable(void); // shared pressure adapter: count destroyed, never credited capacity
 void vk_usnap_end(uint64_t fence);
 int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out);
+typedef struct VkMemSpanCapture VkMemSpanCapture;
 // A resolved range of one immutable capture. A region index is only meaningful while capture matches; no region or
 // arena pointer is retained. GPU writes invalidate just their overlapping regions at their position in the stream.
 typedef struct {
     uint64_t capture, addr, size, align;
     uint32_t region, reserved;
 } VkUsnapLease;
+typedef enum {
+    VK_USNAP_RESOLVE_READY, VK_USNAP_RESOLVE_NATIVE_ONLY, VK_USNAP_RESOLVE_ORDERED_PRODUCER,
+    VK_USNAP_RESOLVE_SOURCE_ADVANCED, VK_USNAP_RESOLVE_UNAVAILABLE, VK_USNAP_RESOLVE_NO_CAPACITY,
+    VK_USNAP_RESOLVE_MAPPING_STALE, VK_USNAP_RESOLVE_ALIGNMENT
+} VkUsnapResolveResult;
+// Only READY supplies a descriptor. Producer evidence requires a separate proof of native input coverage.
+VkUsnapResolveResult vk_usnap_resolve_at(uint64_t addr, uint64_t n, uint64_t align, RcRegistryPosition,
+                                         VkDescriptorBufferInfo *, VkUsnapLease *);
+struct VkGpaPrefixRequest;
+// Only an earlier GPA projection that blocks this exact retained uniform capture can supply a dependency.
+int vk_usnap_gpa_blocker(uint64_t address, uint64_t bytes, uint64_t align, RcRegistryPosition read,
+                        struct VkGpaPrefixRequest *);
 int vk_usnap_find_lease(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out, VkUsnapLease *lease);
 int vk_usnap_lease_valid(const VkUsnapLease *lease);
-uint64_t vk_usnap_capture(void);   // active capture identity, 0 without a capture; unrelated drops do not change it
-// A context-owned proof for a set of leases. The region buckets bound storage; collisions only cause revalidation.
-// Begin before collecting the leases, add every one, then end. A failed construction cannot authorize a shortcut.
-// A successful proof lasts within its capture and until a relevant drop becomes effective in the consumer's epoch.
-// valid may advance the cached publication serial after confirming that all dependency buckets are unchanged.
+int vk_usnap_find_lease_at(uint64_t addr, uint64_t n, uint64_t align, RcRegistryPosition position,
+                           VkDescriptorBufferInfo *out, VkUsnapLease *lease);
+int vk_usnap_lease_valid_at(const VkUsnapLease *lease, RcRegistryPosition position);
+uint64_t vk_usnap_capture(void);   // active capture identity, 0 without a capture
+typedef struct { uint64_t address, size; RcRegistryPosition output; } VkMemBufferInlineProof;
+// Borrow the active snapshot producer observation to identify exact latest native-buffer fragments. The caller
+// retains the selected native span; this does not create or transfer another registry capture.
+RcRegistryResult vk_usnap_buffer_fragments(const VkMemSpanCapture *capture, const VkMemSpan *selected,
+    uint64_t address, uint64_t size, RcRegistryPosition read, const VkMemBufferInlineProof *inline_proofs,
+    uint32_t inline_count, RcRegistryBufferFragment *out, uint32_t capacity, uint32_t *fragment_count);
+// The prepared binding adapter retains the legacy aggregate-proof layout. Canonical snapshot leases validate
+// individually at the consuming position, so the snapshot provider declines this aggregate shortcut.
 #define VK_USNAP_PROOF_BUCKETS 64u
 typedef struct {
     uint64_t capture, serial, epoch, horizon, buckets;
@@ -355,21 +467,19 @@ int vk_usnap_proof_end(VkUsnapProof *proof);
 // Finish into an exclusively owned destination. On failure its previous contents cannot be reused.
 int vk_usnap_proof_end_into(VkUsnapProof *building, VkUsnapProof *destination);
 int vk_usnap_proof_valid(VkUsnapProof *proof);
-// After begin, inherit a still-valid prior proof without revisiting its leases, then add changed contributions and
-// end. Dependencies are a conservative union; removed members can shorten reuse but never permit stale contents.
 int vk_usnap_proof_inherit(VkUsnapProof *building, const VkUsnapProof *prior);
 const uint8_t *vk_usnap_map(void);   // a host copy of the current arena, at the offsets vk_usnap_find gives
 const uint8_t *vk_usnap_bytes(uint64_t addr, uint64_t n);   // the copy of [addr, addr+n) as of the submit, NULL: none
-void vk_usnap_drop(uint64_t addr, uint64_t n);   // the replay makes the GPU write [addr, addr+n) of guest memory
-uint64_t vk_usnap_gen(void);                      // changes whenever a binding may resolve differently
-// [addr, addr+n) into dst: 1 from this submission's copy, 2 from guest memory where the copy lacks it but the bytes are
-// ones the CPU writes (an imported pool) and no GPU write in flight touches them, 0 neither (dst untouched).
+void vk_usnap_drop(uint64_t addr, uint64_t n);   // notify legacy descriptor caches of a recorded GPU write
+uint64_t vk_usnap_gen(void);                      // legacy descriptor-cache generation
+// [addr, addr+n) into dst: 1 from this submission's valid retained copy, 2 from a fresh protected import read at
+// the current operation, 0 if neither can be proven (dst untouched).
 int vk_usnap_read(uint64_t addr, uint64_t n, void *dst);
 int vk_usnap_equal_tail(uint64_t addr, uint64_t size, uint64_t skip, const void *expected);
 // Why vk_usnap_find finds nothing for [addr, addr+n) in this submission (diagnostics).
 enum { VK_USNAP_FOUND, VK_USNAP_NO_SNAPSHOT, VK_USNAP_DROPPED, VK_USNAP_IN_FLIGHT, VK_USNAP_NOT_CPU, VK_USNAP_NOT_BOUND };
 int vk_usnap_why(uint64_t addr, uint64_t n);
-void vk_usnap_shutdown(void);                     // vk_exec_draw_shutdown: frees the arenas
+void vk_usnap_shutdown(void);                     // after recording and completion owners have discharged, before VMA teardown
 // vk_mvprev.c: last frame's copy of the scene's object (c7) and bone (c5) blocks, for per-object motion vectors.
 // vk_mvprev_step: the distance of the game's other copy of a vertex-stage block the snapshot also copies, 0: none.
 // vk_mvprev_find: last frame's block of that object (prev, its address; how, MVPREV_*), 0: none.
@@ -382,7 +492,9 @@ void vk_mvprev_frame(void);   // each present, beside vk_dlaa_frame
 void vk_mem_mirror_begin(void);
 int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence);
 int vk_mem_mirror_pending(void);
-void vk_mem_mirror_prologue(VkCommandBuffer cb);
+int vk_mem_mirror_pressure_waiting(void);
+void vk_mem_mirror_service_pressure(void); // outside submission and provider locks
+void vk_mem_mirror_prologue(VkCommandBuffer cb, uint64_t scene);
 void vk_mem_lazy_part_end(void);   // lazy write-back: a part ends (before its prologue), and it is handed over
 void vk_mem_lazy_handed(void);
 void vk_mem_lazy_decide(void);     // once the driver is known (after vk_caps_driver): on or off, with one log line
@@ -400,6 +512,7 @@ void vk_mem_shadow_table_read(void);
 int vk_mem_shadow_storage(void);   // CPU-visible pools are shadow copies of guest memory, not imports (NX2NAVI_SHADOW)
 int vk_mem_shadow_table_stores(void);   // shadow storage keeps what shaders store through the table (NX2NAVI_SHADOW_TABLE_STORES)
 void vk_mem_gpu_pending(uint64_t addr, uint64_t size);
+void vk_mem_gpu_pending_span(const VkMemSpan *, uint64_t address, uint64_t size);
 void vk_gpu_written(uint64_t addr, uint64_t size);
 // The same for a GPU write into a VRAM mirror, which went back to guest memory with the submission: the texture checks
 // see it, the mirror's next sync does not copy it back up. vk_mem_mirrored at record time, right after the write's
@@ -438,6 +551,207 @@ int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out);   // 1 when al
 // vk_mem_resolve for a caller that reads guest memory itself or only asks what backs it: with shadow storage the pool
 // is not copied in for it (vk_memory.c, mem_resolve).
 int vk_mem_lookup(uint64_t addr, uint64_t size, VkMemSpan *out);
+// Pin the exact selected native argument, and check the narrow logical range before using it again.
+VkMemSpanCapture *vk_mem_span_capture(uint64_t address, uint64_t size, const VkMemSpan *selected);
+struct MemBackingCapturePlan;
+typedef struct {
+    VkMemSpan selected;
+    uint64_t publication;
+    size_t bytes;
+    int nested_host;
+} VkMemSpanCapturePlan;
+// Uniform snapshots reserve both receipts before retaining either of them.
+RcRegistryResult vk_mem_span_capture_plan(const VkMemSpan *, const struct MemBackingCapturePlan *,
+                                           VkMemSpanCapturePlan *);
+RcRegistryResult vk_mem_span_capture_bounded(const VkMemSpanCapturePlan *, const struct MemBackingCapturePlan *,
+                                              VkMemSpanCapture **);
+// Exact already-established native import or installed mirror. No optional mirror placement during planning.
+typedef struct {
+    VkMemSpan imported, selected;
+    uint64_t publication, mirror_incarnation, import_scene;
+    uint64_t transition_mirror;
+    size_t bytes;
+    int cold_writer;
+} VkMemImportInputPlan;
+enum { VK_MEM_IMPORT_WRITER_NONE, VK_MEM_IMPORT_WRITER_COLD, VK_MEM_IMPORT_WRITER_ACTIVE };
+RcRegistryResult vk_mem_span_import_input_plan(const VkMemSpan *, const struct MemBackingCapturePlan *,
+                                                VkMemImportInputPlan *);
+int vk_mem_span_import_writer_candidate(uint64_t address, const VkMemSpan *);
+RcRegistryResult vk_mem_span_import_writer_plan(const VkMemSpan *, const struct MemBackingCapturePlan *,
+                                                VkMemImportInputPlan *);
+RcRegistryResult vk_mem_span_import_input_capture(const VkMemImportInputPlan *, const struct MemBackingCapturePlan *,
+                                                   VkMemSpanCapture **);
+uint32_t vk_mem_span_import_input_ranges(const VkMemSpanCapture *, const RcInterval **);
+RcRegistryResult vk_mem_span_import_writers_publish(VkMemSpanCapture *const *, uint32_t count, RcRegistryPosition read);
+void vk_mem_span_import_writer_issued(VkMemSpanCapture *, uint64_t fence);
+int vk_mem_span_capture_current(const VkMemSpanCapture *, const VkMemSpan *selected);
+// The caller already owns this capture. Another owner can retain the same mapping/provider across a defer.
+VkMemSpanCapture *vk_mem_span_capture_retain(VkMemSpanCapture *);
+void vk_mem_span_capture_release(VkMemSpanCapture **);
+// Select an exact established native input. Optional mirror creation stays in compatibility.
+RcRegistryResult vk_mem_span_native_input(uint64_t address, uint64_t size, int clamp, VkMemSpan *,
+                                          VkMemSpanCapture **);
+typedef enum {
+    VK_MEM_MIRROR_EXISTING,    // no new optional decision during speculative preparation
+    VK_MEM_MIRROR_IMPORT,      // keep the current import for the recording scene
+    VK_MEM_MIRROR_PREPARE,     // actual ordered empty native part with prior work complete
+} VkMemMirrorInputPolicy;
+RcRegistryResult vk_mem_span_prepare_native_input(uint64_t address, uint64_t size, int clamp, VkMemMirrorInputPolicy,
+                                                  VkMemSpan *, VkMemSpanCapture **);
+// Retain the actual buffer already selected by a compatibility binder before parking its operation.
+RcRegistryResult vk_mem_span_capture_bound_input(uint64_t address, uint64_t size, const VkMemSpan *selected,
+                                                  VkMemSpanCapture **);
+int vk_mem_span_record_input(VkMemSpanCapture *, const VkMemSpan *);
+int vk_mem_span_held_argument_current(const VkMemSpanCapture *,uint64_t address,uint64_t size,const VkMemSpan *);
+// Settle the held representation at its original read before another binding can choose a mirror.
+RcRegistryResult vk_mem_span_prepare_held_argument(const VkMemSpanCapture *, const VkMemSpan *, int ordered);
+int vk_mem_span_record_held_argument(VkMemSpanCapture *,uint64_t address,uint64_t size,const VkMemSpan *);
+// Copy a subrange of the prepared provider's mapping. No current address rediscovery.
+uint32_t vk_mem_span_input_intervals(const VkMemSpanCapture *, uint64_t address, uint64_t size, RcInterval **);
+// Inspect the retained device mapping without claiming a raw-buffer write.
+uint32_t vk_mem_span_capture_device_intervals(const VkMemSpanCapture *, const VkMemSpan *, uint64_t address,
+                                              uint64_t size, RcInterval **);
+int vk_mem_span_input_cpu_visible(const VkMemSpanCapture *);
+// Value identity only, from this exact original allocation rather than a new VA selection.
+// Verify the held physical provider for an exact positioned buffer result. Supply a complete independent
+// initial fill only when its ordered origin is intact; otherwise the registry needs earlier valid results.
+int vk_mem_span_buffer_preserve_current(void *, RcRegistryBufferSpan, RcRegistryPosition, int *initialized);
+int vk_mem_span_buffer_location(const VkMemSpanCapture *, const VkMemSpan *, RcRegistryBufferLocation *);
+// Reflect existing fixed raw initialization boundaries in writable effects without narrowing the MayWrite hull.
+enum { VK_MEM_FIXED_WRITER_PARTS = 68 };
+uint32_t vk_mem_span_buffer_fixed_partitions(const VkMemSpanCapture *, const VkMemSpan *,
+                                             const RcInterval *, uint32_t count, RcInterval *, uint32_t capacity);
+typedef struct VkMemNativeRmwWord VkMemNativeRmwWord;
+struct RcVmaDependency;
+VkResult vk_mem_native_rmw_word_prepare(VkMemSpanCapture *, const VkMemSpan *, uint64_t descriptor_size,
+    uint64_t word_address, RcRegistryPosition, struct RcVmaDependency *, VkMemNativeRmwWord **);
+int vk_mem_native_rmw_word_current(const VkMemNativeRmwWord *, const VkMemSpan *, uint64_t word_address,
+    RcRegistryPosition);
+VkDescriptorBufferInfo vk_mem_native_rmw_word_marker(const VkMemNativeRmwWord *);
+RcRegistryResult vk_mem_native_rmw_word_declare(VkMemNativeRmwWord *, RcRegistryPosition output);
+int vk_mem_native_rmw_word_bind(VkMemNativeRmwWord *, VkCommandBuffer);
+int vk_mem_native_rmw_word_order(VkMemNativeRmwWord *, VkCommandBuffer);
+void vk_mem_native_rmw_word_issued(VkMemNativeRmwWord **, VkCommandBuffer);
+void vk_mem_native_rmw_word_cancel(VkMemNativeRmwWord **);
+typedef struct VkMemNativeRmwBitmap VkMemNativeRmwBitmap;
+typedef struct {
+    const char *gate;
+    RcRegistryResult registry;
+    RcInterval range;
+    VkResult result; // original VkResult from prepare, otherwise zero
+    RcRegistryPosition blocker_read;
+    uint64_t mirror_offset, blocker_offset, blocker_bytes;
+} VkMemNativeRmwBitmapFailure;
+// A report is optional. A successful call clears it. Failure carries only evidence from that decision.
+VkResult vk_mem_native_rmw_bitmap_prepare_report(VkMemSpanCapture *, const VkMemSpan *, uint64_t descriptor_size,
+    VkPipelineStageFlags2 writer_stage, RcRegistryPosition, struct RcVmaDependency *, VkMemNativeRmwBitmap **,
+    VkMemNativeRmwBitmapFailure *);
+VkResult vk_mem_native_rmw_bitmap_prepare(VkMemSpanCapture *, const VkMemSpan *, uint64_t descriptor_size,
+    VkPipelineStageFlags2 writer_stage, RcRegistryPosition, struct RcVmaDependency *, VkMemNativeRmwBitmap **);
+int vk_mem_native_rmw_bitmap_current_report(const VkMemNativeRmwBitmap *, const VkMemSpan *, RcRegistryPosition,
+    VkMemNativeRmwBitmapFailure *);
+int vk_mem_native_rmw_bitmap_current(const VkMemNativeRmwBitmap *, const VkMemSpan *, RcRegistryPosition);
+int vk_mem_native_rmw_bitmap_order(VkMemNativeRmwBitmap *, VkCommandBuffer);
+VkDescriptorBufferInfo vk_mem_native_rmw_bitmap_marker(const VkMemNativeRmwBitmap *);
+int vk_mem_native_rmw_bitmap_bind(VkMemNativeRmwBitmap *, VkCommandBuffer);
+RcRegistryResult vk_mem_native_rmw_bitmap_declare(VkMemNativeRmwBitmap *, RcRegistryPosition);
+void vk_mem_native_rmw_bitmap_issued(VkMemNativeRmwBitmap **, VkCommandBuffer);
+void vk_mem_native_rmw_bitmap_cancel(VkMemNativeRmwBitmap **);
+// Value provenance of the mirror actually selected by the native write. The recording owns the span.
+int vk_mem_span_mirror_access_location(const VkMemSpan *, RcRegistryBufferLocation *);
+// An installed and already synchronized mirror with its real imported twin. This never refreshes it.
+int vk_mem_span_gpa_donor(const VkMemSpanCapture *, const VkMemSpan *, RcRegistryBufferLocation *, VkBuffer *twin);
+// The caller keeps the captured provider alive and proves/reuses the same span when recording the transfer.
+RcRegistryResult vk_mem_span_buffer_fragments(const VkMemSpanCapture *, const VkMemSpan *,
+    uint64_t address, uint64_t size, RcRegistryGpuCapture, RcRegistryPosition,
+    const VkMemBufferInlineProof *inline_proofs, uint32_t inline_count,
+    RcRegistryBufferFragment *, uint32_t capacity, uint32_t *fragment_count);
+typedef struct { void *pool; uint64_t mirror_incarnation; } VkMemInputProvider;
+VkMemInputProvider vk_mem_span_take_input_provider(VkMemSpanCapture **);
+void vk_mem_input_provider_release(VkMemInputProvider);
+typedef enum {
+    VK_EXEC_HOST_INPUT_READY,
+    VK_EXEC_HOST_INPUT_UNSUPPORTED,
+    VK_EXEC_HOST_INPUT_BLOCKED,
+    VK_EXEC_HOST_INPUT_STALE,
+    VK_EXEC_HOST_INPUT_STOPPED,
+    VK_EXEC_HOST_INPUT_CAPACITY,
+    VK_EXEC_HOST_INPUT_ABSENT,
+    VK_EXEC_HOST_INPUT_CHANGED,  // source bytes may have changed during this observation
+    VK_EXEC_HOST_INPUT_UNTRACKED, // no exact-page write observation is available
+} VkExecHostInputResult;
+typedef struct {
+    const uint8_t *bytes;
+    void *opaque;
+    RcInterval mapping; // First exact clipped slice, when the original borrow reached mapping.
+    const char *refusal; // The failed check, if recorded.
+} VkExecHostInputRead;
+// At the input phase of an ordered operation, borrow readable bytes from the exact retained provider.
+// The caller retains span ownership through finish/cancel and consumes CPU results only after successful finish.
+// The hold protects mapping and GPU producer order. Ordinary CPU store ordering remains with the guest.
+VkExecHostInputResult vk_exec_host_input_begin(const VkMemSpanCapture *, const VkMemSpan *, uint64_t address,
+                                              uint64_t size, RcRegistryPosition, VkExecHostInputRead *);
+// Observe a current coherent import after the actual earlier command prefix, using exact native output
+// and CPU page proof. Copy into an already allocated immutable destination before finish.
+VkExecHostInputResult vk_exec_host_input_begin_ordered(struct VkExec *, const VkMemSpanCapture *, const VkMemSpan *,
+    uint64_t address, uint64_t size, RcRegistryPosition, VkExecHostInputRead *);
+VkExecHostInputResult vk_exec_host_input_finish(VkExecHostInputRead *);
+void vk_exec_host_input_cancel(VkExecHostInputRead *);
+// Translate an NVN storage pointer from its canonical logical bytes. Only a current host import with
+// ordered, visible contents qualifies. This never represents a live mirror's native byte view.
+VkExecHostInputResult vk_exec_host_pointer_read(uint64_t address, RcRegistryPosition, uint64_t *value);
+// Only explicit physical backing IDs from captured device intervals qualify. Finalized pools with
+// remaining native users still retain the backing. The slot is cached without taking a provider reference.
+int vk_mem_device_backing_reclaimed(RcBackingId *);
+// Texture lock held. Bind and retain the exact physical pool provider selected by the span.
+typedef struct VkMemImageAliasBaseline VkMemImageAliasBaseline;
+// A successful NULL baseline leaves image-only coverage available. A non-NULL baseline owns exact physical buffer
+// ranges through native use. Its allocation, mapping and original read must still be current before recording.
+RcRegistryResult vk_mem_image_alias_baseline_capture(uint64_t address, uint64_t bytes, const RcInterval *mapping,
+    uint32_t count, RcRegistryPosition read, VkMemImageAliasBaseline **out);
+RcRegistryResult vk_mem_image_alias_baseline_capture_handed(uint64_t address, uint64_t bytes, const RcInterval *,
+    uint32_t count, RcRegistryPosition cut, VkMemImageAliasBaseline **, uint64_t *fill_upload);
+RcRegistryResult vk_mem_image_alias_baseline_capture_submitted(uint64_t address, uint64_t bytes, const RcInterval *,
+    uint32_t count, RcRegistryPosition read, VkMemImageAliasBaseline **, uint64_t *fill_upload);
+// Pre-wait authority qualification only. Native source access still requires the exact fill to complete.
+const RcRegistryBufferSpan *vk_mem_image_alias_baseline_submitted_spans(const VkMemImageAliasBaseline *,
+    uint64_t fill_upload, uint32_t *count);
+const RcRegistryBufferSpan *vk_mem_image_alias_baseline_spans(const VkMemImageAliasBaseline *, uint32_t *count);
+int vk_mem_image_alias_baseline_current(const VkMemImageAliasBaseline *);
+int vk_mem_image_alias_baseline_source(const VkMemImageAliasBaseline *, uint32_t baseline,
+    RcRegistryBufferLocation, uint64_t size, VkBuffer *, VkDeviceSize *);
+void vk_mem_image_alias_baseline_release(VkMemImageAliasBaseline **);
+typedef enum {
+    VK_MEM_IMAGE_ALIAS_DIRECT,
+    VK_MEM_IMAGE_ALIAS_PRIVATE_PRESERVE,
+    VK_MEM_IMAGE_ALIAS_STALE,
+    VK_MEM_IMAGE_ALIAS_FAILED,
+    VK_MEM_IMAGE_ALIAS_OCCUPIED
+} VkMemImageAliasPlacement;
+// Texture lock held. Preplacement is advisory; only a successful bind transfers a physical pool hold to the image.
+// Both calls validate the normalized bytes of the whole actual Vulkan requirement, including padding.
+// An image returned with STALE can have bound natively before the remap. Retire it with vk_defer_image.
+VkMemImageAliasPlacement vk_mem_image_alias_preplacement(uint64_t address, const VkMemoryRequirements *requirements,
+    const VkMemSpan *selected, const RcInterval *mapping, uint32_t mapping_count);
+VkMemImageAliasPlacement vk_mem_bind_image_alias(VkImage image, uint64_t address, const VkMemoryRequirements *requirements,
+    const VkMemSpan *selected, const RcInterval *mapping, uint32_t mapping_count, VkResult *native_failure);
+int vk_mem_image_alias_overlaps(uint64_t address, uint64_t size, const VkMemSpan *, VkImage *, uint32_t capacity);
+int vk_mem_image_alias_current(VkImage image, uint64_t addr, uint64_t size, VmaAllocation allocation,
+                               const RcInterval *intervals, uint32_t count);
+typedef struct VkMemoryImageHold VkMemoryImageHold;
+typedef struct {
+    VkDeviceMemory memory;
+    VkDeviceSize offset, size;
+} VkImageMemoryPlacement;
+int vk_mem_image_hold_placement(const VkMemoryImageHold *, VkImage, VkImageMemoryPlacement *);
+VkMemoryImageHold *vk_mem_image_hold(VkImage image);
+VkMemoryImageHold *vk_mem_image_hold_retain(VkMemoryImageHold *);
+// The caller owns a live hold. Verify the immutable VkImage before extending its lifetime.
+VkMemoryImageHold *vk_mem_image_hold_retain_exact(VkMemoryImageHold *, VkImage exact);
+int vk_mem_image_hold_retired(const VkMemoryImageHold *);
+int vk_mem_image_held(VkImage image);
+void vk_defer_image_owned_view(VkImage image, VkImageView view);
+void vk_mem_image_release(VkMemoryImageHold *hold);
 // Changes whenever vk_mem_resolve plus VK_MEM_USE may give another span for an address: a pool added, finalized or
 // mapped, a mirror created, refused or forgotten, a submission started.
 uint64_t vk_mem_gen(void);
@@ -455,7 +769,8 @@ void vk_mem_snap_stats(uint64_t *checks, uint64_t *calls, uint64_t *untracked); 
 
 // Upload batch: one command buffer on gfx_queue that texture uploads and texel copies record into. begin/end bracket
 // the recording (recursive lock); vk_staging (between them) returns a mapped host buffer that lives until the batch
-// completes, or, with alloc non-NULL, until the caller's vmaDestroyBuffer after vk_upload_flush(1). The replay calls
+// completes, or, with alloc non-NULL, until the caller's resource_core_vma_destroy_buffer after vk_upload_flush(1).
+// Caller-owned staging must use that shared destruction adapter so its capacity ownership settles. The replay calls
 // vk_upload_flush(0) before each submission that may read uploaded images; queue order and the batch's closing
 // barrier make the uploads visible to it. Returns the batch sequence number; wait=1 blocks until it completed.
 // NX2NAVI_FIX_ZERO (default 1): physical pools are zeroed once at creation and GPU-only images with memory of their own
@@ -463,10 +778,34 @@ void vk_mem_snap_stats(uint64_t *checks, uint64_t *calls, uint64_t *untracked); 
 int vk_fix_zero(void);
 VkCommandBuffer vk_upload_begin(void);
 void vk_upload_end(void);
+uint64_t vk_upload_dependency(void);
+// Exact active upload caller only; zero for another command buffer or outside begin/end, even if a batch is open.
+uint64_t vk_upload_recording_sequence(VkCommandBuffer cb);
+void vk_upload_defer_release(uint64_t sequence, void (*release)(void *), void *owner);
+void vk_upload_progress(uint64_t *submitted, uint64_t *completed);
 void *vk_staging(VkDeviceSize size, VkBuffer *buf, VmaAllocation *alloc);
 // A 256-byte-aligned range of the staging arena owned by the open upload batch (vk_memory.c): *buf at *off. Only
 // between vk_upload_begin and vk_upload_end; a large request gets a buffer of its own at offset 0.
 void *vk_staging_at(VkDeviceSize size, VkBuffer *buf, VkDeviceSize *off);
+typedef struct {
+    VkDeviceSize size;
+    VkBuffer buffer;
+    VmaAllocation allocation;
+    VmaAllocationCreateInfo placement;
+    uint8_t *map;
+    uint32_t pool_memory_type;
+    int from_cache;
+} VkPreparedStaging;
+// Plan outside upload recording. A cached span is held immediately and needs no new capacity.
+VkResult vk_staging_prepare_plan(VkDeviceSize size, VkPreparedStaging *stage, RcAdmissionVector *peak);
+VkResult vk_staging_prepare_allocate(VkPreparedStaging *stage, RcBudgetTicket *peak, int required);
+// Claim a compatible completed allocation without an allocation attempt or a wait.
+int vk_staging_prepare_reuse(VkDeviceSize size, VkPreparedStaging *stage);
+void vk_staging_prepare_cancel(VkPreparedStaging *stage);
+VkBuffer vk_staging_prepare_record(VkCommandBuffer cb, VkPreparedStaging *stage);
+int vk_staging_prepare_available(VkDeviceSize size);
+uint64_t vk_staging_prepare_supplier(VkDeviceSize size, uint64_t after);
+int vk_staging_prepare_wait(uint64_t handed_upload);
 uint64_t vk_upload_flush(int wait);
 // Texture work on the render and replay threads, summed per frame (vk_texture.c vk_texstat_frame, the "texup:" line of
 // NX2NAVI_TEXUP_LOG_MS). vk_texstat_time adds the time since t0 (kern_now_ns) and one event; vk_texstat_add adds events
@@ -483,6 +822,14 @@ void vk_defer_image(VkImage img, VmaAllocation alloc);   // alloc NULL: vkDestro
 // Same lifetime as vk_defer_image; charge owned allocation bytes until actual allocator destruction completes.
 // Pending bytes prevent duplicate reclamation, not a promise of system commit relief (VMA may retain its blocks).
 void vk_defer_image_reclaim(VkImage img, VmaAllocation alloc, uint64_t bytes);
+// Callback reports actual destruction, after upload and scene use. It can run under the upload lock during drain:
+// use only leaf bookkeeping/atomics; never acquire renderer locks or call back into Vulkan/memory here.
+void vk_defer_image_notify(VkImage img, VmaAllocation alloc, uint64_t bytes,
+                           void (*destroyed)(void *), void *context);
+// Material owner has already excluded new users. Destroy only with actual completed consumers and upload.
+int vk_mem_image_destroy_completed(VkImage, VmaAllocation, uint64_t scene, uint64_t upload,
+                                    void (*destroyed)(void *), void *context);
+void vk_texture_retire_drain(void); // After backend destruction at shutdown: reap stable material metadata.
 uint64_t vk_mem_reclaim_pending(void);
 void vk_defer_view(VkImageView view);
 // free(p) once the GPU is past the submission being recorded, as vk_defer_image: a host record other threads may still
@@ -490,6 +837,9 @@ void vk_defer_view(VkImageView view);
 void vk_defer_free(void *p);
 int vk_exec_image_gone(VkImage image);   // texture lock held: the replay's views of image go with it; returns how many
 void vk_defer_buffer(VkBuffer buf, VmaAllocation alloc);
+// Exclusive upload users only: the caller relinquishes the buffer after its last recorded upload sequence.
+// No scene command, recorded CPU packet or later upload may retain/use it after this call.
+void vk_upload_defer_buffer(VkBuffer buf, VmaAllocation alloc, uint64_t last_upload_seq);
 // ---- ASTC (vk_astc.c). NX2NAVI_ASTC = auto | gpu | native | cpu | check; see vk_astc.c.
 enum { VK_ASTC_CPU, VK_ASTC_GPU, VK_ASTC_NATIVE, VK_ASTC_CHECK };
 int vk_astc_mode(void);                 // decided once per device (logged); VK_ASTC_CPU before vk_init
@@ -545,6 +895,8 @@ typedef struct {
     VkImageUsageFlags usage;
     uint32_t width, height, depth, levels, layers, samples;
     uint64_t addr;                 // storage GPU address
+    uint8_t preserve_pool_bytes;   // optional alias declined to preserve a selected physical RAW source
+    uint8_t rgba8_linear_view;      // exact ordinary 2D SRGB allocation admits an UNORM sampled view
     uint8_t alpha_one;             // X format: sample alpha as 1 through the view swizzle
     uint8_t chan[4];               // TexVkFormat.chan: component order of a stand-in format, applied by the view swizzle
     uint8_t mirrored, gpu_owned;
@@ -565,16 +917,299 @@ typedef struct {
                                    // the GPU is past the submission being recorded (vk_defer_free), as the replay and DLSS
                                    // keep pointers to render targets across a command buffer; no view of it is cached
 } VkTexImage;
+// Capture the selected physical image and hold its storage until graphics composition completes.
+VkTexturePresentSource *vk_texture_present_capture(const tex_t *, VkTexImage *selected);
+// Exact guest texture incarnation recorded when the owner was captured, or zero for an untagged owner.
+GfxPresentPictureSource vk_texture_present_picture(const VkTexturePresentSource *);
+// Fork the physical owner of a live target, before handing its exact image and a view to composition.
+VkTexturePresentSource *vk_texture_present_retain_image(const VkTexImage *selected, VkImage exact);
+// Extend an established physical placement lease, including an older retained frame. The caller
+// proves descriptor/view generation and actual queue order before selecting the image.
+VkTexturePresentSource *vk_texture_present_retain_held_image(VkMemoryImageHold *, VkImage exact);
+void vk_texture_present_release(VkTexturePresentSource *);
+// Capture the explicit transfer image at the ordered read horizon, without resolving or uploading a replacement.
+VkTexturePresentSource *vk_texture_transfer_read_capture(const tex_t *, VkTexImage *);
+// Returns true when the scene use has taken over the material or pin. A raw image still needs the loan.
+int vk_texture_transfer_read_use(const VkTexturePresentSource *, VkImage);
+VkTexturePresentSource *vk_texture_transfer_read_select(const tex_t *, VkTexImage *);
+int vk_texture_transfer_read_current(const VkTexturePresentSource *, VkImage);
+// Negative rejects stale or incomplete projected bytes, zero leaves another layout to the compatibility path.
+int vk_texture_transfer_read_prove(const tex_t *, const VkTexImage *, VkImageSubresourceLayers, const NVNcopyRegion *);
+struct ResourceCommandEffects;
+typedef struct VkTextureProjectedTransfer VkTextureProjectedTransfer;
+int vk_texture_alias_volume_transfer(const tex_t *, const view_t *);
+int vk_texture_host_volume_transfer(const tex_t *, const view_t *);
+int vk_texture_host_color_transfer(const tex_t *, const view_t *);
+int vk_texture_projected_transfer_capture(const tex_t *, const view_t *, const NVNcopyRegion *,
+                                          VkTexImage *, VkTextureProjectedTransfer **);
+// An ordered sequence of disjoint same-image copies. Use these retained regions in order, with a barrier
+// between copies, and report their union after the last one. Begin rechecks the original source proof.
+int vk_texture_projected_self_copy_capture(const tex_t *, const VkTexImage *, const VkImageCopy *,
+                                           uint32_t, VkTextureProjectedTransfer **);
+const VkImageCopy *vk_texture_projected_self_copy_regions(const VkTextureProjectedTransfer *, uint32_t *);
+int vk_texture_projected_transfer_current(const VkTextureProjectedTransfer *);
+VkImage vk_texture_projected_transfer_image(const VkTextureProjectedTransfer *);
+RcRegistryResult vk_texture_projected_transfer_declare(const VkTextureProjectedTransfer *,
+                                                        struct ResourceCommandEffects *, RcRegistryPosition);
+int vk_texture_projected_transfer_begin(VkTextureProjectedTransfer *);
+void vk_texture_projected_transfer_written(VkTextureProjectedTransfer *);
+void vk_texture_projected_transfer_cancel(VkTextureProjectedTransfer **);
+// Fork the already selected ordinary sampled image into the current recording while the texture lock is held.
+int vk_texture_record_selected_sample_locked(const VkTexturePresentSource *, VkImage);
+// Reserve a previously captured image's actual writer coverage. Texture lock held.
+void vk_texture_image_write_prepare_locked(const VkTexImage *, uint64_t logical_size);
+void vk_texture_image_write_prepare(VkImage, uint64_t address, uint64_t logical_size);
 // A 2D texture a shader samples as a 3D one: its one-slice 3D copy, refreshed when its content changed (vk_texture.c);
 // NULL when it does not qualify. Texture lock held.
-const VkTexImage *vk_texture_flat3d_locked(const VkTexImage *img, uint32_t layer);
-// The window texture the backend presents (vk_backend.c): *image and *format become the float picture the game copied
-// into it, when the last draw into it was that copy and the swapchain is HDR10.
-void vk_hdr_present_source(const VkTexImage *win, VkImage *image, VkFormat *format);
+// Immutable one-layer 3D substitute. Nonnull CB is an ordered, outside-rendering scene copy. NULL CB only looks up.
+// required: 0 speculative/no deferral; 1 consuming binding; 2 strict preflight (missing eligible copy defers).
+const VkTexImage *vk_texture_flat3d_locked(const VkTexImage *img, uint32_t layer, VkCommandBuffer ordered_cb, int required);
+// Select the weak HDR repeat identity when the last draw copied a float picture. Texture lock held.
+void vk_hdr_present_source_locked(const VkTexImage *win, VkTexImage *source);
 void vk_hdr_image_gone(VkImage image);
 const VkTexImage *vk_texture_get(const tex_t *t);   // created and made current; NULL for BUFFER or unmapped formats
 const VkTexImage *vk_texture_get_write(const tex_t *t); // private writable contents, before writable view capture
+const VkTexImage *vk_texture_get_transfer_write(const tex_t *t);
+// Read-only recipe geometry for preparing the buffer's source footprint before a compatible transfer.
+int vk_texture_transfer_write_geometry(const tex_t *, VkTexImage *);
+int vk_texture_alias_region_transfer(const tex_t *, const view_t *, const NVNcopyRegion *);
+int vk_texture_alias_depth_transfer(const tex_t *, const view_t *, const NVNcopyRegion *);
+int vk_texture_alias_depth_attachment_range(const tex_t *, const view_t *, VkImageSubresourceRange *);
+int vk_texture_alias_attachment_range(const tex_t *, const view_t *, int depth, VkImageSubresourceRange *);
+int vk_texture_attachment_base_view(const tex_t *, const view_t *);
+int vk_texture_alias_depth_clear_candidate(const tex_t *);
+int vk_texture_alias_depth_clear_bound(const tex_t *);
+const VkTexImage *vk_texture_get_alias_transfer_write(const tex_t *);
+void vk_texture_alias_transfer_written(const tex_t *, VkImage, const view_t *, const NVNcopyRegion *);
+void vk_texture_alias_clear_written(const tex_t *, VkImage, const VkImageSubresourceRange *);
+void vk_texture_alias_depth_clear_written(const tex_t *, VkImage, const NVNcopyRegion *);
+VkImage vk_texture_alias_probe_receiver_image(const tex_t *);
+typedef struct VkTextureAliasRead VkTextureAliasRead;
+// Receives the actual initialized LOAD receipt and retains its allocation at its original scope.
+VkTexturePresentSource *vk_texture_present_retain_alias_image(VkTextureAliasRead *, VkImage exact);
+typedef enum {
+    VK_TEXTURE_ALIAS_ORDER, VK_TEXTURE_ALIAS_MAPPING, VK_TEXTURE_ALIAS_LAYOUT, VK_TEXTURE_ALIAS_COVERAGE,
+    VK_TEXTURE_ALIAS_OWNER, VK_TEXTURE_ALIAS_CAPACITY
+} VkTextureAliasPhase;
+typedef struct {
+    VkTextureAliasPhase phase;
+    RcRegistryResult status;
+    const char *layout_gate;
+    RcInterval receiver;
+    uint64_t registration, material_serial;
+    VkImage image;
+    RcRegistryNativeImageFailure coverage;
+    RcRegistryBufferLocation raw_origin;
+    RcRegistryResult raw_status;
+    uint32_t raw_spans;
+    uint8_t raw_attempted;
+} VkTextureAliasFailure;
+typedef struct {
+    VkTextureAliasRead *alias;
+    VkTexturePresentSource *resident;
+    VkTexImage image;
+    const tex_t *texture;
+    RcRegistryPosition read;
+    RcInterval *mapping, *demand;
+    uint32_t mapping_count, demand_count;
+} VkTextureTransferInput;
+
+int vk_texture_transfer_source_geometry(const tex_t *, VkTexImage *);
+int vk_texture_transfer_input_capture(const tex_t *, const VkTexImage *, VkImageSubresourceLayers, const NVNcopyRegion *,
+                                      VkTextureTransferInput *, VkTextureAliasFailure *);
+int vk_texture_transfer_input_current(const VkTextureTransferInput *);
+int vk_texture_transfer_input_use(const VkTextureTransferInput *);
+void vk_texture_transfer_input_cancel(VkTextureTransferInput *);
+
+int vk_texture_alias_read_capture(const tex_t *, VkTextureAliasRead **, VkTexImage *, VkTextureAliasFailure *);
+int vk_texture_alias_read_current(VkTextureAliasRead *);
+// A direct sample may hold a submitted RAW fill candidate before it has a copyable source.
+int vk_texture_alias_read_raw_progress(VkTextureAliasRead *, RcRegistryPosition, uint64_t *upload);
+int vk_texture_alias_read_raw_finish(VkTextureAliasRead *, RcRegistryPosition);
+int vk_texture_alias_sample_selection_current_locked(int logical, VkTextureAliasRead *);
+// A winning image producer can supply a B2B source. OK with no receipt keeps the selected raw buffer.
+RcRegistryResult vk_texture_alias_buffer_capture(const VkMemSpanCapture *, const VkMemSpan *, uint64_t address,
+    uint64_t size, VkTextureAliasRead **, VkTextureAliasFailure *);
+RcRegistryResult vk_texture_alias_buffer_capture_rows(const VkMemSpanCapture *, const VkMemSpan *, uint64_t address,
+    uint64_t bytes, uint64_t row_bytes, uint64_t row_stride, VkTextureAliasRead **, VkTextureAliasFailure *);
+// The held caller supplies the exact fixed writable span at the original even read.
+// OK without a seed proves direct native use. A returned seed owns its exact mixed sources and destination.
+RcRegistryResult vk_texture_alias_buffer_write_input_capture(const VkMemSpanCapture *, const VkMemSpan *,
+    uint64_t address, uint64_t bytes, VkTextureAliasRead **seed, VkTextureAliasFailure *);
+int vk_texture_alias_buffer_write_input_current(const VkMemSpanCapture *, const VkMemSpan *,
+    uint64_t address, uint64_t bytes, VkTextureAliasRead *seed);
+// Stage after the shared ordered readback. Validate the entire cohort before recording any destination copy.
+int vk_texture_alias_buffer_write_input_stage(VkTextureAliasRead *);
+void vk_texture_alias_buffer_write_input_record(VkTextureAliasRead *, VkCommandBuffer, uint64_t fence);
+// Call only for actual shader issue on the seeded command buffer, before its normal effect commit.
+void vk_texture_alias_buffer_write_input_issued(VkTextureAliasRead *, VkCommandBuffer);
+// Only after the prefix containing vk_texture_alias_read_record actually completed.
+int vk_texture_alias_buffer_source(VkTextureAliasRead *, VkBuffer *, VkDeviceSize *);
+int vk_texture_alias_buffer_copy(VkTextureAliasRead *, void *, uint64_t);
+
+struct RcVmaDependency;
+typedef struct {
+    uint64_t upload;
+    VkDeviceSize size;
+} VkTextureAliasStagingProgress;
+VkResult vk_texture_alias_read_prepare(VkTextureAliasRead *const *, uint32_t count, int required,
+    uint64_t after_upload, VkTextureAliasStagingProgress *, struct RcVmaDependency *);
+void vk_texture_alias_read_unprepare(VkTextureAliasRead *const *, uint32_t count);
+void vk_texture_alias_read_record(VkTextureAliasRead *, VkCommandBuffer, uint64_t);
+const VkTexImage *vk_texture_alias_read_upload(VkTextureAliasRead *, VkCommandBuffer, uint64_t);
+void vk_texture_alias_read_cancel(VkTextureAliasRead *);
+typedef struct VkTextureBoundRelocation VkTextureBoundRelocation;
+int vk_texture_bound_relocation_capture(const tex_t *destination, VkTextureBoundRelocation **);
+int vk_texture_bound_relocation_current(VkTextureBoundRelocation *);
+VkResult vk_texture_bound_relocation_allocate(VkTextureBoundRelocation *, struct RcVmaDependency *);
+void vk_texture_bound_relocation_record(VkTextureBoundRelocation *, VkCommandBuffer, uint64_t fence);
+int vk_texture_bound_relocation_commit(VkTextureBoundRelocation *);
+void vk_texture_bound_relocation_cancel(VkTextureBoundRelocation *);
+typedef enum {
+    VK_TEXTURE_STORAGE_SEED_REFUSED = -1,
+    VK_TEXTURE_STORAGE_SEED_UNSUPPORTED,
+    VK_TEXTURE_STORAGE_SEED_CURRENT,
+    VK_TEXTURE_STORAGE_SEED_CAPTURED,
+} VkTextureStorageSeedResult;
+// The caller owns the selected image and exact storage view. Capture stays at the original even read.
+// CAPTURED uses the ordinary alias cohort to seed only those planes, before the dispatch records.
+VkTextureStorageSeedResult vk_texture_storage_seed_capture(const VkTexImage *, VkImageSubresourceRange,
+                                                            VkTextureAliasRead **, VkTextureAliasFailure *);
+typedef struct VkTextureStorageTarget VkTextureStorageTarget;
+typedef struct VkTextureWriteTarget VkTextureWriteTarget;
+enum {
+    VK_TEXTURE_STORAGE_CAPTURE_UNSUPPORTED = -2,
+    VK_TEXTURE_STORAGE_CAPTURE_INVALIDATED = -1,
+    VK_TEXTURE_STORAGE_CAPTURE_ABSENT = 0,
+    VK_TEXTURE_STORAGE_CAPTURE_READY = 1,
+    VK_TEXTURE_STORAGE_CAPTURE_COW = 2,
+    VK_TEXTURE_STORAGE_CAPTURE_BOUND = 3,
+};
+const VkTexImage *vk_texture_storage_binding_locked(int logical, int exact, view_t *, int *has_view);
+int vk_texture_effect_independent_storage(int logical, int exact, int written, VkTexImage *, view_t *, int *has_view, uint64_t *size,
+                                          VkTextureStorageTarget **, const char **reason);
+// A nonnull material output opts a written binding into exact host copy-on-write preparation.
+int vk_texture_effect_storage_capture(int logical, int exact, VkTexImage *, view_t *, int *has_view, uint64_t *size,
+                                     VkTextureStorageTarget **, VkTextureWriteTarget **material, int written, int allow_bound, const char **reason);
+// The selected bound version is held by the target while its preparation is suspended.
+VkTextureBoundRelocation *vk_texture_storage_target_bound_plan(VkTextureStorageTarget *);
+int vk_texture_storage_target_bound_commit(VkTextureStorageTarget *, VkTexImage *selected);
+int vk_texture_storage_target_current(const VkTextureStorageTarget *);
+int vk_texture_storage_target_load_current(const VkTextureStorageTarget *, const VkImageSubresourceRange *);
+int vk_texture_storage_target_host_mirror(const VkTextureStorageTarget *);
+int vk_texture_storage_target_replaced_stale(const VkTextureStorageTarget *);
+VkResult vk_texture_storage_target_prepare_host_cpu(VkTextureStorageTarget *, struct RcVmaDependency *);
+// Both retained destinations must be current and physically independent at their original read.
+int vk_texture_storage_targets_disjoint(const VkTextureStorageTarget *, const VkTextureStorageTarget *);
+int vk_texture_storage_target_disjoint_input(const VkTextureStorageTarget *, const RcInterval *, uint32_t, VkImageMemoryPlacement);
+int vk_texture_write_target_disjoint_placement(const VkTextureWriteTarget *, VkImageMemoryPlacement);
+VkImage vk_texture_storage_target_image(const VkTextureStorageTarget *, const VkTextureAliasRead *);
+int vk_texture_storage_target_declare(const VkTextureStorageTarget *, const VkTextureAliasRead *, struct ResourceCommandEffects *);
+// The caller holds the texture lock through use, command recording and the actual output report.
+int vk_texture_storage_target_use(const VkTextureStorageTarget *, VkTextureAliasRead *, uint64_t fence, VkCommandBuffer);
+int vk_texture_storage_target_read_use(const VkTextureStorageTarget *, const VkImageSubresourceRange *, uint64_t fence);
+int vk_texture_storage_target_written(const VkTextureStorageTarget *, VkTextureAliasRead *,
+                                      const VkImageSubresourceRange *defined_planes);
+// After issuing a retained in-place storage operation, carry its original initialized plane into later native views.
+int vk_texture_storage_target_written_preserving(const VkTextureStorageTarget *, const VkImageSubresourceRange *);
+void vk_texture_storage_target_release(VkTextureStorageTarget *);
+int vk_texture_alias_target_capture(const tex_t *, const view_t *, uint32_t layers, VkTextureAliasRead **,
+                                    int ordered, VkTextureAliasFailure *);
+const RcInterval *vk_texture_alias_read_intervals(const VkTextureAliasRead *, uint32_t *count);
+int vk_texture_alias_target_current(VkTextureAliasRead *, VkImage);
+int vk_texture_alias_target_load_current(VkTextureAliasRead *, VkImage, const VkImageSubresourceRange *);
+// The LOAD receipt owns this initialized native placement until the last recorded use.
+const VkTexImage *vk_texture_alias_target_image(const VkTextureAliasRead *);
+const VkTexImage *vk_texture_alias_target_replacement(const VkTextureAliasRead *);
+int vk_texture_alias_target_read_prior(VkTextureAliasRead *, VkImage target, VkImage sampled, int fragment);
+int vk_texture_alias_target_prepare_replacement(VkTextureAliasRead *, const VkImageSubresourceRange *);
+void vk_texture_alias_target_record_replacement(VkTextureAliasRead *, const VkImageSubresourceRange *);
+void vk_texture_alias_target_cancel(VkTextureAliasRead *);
+VkTextureAliasRead *vk_texture_alias_read_retain(VkTextureAliasRead *);
+void vk_texture_alias_read_use(VkTextureAliasRead *, uint64_t fence);
+VkImageView vk_texture_alias_read_view_locked(VkTextureAliasRead *, const VkImageViewCreateInfo *);
+const VkTexImage *vk_texture_get_target(const tex_t *t);
+int vk_texture_attachment_load_ready(const VkTexImage *selected, const VkImageSubresourceRange *);
+struct ResourceCommandEffects;
+int vk_texture_declare_pin_write(const tex_t *, struct ResourceCommandEffects *);
+void vk_texture_explicit_read_use(const tex_t *, VkImage);
+typedef struct {
+    const tex_t *pin;
+    VkImage image;
+} VkPinnedTextureWrite;
+void vk_texture_pinned_write_capture(const tex_t *, VkImage, VkPinnedTextureWrite *);
+int vk_texture_pinned_write_matches_locked(const VkPinnedTextureWrite *, VkImage);
+void vk_texture_pinned_write_release(VkPinnedTextureWrite *);
+void vk_texture_pinned_write_use(const VkPinnedTextureWrite *);
+void vk_texture_pinned_write_prepare(const VkPinnedTextureWrite *);
+void vk_texture_pinned_write_recorded(const VkPinnedTextureWrite *);
+typedef struct VkTextureTargetLoan VkTextureTargetLoan;
+VkTextureTargetLoan *vk_texture_target_loan(const tex_t *, VkImage expected, int materialized);
+const VkTexImage *vk_texture_target_loan_image(const VkTextureTargetLoan *);
+int vk_texture_target_loan_current(const VkTextureTargetLoan *);
+int vk_texture_target_loan_backing_current(const VkTextureTargetLoan *, const RcRegistryImageWriteExtent *, uint32_t);
+int vk_texture_target_loan_private(const VkTextureTargetLoan *);
+VkPinnedTextureWrite vk_texture_target_loan_take_pin(VkTextureTargetLoan *);
+void vk_texture_target_loan_release(VkTextureTargetLoan *);
 const VkTexImage *vk_texture_writable_locked(const VkTexImage *img); // texture lock held
+struct RcVmaDependency;
+int vk_texture_write_target_shape(const tex_t *, VkTexImage *);
+// A T2T restore can seed its private target from the old destination's exact nonresident recipe.
+int vk_texture_write_target_restore_shape(const tex_t *, VkTexImage *);
+// Negative is a changed candidate, zero leaves compatibility available before the write target is owned.
+int vk_texture_write_target_capture(const tex_t *, const VkTexImage *, VkTextureWriteTarget **);
+int vk_texture_write_target_current(const VkTextureWriteTarget *);
+int vk_texture_write_target_needs_allocation(const VkTextureWriteTarget *);
+VkResult vk_texture_write_target_allocate(VkTextureWriteTarget *, struct RcVmaDependency *);
+void vk_texture_write_target_declare(const VkTextureWriteTarget *, struct ResourceCommandEffects *);
+const VkTexImage *vk_texture_write_target_begin(VkTextureWriteTarget *, VkCommandBuffer);
+void vk_texture_write_target_written(VkTextureWriteTarget *);
+void vk_texture_write_target_clear_written(VkTextureWriteTarget *, const VkImageSubresourceRange *);
+// An operation may read or write this same exact private image in its subsequent phases.
+void vk_texture_write_target_recorded(VkTextureWriteTarget *);
+int vk_texture_write_target_use(const VkTextureWriteTarget *, VkImage);
+void vk_texture_write_target_cancel(VkTextureWriteTarget *);
+typedef struct {
+    VkTextureWriteTarget **targets;
+    uint32_t count;
+} VkTextureWritePlan;
+
+typedef enum {
+    VK_TEXTURE_STORAGE_GONE,
+    VK_TEXTURE_STORAGE_PINNED,
+    VK_TEXTURE_STORAGE_TARGET,
+    VK_TEXTURE_STORAGE_NEW_TARGET
+} VkTextureStorageResult;
+
+VkTextureStorageResult vk_texture_effect_ordered_image(int logical, int written, const VkTextureWritePlan *,
+    VkTexImage *, view_t *, int *has_view, uint64_t *size, VkPinnedTextureWrite *, VkTextureWriteTarget **);
+int vk_texture_effect_ordered_sample(int logical, const VkTextureWritePlan *, VkTexImage *, view_t *, int *has_view,
+    VkTextureWriteTarget **, VkTexturePresentSource **);
+int vk_texture_write_plan_independent(const VkTextureWritePlan *);
+int vk_texture_write_plan_disjoint_pin(const VkTextureWritePlan *, const VkPinnedTextureWrite *);
+// Compare one selected private writer's full canonical coverage with an exact retained native buffer input.
+int vk_texture_write_disjoint_input(const VkTextureWriteTarget *, const VkPinnedTextureWrite *, const RcInterval *, uint32_t);
+RcRegistryResult vk_texture_write_compare_input(const VkTextureWriteTarget *, const VkPinnedTextureWrite *,
+                                                const RcInterval *, uint32_t, RcInterval *overlap);
+VkResult vk_texture_write_plan_allocate(const VkTextureWritePlan *, struct RcVmaDependency *);
+VkImage vk_texture_write_target_prepared_image(const VkTextureWriteTarget *);
+void vk_texture_write_target_viewed(VkTextureWriteTarget *);
+void vk_texture_write_target_bound(VkTextureWriteTarget *);
+int vk_texture_write_target_bound_current(const VkTextureWriteTarget *);
+typedef struct VkTextureRestore VkTextureRestore;
+VkTextureRestore *vk_texture_restore_capture(const tex_t *, VkTexImage *shape);
+// The transfer owns this optional COW target. Reserve its native placement with the restoration before either grows.
+void vk_texture_restore_pair_write_target(VkTextureRestore *, VkTextureWriteTarget *);
+VkResult vk_texture_restore_prepare(VkTextureRestore *, struct RcVmaDependency *);
+int vk_texture_restore_spare_ready(void *);
+uint64_t vk_texture_restore_upload_supplier(const VkTextureRestore *, uint64_t after);
+const VkTexImage *vk_texture_restore_publish(VkTextureRestore *);
+void vk_texture_restore_use(const VkTextureRestore *);
+void vk_texture_restore_cancel(VkTextureRestore *);
+// The startup probe selects an eligible material using the same residency detach as pressure reclamation.
+int vk_texture_restore_probe_evict(const tex_t *);
+uint64_t vk_texture_restore_probe_count(void);
+uint64_t vk_mem_progress_prior(const struct RcVmaDependency *, uint64_t scene);
 int vk_mem_observe_subresources(uint64_t addr, uint64_t size, const TextureSourceStamp *prior, uint32_t epoch,
                                const TextureSourceSpan *spans, uint32_t count, TextureSourceObservation *out);
 // A texture slot; a slot whose texture was finalized follows the live texture at the same storage (hle_nvn.c).
@@ -584,11 +1219,17 @@ const VkTexImage *vk_texture_by_id(int id, view_t *view, int *has_view);
 void vk_texture_lock(void);
 void vk_texture_unlock(void);
 const VkTexImage *vk_texture_by_id_locked(int id, view_t *view, int *has_view);
+// Shader-selection metadata only: 1 known, 0 absent, -1 content-dependent alias ambiguity (use the ordered
+// resolver). No allocation, guest-byte access, freshness preparation or deferred-state mutation. Output has no
+// image/readiness handles; only format, view_type and samples are authoritative for shader answers.
+int vk_texture_metadata_locked(int id, VkTexImage *out, view_t *view, int *has_view);
 // The replay workers (vk_exec.c "replay workers"): a chunk's lookup that would make or take back a texture entry
 // before the chunk's turn returns nothing and says so here; the chunk replays the op again in turn
 // (vk_texture_deferred_take clears it). vk_exec_turn_due: the calling thread records a chunk whose earlier chunks may not
 // be done yet; vk_exec_turn waits until they are (no-op elsewhere).
 int vk_texture_deferred(void);
+// Mark a turn-dependent lookup for the recorder's existing retry. Acquires no lock.
+int vk_texture_defer_until_turn(void);
 int vk_texture_deferred_take(void);
 void vk_texture_deferred_stats(uint64_t out[3]);   // since the last call, by what the lookup found: none, retired, released
 int vk_exec_turn_due(void);
@@ -622,6 +1263,7 @@ VkSampler vk_sampler_point_by_id_locked(int id);
 // The slot's sampler with its compare on, for a depth-compare read (vk_texture.c, at the definition); the slot's own
 // sampler when it compares already. VK_NULL_HANDLE for an empty slot.
 VkSampler vk_sampler_compare_by_id_locked(int id);
+VkSampler vk_sampler_pool_by_id_locked(int id, int comparison);
 // Texture detail (vk_texture.c): what texture_detail = auto picks on this device, 0 full, 1 reduced, 2 low (the budget is
 // read at the first call). For the menu's row.
 int vk_texture_detail_auto(void);
@@ -634,10 +1276,14 @@ VkSampler vk_sampler_detail_by_id_locked(int id, uint32_t skip);
 // Returns what the slot resolves to now, as vk_texture_by_id_locked does.
 const VkTexImage *vk_texture_exact_by_id_locked(int id, view_t *view, int *has_view);
 uint32_t vk_texture_slots_gen(void);
-int vk_texture_slot_count_locked(void);
+int vk_texture_slot_group_locked(int id); // Diagnostic group identity; caller holds the texture lock.
 void vk_texture_create_budget_locked(int n);         // slot lookups create at most n entries (mapped storage only); -1 any
 int vk_texture_create_deferred_locked(void);        // a lookup since the last call left a creation to the budget             // one past the highest texture slot registered so far (or more)
 int vk_sampler_slot_count_locked(void);
+int vk_sampler_slot_registered_locked(int id); // metadata only; does not create a sampler
+int vk_sampler_slot_comparison_locked(int id);
+int vk_sampler_slot_compare_state_locked(int id, unsigned *mode, unsigned *function);
+int vk_sampler_pool_comparison_locked(void);
 // Bindless pools (vk_exec_draw.c, "texture and sampler pools"): set 2 of every pipeline layout. Shaders that index
 // the texture or sampler pool with handles from memory have their pool arrays moved there (vk_pipeline.c
 // spirv_pool_rebind); VK_POOL_KINDS image bindings, one per view kind, then the sampler pool.
@@ -648,6 +1294,8 @@ extern volatile uint32_t vk_pool_kinds_used;        // bit k: a pipeline was mad
 // Texture pool marks (vk_pipeline.c spirv_pool_mark, vk_exec_draw.c "pool marks"): set 2, this binding, a uint per pool
 // slot that shaders set to 1 when they index the slot.
 #define VK_POOL_MARK_BINDING (VK_POOL_KINDS + 1)
+#define VK_POOL_COMPARISON_BINDING (VK_POOL_KINDS + 2)
+void vk_pool_marks_decline(void);                    // optional resources refused before the first pool layout
 int vk_pool_marks_enabled(void);                     // NX2NAVI_TEX_DISUSE: modules get the marks
 extern volatile int32_t vk_pool_marks_missed;        // modules indexing the pool that could not be marked
 void vk_pool_marks_read(const uint32_t *marks, uint32_t n);   // vk_texture.c: slots marked since the last read
@@ -661,15 +1309,47 @@ uint64_t vk_pool_takes(void);
 // Those lookups leave out a texture evicted by disuse, and are not counted as the texture being used.
 void vk_texture_pool_ctx(int on);
 VkDescriptorSetLayout vk_pool_set_layout(void);     // the pools' layout (made on first use)
+int vk_pool_split_samplers(void);
 VkDescriptorSetLayout vk_empty_set_layout(void);    // set 1 of layouts without one
 // The upscaler stand-in (vk_tonemap.c): src (sampled) scaled to dw x dh and tonemapped into its own RGBA16F image, which
 // it returns for the caller to blit into the target; VK_NULL_HANDLE when it cannot. The caller binds its own compute
 // pipeline again afterwards.
-VkImage vk_tonemap_record(VkCommandBuffer cb, VkImage src, VkFormat sf, uint32_t dw, uint32_t dh);
+VkImage vk_tonemap_record(VkCommandBuffer cb, VkImage src, VkImageView source_view, VkFormat sf, uint32_t dw, uint32_t dh);
+void vk_tonemap_shutdown(void); // after the fallback commands have retired, before the device allocator
 // What vk_texture_by_id(id) returns can change only when this does: the slot is registered again, or a texture entry at
 // its storage address is created, dropped, released or taken back into use. Unlocked; read it before the lookup it
 // guards (a lookup may create an entry). 0 when the slot was never registered: nothing is kept under 0.
 uint64_t vk_texture_slot_token(int id);
+int vk_texture_effect_range(int id, uint64_t *addr, uint64_t *size, uint64_t *token);
+// Resolve and preserve the actual writable image during ordered declaration. Returns 1 ready, 0 absent, -1 deferred.
+// out is a value snapshot, never a Tex pointer. Its image is held through this recording scene's real completion.
+int vk_texture_effect_image(int id, int exact, VkTexImage *out, view_t *view, int *has_view, uint64_t *source_size,
+                            VkPinnedTextureWrite *capture);
+// The selected compute replacement carries the actual image through command recording and into HUD/FG
+// if used. Possible whole-plane projection is optional and requires the same declared physical mapping.
+enum { VK_TEXTURE_COLOR_BLIT_MAPPINGS = 8 };
+typedef struct {
+    VkImage image;
+    VkMemoryImageHold *hold;
+    RcRegistryPosition read;
+    uint64_t address, bytes, serial;
+    VkFormat format;
+    VkExtent2D extent;
+    uint32_t mapping_count;
+    RcInterval mapping[VK_TEXTURE_COLOR_BLIT_MAPPINGS];
+} VkTextureColorBlitSource;
+int vk_texture_effect_color_blit(int id, VkTexImage *, view_t *, int *has_view, uint64_t *source_size,
+                                VkTextureColorBlitSource *);
+void vk_texture_storage_blit_written(const VkTextureColorBlitSource *, const VkImageBlit *);
+// Read only from a current registration's already-selected committed pin. No resolver/upload/COW enters preflight.
+ // Capture the resolved sampled instance in the active scene, without writable conversion or a CPU-source claim.
+// -1: ordered preparation deferred, 0: unavailable/absent, 1: exact image/view metadata retained through completion.
+// The caller must preserve this binding and verify shader-answer metadata before sealing its declaration.
+int vk_texture_effect_sample(int id, int exact, VkTexImage *out, view_t *view, int *has_view, uint64_t *source_size);
+// Texture lock held: whether a captured physical image still has a current owner for cached view creation.
+// A false answer permits only consumer-owned deferred views; it does not revoke an existing image capture.
+int vk_texture_image_live_locked(const VkTexImage *captured);
+
 uint64_t vk_texture_same_regs(void);
 void vk_texture_bucket_stats(char *out, size_t n);   // diagnosis for the pool log (vk_texture.c)
 uint64_t vk_texture_slot_khash_locked(int id);       // vk_texture.c: descriptor hash of a GPU-written slot, 0 otherwise
@@ -679,12 +1359,18 @@ uint32_t vk_texture_entry_gen(void);                 // vk_texture.c: bumped by 
 // from vk_texture_dirty_pos_locked after such a walk. Texture lock held.
 // gfn, when given, gets each slot group of a bucket in place of fn for its members.
 int vk_texture_dirty_slots_locked(uint64_t *pos, void (*fn)(int id, void *arg), void (*gfn)(int g, void *arg), void *arg);
+// Source-proof changes only; no descriptor identity mutation. Zero requires invalidating all source receipts.
+int vk_texture_source_dirty_slots_locked(uint64_t *pos, void (*fn)(int id, void *arg), void *arg);
+int vk_texture_schedule_dirty_slots_locked(uint64_t *pos, void (*fn)(int id, void *arg), void *arg);
 // Slot groups (vk_texture.c): the GPU-written slots of one address bucket with one descriptor hash kh, which resolve
 // alike. head the first member, vk_texture_group_next_locked the next (-1: the end), n how many; stamp and fmask the
 // texture pool's (vk_exec_draw.c pool_dirty_group: 1 when every member holds the same views, of the kinds fmask; a slot
 // that joins goes to the tail, refilled on its own), set 0 by vk_texture_groups_unstamp_locked. Texture lock held.
-typedef struct { uint64_t kh; int32_t head, n; uint32_t stamp, fmask; } VkSlotGroup;
+typedef struct { uint64_t kh, incarnation; int32_t head, n; uint32_t stamp, fmask, association; } VkSlotGroup;
 VkSlotGroup *vk_texture_group_locked(int g);
+int vk_texture_group_member_locked(int group, uint64_t incarnation, int id);
+int vk_texture_group_direct_locked(int group, uint64_t incarnation, int representative,
+                                   VkImage expected, uint32_t *entry);
 int vk_texture_group_next_locked(int id);
 void vk_texture_groups_unstamp_locked(void);
 uint64_t vk_texture_dirty_pos_locked(void);
@@ -730,7 +1416,27 @@ uint32_t vk_sampler_gen(void);                      // changes whenever a sample
 void vk_texture_gpu_written(const tex_t *t);        // rendered or copied into by the GPU: no re-upload from storage
 // The live image of the given format and img's size at img's storage address, NULL when there is none. Texture lock held.
 const VkTexImage *vk_texture_at_locked(const VkTexImage *img, VkFormat format);
+// Rank and decode fallback pictures using issued integer storage descriptors on the base packed-color plane.
+// This records writable intent, carries no proof of executed stores or initialization, and grants no projection.
+void vk_texture_packed_storage_issued(VkImage image, uint64_t address);
+void vk_texture_pinned_storage_picture_issued(const VkPinnedTextureWrite *, VkImage);
+void vk_texture_write_target_picture_issued(const VkTextureWriteTarget *, VkImage);
+int vk_texture_storage_target_picture_written(const VkTextureStorageTarget *, VkTextureAliasRead *,
+    const VkImageSubresourceRange *, int preserving, VkImage);
+int vk_texture_packed_storage_rank_available_locked(void);
+// The query takes a live texture entry under the texture lock and checks its exact recording disposition.
+RcRegistryPosition vk_texture_packed_storage_output_locked(const VkTexImage *image, RcRegistryPosition cut);
 void vk_texture_storage_written(VkImage image, uint64_t addr); // successful command emission only
+int vk_texture_render_target_written(VkImage image, uint64_t addr);
+int vk_texture_render_target_load_current(VkImage, uint64_t, const VkImageSubresourceRange *);
+int vk_texture_render_target_loaded_written(VkImage, uint64_t, VkTextureAliasRead *seed, const VkImageSubresourceRange *);
+// Copy the selected image's existing range owners and native extents. The caller owns the extent vector.
+// Typed reuse still depends on live registry proof; never allocate or rebind a hold here.
+int vk_texture_image_binding(VkImage image, uint64_t addr, uint64_t size, RcRegistryImageBinding *out,
+                             RcRegistryImageWriteExtent **extents, uint32_t *count);
+// Capture the full storage range of this exact live physical owner and its recording lifetime. The optional
+// persistent hold is broad range ownership, not a claim that guest CPU contents are current.
+int vk_texture_image_effect(VkImage image, uint64_t addr, RcSourceRange *range, RcRegistryImageBinding *owner);
 void vk_texture_storage_bound_locked(const VkTexImage *img);   // bound as a storage image in the recording submission
 uint64_t vk_texture_last_write(const tex_t *t);    // timeline value of the newest submission recorded to write it; 0: none
 size_t vk_texture_texel_span(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uint64_t row, uint64_t img);   // bytes ReadTexels spans; 0 for a bad region
@@ -750,11 +1456,17 @@ void vk_texture_stats(uint64_t *images, uint64_t *uploads, uint64_t *reuploads);
 typedef struct { uint64_t live, released, own_live, own_released, bytes_live, bytes_released; } VkTexCensus;
 void vk_texture_census(VkTexCensus *s);
 void vk_texture_census_log(uint64_t frame);         // vk_memory.c vram_log: the live entries' memory by kind and format
-void vk_texture_want_room(uint64_t bytes);          // a VRAM mirror that did not fit: idle textures make that much room
+unsigned vk_texture_reclaim_heap(uint32_t domain, uint64_t bytes); // RcBudgetReclaim status for optional image giveback
 int vk_texture_commit_low(void);                    // the system's commit was low at the last check (vk_texture.c)
 // vk_mem_vram's device-local use less the free space inside VMA's blocks (vk_memory.c), for the evictions
 int vk_mem_vram_live(uint64_t *used, uint64_t *budget);
+// Pressure request is lock-free. Drain only at a replay boundary with no active recording groups, before new work.
+void vk_exec_texture_publications_request_reclaim(void);
+void vk_exec_texture_publications_reclaim(uint64_t incoming_fence);
+void vk_exec_texture_publications_clear(void);      // idle renderer teardown, before texture shutdown
 void vk_texture_shutdown(void);                     // vk_mem_shutdown calls it
+void vk_exec_resource_handoff(uint64_t fence); // close ordered CPU reads before a replay prefix can execute
+void vk_exec_resource_handoff_before(uint64_t fence, uint64_t keep_open_ordinal);
 void vk_texture_new_submit(void);                   // a queue submit starts: draw bindings check storage again
 uint32_t vk_texture_epoch(void);                    // the write-watch snapshot epoch vk_texture_new_submit started
 VkSampler vk_sampler_by_id(int id);                 // VK_NULL_HANDLE for an empty slot
@@ -769,6 +1481,8 @@ void rt_write_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h)
 // once the GPU reached it and the completion thread ran its side effects. Guest or host threads.
 void vk_sync_start(void);                  // vk_init (fatal without a device) and the completion thread; idempotent
 uint64_t vk_sync_submit(const uint64_t *handles, int n);   // records with vk_exec_record, submits; returns the value
+uint64_t vk_sync_submit_capture(const uint64_t *handles, int n, VkUsnapCapture *capture); // always consumes capture
+uint64_t vk_sync_submit_bundle(const uint64_t *handles, int n, VkReplayCaptureBundle bundle); // always consumes both
 // The probes (--probe-vkmem's table parts, the lost-device probe): one submission whose commands the caller records
 // itself where the replay would, with the submission lock, the memory prologue and the fence of any other.
 uint64_t vk_sync_submit_own(void (*record)(VkCommandBuffer, void *), void *arg);
@@ -793,13 +1507,49 @@ void vk_sync_finish(void);                 // every submitted value done
 void vk_sync_shutdown(void);               // finish, stop the completion thread, free the command buffers
 // The op-stream replay (vk_exec.c): records the command handles of one submission into cb, which the caller has
 // begun and ends. fence is the value this submission will signal. Returns the number of commands recorded into the
-// command buffer it holds at the end (0: that one stays empty and is not submitted). A weak vk_sync.c version accepts
-// empty streams only.
-int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t fence);
+// command buffer it holds at the end (0: that one stays empty and is not submitted), or STOPPED when the tail
+// must be abandoned. A weak vk_sync.c version accepts empty streams only.
+enum { VK_EXEC_RECORD_STOPPED = -1 }; // possible handed prefix, no final scene handoff
+int vk_exec_recording_failed(void);  // active native tail cannot continue
+int vk_exec_recording_missing_resource(void); // required resource failure rather than normal cancellation
+typedef struct VkExecReadiness VkExecReadiness;
+// A synchronous readiness plan and capture are valid under the same uninterrupted submission lock.
+int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t fence,
+                   VkReplayCaptureBundle *bundle, const VkExecReadiness *readiness);
+VkResult vk_exec_snapshot_preflight(const uint64_t *handles, int n, VkUsnapCapture **capture,
+                                    VkExecReadiness **readiness, VkReplayCaptureWait *wait);
+void vk_exec_readiness_discard(VkExecReadiness *readiness);
 // Inside vk_exec_record, outside a render pass: ends the command buffer recorded so far, submits it (after the upload
 // batch) without a signal, and returns a new begun one for the rest of the submission. The submission's timeline value
 // is signalled by its last part, whose signal covers every earlier part in submission order.
 VkCommandBuffer vk_sync_split(void);
+struct VkExec;
+struct RcVmaDependency;
+typedef enum {
+    VK_SYNC_PROGRESS_UNAVAILABLE,
+    VK_SYNC_PROGRESS_COMPLETE,
+    VK_SYNC_PROGRESS_STOPPED,
+    VK_SYNC_PROGRESS_STOPPED_AFTER_CUT,
+} VkSyncProgressResult;
+// The replay owner can park outside provider locks without letting another recorder overtake its scene.
+// Only an actual successful native final-fence handoff qualifies as an older scene supplier.
+uint64_t vk_sync_handed_fence(void);
+// Recorder owns an empty current part. Confirm all earlier native scene parts are already done.
+int vk_sync_mirror_publication_safe(uint64_t scene);
+VkSyncProgressResult vk_sync_progress_wait_prior(uint64_t issued_scene);
+VkSyncProgressResult vk_sync_progress_wait_capacity(const struct RcVmaDependency *,
+                                                   int (*compatible_spare_ready)(void *), void *context);
+// After draining replay workers, prepare the selected pipeline outside the recorder mutex. The callback returns
+// nonzero once it owns a result (ready or terminal refusal), or zero on stop. The current scene stays exclusive.
+VkSyncProgressResult vk_sync_progress_prepare_pipeline(int (*prepare)(void *), void *context);
+VkSyncProgressResult vk_sync_progress_wait_upload_staging(uint64_t handed_upload);
+// After draining workers and closing the pass, cut only for eligible prefix scratch. A nonempty cut returns
+// the begun unhanded tail on COMPLETE or STOPPED_AFTER_CUT. An empty tail keeps its open command buffer and
+// waits on a private queue marker only for a fresh, handed ordinary part from this scene.
+VkSyncProgressResult vk_sync_progress_split(struct VkExec *, VkCommandBuffer *resume, int empty_tail);
+// Submit a nonempty native part while keeping the active guest read ordinal open.
+VkSyncProgressResult vk_sync_progress_split_before(struct VkExec *, VkCommandBuffer *resume,
+                                                  uint64_t keep_open_ordinal);
 // Inside vk_exec_record, for the replay workers (vk_exec.c): vk_sync_append_later ends the command buffer recorded so
 // far, puts it into the part followed by n places for command buffers the workers record (*at the first), and returns
 // a new begun one for the rest of the part; vk_sync_append_fill puts the workers' command buffers into their places,
@@ -815,9 +1565,14 @@ extern int vk_sub_in_frame;   // replay: the submission being recorded is the fr
 // Runs fn(arg) on the completion thread once fence is done on the GPU (event writes, counter reports, sync state).
 // Callbacks run in the order they were added, after those of earlier values; a value already done runs at once there.
 void vk_completion_add(uint64_t fence, void (*fn)(void *), void *arg);
+// An owned callback also disposes abandoned work. cancel(arg, 0) means the scene never reached the queue;
+// cancel(arg, 1) is allowed only after all possibly submitted GPU users were drained. It must not publish the
+// execution side effects of commands that may not have run. Submitted users are retained on an undrained loss.
+void vk_completion_add_owned(uint64_t fence, void (*fn)(void *), void (*cancel)(void *, int), void *arg);
 // The same for a side effect the game's CPU reads (an occlusion count, a counter report, an event value): run before
 // the others, and by the wait after a frame's first submission itself (vk_sync.c "the executed timeline").
 void vk_completion_add_result(uint64_t fence, void (*fn)(void *), void *arg);
+void vk_completion_add_result_owned(uint64_t fence, void (*fn)(void *), void (*cancel)(void *, int), void *arg);
 // gfx_vulkan_backend (vk_backend.c): presents go to a present thread and run after the submissions made before them.
 void rdoc_init(void);                     // runtime/rdoc.c: NX2NAVI_RDOC debug capture; before vkCreateInstance
 int rdoc_active(void);
@@ -825,7 +1580,7 @@ void rdoc_after_present(uint64_t frame);
 void vk_present_drain(void);               // returns once every queued present was submitted to gfx_queue
 int vk_replay_async(void);                 // NX2NAVI_REPLAY_ASYNC (default 0): submissions replay on the replay thread
 void vk_program_release(const prog_t *p);  // GfxBackend.program_release: vk_pipeline.c; weak no-op in vk_backend.c
-void vk_backend_shutdown(void);            // presents, vk_sync_shutdown, vk_mem_shutdown, vk_shutdown in that order
+void vk_backend_shutdown(void);            // drains replay and completion before destroying snapshots and memory
 
 // ---- pipelines (vk_pipeline.c)
 // Binding model (comment block at the top of vk_pipeline.c): one descriptor set, set 0, per pipeline. Binding 0 is
@@ -834,6 +1589,12 @@ void vk_backend_shutdown(void);            // presents, vk_sync_shutdown, vk_mem
 // maxPushDescriptors (32 here) descriptors; VkPipeInfo.bindings says what goes where. No push constants.
 // Everything a graphics pipeline depends on, as the op stream carries it. Fields covered by dynamic state are read by
 // vk_pipeline_set_dynamic only and left out of the pipeline key.
+enum {
+    VK_PIPE_RMW_NONE,
+    VK_PIPE_RMW_MESH_WORD,
+    VK_PIPE_RMW_FRAGMENT_BITMAP,
+    VK_PIPE_RMW_MESH_BITMAP,
+};
 typedef struct VkPipeState {
     const GfxShader *vs, *fs;              // gfx_shader_get results; fs NULL: no fragment stage (depth only). vs is
                                            // the mesh stage of a mesh draw (gfx_shader_stage GFX_STAGE_MS)
@@ -850,6 +1611,7 @@ typedef struct VkPipeState {
                                            // (OP_PRIM_RESTART, set by op_draw_idx); dynamic state only
     uint8_t feedback;                      // the fragment shader samples an attachment of the pass in the feedback
                                            // layout: 1 colour, 2 depth/stencil (VK_PIPELINE_CREATE_*_FEEDBACK_LOOP_BIT_EXT)
+    uint8_t native_rmw_marker;             // VK_PIPE_RMW_* explicit command-owned atomic marker variant
     blend_st blend[8];                    // OP_BIND_STATE kind 0, indexed by blend_st.target
     color_st color;                        // kinds 1-5
     chmask_st chmask;
@@ -860,17 +1622,17 @@ typedef struct VkPipeState {
     vs_st vstream[16];                     // OP_BIND_VSTREAM
 } VkPipeState;
 void vk_pipe_state_defaults(VkPipeState *s);   // NVN defaults of every state object (shaders and formats left 0)
-enum { VK_PIPE_SUPPORT = GFX_RES_KINDS };      // VkPipeBinding.kind of the support buffer
+enum { VK_PIPE_SUPPORT = GFX_RES_KINDS, VK_PIPE_NATIVE_RMW_MARKER };
 #define VK_PIPE_ZERO_BINDING 16                // vertex binding of shader inputs without an attribute: bind a zeroed
                                                // buffer of at least 16 bytes there (stride 0)
 typedef struct {
     uint16_t binding;                      // in its set
     uint8_t stage;                         // GFX_STAGE_* that declared it (support buffer: the first stage)
-    uint8_t kind;                          // GFX_RES_* or VK_PIPE_SUPPORT
+    uint8_t kind;                          // GFX_RES_* or a VK_PIPE_* synthetic descriptor role
     VkDescriptorType type;
     uint16_t count;
     VkShaderStageFlags stages;
-    const GfxShaderRes *res;               // the stage's reflection entry; NULL for the support buffer
+    const GfxShaderRes *res;               // stage reflection; NULL for synthetic descriptors
     uint8_t set;                           // descriptor set: 0, or 1 for the fragment stage with independent layouts
 } VkPipeBinding;
 typedef struct {
@@ -891,6 +1653,20 @@ typedef struct {
     // from the start of the set's descriptors. VK_NULL_HANDLE: the set is written with VkWriteDescriptorSet structs.
     VkDescriptorUpdateTemplate tpl[2];
     int pool;                              // a stage indexes the texture or sampler pool: bind set 2 (the pools)
+    // Owned compute source whose bytes exactly match the successfully created native shader module.
+    // A definite-effect analysis of any other source cannot describe this pipeline.
+    const GfxShader *compute_effect_shader;
+    RcNativeImageSeedBindings native_image_seed_bindings;
+    RcNativeImageStore native_image_store; // certified against the final module's selected compute entry point
+    uint64_t compute_query_size_lod0_mask;  // direct set 0 bindings attested by this native compute pipeline
+    const GfxShader *compute_pool_domain_shader; // source index proof remains valid after the final table remap
+    uint32_t compute_pool_query_shape_kinds; // all uses of the selected table binding are LOD0 queries
+    int compute_pool_marks; // the actual final module uses the renderer marker binding
+    // Attestation from the actual final native module. A nonzero binding requires the command's
+    // zero-initialized storage marker at the selected stage and set. The mesh mode records one word.
+    RcNativeRmwWord native_rmw;
+    uint32_t native_rmw_binding;
+    RcNativeImageSeedBindings native_image_rmw_seed_bindings;
 } VkPipeInfo;
 // One descriptor of the packed array a descriptor update template reads (VkPipeInfo.tpl), 24 bytes for every type; the
 // bytes a type leaves unused are zero, so equal descriptors compare equal byte for byte.
@@ -898,11 +1674,58 @@ typedef union { VkDescriptorImageInfo image; VkDescriptorBufferInfo buffer; VkBu
 // Both return the cached pipeline (created on first use; failures are cached and logged once). info: may be NULL.
 // Valid until vk_pipeline_shutdown; thread-safe.
 VkPipeline vk_pipeline_graphics(const VkPipeState *s, const VkPipeInfo **info);
+// Only considers a previously selected writable fragment storage binding after its ordinary import is blocked.
+int vk_pipeline_fragment_rmw_candidate(const VkPipeState *, const VkPipeBinding *);
+int vk_pipeline_mesh_rmw_bitmap_candidate(const VkPipeState *, const VkPipeBinding *);
 // The replay's variant: after vk_pipeline_async_enable a missing pipeline is built by background workers and this
 // returns VK_NULL_HANDLE with *pending 1 until it is ready (the draw is skipped); otherwise as vk_pipeline_graphics.
 // wait_ms > 0 waits up to that long for a pending pipeline first. Pipelines built in a run are recorded to
 // pipeline-keys.bin next to the pipeline cache and prebuilt at the next boot (NX2NAVI_PIPE_PREBUILD=0: not).
 VkPipeline vk_pipeline_graphics_async(const VkPipeState *s, const VkPipeInfo **info, int *pending, uint32_t wait_ms);
+typedef enum {
+    VK_GRAPHICS_READY, VK_GRAPHICS_PENDING, VK_GRAPHICS_STOPPED,
+    VK_GRAPHICS_UNSUPPORTED, VK_GRAPHICS_TERMINAL,
+} VkGraphicsPipelineResult;
+typedef struct VkGraphicsPipelineRevision VkGraphicsPipelineRevision;
+typedef struct VkGraphicsPipelineWait VkGraphicsPipelineWait;
+// Only the actual selected vertex module can certify an ordinary exclusive uniform binding.
+// A bounded result that does not fit these limits leaves the ordinary full input path unchanged.
+enum { VK_GRAPHICS_UNIFORM_BINDINGS = 8, VK_GRAPHICS_UNIFORM_RANGES = 16 };
+typedef struct { uint32_t offset, bytes; } VkGraphicsUniformRange;
+typedef struct { uint16_t binding; uint8_t first, count; } VkGraphicsUniformBinding;
+typedef struct {
+    uint32_t count;
+    VkGraphicsUniformBinding bindings[VK_GRAPHICS_UNIFORM_BINDINGS];
+    VkGraphicsUniformRange ranges[VK_GRAPHICS_UNIFORM_RANGES];
+} VkGraphicsUniformFootprints;
+
+// Binding 0 is reserved for support, so the fragment query mask can carry this revision's pool proof.
+#define VK_GRAPHICS_INACTIVE_POOL_ATTESTED UINT64_C(1)
+typedef struct {
+    const VkPipeInfo *info;
+    VkPipeline pipeline;
+    VkGraphicsPipelineRevision *revision;
+    uint64_t vs_query_size_lod0_mask;       // set 0 bindings certified by this native pipeline revision
+    uint64_t fs_query_size_lod0_mask;       // final fragment layout bindings certified by the same revision
+    const VkGraphicsUniformFootprints *vertex_uniforms; // borrowed from this exact retained revision
+} VkGraphicsPipelineUse;
+typedef struct {
+    VkResult error;
+    const char *reason;
+    RcAdmissionStatus admission;
+    RcAdmissionVector peak;
+    RcBudgetReadiness before;
+} VkGraphicsPipelineFailure;
+// Zero-start prepare is a lookup only. The parked producer starts/waits for the
+// exact state and owns *wait until Ready, terminal failure or explicit cancel.
+VkGraphicsPipelineResult vk_pipeline_graphics_prepare(
+    const VkPipeState *state, int allow_start, VkGraphicsPipelineWait **wait,
+    VkGraphicsPipelineUse *out, VkGraphicsPipelineFailure *failure);
+int vk_pipeline_graphics_wait(VkGraphicsPipelineWait *wait);
+void vk_pipeline_graphics_cancel(VkGraphicsPipelineWait **wait);
+void vk_pipeline_graphics_release(VkGraphicsPipelineUse *use);
+// Move the exact selected revision into the actual scene before native bind.
+void vk_pipeline_graphics_record(VkGraphicsPipelineUse *use, uint64_t scene);
 // How long the pipeline of s has been building since a draw first missed it, in milliseconds; 0 when it is unknown,
 // usable, or no draw has missed it.
 double vk_pipeline_building_ms(const VkPipeState *s);
@@ -927,6 +1750,27 @@ typedef struct {
 } VkPrewarmProgress;
 void vk_pipeline_prewarm_progress(VkPrewarmProgress *p);   // any thread, while vk_pipeline_prewarm runs or after
 VkPipeline vk_pipeline_compute(const GfxShader *cs, const VkPipeInfo **info);
+typedef enum {
+    VK_COMPUTE_READY, VK_COMPUTE_PENDING, VK_COMPUTE_STOPPED, VK_COMPUTE_TERMINAL,
+} VkComputePipelineResult;
+typedef enum {
+    VK_COMPUTE_BUILD, VK_COMPUTE_FLIGHT, VK_COMPUTE_CAPACITY,
+} VkComputePipelineWaitKind;
+typedef struct {
+    const GfxShader *shader;
+    RcAdmissionVector peak;
+    RcBudgetReadiness before;
+    RcAdmissionStatus admission;
+    VkComputePipelineWaitKind kind;
+    VkResult error;
+    const char *failure;
+} VkComputePipelinePending;
+// Probe only with allow_create=0. Creating or waiting requires the serialized recorder to be parked.
+// A wait receipt names the exact immutable shader and can be retried without retaining a flight pointer.
+VkComputePipelineResult vk_pipeline_compute_prepare(const GfxShader *shader, int allow_create,
+                                                      VkPipeline *pipeline, const VkPipeInfo **info,
+                                                      VkComputePipelinePending *pending);
+int vk_pipeline_compute_wait(const VkComputePipelinePending *pending);
 // Records every dynamic state that VkPipeState determines, after binding a graphics pipeline: cull mode, front face,
 // topology, depth and stencil tests and ops, depth bias enable, rasterizer discard, vertex input, and, where the GPU
 // has them dynamic, depth clamp, polygon mode, blend enables, equations, write masks and alpha to coverage. The replay
@@ -972,6 +1816,7 @@ int vk_pipeline_tex_type(int nvn_target);      // NVN_TEXTURE_TARGET_* -> GFX_TE
 uint32_t vk_pipeline_target_wmask(const VkPipeState *s, int i);   // colour write mask of target i the pipeline uses
 VkPrimitiveTopology vk_pipeline_topology(int nvn_prim);   // quads -> triangle list, line loop -> strip: the replay
                                                           // rewrites those draws; polygon -> fan
+int vk_format_shader_numeric_type(VkFormat format);      // GFX_TYPE_* for a supported renderer format
 VkFormat vk_vertex_format(int nvn_format, int *type);     // attribute format (supported fallback), GFX_TYPE_* in *type
 PFN_vkCmdPushDescriptorSetKHR vk_pipeline_push_fn(void);  // after the first vk_pipeline_* call
 // Descriptor update templates (after the first vk_pipeline_* call): NULL when templates are off (NX2NAVI_DESC_TEMPLATE=0,
@@ -987,6 +1832,7 @@ void vk_pipeline_save(void);               // writes the VkPipelineCache to pipe
 void vk_pipeline_save_exit(void);          // vk_pipeline_save as the process ends: new builds wait while it waits for
                                            // the running ones
 void vk_pipeline_autosave(void);           // vk_pipeline_save at most every 20 s, when pipelines were built since
+void vk_pipeline_stop_preparation(void);   // cancel capacity-blocked jobs before joining replay/background workers
 void vk_pipeline_shutdown(void);           // waits for background builds, saves, destroys pipelines, layouts and the
                                            // cache; before vk_shutdown
 int vk_pipeline_selftest(void);            // one graphics and one compute pipeline from census shaders; 0 on success

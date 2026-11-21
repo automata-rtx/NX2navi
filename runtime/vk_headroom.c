@@ -17,18 +17,16 @@
 // one (VRAM behind the PCIe BAR), each got a 256 MiB spare early on and never needed another; to the end the BAR type
 // held 320 MiB of blocks for 37 MiB of allocations and one host type 288 MiB for 0.1 MiB, as VMA keeps an empty block
 // until the next free of its type, and these types seldom free anything.
-// Under VRAM pressure no headroom is kept: the spare block counts against the budget that decides whether a pool gets
-// its VRAM mirror (vk_memory.c), so while use plus two blocks passes 85% of the budget the anchor goes and nothing new
-// is allocated. Nor while the system's commit is low (vk_texture_commit_low) where device memory counts against it:
-// on Windows the driver charges device memory to the commit, and a spare block of each type held up to 256 MiB of it
-// empty when an allocation that failed there ended the game; an integrated GPU's memory is the machine's RAM. Linux's
-// limits (plat_commit_counts_vram) do not count a discrete card's own memory, so dropping its spare would free nothing
-// they count and only put the block allocations back on the render thread.
+// Shared optional capacity controls new backing growth. Existing compatible spans can still be probed without
+// reserving another physical block. Anchors are released when that same shared allowance cannot accommodate the
+// next block, and their capacity ownership ends only at the actual allocator free. No selected/pending free is
+// added to headroom. Explicit give-back also holds off this speculation while required producers make progress.
 // NX2NAVI_VRAM_HEADROOM=0 turns it off.
 
 #include "cfg.h"
 #include "host.h"
 #include "vk.h"
+#include "resource_core_vma.h"
 #include "platform/platform.h"
 
 #define HR_PERIOD_MS 500
@@ -110,14 +108,18 @@ static VkDeviceSize block_size(const VkCtx *c, uint32_t type) {
     return heap <= HR_SMALL_HEAP ? heap / 8 : vk_vma_block_size();   // VMA's preferredLargeHeapBlockSize (vk_device.c)
 }
 
-static int room(const VkCtx *c, uint32_t type, VkDeviceSize block) {
-    if (vk_texture_commit_low() &&
-        (plat_commit_counts_vram() || c->props.deviceType != VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU))
-        return 0;
-    VmaBudget b[VK_MAX_MEMORY_HEAPS];
-    vmaGetHeapBudgets(c->vma, b);
-    const VmaBudget *h = &b[c->mem_props.memoryTypes[type].heapIndex];
-    return h->budget && h->usage + 2 * block <= h->budget / 100 * 85;
+// This decides only whether an old speculative anchor should stay. The subsequent allocation must still obtain
+// its own atomic shared promise; a snapshot is not an admission and does not authorize physical growth.
+static int retain_anchor(const VkCtx *c, uint32_t type, VkDeviceSize block) {
+    uint32_t heap = c->mem_props.memoryTypes[type].heapIndex;
+    if (heap >= RC_BUDGET_GPU_HEAPS) return 0;
+    RcBudgetSnapshot sample;
+    resource_core_budget_snapshot(&sample);
+    int host = c->props.deviceType != VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+    if (sample.optional_available.amount[RC_BUDGET_GPU_FIRST + heap] < block) return 0;
+    if (host && sample.optional_available.amount[RC_BUDGET_RAM] < block) return 0;
+    if ((host || plat_commit_counts_vram()) && sample.optional_available.amount[RC_BUDGET_COMMIT] < block) return 0;
+    return 1;
 }
 
 static void drop_anchor(const VkCtx *c, uint32_t type) {
@@ -125,24 +127,30 @@ static void drop_anchor(const VkCtx *c, uint32_t type) {
         VmaAllocationInfo ai;
         vmaGetAllocationInfo(c->vma, H.anchor[type], &ai);
         plat_add64(&H.held, -(int64_t)ai.size);
-        vmaFreeMemory(c->vma, H.anchor[type]);
+        resource_core_vma_free_memory(c->vma, H.anchor[type]);
     }
     H.anchor[type] = NULL;
 }
 
 static void top_up(const VkCtx *c, uint32_t type) {
     VkDeviceSize block = block_size(c, type);
-    if (!room(c, type, block) || (int32_t)(__atomic_load_n(&H.hold_until, __ATOMIC_RELAXED) - (uint32_t)plat_now_ms()) > 0) {
+    if ((int32_t)(__atomic_load_n(&H.hold_until, __ATOMIC_RELAXED) - (uint32_t)plat_now_ms()) > 0) {
         drop_anchor(c, type);
         return;
     }
+    resource_core_budget_refresh();
+    if (H.anchor[type] && !retain_anchor(c, type, block)) drop_anchor(c, type);
     VkMemoryRequirements req = {.size = block / 2, .alignment = 256, .memoryTypeBits = 1u << type};
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_UNKNOWN};
-    VmaAllocation a;
+    VmaAllocation a = NULL;
+    RcVmaRequest request = {.producer = RC_BUDGET_OTHER, .required = 0};
     int64_t before = H.made;
-    if (vmaAllocateMemory(c->vma, &req, &ai, &a, NULL) != VK_SUCCESS) return;
+    if (resource_core_vma_allocate_memory(&request, c->vma, &req, &ai, &a, NULL, NULL) != VK_SUCCESS) {
+        drop_anchor(c, type);
+        return;
+    }
     if (H.made == before) {   // there was room
-        vmaFreeMemory(c->vma, a);
+        resource_core_vma_free_memory(c->vma, a);
         return;
     }
     drop_anchor(c, type);

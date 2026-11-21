@@ -162,6 +162,69 @@ static void check_exec_slices(const NvnRecordPlan *plan) {
     }
 }
 
+static void add_draw(cmd_t *cmd, int primitive, int count) {
+    *REC(cmd, OP_DRAW, p_draw) = (p_draw){.prim = primitive, .count = count};
+}
+
+static void check_generated_boundaries(void) {
+    cmd_t cmd = {0};
+    put_hdr(cmd_alloc(&cmd, 8), OP_BEGIN, 8);
+    add_draw(&cmd, NVN_DRAW_PRIMITIVE_QUADS, 512); // A larger sibling outside the imported interval.
+    size_t before = (size_t)(cmd.cur - cmd.seg);
+    for (int i = 0; i < 4; i++) add_draw(&cmd, NVN_DRAW_PRIMITIVE_TRIANGLES, 3);
+    size_t generated = (size_t)(cmd.cur - cmd.seg);
+    add_draw(&cmd, NVN_DRAW_PRIMITIVE_QUADS, 9);
+    size_t after = (size_t)(cmd.cur - cmd.seg);
+    for (int i = 0; i < 4; i++) add_draw(&cmd, NVN_DRAW_PRIMITIVE_TRIANGLES, 3);
+    size_t end = (size_t)(cmd.cur - cmd.seg);
+    finish(&cmd);
+
+    uint64_t handle = make_copy(&cmd, 0x39000);
+    uint64_t max;
+    assert(nvn_submission_ordered_scratch_max(&handle, 1, &max) && max == 3072);
+    NvnRecordPlan plan;
+    assert(nvn_record_plan(handle, &plan));
+    const op_hdr *first = (const op_hdr *)(plan.commands + before);
+    const op_hdr *ordered = (const op_hdr *)(plan.commands + generated);
+    const op_hdr *next = (const op_hdr *)(plan.commands + after);
+    const op_hdr *limit = (const op_hdr *)(plan.commands + end);
+    size_t cursor = SIZE_MAX;
+    uint32_t stride = 0;
+    assert(nvn_record_draw_run(&plan, first, limit, &cursor, &stride) == 4);
+    assert(!nvn_record_draw_run(&plan, ordered, limit, &cursor, &stride));
+    assert(nvn_record_draw_run(&plan, next, limit, &cursor, &stride) == 4);
+
+    const NvnRecordSpan *subinterval = NULL;
+    for (size_t i = 0; i < plan.nspans; i++)
+        if (plan.spans[i].begin == generated) subinterval = &plan.spans[i];
+    assert(subinterval && subinterval->end == after && subinterval->ops == 1);
+    assert(subinterval->kind == NVN_PLAN_GENERATED_INDEX && !subinterval->draw_stride);
+    for (size_t i = 0; i < plan.nfront; i++)
+        assert(plan.front[i].end <= generated || plan.front[i].begin >= after);
+
+    // Import just this retained child subinterval at a different parent offset.
+    uint8_t *parent_bytes = calloc(1, plan.bytes + sizeof(op_hdr));
+    assert(parent_bytes);
+    plan_piece part = {
+        .first = generated, .end = after, .delta = sizeof(op_hdr),
+        .child = (const copy_prefix *)(uintptr_t)handle - 1, .spans = subinterval, .nspans = 1,
+    };
+    memcpy(parent_bytes + generated + part.delta, plan.commands + generated, after - generated);
+    offset_list uniform = {0}, deferred = {0}, pins = {0}, capture = {0};
+    capture_set seen = {0};
+    span_list imported = {0};
+    max = 0;
+    assert(!import_resources(&part, parent_bytes, &uniform, &deferred, &pins, &capture, &seen, &imported, &max));
+    assert(max == 48 && imported.n == 1 && imported.v[0].begin == generated + part.delta &&
+           imported.v[0].end == after + part.delta && imported.v[0].kind == NVN_PLAN_GENERATED_INDEX);
+    free(imported.v);
+    free(parent_bytes);
+
+    replayed = nsubmits;
+    release_copies(0x39000, 0x39001);
+    free(cmd.seg);
+}
+
 int main(void) {
     cmd_t cmd = {0};
     pin_t pin = {0};
@@ -238,8 +301,10 @@ int main(void) {
     assert(nvn_record_draw_run(&plan, (const op_hdr *)(plan.commands + sizeof(op_hdr)),
                               (const op_hdr *)(plan.commands + ub), &cursor, &stride) == 7);
     assert(!nvn_handle_live(clone));
+    assert(nvn_submission_handle_bytes(clone) == plan.bytes);
     release_copies(0x10000, 0x10001);
     assert(!nvn_handle_live(h));
+    assert(nvn_submission_handle_bytes(h) == plan.bytes);
     assert(nvn_record_uniform_offsets(h, &offs, &count));
     assert(pin.refs == 2);
     replayed = nsubmits;
@@ -247,6 +312,7 @@ int main(void) {
     assert(pin.refs == 0 && !copy_indexed.n && !nzombies);
     assert(!nvn_record_uniform_offsets(h, &offs, &count));
     assert(!nvn_record_uniform_offsets(clone, &offs, &count));
+    assert(!nvn_submission_handle_bytes(h) && !nvn_submission_handle_bytes(clone));
 
     // Repeated binds, zero-sized uniforms and every deferred kind remain indexed in recording order. Plain binds and
     // invalid deferred counts must not become reads from guest memory. Reuse the scratch builder for another copy.
@@ -283,6 +349,9 @@ int main(void) {
     size_t query = (size_t)(cmd.cur - cmd.seg);
     REC(&cmd, OP_REPORT_COUNTER, p_report_counter)->addr = 0;
     for (int i = 0; i < 3; i++) REC(&cmd, OP_DRAW, p_draw)->count = 3;
+    p_update_ub *update = rec(&cmd, OP_UPDATE_UB, offsetof(p_update_ub, data) + 384);
+    update->dst = 0x1000, update->size = 384;
+    memset(update->data, 0x12, 384);
     finish(&cmd);
     h = make_copy(&cmd, 0x35000);
     assert(nvn_record_plan(h, &plan));
@@ -330,6 +399,10 @@ int main(void) {
     table[0] = 123;
     nvn_submit_prepare_async(&h, &clone, 1);
     assert(clone != h && nvn_record_plan(clone, &original));
+    uint64_t max_update;
+    const uint64_t combined[] = {h, clone, h};
+    assert(nvn_submission_ordered_scratch_max(combined, 3, &max_update) && max_update == 384);
+    assert(nvn_submission_ordered_scratch_max(&clone, 1, &max_update) && max_update == 384);
     assert(original.nfront == plan.nfront && original.front != plan.front);
     assert(!memcmp(original.front, plan.front, plan.nfront * sizeof *plan.front));
     assert(!memcmp(original.state_data, plan.state_data, plan.state_bytes));
@@ -340,19 +413,30 @@ int main(void) {
     replayed = nsubmits;
     release_copies(0x35000, 0x35001);
     check_front_storage_growth();
+    check_generated_boundaries();
 
-    // Reference mode still takes the old walks; empty recordings have a valid empty prepared index.
+    // The inline scratch size is built even when the optional replay index is disabled.
     for (int mode = 0; mode <= 2; mode++) {
         test_mode = mode;
         cmd.cur = cmd.seg;
         put_hdr(cmd_alloc(&cmd, 8), OP_BEGIN, 8);
+        update = rec(&cmd, OP_UPDATE_UB, offsetof(p_update_ub, data) + 29);
+        update->dst = 0x1000, update->size = 29;
+        memset(update->data, 0, 29);
+        add_draw(&cmd, NVN_DRAW_PRIMITIVE_TRIANGLES, 1024);
+        add_draw(&cmd, NVN_DRAW_PRIMITIVE_QUADS, 3);
+        add_draw(&cmd, NVN_DRAW_PRIMITIVE_LINE_LOOP, 1);
+        add_draw(&cmd, NVN_DRAW_PRIMITIVE_QUADS, 9);
+        add_draw(&cmd, NVN_DRAW_PRIMITIVE_LINE_LOOP, 13);
         finish(&cmd);
         h = make_copy(&cmd, 0x40000);
         assert(nvn_record_uniform_offsets(h, &offs, &count) == (mode != 0));
         if (mode) assert(!count);
+        assert(nvn_submission_ordered_scratch_max(&h, 1, &max_update) && max_update == 56);
         nvn_submit_prepare(&h, 1);
         replayed = nsubmits;
         release_copies(0x40000, 0x40001);
+        assert(!nvn_submission_ordered_scratch_max(&h, 1, &max_update) && !max_update);
     }
     free(cmd.seg);
     puts("command index: clone isolation, retained lifetimes, deferred reads and reference fallback passed");

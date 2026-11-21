@@ -21,6 +21,7 @@
 #include "host.h"
 #include "tex.h"
 #include "vk.h"
+#include "resource_core_vma.h"
 
 static uint64_t g_rng = 0x2545F4914F6CDD1Dull;
 static uint64_t rnd64(void) {
@@ -150,7 +151,7 @@ static int gpu_decode_ar(VkCtx *c, const uint8_t *src, size_t src_bytes, const V
     vmaInvalidateAllocation(c->vma, ia, 0, VK_WHOLE_SIZE);
     if (out_rb) memcpy(out_rb, rmap, t0 + t1);
     if (out_img) memcpy(out_img, imap, t0 + t1);
-    vmaDestroyBuffer(c->vma, rb, ra), vmaDestroyBuffer(c->vma, ib, ia);
+    resource_core_vma_destroy_buffer(c->vma, rb, ra), resource_core_vma_destroy_buffer(c->vma, ib, ia);
     vk_defer_image(im.img, im.alloc);
     vk_upload_flush(1);
     return ok > 0;
@@ -240,7 +241,7 @@ static int gpu_bc(VkCtx *c, const uint8_t *blk, const size_t *n, const uint32_t 
     vk_upload_flush(1);
     vmaInvalidateAllocation(c->vma, ia, 0, VK_WHOLE_SIZE);
     memcpy(out, imap, ob);
-    vmaDestroyBuffer(c->vma, ib, ia);
+    resource_core_vma_destroy_buffer(c->vma, ib, ia);
     vk_defer_image(im.img, im.alloc);
     vk_upload_flush(1);
     return ok > 0;

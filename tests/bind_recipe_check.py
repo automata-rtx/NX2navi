@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -27,25 +28,30 @@ def function(source, name):
     return source[start:end] + "\n"
 
 
-def main():
+def run_checks(work):
     cc = os.environ.get("CC") or shutil.which("clang")
     if not cc:
         raise SystemExit("Clang is required (set CC)")
     env = dict(os.environ)
     cc_path = Path(shutil.which(cc) or cc).resolve()
     env["PATH"] = str(cc_path.parent) + os.pathsep + env.get("PATH", "")
-    work = ROOT / "build/test/bind_recipe"
-    work.mkdir(parents=True, exist_ok=True)
     draw = (ROOT / "runtime/vk_exec_draw.c").read_text()
     prepared = (ROOT / "runtime/vk_bind_prepared.h").read_text()
     prefix = draw[:draw.index("static void prepared_stats_flush")]
     declarations = '''
+static uint64_t test_authority_epoch = 1;
+RcRegistry *rc_registry_runtime(void) {return NULL;}
+uint64_t rc_registry_authority_epoch(RcRegistry *r) {(void)r;return test_authority_epoch;}
+
 static _Thread_local int twin_dispatch;
 static int td_mode(void);
 static void shader_packet_stats_collect(void) {} // telemetry is outside the resource-validity fixture
 static void pool_stats_collect(void) {}
 static void prepared_residency_stats_collect(void) {}
+static void effect_stats_collect(void) {}
 static int slot_still(uint32_t *, uint64_t, uint64_t, uint32_t);
+static int registered_slot_locked(int logical) { return logical; }
+static CbRes *cb_res(VkExec *);
 static void count_use(DrawCtx *, int, int, uint64_t);
 static void prepared_support(VkExec *, const VkBindRecipeOp *, PreparedBindings *, int);
 static void prepared_uniforms(VkExec *, const VkBindRecipeOp *, PreparedBindings *, int);
@@ -74,9 +80,12 @@ static void *prepared_test_memset(void *, int, size_t);
         "prepared_watch", "prepared_watch_recipe", "prepared_bucket", "prepared_hot", "prepared_directory_init",
         "prepared_fixed_bytes", "prepared_total_bytes", "prepared_forget", "prepared_evict", "prepared_make_room",
         "prepared_same_epoch", "prepared_demote", "prepared_dormant_find", "prepared_dormant_admit", "prepared_promote",
-        "prepared_dispose", "prepared_instance", "prepared_buffer",
-        "prepared_handle", "prepared_buffer_valid", "prepared_op_check", "prepared_changed", "prepared_stamp", "prepared_stamp_equal",
-        "prepared_refresh_record", "prepared_texture_reusable", "prepared_texture_valid", "prepared_group_valid", "prepared_op_inputs_equal",
+        "prepared_dispose", "prepared_instance", "prepared_publish_images", "prepared_buffer",
+        "prepared_handle", "prepared_buffer_valid", "prepared_buffer_end", "prepared_op_check", "prepared_changed",
+        "prepared_stamp", "prepared_stamp_equal",
+        "prepared_refresh_record", "prepared_sample_matches", "prepared_texture_reusable", "prepared_texture_receipt",
+        "prepared_texture_valid", "prepared_group_guard", "prepared_group_valid", "prepared_qualified_sample",
+        "prepared_group_current", "prepared_op_inputs_equal",
         "prepared_census_adjust", "prepared_renew_member", "prepared_try_renew", "prepared_seal", "prepared_resolve"))
     # The fixture contains runtime source only; use the repository marker for files emitted by tools.
     import sys
@@ -85,13 +94,15 @@ static void *prepared_test_memset(void *, int, size_t);
     marker = GENERATED_MARKER.decode() if isinstance(GENERATED_MARKER, bytes) else GENERATED_MARKER
     (work / "prepared_state_under_test.h").write_text(f"// {marker}\n" + prefix + declarations + "\n" + selected)
     images = function(prepared, "prepared_images").replace("prepared_images(", "actual_prepared_images(")
-    images = images.replace("prepared_check(", "texture_check(").replace("slot_still(", "texture_slot_still(")
+    images = images.replace("prepared_check(", "texture_check(").replace("prepared_sample_matches(", "texture_sample_matches(")
+    matches = function(prepared, "prepared_sample_matches").replace("prepared_sample_matches(", "texture_sample_matches(")
+    matches = matches.replace("slot_still(", "texture_slot_still(")
     still = function(draw, "slot_still").replace("slot_still(", "texture_slot_still(")
-    td = draw[draw.index("#define TD_N"):draw.index("static void tex_info_lookup(")]
-    lookup = function(draw, "tex_info_lookup").replace("tex_info_lookup(", "actual_tex_info_lookup(")
-    lookup = lookup.replace("slot_still(", "texture_slot_still(")
-    sampled = function(draw, "sampled_resource")
-    (work / "prepared_images_under_test.h").write_text(f"// {marker}\n" + still + "\n" + sampled + td + lookup + images)
+    texture = (ROOT / "runtime/vk_texture.c").read_text()
+    sampled = "\n".join(function(texture, name) for name in (
+        "vk_texture_resolve_sample_report_locked", "vk_texture_resolve_sample_locked"))
+    assert "static void tex_info_lookup(" not in draw and "} TD[" not in draw
+    (work / "prepared_images_under_test.h").write_text(f"// {marker}\n" + still + "\n" + sampled + matches + images)
     includes = [ROOT / "runtime", work, cc_path.parent.parent / "include/vma"]
     includes += [Path(p) for p in env.get("BIND_RECIPE_INCLUDE_DIRS", "").split(os.pathsep) if p]
     flags = [arg for p in includes if p.is_dir() for arg in ("-I", str(p))]
@@ -107,6 +118,13 @@ static void *prepared_test_memset(void *, int, size_t);
             "-Wno-unused-variable", "-Wno-missing-field-initializers", *flags,
             str(ROOT / f"tests/{name}.c"), str(ROOT / "runtime/vk_bind_recipe.c"), "-o", str(exe)], env=env)
         subprocess.check_call([str(exe)], env=env)
+
+
+def main():
+    parent = ROOT / "build/test"
+    parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="bind-recipe-", dir=parent) as temporary:
+        run_checks(Path(temporary))
 
 
 if __name__ == "__main__":

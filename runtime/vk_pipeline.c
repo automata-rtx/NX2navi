@@ -48,9 +48,11 @@
 #include "nvn_hmap.h"
 #include "platform/platform.h"
 #include "prp_file.h"
+#include "rc_sampled_image_query.h"
+#include "rc_spirv_uniform_footprint.h"
 #include "spirv_water.h"
 #include "tex.h"
-#include "resource_budget.h"
+#include "resource_core_budget.h"
 #include "vk_cache_file.h"
 #include "vk_save_retry.h"
 #include "vk_warm_progress.h"
@@ -133,6 +135,20 @@ typedef struct Layout {
     VkDescriptorSetLayoutBinding b[];
 } Layout;
 
+typedef struct {
+    uint64_t vs, fs;
+    VkGraphicsUniformFootprints vertex_uniforms;
+} GraphicsSampledQueries;
+
+struct VkGraphicsPipelineRevision {
+    VkPipeline pipeline;
+    uint64_t vs_query_size_lod0_mask, fs_query_size_lod0_mask;
+    VkGraphicsUniformFootprints vertex_uniforms;
+    uint64_t last_scene;
+    uint32_t users;
+    int retired, legacy;
+};
+
 typedef struct Pipe {
     struct Pipe *next;
     uint64_t hash;
@@ -141,7 +157,13 @@ typedef struct Pipe {
     int building;                      // a background job owns info.pipeline (under P.lock)
     struct Job *job;                   // that job while building
     const struct Layout *lay;          // graphics: the layout it was entered with
-    VkPipeline fast;                   // GPL: the fast-linked pipeline (kept until shutdown: recorded draws use it)
+    VkGraphicsPipelineRevision fast, full;
+    uint32_t required_waiters;
+    const char *graphics_failure;
+    VkResult graphics_error;
+    RcAdmissionStatus graphics_admission;
+    uint8_t graphics_unsupported;
+    uint8_t required_layout;
     uint8_t fast_tried;
     uint8_t link_queued;               // a waiting draw queued its fast link to the workers (LibJob p), not yet run
     uint8_t used;                      // compute: a dispatch of this run asked for it (vk_pipeline_compute)
@@ -377,6 +399,15 @@ static uint8_t *pb_read(uint32_t type, const uint8_t *key, uint32_t ks, uint32_t
     return out;
 }
 
+static int pipe_budget_enter_native(void);
+
+static VkResult pipe_binary_create(const VkPipelineBinaryCreateInfoKHR *ci, VkPipelineBinaryHandlesInfoKHR *hi) {
+    if (!pipe_budget_enter_native()) return VK_ERROR_INITIALIZATION_FAILED;
+    VkResult result = PB.create(P.device, ci, NULL, hi);
+    vk_device_lost_check(result, "creating pipeline binaries");
+    return result;
+}
+
 // The binaries stored for pipeline key k, created in bins (*n of them). 0 when none are stored or they fail.
 static int pb_load(const VkPipelineBinaryKeyKHR *k, VkPipelineBinaryKHR bins[PB_MAX_BIN], uint32_t *n) {
     VkPipelineBinaryKeyKHR keys[PB_MAX_BIN];
@@ -403,7 +434,7 @@ static int pb_load(const VkPipelineBinaryKeyKHR *k, VkPipelineBinaryKHR bins[PB_
         VkPipelineBinaryCreateInfoKHR ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_CREATE_INFO_KHR, .pKeysAndDataInfo = &kd};
         VkPipelineBinaryHandlesInfoKHR hi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_HANDLES_INFO_KHR,
                                              .pipelineBinaryCount = nb, .pPipelineBinaries = bins};
-        ok = PB.create(P.device, &ci, NULL, &hi) == VK_SUCCESS;
+        ok = pipe_binary_create(&ci, &hi) == VK_SUCCESS;
         *n = nb;
     }
     for (uint32_t i = 0; i < PB_MAX_BIN; i++) free(blob[i]);
@@ -444,11 +475,11 @@ static void pb_capture(VkPipeline p, const VkPipelineBinaryKeyKHR *k) {
     VkPipelineBinaryKHR bins[PB_MAX_BIN];
     VkPipelineBinaryHandlesInfoKHR hi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_HANDLES_INFO_KHR};
     uint32_t nb = 0;
-    int ok = PB.create(P.device, &ci, NULL, &hi) == VK_SUCCESS && hi.pipelineBinaryCount &&
+    int ok = pipe_binary_create(&ci, &hi) == VK_SUCCESS && hi.pipelineBinaryCount &&
              hi.pipelineBinaryCount <= PB_MAX_BIN;
     if (ok) {
         hi.pPipelineBinaries = bins;
-        ok = PB.create(P.device, &ci, NULL, &hi) == VK_SUCCESS;
+        ok = pipe_binary_create(&ci, &hi) == VK_SUCCESS;
         nb = ok ? hi.pipelineBinaryCount : 0;
     }
     VkPipelineBinaryKeyKHR keys[PB_MAX_BIN];
@@ -573,9 +604,182 @@ static volatile uint32_t cache_merges;
 // everything goes into P.cache as before.
 static int prep_mode;   // a preparation mode (set before ensure_init): no play cache
 
+// One compiler invocation owns its measured-policy estimate through its native attempts. Nested wrappers
+// borrow it only if their complete estimate fits. Admission waits precede native compiler entry and cache_rw.
+#define GATE_BIG_MB 4096.0
+#define PIPE_BUDGET_MB 64.0
+#define GATE_WAIT_MS 30000u
+#define PIPE_BUDGET_RESCAN_NS 100000000ull
+typedef enum {
+    PIPE_BUDGET_TERMINAL = -3, PIPE_BUDGET_STOPPED = -2, PIPE_BUDGET_REFUSED = -1,
+    PIPE_BUDGET_BORROWED = 0, PIPE_BUDGET_OWNED = 1
+} PipeBudgetResult;
+typedef struct {
+    RcBudgetTicket ticket;
+    uint64_t bytes;
+    const volatile int32_t *stop;
+    int native_entered;
+} PipeBudgetGrant;
+static __thread PipeBudgetGrant pipe_budget;
+static volatile int32_t pipe_budget_stopping;
+
+static const char *gate_text(char *buf, size_t n);
+
+static RcAdmissionVector pipe_budget_cost(double mb) {
+    uint64_t bytes = (uint64_t)(mb * 1048576.0);
+    RcAdmissionVector cost = {{0}};
+    cost.amount[RC_BUDGET_RAM] = cost.amount[RC_BUDGET_COMMIT] = bytes;
+    return cost;
+}
+
+static int pipe_budget_stopped(void) {
+    return __atomic_load_n(&pipe_budget_stopping, __ATOMIC_ACQUIRE) || vk_device_is_lost();
+}
+
+static int pipe_budget_source_stopped(const volatile int32_t *stop) {
+    return pipe_budget_stopped() || (stop && __atomic_load_n(stop, __ATOMIC_ACQUIRE));
+}
+
+static void pipe_budget_end(int owned) {
+    if (owned != PIPE_BUDGET_OWNED) return;
+    RcAdmissionStatus status = pipe_budget.native_entered ? resource_core_budget_opaque_done(&pipe_budget.ticket)
+                                                         : resource_core_budget_cancel(&pipe_budget.ticket);
+    if (status != RC_ADMISSION_OK) rt_fatal("vk_pipeline: preparation settlement failed (%d)", (int)status);
+    pipe_budget = (PipeBudgetGrant){0};
+}
+
+static PipeBudgetResult pipe_budget_try(const RcAdmissionVector *cost, int required, const volatile int32_t *stop,
+                                        RcAdmissionStatus *reason) {
+    *reason = RC_ADMISSION_INVALID;
+    if (pipe_budget_source_stopped(stop) || pipe_budget_source_stopped(pipe_budget.stop)) return PIPE_BUDGET_STOPPED;
+    uint64_t bytes = cost->amount[RC_BUDGET_RAM];
+    if (pipe_budget.ticket.token.ledger) {
+        if (bytes > pipe_budget.bytes) {
+            *reason = RC_ADMISSION_REFUSED;
+            return PIPE_BUDGET_REFUSED;
+        }
+        *reason = RC_ADMISSION_OK;
+        return PIPE_BUDGET_BORROWED;
+    }
+    *reason = resource_core_budget_reserve(RC_BUDGET_PIPELINE, required, cost, &pipe_budget.ticket);
+    if (*reason == RC_ADMISSION_OK) {
+        if (pipe_budget_source_stopped(stop)) {
+            pipe_budget_end(PIPE_BUDGET_OWNED);
+            return PIPE_BUDGET_STOPPED;
+        }
+        pipe_budget.bytes = bytes;
+        pipe_budget.stop = stop;
+        return PIPE_BUDGET_OWNED;
+    }
+    if (pipe_budget_source_stopped(stop)) return PIPE_BUDGET_STOPPED;
+    if (*reason == RC_ADMISSION_REFUSED || *reason == RC_ADMISSION_NO_RECORDS) return PIPE_BUDGET_REFUSED;
+    return PIPE_BUDGET_TERMINAL;
+}
+
+static PipeBudgetResult pipe_budget_try_begin(double mb, int required, RcAdmissionStatus *reason) {
+    RcAdmissionStatus status;
+    if (!reason) reason = &status;
+    if (!(mb > 0 && mb < 0x1p44)) {
+        *reason = RC_ADMISSION_INVALID;
+        return PIPE_BUDGET_TERMINAL;
+    }
+    RcAdmissionVector cost = pipe_budget_cost(mb);
+    return pipe_budget_try(&cost, required, NULL, reason);
+}
+
+static int pipe_budget_physically_impossible(const RcAdmissionVector *cost) {
+    RcBudgetSnapshot snapshot;
+    resource_core_budget_snapshot(&snapshot);
+    return (snapshot.sample.known_mask & (1u << RC_BUDGET_RAM)) &&
+        cost->amount[RC_BUDGET_RAM] > snapshot.sample.total.amount[RC_BUDGET_RAM];
+}
+
+static PipeBudgetResult pipe_budget_acquire_for(double mb, int required, const volatile int32_t *stop,
+                                                uint32_t optional_wait_ms, const char *who) {
+    if (!(mb > 0 && mb < 0x1p44)) return PIPE_BUDGET_TERMINAL;
+    RcAdmissionVector cost = pipe_budget_cost(mb);
+    RcAdmissionStatus reason;
+    PipeBudgetResult result = pipe_budget_try(&cost, required, stop, &reason);
+    if (result != PIPE_BUDGET_REFUSED || pipe_budget.ticket.token.ledger || (!required && !optional_wait_ms))
+        return result;
+    if (required && pipe_budget_physically_impossible(&cost)) return PIPE_BUDGET_TERMINAL;
+    uint64_t started = plat_now_ns(), next_scan = started;
+    uint64_t optional_wait_ns = (uint64_t)optional_wait_ms * 1000000ull;
+    RcBudgetProgress progress = {0};
+    int use_event = 0, try_ready = 1, logged = 0;
+    while (!pipe_budget_source_stopped(stop)) {
+        uint64_t now = plat_now_ns(), elapsed = now - started;
+        if (!required && elapsed >= optional_wait_ns) return PIPE_BUDGET_REFUSED;
+        if (!logged && (who || (required && elapsed >= PIPE_BUDGET_RESCAN_NS))) {
+            char detail[256];
+            if (who) rt_log("vk_pipeline: %s: waiting for shared capacity (%s)", who, gate_text(detail, sizeof detail));
+            else rt_log("vk_pipeline: required build waits for shared memory capacity (%.0f MiB); its job remains pending", mb);
+            logged = 1;
+        }
+
+        RcBudgetReadiness ready;
+        resource_core_budget_readiness(required, &ready);
+        if (!resource_core_budget_peak_ready(&cost, &ready)) try_ready = 1;
+        else if (try_ready) {
+            try_ready = 0;
+            result = pipe_budget_try(&cost, required, stop, &reason);
+            if (result != PIPE_BUDGET_REFUSED) return result;
+        }
+
+        if (now >= next_scan) {
+            // Completion can expose a reclaimable owner without increasing sampled capacity. Rescan once per
+            // telemetry window. Unrelated events and the service's own wake never authorize a reserve or rescan.
+            if (required && (ready.available.amount[RC_BUDGET_RAM] < cost.amount[RC_BUDGET_RAM] ||
+                             ready.available.amount[RC_BUDGET_COMMIT] < cost.amount[RC_BUDGET_COMMIT])) {
+                resource_core_budget_service(1, &cost, &progress);
+                use_event = 1;
+            }
+            next_scan = plat_now_ns() + PIPE_BUDGET_RESCAN_NS;
+            try_ready = 1;
+            continue;
+        }
+        uint64_t remaining = next_scan - now;
+        if (!required && optional_wait_ns - elapsed < remaining) remaining = optional_wait_ns - elapsed;
+        uint32_t wait_ms = (uint32_t)((remaining + 999999ull) / 1000000ull);
+        if (use_event) {
+            resource_core_budget_wait_since(progress.event, wait_ms);
+            use_event = 0;
+        } else resource_core_budget_wait(wait_ms);
+    }
+    return PIPE_BUDGET_STOPPED;
+}
+
+static PipeBudgetResult pipe_budget_acquire(double mb, int required, const volatile int32_t *stop,
+                                            uint32_t optional_wait_ms) {
+    return pipe_budget_acquire_for(mb, required, stop, optional_wait_ms, NULL);
+}
+
+static PipeBudgetResult pipe_budget_begin(double mb) {
+    PipeBudgetResult result = pipe_budget_acquire(mb, 1, NULL, 0);
+    if (result == PIPE_BUDGET_TERMINAL) {
+        if (pipe_budget_stopped()) return PIPE_BUDGET_STOPPED;
+        rt_fatal("vk_pipeline: cannot reserve the required %.0f MiB compiler estimate in the shared RAM/commit budget "
+                 "(unsupported admission request or estimate exceeds physical RAM)", mb);
+    }
+    return result;
+}
+
+static int pipe_budget_enter_native(void) {
+    if (pipe_budget_source_stopped(pipe_budget.stop)) return 0;
+    if (!pipe_budget.ticket.token.ledger) rt_fatal("vk_pipeline: native build has no preparation reservation");
+    pipe_budget.native_entered = 1;
+    return 1;
+}
+
 static VkResult pipe_create_one(int kind, void *ci, VkPipeline *pipe, VkPipelineCache cache) {
-    return kind == 2 ? vkCreateComputePipelines(P.device, cache, 1, ci, NULL, pipe)
-                     : vkCreateGraphicsPipelines(P.device, cache, 1, ci, NULL, pipe);
+    if (!pipe_budget_enter_native()) {
+        *pipe = VK_NULL_HANDLE;
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    VkResult result = kind == 2 ? vkCreateComputePipelines(P.device, cache, 1, ci, NULL, pipe)
+                               : vkCreateGraphicsPipelines(P.device, cache, 1, ci, NULL, pipe);
+    vk_device_lost_check(result, "creating a graphics or compute pipeline");
+    return result;
 }
 
 static VkResult pipe_create_in(int kind, void *ci, VkPipeline *pipe, VkPipelineCache cache) {
@@ -624,12 +828,16 @@ void vk_pipeline_foreign_counts(VkForeignPipes *o) {
 
 static VkResult foreign_one(VkDevice dev, int compute, VkPipelineCache cache, uint32_t n, const void *ci,
                             const VkAllocationCallbacks *alloc, VkPipeline *out) {
+    if (!pipe_budget_enter_native()) {
+        for (uint32_t i = 0; i < n; i++) out[i] = VK_NULL_HANDLE;
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
     return compute ? vkCreateComputePipelines(dev, cache, n, ci, alloc, out)
                    : vkCreateGraphicsPipelines(dev, cache, n, ci, alloc, out);
 }
 
-VkResult vk_pipeline_create_foreign(VkDevice dev, int compute, uint32_t n, const void *infos,
-                                    const VkAllocationCallbacks *alloc, VkPipeline *out) {
+static VkResult create_foreign_admitted(VkDevice dev, int compute, uint32_t n, const void *infos,
+                                        const VkAllocationCallbacks *alloc, VkPipeline *out) {
     VkPipelineCache cache = __atomic_load_n(&P.ready, __ATOMIC_ACQUIRE) && dev == P.device ? P.cache : VK_NULL_HANDLE;
     if (!cache) {
         VkResult r = foreign_one(dev, compute, VK_NULL_HANDLE, n, infos, alloc, out);
@@ -672,12 +880,30 @@ VkResult vk_pipeline_create_foreign(VkDevice dev, int compute, uint32_t n, const
                 __atomic_fetch_add(&cache_merges, 1, __ATOMIC_RELAXED);   // autosave_once: the play file is due
             }
         }
+        if (ri == VK_ERROR_DEVICE_LOST) {
+            for (uint32_t j = i; j < n; j++) out[j] = VK_NULL_HANDLE;
+            r = ri;
+            break;
+        }
         if (ri == VK_SUCCESS) __atomic_fetch_add(&FP.made, 1, __ATOMIC_RELAXED);
         else if (r == VK_SUCCESS) r = ri;   // the first that failed, as a create of several reports one result
         if (ri != VK_SUCCESS) out[i] = VK_NULL_HANDLE;
     }
     plat_mutex_unlock_shared(&cache_rw);
     return r;
+}
+
+VkResult vk_pipeline_create_foreign(VkDevice dev, int compute, uint32_t n, const void *infos,
+                                    const VkAllocationCallbacks *alloc, VkPipeline *out) {
+    int owned = pipe_budget_begin(PIPE_BUDGET_MB);
+    if (owned < 0) {
+        for (uint32_t i = 0; i < n; i++) out[i] = VK_NULL_HANDLE;
+        return vk_device_is_lost() ? VK_ERROR_DEVICE_LOST : VK_ERROR_INITIALIZATION_FAILED;
+    }
+    VkResult result = create_foreign_admitted(dev, compute, n, infos, alloc, out);
+    pipe_budget_end(owned);
+    vk_device_lost_check(result, "creating pipelines for a graphics library");
+    return result;
 }
 
 static VkResult pipe_create(int kind, void *ci, VkPipeline *pipe) {
@@ -715,7 +941,8 @@ static VkResult pipe_create(int kind, void *ci, VkPipeline *pipe) {
     if (capture) hd->pNext = &f2;
     r = PIPE_CREATE(P.cache);
     hd->pNext = next;
-    if (capture && r < 0) {   // the driver refuses the capture for this kind: create without it from now on
+    if (capture && r < 0 && !pipe_budget_source_stopped(pipe_budget.stop)) {
+        // The driver refuses the capture for this kind: create without it from now on.
         PB.no_capture[kind] = 1;
         rt_log("vk_pipeline: pipeline binaries: a %s with its data captured failed (%d); such pipelines are not stored",
                kind == 2 ? "compute pipeline" : kind ? "pipeline library" : "graphics pipeline", (int)r);
@@ -896,9 +1123,14 @@ static void cu_open(void);
 static void prebuild_start(void);
 
 static int ensure_init(void) {
+    if (pipe_budget_stopped()) return 0;
     if (P.ready) return 1;
     if (!vk_init()) return 0;
     plat_mutex_lock(&P.lock);
+    if (pipe_budget_stopped()) {
+        plat_mutex_unlock(&P.lock);
+        return 0;
+    }
     if (P.ready) {
         plat_mutex_unlock(&P.lock);
         return 1;
@@ -1142,8 +1374,8 @@ int vk_pipeline_tex_type(int target) {
     }
 }
 
-// Numeric type of a colour format as a shader sees it: GFX_TYPE_*.
-static int format_type(VkFormat f) {
+// Numeric type of a renderer format as a shader sees it: GFX_TYPE_*.
+int vk_format_shader_numeric_type(VkFormat f) {
     switch (f) {
     case VK_FORMAT_R8_UINT: case VK_FORMAT_R8G8_UINT: case VK_FORMAT_R8G8B8_UINT: case VK_FORMAT_R8G8B8A8_UINT:
     case VK_FORMAT_R16_UINT: case VK_FORMAT_R16G16_UINT: case VK_FORMAT_R16G16B16_UINT: case VK_FORMAT_R16G16B16A16_UINT:
@@ -1161,15 +1393,18 @@ static int format_type(VkFormat f) {
 
 // Optimal-tiling (o = 1) or buffer (o = 0) features of a core format, cached.
 static VkFormatFeatureFlags format_features(VkFormat f, int optimal) {
-    static VkFormatFeatureFlags known[2][256];
-    static uint8_t have[2][256];
+    static uint64_t known[2][256];
     VkCtx *c = vk_ctx();
     if (!c) return 0;
-    if ((unsigned)f < 256 && have[optimal][f]) return known[optimal][f];
+    if ((unsigned)f < 256) {
+        uint64_t entry = __atomic_load_n(&known[optimal][f], __ATOMIC_RELAXED);
+        if (entry) return (VkFormatFeatureFlags)entry;
+    }
     VkFormatProperties p;
     vkGetPhysicalDeviceFormatProperties(c->phys, f, &p);
     VkFormatFeatureFlags r = optimal ? p.optimalTilingFeatures : p.bufferFeatures;
-    if ((unsigned)f < 256) known[optimal][f] = r, have[optimal][f] = 1;
+    if ((unsigned)f < 256)
+        __atomic_store_n(&known[optimal][f], (UINT64_C(1) << 32) | r, __ATOMIC_RELAXED);
     return r;
 }
 
@@ -1288,7 +1523,7 @@ void vk_pipeline_answers(const VkPipeState *s, GfxShaderAnswers *vs, GfxShaderAn
     if (fs)
         for (int i = 0; i < 8; i++) {
             VkFormat f = target_format(s->color_fmt[i], NULL, NULL);
-            fs->frag_out_type[i] = (uint8_t)(f == VK_FORMAT_UNDEFINED ? GFX_TYPE_FLOAT : format_type(f));
+            fs->frag_out_type[i] = (uint8_t)(f == VK_FORMAT_UNDEFINED ? GFX_TYPE_FLOAT : vk_format_shader_numeric_type(f));
         }
 }
 
@@ -2112,7 +2347,10 @@ static uint32_t local_size_x(const uint32_t *w, uint64_t words) {
 // Pool arrays (the translator's bindless texture and sampler arrays of VK_POOL_TEX / VK_POOL_SAMP elements, found by
 // their types) move to set 2, at the binding of their view kind (vk.h VK_POOL_KINDS) or VK_POOL_KINDS for samplers;
 // the kinds used are noted in vk_pool_kinds_used so the replay fills them. NULL: nothing to move (or no memory).
-static uint32_t *spirv_pool_rebind(const uint32_t *w, uint64_t n) {
+#include "vk_pool_sampler_spirv.h"
+
+static uint32_t *spirv_pool_rebind(const uint32_t *w, uint64_t n, uint32_t *sampler) {
+    if (sampler) *sampler = 0;
     enum { OP_TYPE_IMAGE = 25, OP_TYPE_SAMPLER = 26, OP_TYPE_ARRAY_ = 28 };
     uint32_t bound = n >= 5 && w[3] < (1u << 22) ? w[3] : 0;
     if (!bound) return NULL;
@@ -2156,6 +2394,10 @@ static uint32_t *spirv_pool_rebind(const uint32_t *w, uint64_t n) {
                 if (o[i + 2] == SPV_DEC_DESCRIPTOR_SET) o[i + 3] = 2;
                 else if (o[i + 2] == SPV_DEC_BINDING) o[i + 3] = k == 100 ? VK_POOL_KINDS : (uint32_t)k;
                 if (k != 100) used |= 1u << k;
+                else if (sampler && o[i + 2] == SPV_DEC_DESCRIPTOR_SET) {
+                    if (*sampler) *sampler = UINT32_MAX; // independent declarations need independent provenance
+                    else *sampler = o[i + 1];
+                }
             }
             i += len;
         }
@@ -2179,6 +2421,9 @@ static uint32_t *spirv_pool_rebind(const uint32_t *w, uint64_t n) {
 // texture the marks call unused. make_module logs the first few by stage, version, size, hash and reason.
 volatile int32_t vk_pool_marks_missed;
 static int marks_on = -1, marks_vs_ok, marks_fs_ok;
+static int marks_declined;
+
+void vk_pool_marks_decline(void) { __atomic_store_n(&marks_declined, 1, __ATOMIC_RELEASE); }
 
 int vk_pool_marks_enabled(void) {
     if (marks_on < 0) {
@@ -2190,7 +2435,7 @@ int vk_pool_marks_enabled(void) {
             marks_vs_ok = f.vertexPipelineStoresAndAtomics, marks_fs_ok = f.fragmentStoresAndAtomics;
         }
     }
-    return marks_on;
+    return marks_on && !__atomic_load_n(&marks_declined, __ATOMIC_ACQUIRE);
 }
 
 // A fragment shader that stores to memory runs before the depth test unless it declares EarlyFragmentTests: the GPU
@@ -2351,7 +2596,7 @@ static int spirv_mark_list_test(const char *list) {
         if (!w || fread(w, 1, (size_t)sz, g) != (size_t)sz) { fclose(g), free(w), bad++; continue; }
         fclose(g);
         uint64_t n = (uint64_t)sz / 4, mn = 0;
-        uint32_t *pooled = spirv_pool_rebind(w, n);
+        uint32_t *pooled = spirv_pool_rebind(w, n, NULL);
         int st;
         const char *why;
         uint32_t *m = spirv_pool_mark(pooled ? pooled : w, n, 1, &mn, &st, &why);
@@ -2375,16 +2620,134 @@ static int spirv_mark_list_test(const char *list) {
     return bad;
 }
 
+// The runtime translator can emit typed storage formats without the corresponding declaration.
+static int spirv_storage_image_extended(const uint32_t *w, uint64_t words, uint32_t **updated) {
+    enum { OP_CAPABILITY = 17, OP_TYPE_IMAGE = 25, CAP_STORAGE_IMAGE_EXTENDED_FORMATS = 49 };
+    int needed = 0;
+    for (uint64_t i = 5; i < words;) {
+        const uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || len > words - i) return 1;
+        if (op == OP_CAPABILITY && len == 2 && w[i + 1] == CAP_STORAGE_IMAGE_EXTENDED_FORMATS) return 1;
+        if (op == SPV_OP_FUNCTION) break;
+        if (op == OP_TYPE_IMAGE && (len == 9 || len == 10) && w[i + 7] == 2) {
+            const uint32_t format = w[i + 8];
+            needed |= (format >= 6 && format <= 20) || (format >= 25 && format <= 29) ||
+                      (format >= 34 && format <= 39);
+        }
+        i += len;
+    }
+    if (!needed) return 1;
+    if (words > SIZE_MAX / sizeof *w - 2) return 0;
+    uint32_t *copy = malloc((words + 2) * sizeof *w);
+    if (!copy) return 0;
+    memcpy(copy, w, 5 * sizeof *w);
+    copy[5] = 2u << 16 | OP_CAPABILITY;
+    copy[6] = CAP_STORAGE_IMAGE_EXTENDED_FORMATS;
+    memcpy(copy + 7, w + 5, (words - 5) * sizeof *w);
+    *updated = copy;
+    return 1;
+}
+
 // early_ok: a fragment shader whose pipeline has no alpha to coverage (spirv_pool_mark)
-static VkShaderModule make_module(const uint32_t *w, uint64_t words, int early_ok) {
+typedef struct {
+    uint64_t candidates, attested;
+    RcSampledImageQueryStage stage;
+    uint32_t set;
+    int pool_domain_candidate, pool_domain_attested, pool_marks;
+    uint32_t pool_query_shape_kinds;
+    const GfxShader *inactive_pool_source;
+    const GfxShader *vertex_uniform_source;
+    VkGraphicsUniformFootprints *vertex_uniforms;
+    uint32_t binding_offset;
+} ModuleSampledQueries;
+
+static ModuleSampledQueries module_sampled_queries(const GfxShader *shader, RcSampledImageQueryStage stage,
+                                                   uint32_t set, uint32_t binding_offset) {
+    ModuleSampledQueries queries = {.stage = stage, .set = set, .binding_offset = binding_offset,
+        .inactive_pool_source = stage == RC_SAMPLED_IMAGE_QUERY_FRAGMENT ? shader : NULL};
+    const GfxShaderRes *resources;
+    const int count = gfx_shader_resources(shader, GFX_RES_TEX, &resources);
+    for (int i = 0; i < count; i++) {
+        const GfxShaderRes *resource = &resources[i];
+        if (resource->exact && !resource->pool && !resource->separate && resource->count <= 1 &&
+            resource->type == 3 && resource->slot >= 0 && resource->slot < 128 &&
+            !resource->set && resource->binding && binding_offset < 64 && resource->binding < 64 - binding_offset)
+            queries.candidates |= UINT64_C(1) << (resource->binding + binding_offset);
+    }
+    return queries;
+}
+
+static uint32_t compute_pool_query_shape_kinds(const uint32_t *words, size_t count) {
+    // The current finite native grant handles only the ordinary 2D sampled-image table.
+    const RcSampledImageQueryTarget target = {.stage = RC_SAMPLED_IMAGE_QUERY_COMPUTE, .set = 2, .binding = 2,
+        .table_count = VK_POOL_TEX, .member = RC_SAMPLED_IMAGE_QUERY_ALL_MEMBERS};
+    RcSampledImageQueryProof proof;
+    return rc_sampled_image_query_size_lod0_for(words, count, target, &proof, NULL, 0) ==
+        RC_SAMPLED_IMAGE_QUERY_PROVEN ? 1u << target.binding : 0;
+}
+
+static void module_vertex_uniforms(const uint32_t *words, size_t word_count, const GfxShader *shader,
+                                   VkGraphicsUniformFootprints *out) {
+    const GfxShaderRes *resources;
+    const int count = gfx_shader_resources(shader, GFX_RES_UBO, &resources);
+    uint32_t used = 0;
+    for (int i = 0; i < count && out->count < VK_GRAPHICS_UNIFORM_BINDINGS && used < VK_GRAPHICS_UNIFORM_RANGES; ++i) {
+        const GfxShaderRes *binding = &resources[i];
+        if (binding->set || !binding->binding || binding->binding > UINT16_MAX || binding->count > 1 ||
+            binding->slot < 3 || binding->slot - 3 >= 18) continue;
+        RcSpirvUniformProof proof;
+        RcSpirvUniformRange ranges[VK_GRAPHICS_UNIFORM_RANGES];
+        if (rc_spirv_uniform_vertex_footprint(words, word_count, 0, binding->binding, &proof, ranges,
+                VK_GRAPHICS_UNIFORM_RANGES - used) != RC_SPIRV_UNIFORM_PROVEN || !proof.range_count) continue;
+        out->bindings[out->count++] = (VkGraphicsUniformBinding){binding->binding, used, proof.range_count};
+        for (uint32_t j = 0; j < proof.range_count; ++j)
+            out->ranges[used++] = (VkGraphicsUniformRange){ranges[j].offset, ranges[j].bytes};
+    }
+}
+
+static VkShaderModule make_module_status(const uint32_t *w, uint64_t words, int early_ok, VkResult *status,
+                                          int *exact_source, uint32_t marker_binding, unsigned marker_kind,
+                                          RcNativeRmwWord *native_rmw, RcNativeImageStore *image_store,
+                                          RcNativeImageSeedBindings *seed_bindings, RcNativeImageSeedBindings *rmw_seed_bindings,
+                                          ModuleSampledQueries *queries) {
+    if (queries) queries->attested = 0;
+    if (queries) {
+        queries->pool_domain_attested = 0;
+        queries->pool_query_shape_kinds = 0;
+        queries->pool_marks = 0;
+    }
+    int inactive_pool = queries && gfx_shader_pool_inactive_source(queries->inactive_pool_source,
+        w, words, queries->set, queries->binding_offset);
     const uint32_t *orig_w = w;   // for the log of a module the marks cannot take
     uint64_t orig_words = words, fixed_n = 0;
     uint32_t *fixed = spirv_fixup(w, words, &fixed_n);
     if (fixed) w = fixed, words = fixed_n;
-    uint32_t *pooled = spirv_pool_rebind(w, words);
+    uint32_t sampler = 0;
+    uint32_t *pooled = spirv_pool_rebind(w, words, &sampler);
+    // The typed table rebind only rewrites matching declarations. The compute marker copies the original
+    // instructions and indexes its own marker buffer with the same original access operands.
+    int domain_unchanged = queries && queries->pool_domain_candidate && !fixed && pooled;
+    int pool_marks = 0;
+    inactive_pool &= pooled != NULL;
     if (pooled) {
         free(fixed);
         w = fixed = pooled;
+        if (sampler && vk_pool_split_samplers()) {
+            uint32_t *typed;
+            uint64_t typed_words;
+            const int split = pool_sampler_spirv_split(w, words, sampler, &typed, &typed_words);
+            if (split < 0) {
+                rt_log("vk: could not separate comparison sampler operands in the final bindless module");
+                if (status) *status = VK_ERROR_FEATURE_NOT_PRESENT;
+                free(fixed);
+                return VK_NULL_HANDLE;
+            }
+            if (split) {
+                free(fixed);
+                w = fixed = typed;
+                words = typed_words;
+            }
+        }
         if (vk_pool_marks_enabled()) {
             uint64_t mk_n = 0;
             int st;
@@ -2393,6 +2756,7 @@ static VkShaderModule make_module(const uint32_t *w, uint64_t words, int early_o
             if (mk) {
                 free(fixed);
                 w = fixed = mk, words = mk_n;
+                pool_marks = 1;
             } else if (st < 0) {
                 int nth = plat_inc32(&vk_pool_marks_missed);
                 // the hash is FNV-1a of the words make_module got, as vk_dump hashes a shader's SPIR-V; it differs
@@ -2418,12 +2782,14 @@ static VkShaderModule make_module(const uint32_t *w, uint64_t words, int early_o
     uint64_t rc_n = 0;
     uint32_t *rc = P.reconverge ? spirv_reconverge(w, words, &rc_n) : NULL;
     if (rc) {
+        domain_unchanged = 0;
         free(fixed);
         w = fixed = rc, words = rc_n;
     }
     uint64_t np_n = 0;
     uint32_t *np = P.nan_preserve ? spirv_nan_preserve(w, words, P.nan_preserve, &np_n) : NULL;
     if (np) {
+        domain_unchanged = 0;
         free(fixed);
         w = fixed = np, words = np_n;
     }
@@ -2431,6 +2797,8 @@ static VkShaderModule make_module(const uint32_t *w, uint64_t words, int early_o
     uint32_t nb_tests = 0, nb_sels = 0;
     uint32_t *nb = P.nan_bits ? spirv_nan_bits(w, words, &nb_n, &nb_tests, &nb_sels) : NULL;
     if (nb) {
+        inactive_pool = 0;
+        domain_unchanged = 0;
         free(fixed);
         w = fixed = nb, words = nb_n;
         __atomic_fetch_add(&P.nan_bits_tests, nb_tests, __ATOMIC_RELAXED);
@@ -2439,12 +2807,95 @@ static VkShaderModule make_module(const uint32_t *w, uint64_t words, int early_o
             rt_log("vk_pipeline: first module with NaN tests made integer: %u tests, %u selects of NaN bits", nb_tests,
                    nb_sels);
     }
+    RcNativeRmwWord rmw = {0};
+    if (marker_binding) {
+        inactive_pool = 0;
+        domain_unchanged = 0;
+        size_t marked_words;
+        uint32_t *marked = marker_kind == VK_PIPE_RMW_FRAGMENT_BITMAP ?
+            rc_native_rmw_fragment_mark(w, words, marker_binding, &rmw, &marked_words) :
+            marker_kind == VK_PIPE_RMW_MESH_BITMAP ?
+            rc_native_rmw_mesh_bitmap_mark(w, words, marker_binding, &rmw, &marked_words) :
+            rc_native_rmw_word_mark(w, words, marker_binding, &rmw, &marked_words);
+        if (!marked) {
+            free(fixed);
+            if (status) *status = VK_ERROR_FEATURE_NOT_PRESENT;
+            return VK_NULL_HANDLE;
+        }
+        free(fixed);
+        w = fixed = marked;
+        words = marked_words;
+    } else if (native_rmw) {
+        rc_native_rmw_word(w, words, &rmw);
+    }
+    if (image_store) {
+        uint32_t *extended = NULL;
+        if (!spirv_storage_image_extended(w, words, &extended)) {
+            free(fixed);
+            if (status) *status = VK_ERROR_OUT_OF_HOST_MEMORY;
+            return VK_NULL_HANDLE;
+        }
+        if (extended) {
+            inactive_pool = 0;
+            domain_unchanged = 0;
+            free(fixed);
+            w = fixed = extended;
+            words += 2;
+        }
+    }
     if (P.feedback >= 2) mm_hash = fnv(FNV0, w, (size_t)words * 4);
     VkShaderModuleCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = (size_t)words * 4, .pCode = w};
     VkShaderModule m = VK_NULL_HANDLE;
-    VkResult r = vkCreateShaderModule(P.device, &ci, NULL, &m);
+    VkResult r = pipe_budget_enter_native() ? vkCreateShaderModule(P.device, &ci, NULL, &m)
+                                           : VK_ERROR_INITIALIZATION_FAILED;
+    if (native_rmw) *native_rmw = r == VK_SUCCESS && m ? rmw : (RcNativeRmwWord){0};
+    if (exact_source)
+        *exact_source = r == VK_SUCCESS && m && words == orig_words &&
+                        (w == orig_w || memcmp(w, orig_w, ci.codeSize) == 0);
+    if (image_store && r == VK_SUCCESS && m) rc_native_image_store(ci.pCode, ci.codeSize / sizeof *w, image_store);
+    if (seed_bindings && r == VK_SUCCESS && m)
+        rc_native_image_seed_bindings(ci.pCode, ci.codeSize / sizeof *w, seed_bindings);
+    if (rmw_seed_bindings && r == VK_SUCCESS && m && (!seed_bindings || !seed_bindings->count))
+        rc_native_image_seed_rmw_bindings(ci.pCode, ci.codeSize / sizeof *w, rmw_seed_bindings);
+    if (domain_unchanged && r == VK_SUCCESS && m) {
+        queries->pool_domain_attested = 1;
+        queries->pool_marks = pool_marks;
+        queries->pool_query_shape_kinds = compute_pool_query_shape_kinds(ci.pCode, ci.codeSize / sizeof *w);
+    }
+    if (queries && r == VK_SUCCESS && m) {
+        // Other admitted transforms here only adjust declarations or edit a pool access in place.
+        if (inactive_pool) queries->attested |= VK_GRAPHICS_INACTIVE_POOL_ATTESTED;
+        if (queries->vertex_uniforms)
+            module_vertex_uniforms(ci.pCode, ci.codeSize / sizeof *w, queries->vertex_uniform_source,
+                                   queries->vertex_uniforms);
+        for (uint64_t bits = queries->candidates; bits; bits &= bits - 1) {
+            const uint32_t binding = (uint32_t)__builtin_ctzll(bits);
+            RcSampledImageQueryProof proof;
+            const RcSampledImageQueryTarget target = {.stage = queries->stage, .set = queries->set, .binding = binding};
+            if (rc_sampled_image_query_size_lod0_for(ci.pCode, ci.codeSize / sizeof *w, target,
+                                                    &proof, NULL, 0) == RC_SAMPLED_IMAGE_QUERY_PROVEN)
+                queries->attested |= UINT64_C(1) << binding;
+        }
+    }
     free(fixed);
+    vk_device_lost_check(r, "creating a pipeline shader module");
+    if (status) *status = r;
     return r == VK_SUCCESS ? m : VK_NULL_HANDLE;
+}
+
+static VkShaderModule make_module(const uint32_t *w, uint64_t words, int early_ok) {
+    return make_module_status(w, words, early_ok, NULL, NULL, 0, 0, NULL, NULL, NULL, NULL, NULL);
+}
+
+static VkShaderModule make_vertex_module(const GfxShader *shader, const uint32_t *words, uint64_t count,
+                                         uint64_t *query_mask, VkGraphicsUniformFootprints *uniforms) {
+    if (!query_mask) return make_module(words, count, 0);
+    ModuleSampledQueries queries = module_sampled_queries(shader, RC_SAMPLED_IMAGE_QUERY_VERTEX, 0, 0);
+    queries.vertex_uniform_source = shader;
+    queries.vertex_uniforms = uniforms;
+    VkShaderModule module = make_module_status(words, count, 0, NULL, NULL, 0, 0, NULL, NULL, NULL, NULL, &queries);
+    *query_mask = queries.attested;
+    return module;
 }
 
 // ---- descriptor layouts
@@ -2577,6 +3028,21 @@ static int layout_covers(const VkPipeState *s, const Layout *l, uint32_t fs_off,
     return m < 0;
 }
 
+static int native_rmw_binding_add(Bindings *b, int stage_kind, uint32_t *binding) {
+    if (b->n == MAX_BINDINGS) return 0;
+    uint32_t next = 1;
+    for (uint32_t i = 0; i < b->n; ++i) {
+        if (b->b[i].binding >= UINT16_MAX) return 0;
+        if (next <= b->b[i].binding) next = b->b[i].binding + 1;
+    }
+    const VkDescriptorType type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    const VkShaderStageFlags stage = stage_bit(stage_kind);
+    b->b[b->n] = (VkDescriptorSetLayoutBinding){next, type, 1, stage, NULL};
+    b->pb[b->n++] = (VkPipeBinding){(uint16_t)next, stage_kind, VK_PIPE_NATIVE_RMW_MARKER, type, 1, stage, NULL};
+    *binding = next;
+    return 1;
+}
+
 // The update template of a set whose bindings are b[0..n): one entry per binding, in order, over the packed array the
 // replay fills from the set's first descriptor, a VkDescSlot per descriptor. The bind point follows the stages (compute
 // layouts hold the compute stage only). VK_NULL_HANDLE when templates are off, for an empty set, for a push set
@@ -2626,7 +3092,7 @@ static int64_t bindings_sort(Bindings *B, uint64_t *h) {
     return total;
 }
 
-static Layout *layout_get(Bindings *B) {
+static Layout *layout_get_for(Bindings *B, VkResult *status) {
     uint64_t h = FNV0;
     int64_t total = bindings_sort(B, &h);
     if (total < 0) return NULL;
@@ -2634,21 +3100,32 @@ static Layout *layout_get(Bindings *B) {
     for (Layout *l = *head; l; l = l->next)
         if (l->hash == h && l->n == B->n && !memcmp(l->b, B->b, B->n * sizeof *B->b)) return l;
     Layout *l = calloc(1, sizeof *l + B->n * sizeof *B->b);
-    if (!l) return NULL;
+    if (!l) {
+        if (status) *status = VK_ERROR_OUT_OF_HOST_MEMORY;
+        return NULL;
+    }
+    if (status && !pipe_budget_enter_native()) {
+        free(l);
+        return NULL;
+    }
     l->hash = h, l->n = B->n;
     memcpy(l->b, B->b, B->n * sizeof *B->b);
     l->push = total <= (int64_t)P.max_push;
     VkDescriptorSetLayoutCreateInfo si = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
                                           .flags = l->push ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR : 0,
                                           .bindingCount = l->n, .pBindings = l->b};
-    if (vkCreateDescriptorSetLayout(P.device, &si, NULL, &l->set) != VK_SUCCESS) {
+    VkResult result = vkCreateDescriptorSetLayout(P.device, &si, NULL, &l->set);
+    if (result != VK_SUCCESS) {
+        if (status) *status = result;
         free(l);
         return NULL;
     }
     VkDescriptorSetLayout sets3[3] = {l->set, vk_empty_set_layout(), vk_pool_set_layout()};   // set 2: the pools
     VkPipelineLayoutCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 3,
                                      .pSetLayouts = sets3};
-    if (vkCreatePipelineLayout(P.device, &pi, NULL, &l->layout) != VK_SUCCESS) {
+    result = vkCreatePipelineLayout(P.device, &pi, NULL, &l->layout);
+    if (result != VK_SUCCESS) {
+        if (status) *status = result;
         vkDestroyDescriptorSetLayout(P.device, l->set, NULL);
         free(l);
         return NULL;
@@ -2661,17 +3138,22 @@ static Layout *layout_get(Bindings *B) {
     return l;
 }
 
+static Layout *layout_get(Bindings *B) { return layout_get_for(B, NULL); }
+
 // Independent layouts (P.indep): the vertex stage's bindings in set 0, the fragment stage's in set 1 (empty without a
 // fragment shader), each with its own support buffer at binding 0, the pipeline layout created with
 // VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT so stage libraries can use it. Only the P.push_stage set is a
 // push-descriptor set (a layout holds one), when it fits maxPushDescriptors; the other is allocated per draw from the
 // command buffer's pools. On success *B holds both lists, set 0 first, VkPipeBinding.set filled in. Caller holds P.lock.
-static Layout *layout_pair(Bindings *B, Bindings *F) {
+static Layout *layout_pair_select(Bindings *B, Bindings *F, VkResult *status, int create) {
     uint64_t h = fnv(FNV0, "indep", 5);
     int64_t tv = bindings_sort(B, &h);
     h = fnv(h, "|", 1);
     int64_t tf = bindings_sort(F, &h);
-    if (tv < 0 || tf < 0 || B->n + F->n > MAX_BINDINGS) return NULL;
+    if (tv < 0 || tf < 0 || B->n + F->n > MAX_BINDINGS) {
+        if (status) *status = VK_ERROR_INITIALIZATION_FAILED;
+        return NULL;
+    }
     uint32_t n0 = B->n, n = B->n + F->n;
     memcpy(B->b + n0, F->b, F->n * sizeof *F->b);
     memcpy(B->pb + n0, F->pb, F->n * sizeof *F->pb);
@@ -2680,8 +3162,16 @@ static Layout *layout_pair(Bindings *B, Bindings *F) {
     Layout **head = &layouts[h % LAYOUT_BUCKETS];
     for (Layout *l = *head; l; l = l->next)
         if (l->hash == h && l->set1 && l->n == n && l->n0 == n0 && !memcmp(l->b, B->b, n * sizeof *B->b)) return l;
+    if (!create) return NULL;
     Layout *l = calloc(1, sizeof *l + n * sizeof *B->b);
-    if (!l) return NULL;
+    if (!l) {
+        if (status) *status = VK_ERROR_OUT_OF_HOST_MEMORY;
+        return NULL;
+    }
+    if (status && !pipe_budget_enter_native()) {
+        free(l);
+        return NULL;
+    }
     l->hash = h, l->n = n, l->n0 = n0;
     memcpy(l->b, B->b, n * sizeof *B->b);
     l->push = P.push_stage == GFX_STAGE_VS && tv <= (int64_t)P.max_push;
@@ -2692,11 +3182,15 @@ static Layout *layout_pair(Bindings *B, Bindings *F) {
     VkDescriptorSetLayoutCreateInfo s1 = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
                                           .flags = l->push1 ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR : 0,
                                           .bindingCount = n - n0, .pBindings = l->b + n0};
-    if (vkCreateDescriptorSetLayout(P.device, &s0, NULL, &l->set) != VK_SUCCESS) {
+    VkResult result = vkCreateDescriptorSetLayout(P.device, &s0, NULL, &l->set);
+    if (result != VK_SUCCESS) {
+        if (status) *status = result;
         free(l);
         return NULL;
     }
-    if (vkCreateDescriptorSetLayout(P.device, &s1, NULL, &l->set1) != VK_SUCCESS) {
+    result = vkCreateDescriptorSetLayout(P.device, &s1, NULL, &l->set1);
+    if (result != VK_SUCCESS) {
+        if (status) *status = result;
         vkDestroyDescriptorSetLayout(P.device, l->set, NULL);
         free(l);
         return NULL;
@@ -2705,7 +3199,9 @@ static Layout *layout_pair(Bindings *B, Bindings *F) {
     VkPipelineLayoutCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
                                      .flags = VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT, .setLayoutCount = 3,
                                      .pSetLayouts = sets};
-    if (vkCreatePipelineLayout(P.device, &pi, NULL, &l->layout) != VK_SUCCESS) {
+    result = vkCreatePipelineLayout(P.device, &pi, NULL, &l->layout);
+    if (result != VK_SUCCESS) {
+        if (status) *status = result;
         vkDestroyDescriptorSetLayout(P.device, l->set, NULL);
         vkDestroyDescriptorSetLayout(P.device, l->set1, NULL);
         free(l);
@@ -2719,6 +3215,12 @@ static Layout *layout_pair(Bindings *B, Bindings *F) {
     P.stats.push_layouts += (uint64_t)(l->push | l->push1);
     return l;
 }
+
+static Layout *layout_pair_for(Bindings *B, Bindings *F, VkResult *status) {
+    return layout_pair_select(B, F, status, 1);
+}
+
+static Layout *layout_pair(Bindings *B, Bindings *F) { return layout_pair_for(B, F, NULL); }
 
 // Vertex outputs with independent layouts: each vertex shader declares the union of the inputs of every fragment
 // shader met with it (pipeline-keys.bin at the prewarm, then each pipeline built), so its module does not depend on the
@@ -2776,9 +3278,13 @@ static Pipe *pipe_add(const void *key, size_t size, uint64_t h, VkPipeline pipel
     if (!p) return NULL;
     p->hash = h, p->key_size = size;
     memcpy(p->key, key, size);
-    if (l && B) {
+    if (l && B && B->n) {
         p->bindings = malloc(B->n * sizeof *p->bindings);
-        if (p->bindings) memcpy(p->bindings, B->pb, B->n * sizeof *p->bindings);
+        if (!p->bindings) {
+            free(p);
+            return NULL;
+        }
+        memcpy(p->bindings, B->pb, B->n * sizeof *p->bindings);
     }
     p->info = (VkPipeInfo){pipeline, l ? l->layout : VK_NULL_HANDLE, l ? l->set : VK_NULL_HANDLE, l ? l->push : 0, bp,
                            p->bindings ? B->n : 0, p->bindings, vs_inputs};
@@ -2794,6 +3300,109 @@ static Pipe *pipe_add(const void *key, size_t size, uint64_t h, VkPipeline pipel
     return p;
 }
 
+// The immutable info remains the descriptor-recipe identity. Release stores
+// match the unlocked legacy memo loads. P.lock also protects exact leases.
+static VkPipeline graphics_selected(const Pipe *p) {
+    return __atomic_load_n(&p->info.pipeline, __ATOMIC_ACQUIRE);
+}
+
+static VkPipeline graphics_take_retired_locked(VkGraphicsPipelineRevision *r) {
+    if (!r->retired || r->users || r->legacy || vk_device_is_lost()) return VK_NULL_HANDLE;
+    VkPipeline pipeline = r->pipeline;
+    r->pipeline = VK_NULL_HANDLE;
+    return pipeline;
+}
+
+static void graphics_publish_fast_locked(Pipe *p, VkPipeline pipeline, GraphicsSampledQueries queries) {
+    if (!pipeline || graphics_selected(p) || p->fast.pipeline || p->full.pipeline)
+        rt_fatal("vk_pipeline: invalid fast graphics publication");
+    p->fast.pipeline = pipeline;
+    p->fast.vs_query_size_lod0_mask = queries.vs;
+    p->fast.fs_query_size_lod0_mask = queries.fs;
+    p->fast.vertex_uniforms = queries.vertex_uniforms;
+    __atomic_store_n(&p->info.pipeline, pipeline, __ATOMIC_RELEASE);
+}
+
+static VkPipeline graphics_publish_full_locked(Pipe *p, VkPipeline pipeline, GraphicsSampledQueries queries) {
+    if (!pipeline) return VK_NULL_HANDLE;  // a failed optimization preserves the current fast revision
+    if (p->full.pipeline) rt_fatal("vk_pipeline: duplicate full graphics publication");
+    p->full.pipeline = pipeline;
+    p->full.vs_query_size_lod0_mask = queries.vs;
+    p->full.fs_query_size_lod0_mask = queries.fs;
+    p->full.vertex_uniforms = queries.vertex_uniforms;
+    __atomic_store_n(&p->info.pipeline, pipeline, __ATOMIC_RELEASE);
+    p->fast.retired = 1;
+    return graphics_take_retired_locked(&p->fast);
+}
+
+static VkPipeline graphics_legacy_locked(Pipe *p) {
+    VkPipeline pipeline = graphics_selected(p);
+    if (pipeline && p->fast.pipeline == pipeline) p->fast.legacy = 1;
+    return pipeline;
+}
+
+static int graphics_acquire_locked(Pipe *p, VkGraphicsPipelineUse *use) {
+    VkPipeline pipeline = graphics_selected(p);
+    if (!pipeline) return 0;
+    VkGraphicsPipelineRevision *r = p->fast.pipeline == pipeline ? &p->fast : &p->full;
+    if (r->pipeline != pipeline || r->retired || r->users == UINT32_MAX)
+        rt_fatal("vk_pipeline: invalid graphics revision acquire");
+    r->users++;
+    // Fast and full builds share the descriptor recipe, but attest different native modules.
+    *use = (VkGraphicsPipelineUse){.info = &p->info, .pipeline = pipeline, .revision = r,
+        .vs_query_size_lod0_mask = r->vs_query_size_lod0_mask, .fs_query_size_lod0_mask = r->fs_query_size_lod0_mask,
+        .vertex_uniforms = r->vertex_uniforms.count ? &r->vertex_uniforms : NULL};
+    return 1;
+}
+
+static void graphics_destroy_retired(VkPipeline pipeline) {
+    if (pipeline && !vk_device_is_lost()) vkDestroyPipeline(P.device, pipeline, NULL);
+}
+
+static void graphics_drop_revision(VkGraphicsPipelineRevision *r) {
+    plat_mutex_lock(&P.lock);
+    if (!r->users) rt_fatal("vk_pipeline: graphics revision released twice");
+    r->users--;
+    VkPipeline retired = graphics_take_retired_locked(r);
+    plat_mutex_unlock(&P.lock);
+    graphics_destroy_retired(retired);
+}
+
+void vk_pipeline_graphics_release(VkGraphicsPipelineUse *use) {
+    VkGraphicsPipelineRevision *r = use->revision;
+    *use = (VkGraphicsPipelineUse){0};
+    if (r) graphics_drop_revision(r);
+}
+
+static void graphics_scene_done(void *context) {
+    graphics_drop_revision(context);
+}
+
+static void graphics_scene_cancel(void *context, int may_have_executed) {
+    // vk_sync invokes this only for wholly unsent work or after checked idle.
+    (void)may_have_executed;
+    graphics_drop_revision(context);
+}
+
+void vk_pipeline_graphics_record(VkGraphicsPipelineUse *use, uint64_t scene) {
+    VkGraphicsPipelineRevision *r = use->revision;
+    if (!r || !scene) rt_fatal("vk_pipeline: missing graphics record ownership");
+    plat_mutex_lock(&P.lock);
+    if (r->pipeline != use->pipeline || !r->users || r->last_scene > scene)
+        rt_fatal("vk_pipeline: invalid graphics revision record");
+    int first = r->last_scene != scene;
+    r->last_scene = scene;
+    plat_mutex_unlock(&P.lock);
+    if (first) {
+        // Move this exact use to the ordered scene. Its split prefixes and
+        // canceled or uncertain tails follow the existing completion owner.
+        *use = (VkGraphicsPipelineUse){0};
+        vk_completion_add_owned(scene, graphics_scene_done, graphics_scene_cancel, r);
+    } else {
+        vk_pipeline_graphics_release(use);
+    }
+}
+
 // ---- graphics pipelines
 
 typedef struct {                       // normalized: zero where the state is dynamic or unused
@@ -2801,7 +3410,7 @@ typedef struct {                       // normalized: zero where the state is dy
     uint32_t color[8], depth, stencil; // VkFormat
     uint8_t n_color, samples, topo_class, minus_w;
     uint8_t clamp, poly_mode, a2c, logic_op;   // logic_op: VkLogicOp + 1 when enabled
-    uint8_t blend_en, dsb, fbl, pad;  // dsb: an enabled target blends with a SRC1 factor; fbl: VkPipeState.feedback
+    uint8_t blend_en, dsb, fbl, native_rmw_marker;  // dsb: SRC1 factor; fbl: VkPipeState.feedback
     uint32_t wmask;
     uint8_t blend[8][6];               // src, dst, op, src alpha, dst alpha, alpha op (VkBlendFactor / VkBlendOp)
     uint32_t attr_fmt[32], attr_off[32];
@@ -2810,6 +3419,14 @@ typedef struct {                       // normalized: zero where the state is dy
     uint8_t indep;                     // P.indep when built: the probe draws through both layouts
     uint8_t pad2[2];
 } GKey;
+
+struct VkGraphicsPipelineWait {
+    Pipe *pipe;
+    VkPipeState state;
+    GKey key;
+    uint64_t hash;
+    RcAdmissionVector peak;
+};
 
 static int blendable(VkFormat f) {
     return f != VK_FORMAT_UNDEFINED && (format_features(f, 1) & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT);
@@ -2932,6 +3549,7 @@ static void gkey_fill(const VkPipeState *s, GKey *k) {
     memset(k, 0, sizeof *k);
     k->vs = s->vs, k->fs = s->fs, k->ts = s->ts;
     k->indep = (uint8_t)P.indep;
+    k->native_rmw_marker = s->native_rmw_marker;
     k->n_color = (uint8_t)target_count(s);
     for (int i = 0; i < k->n_color; i++) k->color[i] = target_format(s->color_fmt[i], NULL, NULL);
     int d, st;
@@ -3079,11 +3697,11 @@ static int water_projective_pair(const VkPipeState *s) {
 
 // The fragment module of a pipeline in water mode `mode` (water_mode): the edited one for the module as it is built
 // (in its set 1 form), else the module itself.
-static VkShaderModule water_pair_module(const uint32_t *w, uint64_t n, int early, int mode) {
+static VkShaderModule water_pair_module(const uint32_t *w, uint64_t n, int early, int mode, ModuleSampledQueries *queries) {
     uint64_t words = 0;
     const uint32_t *code = mode ? water_module(fnv(FNV0, w, (size_t)n * 4), 0, NULL, NULL, 0, &words) : NULL;
     if (mode == 1 && !code) LOG_ONCE("vk_pipeline: water: a coordinate pair's fragment module is not in its known form; built as it is");
-    return code ? make_module(code, words, early) : make_module(w, n, early);
+    return make_module_status(code ? code : w, code ? words : n, early, NULL, NULL, 0, 0, NULL, NULL, NULL, NULL, queries);
 }
 
 // The vertex stage of a coordinate pair (mode 1): the edited module for the translation itself, taken before the
@@ -3100,8 +3718,85 @@ static int water_mode(const VkPipeState *s, const GKey *k) {
     return mode == 1 && k->dsb ? 0 : mode;
 }
 
-static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Layout *l, uint32_t fs_off) {
+static int native_mesh_writes_storage(const GfxShader *s) {
+    const GfxShaderRes *storage;
+    int count = gfx_shader_resources(s, GFX_RES_SSBO, &storage);
+    for (int i = 0; i < count; ++i)
+        if (storage[i].flags & 1) return 1;
+    return 0;
+}
+
+static int native_rmw_reflected(const GfxShader *s, const RcNativeRmwWord *word) {
+    if (!word->atomic_word || word->execution_model != 5365 || word->storage_set != 0 || word->c0_set != 0) return 0;
+    const GfxShaderRes *resources;
+    int count = gfx_shader_resources(s, GFX_RES_SSBO, &resources);
+    int storage = 0;
+    for (int i = 0; i < count; ++i) {
+        const GfxShaderRes *r = &resources[i];
+        if (r->set == word->storage_set && r->binding == word->storage_binding && r->count <= 1 && (r->flags & 1))
+            storage++;
+    }
+    count = gfx_shader_resources(s, GFX_RES_UBO, &resources);
+    int uniform = 0;
+    for (int i = 0; i < count; ++i) {
+        const GfxShaderRes *r = &resources[i];
+        if (r->set == word->c0_set && r->binding == word->c0_binding && r->count <= 1 && r->slot == 0)
+            uniform++;
+    }
+    return storage == 1 && uniform == 1;
+}
+
+static int native_bitmap_reflected(const GfxShader *s, const RcNativeRmwWord *word,
+                                   uint32_t model, unsigned set, uint32_t offset) {
+    if (!s || !word->atomic_word || !word->index || !word->bitmap_sites ||
+        word->execution_model != model || word->storage_set != set) return 0;
+    const GfxShaderRes *resources;
+    int count = gfx_shader_resources(s, GFX_RES_SSBO, &resources);
+    for (int i = 0; i < count; i++) {
+        const GfxShaderRes *r = &resources[i];
+        if (!r->set && r->binding + offset == word->storage_binding && r->count <= 1 && (r->flags & 1))
+            return 1;
+    }
+    return 0;
+}
+
+int vk_pipeline_fragment_rmw_candidate(const VkPipeState *s, const VkPipeBinding *binding) {
+    if (!s || is_mesh(s) || !s->fs || s->ts || s->native_rmw_marker ||
+        gfx_shader_guest_writes(s->vs) || !binding || binding->stage != GFX_STAGE_FS || !binding->res) return 0;
+    uint64_t count = 0;
+    const uint32_t *words = gfx_shader_spirv(s->fs, &count);
+    RcNativeRmwWord raw = {0};
+    return rc_native_rmw_fragment(words, count, &raw) && !binding->res->set &&
+        binding->res->binding == raw.storage_binding && native_bitmap_reflected(s->fs, &raw, 4, 0, 0);
+}
+
+static int mesh_bitmap_stages(const VkPipeState *s) {
+    return is_mesh(s) && (!s->fs || !gfx_shader_guest_writes(s->fs)) &&
+        (!s->ts || !gfx_shader_guest_writes(s->ts));
+}
+
+int vk_pipeline_mesh_rmw_bitmap_candidate(const VkPipeState *s, const VkPipeBinding *binding) {
+    if (!s || !mesh_bitmap_stages(s) || s->native_rmw_marker ||
+        !binding || binding->stage != GFX_STAGE_MS || !binding->res) return 0;
+    uint64_t count = 0;
+    const uint32_t *words = gfx_shader_spirv(s->vs, &count);
+    RcNativeRmwWord raw = {0};
+    return rc_native_rmw_mesh_bitmap(words, count, &raw) &&
+        binding->set == raw.storage_set && binding->binding == raw.storage_binding &&
+        native_bitmap_reflected(s->vs, &raw, 5365, 0, 0);
+}
+
+static VkPipeline create_graphics_admitted(const VkPipeState *s, const GKey *k, const Layout *l, uint32_t fs_off,
+                                            VkResult *status, uint32_t marker_binding, RcNativeRmwWord *mesh_rmw,
+                                            GraphicsSampledQueries *queries) {
+    *status = VK_ERROR_INITIALIZATION_FAILED;
+    GraphicsSampledQueries selected = {0};
     VkShaderModule vm = VK_NULL_HANDLE, fm = VK_NULL_HANDLE;
+    RcNativeRmwWord word = {0};
+    VkResult module_status;
+    const int fragment_marker = k->native_rmw_marker == VK_PIPE_RMW_FRAGMENT_BITMAP;
+    const int mesh_bitmap = k->native_rmw_marker == VK_PIPE_RMW_MESH_BITMAP;
+    const uint32_t mesh_marker_binding = k->native_rmw_marker == VK_PIPE_RMW_MESH_WORD || mesh_bitmap ? marker_binding : 0;
     uint64_t vw, fw, vm_hash = 0, fm_hash = 0;   // the hashes: of the final modules, for the PIPE_FEEDBACK 2 line
     const uint32_t *vcode = gfx_shader_spirv(s->vs, &vw);
     uint32_t *vpatched = NULL, *fpatched = NULL;
@@ -3165,13 +3860,31 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
             free(fpatched);
             fcode = fpatched = r;
         }
+        ModuleSampledQueries fragment_queries = module_sampled_queries(s->fs, RC_SAMPLED_IMAGE_QUERY_FRAGMENT,
+            l->set1 ? 1 : 0, l->set1 ? 0 : fs_off);
         // A bound colour target outside the shader's output map gets write mask 0 (target_wmask)
-        if (fcode) fm = water_pair_module(fcode, fw, !k->a2c, wmode), fm_hash = mm_hash;
+        if (fcode && fragment_marker && !wmode) {
+            fm = make_module_status(fcode, fw, !k->a2c, &module_status, NULL, marker_binding, k->native_rmw_marker, &word, NULL, NULL, NULL, &fragment_queries);
+            if (!fm) *status = module_status;
+            if (!native_bitmap_reflected(s->fs, &word, 4, !!l->set1, fs_off)) word = (RcNativeRmwWord){0};
+            fm_hash = mm_hash;
+        } else if (!fragment_marker && fcode) {
+            fm = water_pair_module(fcode, fw, !k->a2c, wmode, &fragment_queries), fm_hash = mm_hash;
+        }
+        selected.fs = fragment_queries.attested;
     }
-    vm = make_module(vcode, vw, 0), vm_hash = mm_hash;
+    if (mesh && (mesh_marker_binding || native_mesh_writes_storage(s->vs))) {
+        vm = make_module_status(vcode, vw, 0, &module_status, NULL, mesh_marker_binding, k->native_rmw_marker, &word, NULL, NULL, NULL, NULL);
+        if (!vm) *status = module_status;
+        if (mesh_bitmap ? !native_bitmap_reflected(s->vs, &word, 5365, 0, 0) :
+                          !native_rmw_reflected(s->vs, &word)) word = (RcNativeRmwWord){0};
+    } else {
+        vm = mesh ? make_module(vcode, vw, 0) : make_vertex_module(s->vs, vcode, vw, &selected.vs, &selected.vertex_uniforms);
+    }
+    vm_hash = mm_hash;
     free(vpatched), free(fpatched);
     VkPipeline pipe = VK_NULL_HANDLE;
-    if (!vm || (s->fs && !fm) || (mesh && s->ts && !tm)) goto out;
+    if (!vm || (s->fs && !fm) || (mesh && s->ts && !tm) || (marker_binding && !word.atomic_word)) goto out;
 
     VkPipelineShaderStageCreateInfo stages[3] = {
         {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = mesh ? VK_SHADER_STAGE_MESH_BIT_EXT : VK_SHADER_STAGE_VERTEX_BIT,
@@ -3274,6 +3987,7 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
     }
     plat_crash_context(NULL);
     perf_end(PERF_PIPE, p0);   // counts on the render thread only, so background builds stay out of it
+    *status = r;
     if (r != VK_SUCCESS) {
         rt_log("vk_pipeline: vkCreateGraphicsPipelines failed (%d)", (int)r);
         pipe = VK_NULL_HANDLE;
@@ -3300,6 +4014,25 @@ out:
     if (vm) vkDestroyShaderModule(P.device, vm, NULL);
     if (fm) vkDestroyShaderModule(P.device, fm, NULL);
     if (tm) vkDestroyShaderModule(P.device, tm, NULL);
+    if (pipe) {
+        *mesh_rmw = word;
+        *queries = selected;
+    }
+    return pipe;
+}
+
+static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Layout *l, uint32_t fs_off,
+                                  VkResult *status, uint32_t marker_binding, RcNativeRmwWord *mesh_rmw,
+                                  GraphicsSampledQueries *queries) {
+    *queries = (GraphicsSampledQueries){0};
+    int owned = pipe_budget_begin(PIPE_BUDGET_MB);
+    if (owned < 0) {
+        *status = vk_device_is_lost() ? VK_ERROR_DEVICE_LOST : VK_ERROR_INITIALIZATION_FAILED;
+        return VK_NULL_HANDLE;
+    }
+    VkPipeline pipe = create_graphics_admitted(s, k, l, fs_off, status, marker_binding, mesh_rmw,
+                                               queries);
+    pipe_budget_end(owned);
     return pipe;
 }
 
@@ -3317,9 +4050,16 @@ out:
 static PlatCond work_cv = PLAT_COND_INIT, done_cv = PLAT_COND_INIT;
 static PlatCond lib_cv = PLAT_COND_INIT;   // wakes the library workers (lib_worker): work_cv's signal must reach a pool worker
 #define LIB_BUCKETS 1024
-enum { LIB_VI, LIB_PR, LIB_FS, LIB_FO };
+enum { LIB_VI, LIB_PR, LIB_FS, LIB_FO, LIB_COUNT };
+#define MAX_WORKERS 4
+typedef struct {
+    uint64_t query_size_lod0_mask;
+    VkGraphicsUniformFootprints vertex_uniforms;
+} GraphicsStageProof;
+
 typedef struct Lib { struct Lib *next; uint64_t hash; VkPipeline pipe; uint32_t size; uint8_t pre, used, building, pad;
-                     struct LibJob *job; uint8_t key[]; } Lib;
+                     struct LibJob *job; struct LibWait *waiters; GraphicsStageProof proof;
+                     uint8_t key[]; } Lib;
 // pre: built by the boot prebuild ("stage library prebuild" below); used: a draw's link found it; building: a thread
 // builds it or job holds it queued (pipe not set yet); entries live until libs_destroy
 static Lib *libs[LIB_BUCKETS];
@@ -3372,7 +4112,9 @@ static VkResult library_lookup(VkGraphicsPipelineCreateInfo *ci, VkPipeline *pip
     return r == VK_SUCCESS && !*pipe ? VK_ERROR_INITIALIZATION_FAILED : r;
 }
 
-static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPipelineLayout lay, const void *key, LibraryProbe *probe) {
+static VkPipeline lib_create_admitted(int kind, const VkPipeState *s, const GKey *k, VkPipelineLayout lay,
+                                       const void *key, LibraryProbe *probe, GraphicsStageProof *proof) {
+    GraphicsStageProof module_proof = {0};
     static const VkGraphicsPipelineLibraryFlagsEXT part[4] = {
         VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT, VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT,
         VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT, VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT};
@@ -3432,7 +4174,8 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
         if (vwater) vcode = vwater, vw = wn;
         if (pk->missing && (patched = spirv_add_outputs(vcode, vw, pk->missing, pk->fin, &n2))) vcode = patched, vw = n2;
         else if (pk->missing) LOG_ONCE("vk_pipeline: cannot add missing vertex outputs (mask %#x)", pk->missing);
-        if (!(m = make_module(vcode, vw, 0))) goto out;
+        if (!(m = make_vertex_module(s->vs, vcode, vw, proof ? &module_proof.query_size_lod0_mask : NULL,
+                                      proof ? &module_proof.vertex_uniforms : NULL))) goto out;
         st.stage = VK_SHADER_STAGE_VERTEX_BIT, st.module = m;
         pin_subgroup32(&st, &rq, scode, sw);
         pi.stageCount = 1, pi.pStages = &st, pi.pViewportState = &vp, pi.pRasterizationState = &rs;
@@ -3449,7 +4192,10 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
             }
             patched = fcode ? spirv_set(fcode, fw, 1) : NULL;
             free(d);
-            if (!patched || !(m = water_pair_module(patched, fw, !k->a2c, ((const FsKey *)key)->water_projective))) goto out;
+            ModuleSampledQueries fragment_queries = module_sampled_queries(s->fs, RC_SAMPLED_IMAGE_QUERY_FRAGMENT, 1, 0);
+            if (!patched || !(m = water_pair_module(patched, fw, !k->a2c, ((const FsKey *)key)->water_projective,
+                                                     proof ? &fragment_queries : NULL))) goto out;
+            module_proof.query_size_lod0_mask = fragment_queries.attested;
             st.stage = VK_SHADER_STAGE_FRAGMENT_BIT, st.module = m;
             pin_subgroup32(&st, &rq, scode, sw);
             pi.stageCount = 1, pi.pStages = &st;
@@ -3489,6 +4235,17 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
 out:
     if (m) vkDestroyShaderModule(P.device, m, NULL);
     free(patched);
+    if (pipe && proof) *proof = module_proof;
+    return pipe;
+}
+
+static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPipelineLayout lay,
+                              const void *key, LibraryProbe *probe, GraphicsStageProof *proof) {
+    if (proof) *proof = (GraphicsStageProof){0};
+    int owned = pipe_budget_begin(PIPE_BUDGET_MB);
+    if (owned < 0) return VK_NULL_HANDLE;
+    VkPipeline pipe = lib_create_admitted(kind, s, k, lay, key, probe, proof);
+    pipe_budget_end(owned);
     return pipe;
 }
 
@@ -3501,41 +4258,41 @@ static Lib *lib_find(uint64_t h, const void *key, uint32_t size) {
     return NULL;
 }
 
-// Enters a library built with P.lock released; another thread's entry made meanwhile wins and pipe is destroyed.
-// Returns the entered handle. Caller holds P.lock.
-static VkPipeline lib_put(uint64_t h, const void *key, uint32_t size, VkPipeline pipe) {
-    Lib *b = lib_find(h, key, size);
-    if (b && b->building) {   // another thread's build publishes the entry
-        if (pipe) vkDestroyPipeline(P.device, pipe, NULL);
-        return VK_NULL_HANDLE;
-    }
-    if (b) {
-        if (pipe) vkDestroyPipeline(P.device, pipe, NULL);
-        return b->pipe;
-    }
-    if (!(b = calloc(1, sizeof *b + size))) return pipe;
-    b->hash = h, b->size = size, b->pipe = pipe;
-    memcpy(b->key, key, size);
-    b->next = libs[h % LIB_BUCKETS];
-    libs[h % LIB_BUCKETS] = b;
-    return pipe;
-}
+// Independent graphics libraries can build concurrently. A fast link becomes runnable once its exact libraries
+// settle. Both the dependency edges and the ready queues belong to P.lock.
+typedef struct LibWait {
+    struct LibWait *next, *prev;
+    struct LibJob *link;
+    Lib *library;
+} LibWait;
 
-// Shader libraries a waiting draw needs (lib_wait, link_queue): queued here ahead of every pipeline job, so an idle
-// worker builds each at once and the vertex and fragment libraries of one draw build in parallel. A job no worker took
-// is built by the first thread that needs its library (lib_get; lib_wait only without library workers). A job with p
-// is a waiting draw's fast link of p (after its library jobs), run on a worker so the drawing thread only waits.
-// Under P.lock.
-typedef struct LibJob { struct LibJob *next; Lib *b; int kind; Layout *l; VkPipeState s; GKey k; Pipe *p; } LibJob;
+typedef struct LibJob {
+    struct LibJob *next, *prev;        // runnable or awaiting libraries
+    Lib *b;
+    int kind;
+    Layout *l;
+    VkPipeState s;
+    GKey k;
+    Pipe *p;
+    LibWait waits[LIB_COUNT];
+    Lib *libraries[LIB_COUNT];
+    uint32_t remaining;
+    int optional, active;
+} LibJob;
 static struct {
-    LibJob *head, *tail;
+    LibJob *head, *tail;                // runnable required work
+    LibJob *low, *low_tail;             // runnable lookahead
+    LibJob *blocked;                    // links with unresolved libraries
     int idle;                          // workers asleep on work_cv
     int running;                       // jobs workers are building
-    int on;                            // NX2NAVI_PIPE_WAIT: 1 workers (default), 0 the drawing thread builds them (draw);
+    int on;                            // NX2NAVI_PIPE_WAIT=draw disables dedicated workers; the general pool still runs dependencies
                                        // set by vk_pipeline_async_enable, before the replay runs
+    PlatThread *thread[MAX_WORKERS];              // joined before layout and pipeline keys are destroyed
     int lib_workers;                   // workers that take only these jobs (lib_worker), started with the pool
     uint64_t waits, queued, by_worker, stolen, timeouts, links;
 } U;
+
+static void u_library_complete(Lib *library);
 
 // A building entry for key, NULL when out of memory. Caller holds P.lock and found none.
 static Lib *lib_new(uint64_t h, const void *key, uint32_t size) {
@@ -3552,10 +4309,11 @@ static Lib *lib_new(uint64_t h, const void *key, uint32_t size) {
 static VkPipeline lib_build(Lib *b, int kind, const VkPipeState *s, const GKey *k, Layout *l) {
     VkPipelineLayout lay = kind == LIB_PR ? half_layout(l, 0) : kind == LIB_FS ? half_layout(l, 1) : VK_NULL_HANDLE;
     VkPipeline pipe = VK_NULL_HANDLE;
+    GraphicsStageProof module_proof = {0};
     if (lay || kind == LIB_VI || kind == LIB_FO) {
         plat_mutex_unlock(&P.lock);
         uint64_t t0 = qpc();
-        pipe = lib_create(kind, s, k, lay, b->key, NULL);
+        pipe = lib_create(kind, s, k, lay, b->key, NULL, (kind == LIB_PR || kind == LIB_FS) ? &module_proof : NULL);
         double ms = ms_since(t0);
         plat_mutex_lock(&P.lock);
         P.g.lib_n[kind]++, P.g.lib_ms[kind] += ms;
@@ -3576,59 +4334,12 @@ static VkPipeline lib_build(Lib *b, int kind, const VkPipeState *s, const GKey *
                    : "; the driver's cache did not have it, or the build waited behind others in the driver");
         }
     }
-    if (!pipe && ++P.g.lib_fail <= 8) rt_log("vk_pipeline: gpl: stage library %d not built", kind);
+    if (!pipe && !pipe_budget_stopped() && ++P.g.lib_fail <= 8) rt_log("vk_pipeline: gpl: stage library %d not built", kind);
     b->pipe = pipe, b->building = 0;
+    b->proof = module_proof;
+    u_library_complete(b);
     plat_cond_broadcast(&done_cv);
     return pipe;
-}
-
-// Takes b's queued job out of the queue and builds it on this thread. Caller holds P.lock.
-static void lib_steal(Lib *b) {
-    LibJob *j = b->job, **pp = &U.head, *prev = NULL;
-    while (*pp && *pp != j) prev = *pp, pp = &(*pp)->next;
-    if (*pp) *pp = j->next;
-    if (U.tail == j) U.tail = prev;
-    b->job = NULL;
-    lib_build(b, j->kind, &j->s, &j->k, j->l);
-    free(j);
-}
-
-static VkPipeline lib_get(int kind, const VkPipeState *s, const GKey *k, Layout *l, const void *key, uint32_t size,
-                          int build, int *miss) {
-    uint64_t h = key_hash(key, size);
-    Lib *have = lib_find(h, key, size);
-    while (have && have->building) {   // being built (wait) or queued (build it here)
-        if (!build) {
-            *miss = 1;
-            return VK_NULL_HANDLE;
-        }
-        if (have->job) U.stolen++, lib_steal(have);
-        else plat_cond_wait(&done_cv, &P.lock);
-    }
-    if (have) {
-        if (have->pre && !have->used) have->used = 1, P.g.pre_used[kind]++;
-        return have->pipe;
-    }
-    VkPipelineLayout lay = kind == LIB_PR ? half_layout(l, 0) : kind == LIB_FS ? half_layout(l, 1) : VK_NULL_HANDLE;
-    if (!build || ((kind == LIB_PR || kind == LIB_FS) && !lay)) {
-        *miss = 1;
-        return VK_NULL_HANDLE;
-    }
-    Lib *b = lib_new(h, key, size);   // entered first, so other threads wait for this build instead of repeating it
-    if (b) return lib_build(b, kind, s, k, l);
-    plat_mutex_unlock(&P.lock);
-    uint64_t t0 = qpc();
-    VkPipeline pipe = lib_create(kind, s, k, lay, key, NULL);
-    double ms = ms_since(t0);
-    plat_mutex_lock(&P.lock);
-    if ((have = lib_find(h, key, size)) && !have->building) {   // another thread built it meanwhile
-        if (pipe) vkDestroyPipeline(P.device, pipe, NULL);
-        return have->pipe;
-    }
-    P.g.lib_n[kind]++, P.g.lib_ms[kind] += ms;
-    if (ms > P.g.lib_max[kind]) P.g.lib_max[kind] = ms;
-    if (!pipe && ++P.g.lib_fail <= 8) rt_log("vk_pipeline: gpl: stage library %d not built", kind);
-    return lib_put(h, key, size, pipe);
 }
 
 static void libs_destroy(void) {
@@ -3681,51 +4392,41 @@ static int gpl_feedback(void) {
 }
 
 // A fast-linked pipeline for s from its stage libraries. Caller holds P.lock.
-// build 0 (drawing thread): links only when the shader libraries exist (vertex input and fragment output libraries,
-// which hold no shader, are built here); *final 0 = not yet, a worker builds them. build 1 (worker): builds the
-// missing libraries and links with P.lock released. VK_NULL_HANDLE with *final 1 when GPL cannot express the pipeline
-// (shared layout; a feedback loop with NX2NAVI_GPL_FEEDBACK=0) or a build failed.
-static VkPipeline gpl_link(const VkPipeState *s, const GKey *k, const Layout *lc, int build, int *final) {
-    Layout *l = (Layout *)lc;
-    *final = 1;
-    if (!l->set1 || (k->fbl && !gpl_feedback())) return VK_NULL_HANDLE;
-    uint64_t t0 = qpc();
-    ViKey vk_;
-    PrKey pk;
-    FsKey fk;
-    FoKey ok;
-    lib_keys(s, k, &vk_, &pk, &fk, &ok);
-    int miss = 0;
-    VkPipeline lib[4];
-    lib[1] = lib_get(LIB_PR, s, k, l, &pk, sizeof pk, build, &miss);   // shader libraries first: no work when absent
-    lib[2] = miss ? VK_NULL_HANDLE : lib_get(LIB_FS, s, k, l, &fk, sizeof fk, build, &miss);
-    if (miss) {
-        if (!build) *final = 0, P.g.defer++;
-        return VK_NULL_HANDLE;
+// Called by a link owner after its library dependencies have settled.
+static VkPipeline gpl_link(const VkPipeState *s, const GKey *k, const Layout *l,
+                           Lib *const libraries[LIB_COUNT]) {
+    VkPipeline lib[LIB_COUNT];
+    for (uint32_t i = 0; i < LIB_COUNT; i++) {
+        Lib *b = libraries[i];
+        if (b->building) rt_fatal("vk_pipeline: scheduled GPL link has unresolved libraries");
+        if (b->pre && !b->used) b->used = 1, P.g.pre_used[i]++;
+        lib[i] = b->pipe;
     }
-    lib[0] = lib_get(LIB_VI, s, k, l, &vk_, sizeof vk_, 1, &miss);
-    lib[3] = lib_get(LIB_FO, s, k, l, &ok, sizeof ok, 1, &miss);
     VkPipeline pipe = VK_NULL_HANDLE;
     if (lib[0] && lib[1] && lib[2] && lib[3]) {
         VkPipelineLibraryCreateInfoKHR li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR, .libraryCount = 4,
                                              .pLibraries = lib};
         VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &li,
                                            .layout = l->layout};
-        if (build) plat_mutex_unlock(&P.lock);
+        // Libraries/layouts are stable until shutdown. Release even for a drawing-thread fast link so required
+        // admission cannot wait under the shared registry lock; callers already resolve a competing publication.
+        plat_mutex_unlock(&P.lock);
         uint64_t t1 = qpc();
         crash_note("a library link", s->vs, s->fs, NULL);
-        if (vkCreateGraphicsPipelines(P.device, VK_NULL_HANDLE, 1, &pi, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
+        int budget = pipe_budget_begin(PIPE_BUDGET_MB);
+        if (budget >= 0) {
+            VkResult result = pipe_create_one(0, &pi, &pipe, VK_NULL_HANDLE);
+            if (result != VK_SUCCESS) pipe = VK_NULL_HANDLE;
+        }
+        pipe_budget_end(budget);
         plat_crash_context(NULL);
         double ms = ms_since(t1);   // the link alone: library builds are counted apart
-        if (build) plat_mutex_lock(&P.lock);
+        plat_mutex_lock(&P.lock);
         P.g.link_ms += ms;
         if (ms > P.g.link_max) P.g.link_max = ms;
     }
     if (pipe) P.g.links++, P.g.fb_links += k->fbl != 0;
     else if (!P.g.link_fail++) rt_log("vk_pipeline: gpl: fast link failed; such draws wait or skip as without GPL");
-    double total = ms_since(t0);
-    if (!build && total > 5.0 && P.g.slow++ < 16)
-        rt_log("vk_pipeline: gpl: fast link on the drawing thread took %.1f ms", total);
     return pipe;
 }
 
@@ -3743,22 +4444,25 @@ static VkPipeline gpl_link(const VkPipeState *s, const GKey *k, const Layout *lc
 // queue only when the other is empty and run its jobs at PLAT_PRIO_BELOW_NORMAL, so guest threads win. A draw
 // that finds a prebuild job still queued moves it to the draw queue; one that finds it running raises its worker.
 typedef struct Job {
-    struct Job *next, *prev;           // prev: low queue only
+    struct Job *next, *prev;
     Pipe *p;
     const Layout *l;
     uint32_t fs_off;
     uint8_t low;                       // in the low queue, or running at below-normal priority
     uint8_t prebuild, demanded;        // from the key file; a draw asked for it before it was ready
-    int worker;                        // running on A.thread[worker]; -1 queued; JOB_ON_DRAW on the thread that waits for it
+    int worker;                        // pool owner, -1 runnable, JOB_ON_DRAW inline or JOB_WAIT_LINK parked
     VkPipeState s;
     GKey k;
 } Job;
 
-#define MAX_WORKERS 4
 #define JOB_ON_DRAW (-2)
+#define JOB_WAIT_LINK (-3)
 
 static struct {
     int on;                            // set once by vk_pipeline_async_enable, before the replay runs
+    int closed;                        // no new queue owners, including startup work
+    int external;                      // active synchronous or warm graphics builders
+    int pressure_service;              // one out-of-lock capacity service for required work
     int threads;
     PlatThread *thread[MAX_WORKERS];
     uint8_t prio_low[MAX_WORKERS];     // worker runs below normal (under P.lock)
@@ -3766,8 +4470,7 @@ static struct {
     Job *low, *low_tail;               // prebuild
     uint32_t inflight;                 // queued or running, both queues
     int low_running;                   // pool workers running a job taken from the low queue
-    int gate_shut;                     // pool workers the memory gate has refused a low job since it last admitted one
-    uint64_t first, taken;             // waited-for jobs moved to the head of the draw queue; built by the waiting thread
+    uint64_t first, taken;             // waited-for queue promotions; old inline build count
     PlatCond idle;           // with P.lock: no job queued or running
 } A = {.idle = PLAT_COND_INIT};
 
@@ -3853,11 +4556,12 @@ static void rec_fill(KeyRec *r, const VkPipeState *s) {
     r->s = *s;
     r->s.vs = r->s.fs = r->s.ts = NULL;
     r->s.prim_restart = 0;   // dynamic state: the same pipeline either way
+    r->s.native_rmw_marker = 0; // Warm records have no command-owned marker request.
 }
 
 // A pipeline was built for a draw: queue its record for the file. Caller holds P.lock.
 static void keys_note(const VkPipeState *s) {
-    if (!A.on || !K.path[0]) return;
+    if (!A.on || !K.path[0] || s->native_rmw_marker) return;
     static const uint8_t none[32];
     if (s->fs && !memcmp(gfx_shader_input_id(s->fs), none, 32)) return;   // the runtime's own shader (gfx_shader_own)
     if (s->ts && !memcmp(gfx_shader_input_id(s->ts), none, 32)) return;
@@ -4060,268 +4764,259 @@ static void prebuild_report(void) {
            "ready", K.built, K.failed, K.promoted, now_ms() - K.t0);
 }
 
-static void job_lower(Job *j);
+static void promote(Pipe *p);
+static int link_queue(Pipe *p, const VkPipeState *s, const GKey *k, Layout *l);
 
-// Runs a waiting draw's job taken from U on a worker: a library build or, for a job with p, p's fast link (gpl_link
-// build 1 builds a library still missing and waits for one another worker builds). Releases P.lock while building.
-static void u_run(LibJob *lj) {
-    U.by_worker++, U.running++;
-    if (lj->p) {
-        Pipe *p = lj->p;
-        if (!p->info.pipeline) {
-            int final = 0;
-            VkPipeline f = gpl_link(&lj->s, &lj->k, lj->l, 1, &final);   // releases P.lock while linking
-            if (f && !p->info.pipeline) {
-                p->fast = p->info.pipeline = f;
-                ready_note(p, 1);
-                job_lower(p->job);   // its job now only does the optimised build
-            } else if (f) {
-                vkDestroyPipeline(P.device, f, NULL);   // the job published one meanwhile
-            }
-        }
-        p->link_queued = 0;
-        U.links++;
-        plat_cond_broadcast(&done_cv);
-    } else {
-        lib_build(lj->b, lj->kind, &lj->s, &lj->k, lj->l);
-    }
-    U.running--;
-    free(lj);
+static void job_push(Job *j, int first) {
+    Job **head = j->low ? &A.low : &A.head;
+    Job **tail = j->low ? &A.low_tail : &A.tail;
+    j->prev = first ? NULL : *tail;
+    j->next = first ? *head : NULL;
+    if (j->prev) j->prev->next = j;
+    else *head = j;
+    if (j->next) j->next->prev = j;
+    else *tail = j;
+    plat_cond_broadcast(&work_cv);
 }
 
-// NX2NAVI_PIPE_FAST_WORKERS (default 1; 0 = as before): the library workers also take the fast link of a draw-queue job
-// (fast_take). A draw that is skipped rather than waiting leaves its pipeline to the pool, where a job is first
-// fast-linked and then goes back in the queue for its optimised build. The pool keeps one worker out of optimised
-// builds, so with the others inside one (about 100 ms each with the driver's cache warm, 350 ms cold) that single
-// worker linked every new pipeline of a burst, one after another at 5 to 10 ms each. On a first visit to Kokiri
-// Forest (RTX 5090, libraries in the driver's cache) 180 of the 444 pipelines draws missed took over 50 ms to become
-// usable, the longest 1.3 s, and their draws were missing from every frame until then; with the library workers
-// linking, 23 did, 19 of them mesh pipelines, which have no fast link.
+static void job_unlink(Job *j) {
+    Job **head = j->low ? &A.low : &A.head;
+    Job **tail = j->low ? &A.low_tail : &A.tail;
+    if (j->prev) j->prev->next = j->next;
+    else *head = j->next;
+    if (j->next) j->next->prev = j->prev;
+    else *tail = j->prev;
+    j->next = j->prev = NULL;
+}
+
+static void job_cancel(Job *j) {
+    j->p->building = 0;
+    j->p->job = NULL;
+    if (j->prebuild) K.left--;
+    if (!--A.inflight) plat_cond_broadcast(&A.idle);
+    plat_cond_broadcast(&done_cv);
+    free(j);
+}
+
+// P.lock owns both queues and every unresolved dependency edge. Closing removes the edges before any key is freed.
+static void u_push(LibJob *job) {
+    LibJob **head = job->optional ? &U.low : &U.head;
+    LibJob **tail = job->optional ? &U.low_tail : &U.tail;
+    job->prev = *tail;
+    job->next = NULL;
+    if (*tail) (*tail)->next = job;
+    else *head = job;
+    *tail = job;
+    plat_cond_broadcast(&work_cv);
+    plat_cond_broadcast(&lib_cv);
+}
+
+static void u_unlink(LibJob *job) {
+    LibJob **head = job->optional ? &U.low : &U.head;
+    LibJob **tail = job->optional ? &U.low_tail : &U.tail;
+    if (job->next) job->next->prev = job->prev;
+    else *tail = job->prev;
+    if (job->prev) job->prev->next = job->next;
+    else *head = job->next;
+    job->next = job->prev = NULL;
+}
+
+static void u_promote(LibJob *job) {
+    if (!job || !job->optional) return;
+    if (!job->active) u_unlink(job);
+    job->optional = 0;
+    if (!job->active) u_push(job);
+}
+
+static void u_block(LibJob *job, Lib *const libraries[LIB_COUNT]) {
+    for (uint32_t i = 0; i < LIB_COUNT; i++) {
+        Lib *b = libraries[i];
+        if (!b->building) continue;
+        LibWait *w = &job->waits[job->remaining++];
+        *w = (LibWait){.next = b->waiters, .link = job, .library = b};
+        if (w->next) w->next->prev = w;
+        b->waiters = w;
+    }
+    if (job->remaining) {
+        job->next = U.blocked;
+        if (U.blocked) U.blocked->prev = job;
+        U.blocked = job;
+    } else u_push(job);
+}
+
+static void u_unblock(LibJob *job) {
+    if (job->next) job->next->prev = job->prev;
+    if (job->prev) job->prev->next = job->next;
+    else U.blocked = job->next;
+    job->next = job->prev = NULL;
+}
+
+static void u_unwait(LibWait *w) {
+    if (w->next) w->next->prev = w->prev;
+    if (w->prev) w->prev->next = w->next;
+    else w->library->waiters = w->next;
+    w->library = NULL;
+}
+
+static void u_library_complete(Lib *b) {
+    while (b->waiters) {
+        LibWait *w = b->waiters;
+        LibJob *link = w->link;
+        u_unwait(w);
+        if (!--link->remaining) {
+            u_unblock(link);
+            u_push(link);
+        }
+    }
+}
+
+static Job *u_link_owner(Pipe *p) {
+    Job *owner = p->job;
+    if (!p->link_queued || !owner || owner->worker != JOB_WAIT_LINK)
+        rt_fatal("vk_pipeline: GPL link has no parked graphics owner");
+    p->link_queued = 0;
+    return owner;
+}
+
+static void u_cancel(LibJob *job) {
+    if (job->p) job_cancel(u_link_owner(job->p));
+    else job->b->job = NULL, job->b->building = 0;
+    free(job);
+}
+
+// The caller owns the exact compiler permit when it claims a runnable job.
+static void u_run(LibJob *job) {
+    U.by_worker++, U.running++;
+    if (job->p) {
+        Pipe *p = job->p;
+        VkPipeline fast = gpl_link(&job->s, &job->k, job->l, job->libraries);
+        Job *owner = u_link_owner(p);
+        if (A.closed || pipe_budget_stopped()) {
+            if (fast && !vk_device_is_lost()) vkDestroyPipeline(P.device, fast, NULL);
+            job_cancel(owner);
+        } else {
+            if (fast) {
+                const GraphicsSampledQueries queries = {
+                    .vs = job->libraries[LIB_PR]->proof.query_size_lod0_mask,
+                    .fs = job->libraries[LIB_FS]->proof.query_size_lod0_mask,
+                    .vertex_uniforms = job->libraries[LIB_PR]->proof.vertex_uniforms};
+                graphics_publish_fast_locked(p, fast, queries);
+                ready_note(p, 1);
+                P.g.wlinks++, P.g.flinks++, P.g.requeued++;
+            }
+            owner->worker = -1;
+            owner->low = fast != VK_NULL_HANDLE;
+            job_push(owner, owner->low);
+        }
+        U.links++;
+        plat_cond_broadcast(&done_cv);
+        plat_cond_broadcast(&work_cv);
+    } else {
+        job->b->job = NULL;
+        lib_build(job->b, job->kind, &job->s, &job->k, job->l);
+    }
+    U.running--;
+    free(job);
+}
+
 static int fast_workers(void) {
     static int on = -1;
     if (on < 0) on = cfg_bool("NX2NAVI_PIPE_FAST_WORKERS");
     return on;
 }
 
-// The first draw-queue job whose pipeline still lacks its fast link, taken out of the queue; NULL when there is none.
-// Caller holds P.lock.
-static Job *fast_take(void) {
-    if (!P.gpl || !fast_workers()) return NULL;
-    for (Job *j = A.head, *prev = NULL; j; prev = j, j = j->next) {
-        Pipe *p = j->p;
-        if (p->info.pipeline || p->fast_tried || p->link_queued || !p->lay || is_mesh(&j->s)) continue;
-        if (prev) prev->next = j->next;
-        else A.head = j->next;
-        if (A.tail == j) A.tail = prev;
-        j->next = j->prev = NULL;
-        return j;
-    }
-    return NULL;
-}
+static void lib_worker(void *arg);
 
-// A worker for stage libraries and fast links only: a waiting draw's jobs (U) first, so a draw that waits finds one
-// free even while the pool builds pipelines and the drawing thread never builds a library itself; then the fast link
-// of a draw-queue job (fast_take), whose optimised build goes on to the pool.
-static void lib_worker(void *arg) {
-    (void)arg;
-    plat_mutex_lock(&P.lock);
-    for (;;) {
-        Job *j = NULL;
-        while (!U.head && !(j = fast_take())) plat_cond_wait(&lib_cv, &P.lock);
-        if (!j) {
-            LibJob *lj = U.head;
-            if (!(U.head = lj->next)) U.tail = NULL;
-            if (lj->b) lj->b->job = NULL;
-            u_run(lj);
-            continue;
-        }
-        Pipe *p = j->p;
-        int final;
-        p->fast_tried = 1;   // no other thread links it meanwhile; a draw that waits for it waits for this link
-        VkPipeline f = gpl_link(&j->s, &j->k, p->lay, 1, &final);   // releases P.lock while building
-        if (f && !p->info.pipeline) {
-            p->fast = p->info.pipeline = f, P.g.wlinks++, P.g.flinks++;
-            ready_note(p, 1);
-            plat_cond_broadcast(&done_cv);
-        } else if (f) {
-            vkDestroyPipeline(P.device, f, NULL);
-        }
-        if (p->info.pipeline) {   // the optimised build: ahead of the prebuild, behind other draws' misses
-            j->low = 1, P.g.requeued++;
-            j->next = A.low;
-            if (A.low) A.low->prev = j;
-            else A.low_tail = j;
-            A.low = j;
-        } else {   // no fast link for this one: its whole build, next in the draw queue
-            if (!(j->next = A.head)) A.tail = j;
-            A.head = j;
-        }
-        plat_cond_signal(&work_cv);
-    }
-}
-
-// ---- coordinated commit admission of background builds (resource_budget.h)
-// Every pipeline built ahead of its first use passes here before it starts: the recorded pipelines the boot builds
-// (warm_builder), the pool's low queue during play (pipe_worker: the rest of the recorded pipelines and the optimised
-// builds behind a fast link), the compute pipelines and stage libraries of the boot (lb_worker), the library warm
-// (lw_worker) and the large compute shaders (bg_main). A build a draw or a dispatch waits for never does: it is needed
-// now.
-// NX2NAVI_BUILD_FREE_MB (default 4096; 0 no check): minimum commit headroom. The effective margin is also
-// at least the texture-pressure floor, so optional builds cannot compete with textures already giving way.
-// NX2NAVI_BUILD_RESERVE_MB (default 64): what one build under way is taken to cost the driver's compiler while it
-// runs; a large compute shader reserves GATE_BIG_MB. A build starts only when the headroom holds the part kept free,
-// the reservations of the builds under way and its own.
-// Measured on the machine this was written on (RTX 5090, 73,154 MB commit limit, warm driver cache): the boot's 3,898
-// recorded pipelines on 16 threads raised the process commit by 3,054 MB in 2.2 s, and the 4,066 compute pipelines and
-// libraries after them, together with the game's own start, by another 9,824 MB. A device was lost on that machine
-// at 56,673 of 65,531 MB system commit right after such a prebuild.
-// The commit is normally read every GATE_SAMPLE_MS: sixteen builders finishing a cached pipeline every half millisecond
-// would otherwise ask the system thousands of times a second. Active reservations and completed estimates cover the
-// work since that reading. Before completed estimates can refuse work, a fresh reading replaces those estimates:
-// cache hits can finish hundreds of builds without retaining anything close to their peak compiler reservations.
-#define GATE_BIG_MB 4096.0
-#define GATE_SAMPLE_MS 100.0
-#define GATE_WAIT_MS 30000.0   // how long a boot or warm builder waits for room before it leaves the rest to their first use
-static struct {
-    PlatMutex lock;
-    ResourceBudget g;
-    double est, used, limit, at, configured_free, texture_free;
-    int init;
-    int off;   // a preparation run (seed_pipelines): nothing is refused, there is no game to keep room for
-    uint64_t refused;
-} GATE = {.lock = PLAT_MUTEX_INIT};
-
-// 1 when a build estimated at est MB may start. gate_leave settles its reservation until the next fresh usage sample.
-// est 0: an ordinary build
-// (NX2NAVI_BUILD_RESERVE_MB), whose estimate *took returns for gate_leave.
+// ---- shared admission for speculative preparation
+// These adapters preserve the existing job queues and their optional allowance.
 static int gate_enter(double est, double *took) {
-    plat_mutex_lock(&GATE.lock);
-    if (!GATE.init) {
-        GATE.init = 1;
-        GATE.configured_free = strtod(cfg_value("NX2NAVI_BUILD_FREE_MB"), NULL);
-        const char *texture = cfg_get("NX2NAVI_TEX_COMMIT_FREE_MB");
-        GATE.texture_free = texture && *texture ? (double)atoll(texture) : -1;
-        if (GATE.texture_free < -1) GATE.texture_free = -1;
-        if (!plat_commit_enforced()) GATE.texture_free = 0;
-        GATE.est = strtod(cfg_value("NX2NAVI_BUILD_RESERVE_MB"), NULL);
-        if (GATE.est < 0) GATE.est = 0;
-        GATE.at = -GATE_SAMPLE_MS;
-    }
-    double now = now_ms();
-    if (now - GATE.at >= GATE_SAMPLE_MS) {
-        double proc;
-        plat_commit_info(&proc, &GATE.used, &GATE.limit);
-        GATE.at = now;
-        resource_budget_sample(&GATE.g);
-    }
-    GATE.g.active.free_mb = GATE.off ? 0 :
-        resource_build_headroom_mb(GATE.limit, GATE.configured_free, GATE.texture_free);
-    if (est <= 0) est = GATE.est;
-    int ok = resource_budget_enter(&GATE.g, GATE.used, GATE.limit, est);
-    if (!ok && GATE.g.completed_mb > 0) {
-        // A failed admission reserved nothing. Keep the lock across sampling and debt settlement so another
-        // compiler cannot complete between them; active compiler reservations survive the fresh sample.
-        double proc;
-        plat_commit_info(&proc, &GATE.used, &GATE.limit);
-        GATE.at = now_ms();
-        resource_budget_sample(&GATE.g);
-        GATE.g.active.free_mb = GATE.off ? 0 :
-            resource_build_headroom_mb(GATE.limit, GATE.configured_free, GATE.texture_free);
-        ok = resource_budget_enter(&GATE.g, GATE.used, GATE.limit, est);
-    }
-    if (!ok) GATE.refused++;
-    plat_mutex_unlock(&GATE.lock);
+    if (est <= 0) est = PIPE_BUDGET_MB;
     if (took) *took = est;
-    return ok;
+    if (pipe_budget.ticket.token.ledger) rt_fatal("vk_pipeline: nested preparation reservation");
+    return pipe_budget_try_begin(est, 0, NULL) == PIPE_BUDGET_OWNED;
 }
 
 static void gate_leave(double est) {
-    plat_mutex_lock(&GATE.lock);
-    resource_budget_leave(&GATE.g, est);
-    plat_mutex_unlock(&GATE.lock);
+    (void)est;
+    pipe_budget_end(PIPE_BUDGET_OWNED);
 }
 
-// The gate's numbers for a log line that says why a builder stopped or waits.
 static const char *gate_text(char *buf, size_t n) {
-    plat_mutex_lock(&GATE.lock);
-    snprintf(buf, n, "system commit %.0f of %.0f MB, %.0f MB active reservations, %.0f MB completed since sample, "
-                     "%.0f MB coordinated headroom, %.0f MB per build", GATE.used, GATE.limit,
-             GATE.g.active.reserved_mb, GATE.g.completed_mb, GATE.g.active.free_mb, GATE.est);
-    plat_mutex_unlock(&GATE.lock);
+    RcBudgetSnapshot s;
+    resource_core_budget_snapshot(&s);
+    snprintf(buf, n, "available RAM %.0f MiB, commit %.0f MiB; pipeline reservations %.0f MiB, unsampled estimate %.0f MiB",
+             s.optional_available.amount[RC_BUDGET_RAM] / 1048576.0,
+             s.optional_available.amount[RC_BUDGET_COMMIT] / 1048576.0,
+             s.producer[RC_BUDGET_PIPELINE].reserved.amount[RC_BUDGET_COMMIT] / 1048576.0,
+             s.producer[RC_BUDGET_PIPELINE].opaque_debt.amount[RC_BUDGET_COMMIT] / 1048576.0);
     return buf;
 }
 
-// A boot or warm builder's wait for room: 1 with est reserved (*took), 0 when *stop was set or GATE_WAIT_MS passed
-// without room, which the caller takes as the end of its work. who names the builder for the log's one line a wait.
-static int gate_wait(const char *who, volatile int32_t *stop, double *took) {
-    double w0 = now_ms();
-    int waited = 0;
-    while (!gate_enter(0, took)) {
-        char g[256];
-        if (*stop) return 0;
-        if (!waited++) rt_log("vk_pipeline: %s: waiting for commit headroom (%s)", who, gate_text(g, sizeof g));
-        if (now_ms() - w0 > GATE_WAIT_MS) return 0;
-        for (int i = 0; i < 20 && !*stop; i++) plat_sleep_ms(100);
-    }
-    return 1;
+static int gate_wait_for(double est, const char *who, volatile int32_t *stop, double *took) {
+    if (est <= 0) est = PIPE_BUDGET_MB;
+    if (took) *took = est;
+    if (pipe_budget.ticket.token.ledger) rt_fatal("vk_pipeline: nested preparation reservation");
+    return pipe_budget_acquire_for(est, 0, stop, GATE_WAIT_MS, who) == PIPE_BUDGET_OWNED;
 }
 
-// --probe-buildgate (host.h): the gate with this machine's commit and the settings in effect, without a device and
-// without a build. It prints what the settings and the system give, asks for sixteen ordinary builds and one large
-// one, and checks the answers against the same numbers: the builds admitted are those that fit with the earlier
-// ones' reservations, a refused one reserves nothing, and a builder's wait ends at once when its stop flag is set.
-// tests/build_gate_check.py runs it with build_free_mb at 0 (everything admitted) and at a value no machine has free
-// (everything refused).
+static int gate_wait(const char *who, volatile int32_t *stop, double *took) {
+    return gate_wait_for(PIPE_BUDGET_MB, who, stop, took);
+}
+
+// The probe reserves real shared capacity for simulated simultaneous producers, then cancels unused promises.
+// It neither launches compilers nor converts the promises into opaque retained-allocation estimates.
 int vk_pipeline_probe_buildgate(void) {
-    double took = 0, big = 0;
-    int fails = 0, in = 0, want = 0;
-    int first = gate_enter(0, &took);
-    double free_mb = GATE.g.active.free_mb, used = GATE.used, limit = GATE.limit, est = took;
-    if (first) gate_leave(took);
-    printf("probe-buildgate: system commit %.0f of %.0f MB, %.0f MB coordinated headroom, %.0f MB a build "
-           "(NX2NAVI_BUILD_RESERVE_MB)\n", used, limit, free_mb, est);
-    double room = limit - used - free_mb - GATE.g.completed_mb;
-    for (int i = 0; i < 16; i++) {
-        want += free_mb <= 0 || limit < 0 || room - i * est >= est;   // the commit sample stays for GATE_SAMPLE_MS
-        in += gate_enter(0, &took);
+    RcBudgetTicket tickets[16] = {0};
+    RcAdmissionVector cost = pipe_budget_cost(PIPE_BUDGET_MB);
+    unsigned admitted = 0;
+    int fails = 0;
+    for (unsigned i = 0; i < 16; i++) {
+        RcAdmissionStatus status = resource_core_budget_reserve(RC_BUDGET_PIPELINE, 0, &cost, &tickets[i]);
+        if (status == RC_ADMISSION_OK) admitted++;
+        else if (status != RC_ADMISSION_REFUSED && status != RC_ADMISSION_UNSUPPORTED) fails++;
     }
-    double reserved = GATE.g.active.reserved_mb;
-    int big_in = gate_enter(GATE_BIG_MB, &big);
-    int big_want = free_mb <= 0 || limit < 0 || room - reserved >= GATE_BIG_MB;
-    printf("probe-buildgate: %d of 16 ordinary builds admitted (%d fit), %.0f MB reserved; a large compute build beside "
-           "them %s\n", in, want, reserved, big_in ? "admitted" : "refused");
-    if (in != want) fails++, printf("probe-buildgate: FAIL: %d admitted, %d fit\n", in, want);
-    if (reserved != in * est) fails++, printf("probe-buildgate: FAIL: %.0f MB reserved for %d builds\n", reserved, in);
-    if (big_in != big_want) fails++, printf("probe-buildgate: FAIL: the large build was %s\n", big_in ? "admitted" : "refused");
-    if (big_in) gate_leave(big);
-    for (int i = 0; i < in; i++) gate_leave(est);
-    if (GATE.g.active.reserved_mb != 0) fails++, printf("probe-buildgate: FAIL: %.0f MB still reserved\n", GATE.g.active.reserved_mb);
-    volatile int32_t stop = 1;
-    double t0 = now_ms();
-    int got = gate_wait("probe", &stop, &took);
-    if (got) gate_leave(took);
-    if ((free_mb <= 0 && !got) || (limit >= 0 && free_mb > limit && got) || now_ms() - t0 > 1000)
-        fails++, printf("probe-buildgate: FAIL: a stopped builder's wait gave %d after %.0f ms\n", got, now_ms() - t0);
-    printf("probe-buildgate: an ordinary build is %s now; %s\n", got ? "admitted" : "refused", fails ? "FAILED" : "passed");
+    RcBudgetSnapshot s;
+    resource_core_budget_snapshot(&s);
+    uint64_t reserved = s.producer[RC_BUDGET_PIPELINE].reserved.amount[RC_BUDGET_COMMIT];
+    if (reserved != (uint64_t)admitted * cost.amount[RC_BUDGET_COMMIT]) fails++;
+    for (unsigned i = 0; i < 16; i++)
+        if (tickets[i].token.ledger && resource_core_budget_cancel(&tickets[i]) != RC_ADMISSION_OK) fails++;
+    resource_core_budget_snapshot(&s);
+    if (s.producer[RC_BUDGET_PIPELINE].reserved.amount[RC_BUDGET_COMMIT]) fails++;
+    printf("probe-buildgate: %u of 16 simultaneous estimates admitted; %s\n", admitted, fails ? "FAILED" : "passed");
     return fails ? 1 : 0;
 }
-
 // The whole build of job j, which the caller took off its queue, and the job's end: its pipeline is entered, the
 // threads waiting for it are woken and j is freed. lowrun: 1 on a pool worker that took j from the low queue. Caller
 // holds P.lock, which is released for the build.
 static void job_build(Job *j, int lowrun) {
     plat_mutex_unlock(&P.lock);
-    VkPipeline pipe = create_graphics(&j->s, &j->k, j->l, j->fs_off);
+    VkResult result;
+    RcNativeRmwWord word = {0};
+    GraphicsSampledQueries queries;
+    VkPipeline pipe = create_graphics(&j->s, &j->k, j->l, j->fs_off, &result, j->p->info.native_rmw_binding, &word,
+                                       &queries);
     plat_mutex_lock(&P.lock);
-    if (pipe || !j->p->fast) j->p->info.pipeline = pipe;   // a failed optimised build keeps the fast-linked one
+    if (A.closed || pipe_budget_stopped()) {
+        if (pipe && !vk_device_is_lost()) vkDestroyPipeline(P.device, pipe, NULL);
+        A.low_running -= lowrun;
+        job_cancel(j);
+        return;
+    }
+    if (pipe && j->p->fast.pipeline) P.g.swaps++;
+    if (word.atomic_word) j->p->info.native_rmw = word; // Native mesh has no fast GPL revision.
+    VkPipeline retired = graphics_publish_full_locked(j->p, pipe, queries);
     ready_note(j->p, 0);
-    if (pipe && j->p->fast) P.g.swaps++;
     j->p->building = 0;
     j->p->job = NULL;
     if (pipe) {
         P.stats.graphics++, P.stats.async_built++;
         if (!j->prebuild) keys_note(&j->s);
     } else {
+        if (!graphics_selected(j->p)) {
+            j->p->graphics_failure = "native graphics pipeline creation failed";
+            j->p->graphics_error = result;
+        }
         P.stats.failures++;
         rt_log("vk_pipeline: graphics pipeline not built: pipeline creation failed");
     }
@@ -4336,92 +5031,169 @@ static void job_build(Job *j, int lowrun) {
     plat_cond_broadcast(&done_cv);
     if (pipe && (!j->prebuild || j->demanded)) perf_count(PERF_CNT_PIPE_ASYNC);   // a draw waited for it
     free(j);
+    if (retired) {
+        plat_mutex_unlock(&P.lock);
+        graphics_destroy_retired(retired);
+        plat_mutex_lock(&P.lock);
+    }
+}
+
+// Required consumers of the same compiler allowance share capacity service. The refusing job has no permit,
+// and every driver owner can finish while this worker waits outside P.lock.
+static void worker_pressure(void) {
+    if (A.pressure_service) return;
+    A.pressure_service = 1;
+    RcAdmissionVector peak = pipe_budget_cost(PIPE_BUDGET_MB);
+    plat_mutex_unlock(&P.lock);
+    RcBudgetReadiness refused;
+    resource_core_budget_readiness(1, &refused);
+    uint64_t next_scan = 0;
+    while (!pipe_budget_stopped()) {
+        RcBudgetReadiness ready;
+        resource_core_budget_readiness(1, &ready);
+        if (resource_core_budget_peak_progress(&peak, &refused, &ready)) break;
+
+        uint64_t now = plat_now_ns();
+        if (now >= next_scan) {
+            if (next_scan && (resource_core_budget_peak_ready(&peak, &ready) ||
+                              pipe_budget_physically_impossible(&peak))) break;
+            RcBudgetProgress progress;
+            int byte_deficit = ready.available.amount[RC_BUDGET_RAM] < peak.amount[RC_BUDGET_RAM] ||
+                               ready.available.amount[RC_BUDGET_COMMIT] < peak.amount[RC_BUDGET_COMMIT];
+            if (byte_deficit) resource_core_budget_service(1, &peak, &progress);
+            next_scan = plat_now_ns() + PIPE_BUDGET_RESCAN_NS;
+            if (byte_deficit && !pipe_budget_stopped()) {
+                resource_core_budget_readiness(1, &ready);
+                if (resource_core_budget_peak_progress(&peak, &refused, &ready)) break;
+                resource_core_budget_wait_since(progress.event, (uint32_t)(PIPE_BUDGET_RESCAN_NS / 1000000ull));
+            }
+            continue;
+        }
+        resource_core_budget_wait((uint32_t)((next_scan - now + 999999ull) / 1000000ull));
+    }
+    plat_mutex_lock(&P.lock);
+    A.pressure_service = 0;
+    plat_cond_broadcast(&work_cv);
+    plat_cond_broadcast(&lib_cv);
+}
+
+static void graphics_worker(int worker) {
+    int library_only = worker < 0;
+    PlatCond *wake = library_only ? &lib_cv : &work_cv;
+    plat_mutex_lock(&P.lock);
+    while (!A.closed) {
+        int optional_ok = A.low_running < (A.threads > 1 ? A.threads - 1 : 1);
+        LibJob *lib = U.head;
+        Job *job = library_only ? NULL : A.head;
+        if (!lib && !job && !library_only && A.low && prep_mode && A.low->prebuild)
+            job = A.low;
+        if (!lib && !job && optional_ok) {
+            lib = U.low;
+            job = library_only ? NULL : A.low;
+        }
+        if (A.pressure_service || (!lib && !job)) {
+            U.idle++;
+            plat_cond_wait(wake, &P.lock);
+            U.idle--;
+            continue;
+        }
+        if (!lib && !job->low && P.gpl && !job->p->info.pipeline && !job->p->fast_tried &&
+            !job->p->link_queued && job->p->lay && !is_mesh(&job->s) &&
+            link_queue(job->p, &job->s, &job->k, (Layout *)job->p->lay))
+            continue;
+        int optional = lib ? lib->optional : job->low && !(prep_mode && job->prebuild);
+        if (lib) {
+            u_unlink(lib);
+            lib->active = 1;
+        } else {
+            job_unlink(job);
+            job->worker = worker;
+        }
+        A.low_running += optional;
+        if (!library_only && optional != A.prio_low[worker]) {
+            A.prio_low[worker] = (uint8_t)optional;
+            plat_thread_priority(optional ? PLAT_PRIO_BELOW_NORMAL : PLAT_PRIO_NORMAL);
+        }
+        plat_mutex_unlock(&P.lock);
+        RcAdmissionVector worker_peak = pipe_budget_cost(PIPE_BUDGET_MB);
+        RcAdmissionStatus reason;
+        PipeBudgetResult permit = pipe_budget_try_begin(PIPE_BUDGET_MB, !optional, &reason);
+        int impossible = !optional && permit == PIPE_BUDGET_REFUSED && pipe_budget_physically_impossible(&worker_peak);
+        plat_mutex_lock(&P.lock);
+        if (!optional && !A.closed && !pipe_budget_stopped() && (permit == PIPE_BUDGET_TERMINAL || impossible)) {
+            Pipe *p = lib ? lib->p : job->p;
+            if (p) {
+                p->graphics_error = impossible ? VK_ERROR_OUT_OF_HOST_MEMORY : VK_ERROR_INITIALIZATION_FAILED;
+                p->graphics_failure = impossible ? "compiler estimate exceeds physical RAM" :
+                                                   "compiler estimate is unsupported by the shared budget";
+                p->graphics_admission = reason;
+                P.stats.failures++;
+                if (p->job && p->job->prebuild) K.failed++;
+            }
+            if (lib) {
+                if (lib->b) u_library_complete(lib->b);
+                u_cancel(lib);
+            } else job_cancel(job);
+            continue;
+        }
+        if (A.closed || permit == PIPE_BUDGET_STOPPED) {
+            if (lib) {
+                if (lib->b && !A.closed) u_library_complete(lib->b);
+                u_cancel(lib);
+            } else job_cancel(job);
+            A.low_running -= optional;
+            if (permit == PIPE_BUDGET_OWNED) {
+                plat_mutex_unlock(&P.lock);
+                pipe_budget_end(permit);
+                plat_mutex_lock(&P.lock);
+            }
+            continue;
+        }
+        if (permit == PIPE_BUDGET_REFUSED || permit == PIPE_BUDGET_TERMINAL) {
+            // Optional telemetry can be unsupported even when required admission is available. Leave the same
+            // owner promotable and avoid treating an unattempted native build as a failed pipeline.
+            int promoted = optional && !(lib ? lib->optional : job->low);
+            A.low_running -= optional;
+            if (lib) {
+                lib->active = 0;
+                u_push(lib);
+            } else {
+                job->worker = -1;
+                job_push(job, 0);
+            }
+            if (!optional) worker_pressure();
+            else if (!promoted)
+                plat_cond_wait_ns(wake, &P.lock, 2000000000ull);
+            continue;
+        }
+        if (permit != PIPE_BUDGET_OWNED) rt_fatal("vk_pipeline: worker has no owned preparation permit");
+        if (lib) {
+            u_run(lib);
+            A.low_running -= optional;
+        } else job_build(job, optional);
+        plat_mutex_unlock(&P.lock);
+        pipe_budget_end(permit);
+        plat_mutex_lock(&P.lock);
+        plat_cond_broadcast(&work_cv);
+        plat_cond_broadcast(&lib_cv);
+    }
+    plat_mutex_unlock(&P.lock);
 }
 
 static void pipe_worker(void *arg) {
-    int me = (int)(intptr_t)arg;
-    plat_mutex_lock(&P.lock);
-    for (;;) {
-        // With 3 or more workers one never takes low-queue work, so a waiting draw's library starts at once
-        // (not with NX2NAVI_PIPE_WAIT=draw).
-        while (!U.head && !A.head && !(A.low && (A.threads < 3 || !U.on || A.low_running < A.threads - 1))) {
-            U.idle++;
-            plat_cond_wait(&work_cv, &P.lock);
-            U.idle--;
-        }
-        if (U.head) {   // a library a draw waits for
-            LibJob *lj = U.head;
-            if (!(U.head = lj->next)) U.tail = NULL;
-            if (lj->b) lj->b->job = NULL;
-            if (A.prio_low[me]) A.prio_low[me] = 0, plat_thread_priority(PLAT_PRIO_NORMAL);
-            u_run(lj);   // releases P.lock while building
-            continue;
-        }
-        Job *j = A.head;
-        int lowrun = !j;
-        double held = 0;   // the low job's reservation at the memory gate
-        if (!j && !gate_enter(0, &held)) {
-            // No room for a background build now (gate_enter). The job stays queued: a draw that needs its pipeline
-            // moves it to the draw queue (promote), which wakes this wait; otherwise the gate is asked again in 2 s.
-            if (!A.gate_shut++) {
-                char g[256];
-                rt_log("vk_pipeline: background pipeline builds wait for commit headroom (%s); a pipeline a draw needs "
-                       "is still built at once", gate_text(g, sizeof g));
-            }
-            plat_cond_wait_ns(&work_cv, &P.lock, 2000000000ull);
-            continue;
-        }
-        if (!j && A.gate_shut) {
-            A.gate_shut = 0;
-            rt_log("vk_pipeline: background pipeline builds go on: the commit headroom is back");
-        }
-        if (j) {
-            if (!(A.head = j->next)) A.tail = NULL;
-        } else {
-            j = A.low;
-            if ((A.low = j->next)) A.low->prev = NULL;
-            else A.low_tail = NULL;
-            A.low_running++;
-        }
-        j->next = j->prev = NULL;
-        j->worker = me;
-        if (j->low != A.prio_low[me]) {   // under P.lock, so a draw raising this thread (promote) is not undone
-            A.prio_low[me] = j->low;
-            plat_thread_priority(j->low ? PLAT_PRIO_BELOW_NORMAL : PLAT_PRIO_NORMAL);
-        }
-        // Step 1 for a job a draw waits for: its stage libraries and the fast link. Step 2, the optimised build, goes to
-        // the head of the low queue, so a burst of new pipelines gets every fast link before any optimised build.
-        if (P.gpl && (!j->prebuild || j->demanded) && !j->p->info.pipeline && !j->p->fast_tried && j->p->lay &&
-            !is_mesh(&j->s)) {
-            int final;
-            VkPipeline f = gpl_link(&j->s, &j->k, j->p->lay, 1, &final);   // releases P.lock while building
-            j->p->fast_tried = 1;
-            if (f && !j->p->info.pipeline) {
-                j->p->fast = j->p->info.pipeline = f, P.g.wlinks++;
-                ready_note(j->p, 1);
-                plat_cond_broadcast(&done_cv);
-                j->low = 1, j->worker = -1, P.g.requeued++;
-                j->prev = NULL, j->next = A.low;
-                if (A.low) A.low->prev = j;
-                else A.low_tail = j;
-                A.low = j;
-                A.low_running -= lowrun;
-                if (lowrun) gate_leave(held);
-                continue;
-            } else if (f) {
-                vkDestroyPipeline(P.device, f, NULL);
-            }
-        }
-        job_build(j, lowrun);
-        if (lowrun) gate_leave(held);
-    }
-    return;
+    graphics_worker((int)(intptr_t)arg);
+}
+
+static void lib_worker(void *arg) {
+    (void)arg;
+    graphics_worker(-1);
 }
 
 static int hint_on(void);
 
 // Starts the pool on first use: a quarter of the logical processors, 2 to 4. Caller holds P.lock.
 static int workers_start(void) {
+    if (A.closed) return 0;
     if (A.threads) return 1;
     uint32_t cpus = plat_cpu_usable();
     int n = cpus / 4 < 2 ? 2 : cpus / 4 > MAX_WORKERS ? MAX_WORKERS : (int)(cpus / 4);
@@ -4435,8 +5207,11 @@ static int workers_start(void) {
     // new pipelines at once (vk_pipeline_hint), or with the fast links of skipped draws (lib_worker). They sleep
     // unless a library or a fast link is queued.
     int nlib = hint_on() || fast_workers() ? n : 2;
-    for (int i = 0; A.threads && U.on && P.gpl && i < nlib; i++)
-        if (plat_thread_new(lib_worker, NULL, "pipe lib worker")) U.lib_workers++;
+    for (int i = 0; A.threads && U.on && P.gpl && i < nlib; i++) {
+        PlatThread *thread = plat_thread_new(lib_worker, NULL, "pipe lib worker");
+        if (!thread) break;
+        U.thread[U.lib_workers++] = thread;
+    }
     if (A.threads)
         rt_log("vk_pipeline: %d background graphics pipeline workers, %d for waiting draws' libraries", A.threads,
                U.lib_workers);
@@ -4444,24 +5219,50 @@ static int workers_start(void) {
     return A.threads != 0;
 }
 
-static void workers_drain(void) {
+static void workers_close(void) {
     plat_mutex_lock(&P.lock);
-    K.loading = 0;
-    for (Job *j = A.low, *n; j; j = n) {   // queued prebuild jobs are dropped, not built
-        n = j->next;
-        j->p->building = 0, j->p->job = NULL;
-        A.inflight--, K.left--;
-        free(j);
+    if (!A.closed) {
+        A.closed = 1;
+        K.loading = 0;
+        Job *queued[] = {A.head, A.low};
+        A.head = A.tail = A.low = A.low_tail = NULL;
+        for (unsigned i = 0; i < sizeof queued / sizeof queued[0]; i++) {
+            for (Job *job = queued[i], *next; job; job = next) {
+                next = job->next;
+                job_cancel(job);
+            }
+        }
+        while (U.blocked) {
+            LibJob *link = U.blocked;
+            u_unblock(link);
+            for (uint32_t i = 0; i < LIB_COUNT; i++)
+                if (link->waits[i].library) u_unwait(&link->waits[i]);
+            u_cancel(link);
+        }
+        LibJob *libraries[] = {U.head, U.low};
+        U.head = U.tail = U.low = U.low_tail = NULL;
+        for (unsigned i = 0; i < sizeof libraries / sizeof libraries[0]; i++) {
+            for (LibJob *job = libraries[i], *next; job; job = next) {
+                next = job->next;
+                u_cancel(job);
+            }
+        }
+        plat_cond_broadcast(&work_cv);
+        plat_cond_broadcast(&lib_cv);
+        plat_cond_broadcast(&done_cv);
+        plat_cond_broadcast(&A.idle);
     }
-    A.low = A.low_tail = NULL;
-    for (LibJob *j = U.head, *n; j; j = n) {   // queued library jobs too: their entries read as failed builds
-        n = j->next;
-        j->b->job = NULL, j->b->building = 0;
-        free(j);
-    }
-    U.head = U.tail = NULL;
-    while (A.inflight) plat_cond_wait(&A.idle, &P.lock);
-    while (U.running) plat_cond_wait(&done_cv, &P.lock);
+    plat_mutex_unlock(&P.lock);
+}
+
+// Already claimed native jobs can settle. Join their owners before freeing retained pipeline and library keys.
+static void workers_drain(void) {
+    workers_close();
+    for (int i = 0; i < A.threads; i++) plat_thread_join(A.thread[i]);
+    for (int i = 0; i < U.lib_workers; i++) plat_thread_join(U.thread[i]);
+    plat_mutex_lock(&P.lock);
+    while (A.inflight || A.external) plat_cond_wait(&A.idle, &P.lock);
+    A.threads = U.lib_workers = 0;
     plat_mutex_unlock(&P.lock);
 }
 
@@ -4474,269 +5275,311 @@ void vk_pipeline_async_enable(void) {
 
 int vk_pipeline_async_on(void) { return A.on; }
 
-// A draw needs a pipeline a prebuild job owns: the job moves to the draw queue, or its worker to normal priority.
-// Caller holds P.lock.
+// Promote the existing owner instead of allocating another build.
 static void promote(Pipe *p) {
     Job *j = p->job;
-    if (!j || !j->low) return;
+    if (A.closed || !j || !j->low) return;
     if (j->prebuild && !j->demanded && !p->info.pipeline) p->t_miss = plat_now_ns();
-    j->low = 0, j->demanded = 1;
+    j->demanded = 1;
     if (j->worker == -1) {
-        if (j->prev) j->prev->next = j->next;
-        else A.low = j->next;
-        if (j->next) j->next->prev = j->prev;
-        else A.low_tail = j->prev;
-        j->next = j->prev = NULL;
-        if (A.tail) A.tail->next = j;
-        else A.head = j;
-        A.tail = j;
-        plat_cond_signal(&work_cv);
-        if (U.lib_workers) plat_cond_signal(&lib_cv);   // its fast link (lib_worker)
-    } else if (j->worker >= 0 && A.prio_low[j->worker]) {
-        A.prio_low[j->worker] = 0;
-        plat_thread_set_priority(A.thread[j->worker], PLAT_PRIO_NORMAL);
+        job_unlink(j);
+        j->low = 0;
+        job_push(j, 0);
+    } else {
+        j->low = 0;
+        if (j->worker >= 0 && A.prio_low[j->worker]) {
+            A.prio_low[j->worker] = 0;
+            plat_thread_set_priority(A.thread[j->worker], PLAT_PRIO_NORMAL);
+        }
     }
 }
 
-// A draw waits up to wait_ms for the pipeline of job j, which has no fast link (a mesh pipeline, a pipeline without
-// stage libraries, or one whose link failed) and so needs its whole build. While the job is still queued the wait
-// buys nothing: the draw queue is first in, first out, and the jobs before it are the fast links and builds of other
-// draws' misses, so on a burst of new pipelines the one a draw stood waiting for started last and the draw was
-// skipped at the end of its wait all the same.
-// - The job goes to the head of the draw queue and a worker is woken, so the next free worker takes it.
-// - A wait longer than TAKE_WAIT_MS is not one of a frame's budgets (vk_exec_draw.c frame_wait is at most 500 ms): the
-//   caller wants this pipeline whatever it takes (a one-shot draw with NX2NAVI_ONESHOT_BUDGET=0). With no worker idle
-//   the job is then built here at once (job_build), as a library no worker took is (lib_wait). A wait inside a
-//   budget is never turned into a build on this thread: a compile takes 0.2 to 1.1 s for a mesh pipeline, and the
-//   budget exists so that the replay thread is not held that long.
-// Caller holds P.lock; it is released while the job is built here.
-#define TAKE_WAIT_MS 500u
-static void job_wanted(Job *j, uint32_t wait_ms) {
-    if (!j || j->worker != -1 || j->low) return;   // running already, or gone
-    Job *q = NULL;
-    if (A.head != j) {
-        for (q = A.head; q && q->next != j; q = q->next) {}
-        if (!q) return;
-    }
-    if (wait_ms > TAKE_WAIT_MS && !U.idle) {
-        if (q) {
-            if (!(q->next = j->next)) A.tail = q;
-        } else if (!(A.head = j->next)) {
-            A.tail = NULL;
-        }
-        j->next = j->prev = NULL;
-        j->worker = JOB_ON_DRAW;
-        A.taken++;
-        job_build(j, 0);
+static void job_wanted(Job *j) {
+    if (A.closed || !j || j->worker != -1 || j->low || A.head == j) return;
+    job_unlink(j);
+    job_push(j, 1);
+    A.first++;
+}
+
+// The selected Pipe and its wait record outlive the Job. Canceling a waiter
+// never cancels the underlying shared or originally optional build.
+static void graphics_wait_attach_locked(VkGraphicsPipelineWait *wait, Pipe *p) {
+    if (wait->pipe) {
+        if (wait->pipe != p) rt_fatal("vk_pipeline: required waiter switched graphics key");
         return;
     }
-    if (q) {   // to the head
-        if (!(q->next = j->next)) A.tail = q;
-        j->next = A.head, A.head = j;
-        A.first++;
+    if (p->required_waiters == UINT32_MAX) rt_fatal("vk_pipeline: too many graphics waiters");
+    wait->pipe = p;
+    p->required_waiters++;
+    p->required_layout = 1;
+    promote(p);
+    job_wanted(p->job);
+}
+
+static void graphics_wait_cancel_locked(VkGraphicsPipelineWait *wait) {
+    if (!wait->pipe) return;
+    if (!wait->pipe->required_waiters) rt_fatal("vk_pipeline: graphics waiter released twice");
+    wait->pipe->required_waiters--;
+    wait->pipe = NULL;
+}
+
+static const char *graphics_shape_unsupported(const VkPipeState *s, const GKey *k) {
+    if (k->native_rmw_marker > VK_PIPE_RMW_MESH_BITMAP) return "unknown storage atomic marker variant";
+    if (is_mesh(s)) {
+        if (k->native_rmw_marker == VK_PIPE_RMW_FRAGMENT_BITMAP) return "fragment bitmap requires an ordinary vertex draw";
+        if (k->native_rmw_marker == VK_PIPE_RMW_MESH_BITMAP && !mesh_bitmap_stages(s))
+            return "mesh bitmap requires a mesh-only storage writer";
+        if (!vk_ctx()->has_mesh_shader) return "the GPU has no mesh shaders";
+        if (s->ts && gfx_shader_stage(s->ts) != GFX_STAGE_TS) return "stage mismatch";
+    } else {
+        if (k->native_rmw_marker == VK_PIPE_RMW_MESH_WORD || k->native_rmw_marker == VK_PIPE_RMW_MESH_BITMAP)
+            return "the mesh marker requires a native mesh shader";
+        if (k->native_rmw_marker == VK_PIPE_RMW_FRAGMENT_BITMAP && (!s->fs || gfx_shader_guest_writes(s->vs)))
+            return "the bitmap requires a fragment-only storage writer";
+        if (gfx_shader_stage(s->vs) != GFX_STAGE_VS) return "stage mismatch";
+        if (k->topo_class == 3) return "patches need tessellation stages, which are not translated";
     }
-    plat_cond_signal(&work_cv);
+    if (s->fs && gfx_shader_stage(s->fs) != GFX_STAGE_FS) return "stage mismatch";
+    return NULL;
 }
 
 // Enters a missing pipeline: built here (mode 0), or queued for a draw (1) or for the prebuild (2). Failures are
 // entered too. *queued: 1 when a job owns it. Caller holds P.lock.
-static Pipe *pipe_miss(const VkPipeState *s, const GKey *k, uint64_t h, int mode, int *queued) {
+static Pipe *pipe_miss(const VkPipeState *s, const GKey *k, uint64_t h, int mode, int *queued, int required) {
     *queued = 0;
-    const char *why = NULL;
+    if (A.closed) return NULL;
+    const char *why = graphics_shape_unsupported(s, k);
+    const int unsupported = why != NULL;
+    VkResult layout_error = VK_ERROR_INITIALIZATION_FAILED;
+    VkResult *layout_status = required ? &layout_error : NULL;
     Bindings B = {0};
     Layout *l = NULL;
     uint32_t span = binding_span(s->vs);
+    uint32_t marker_binding = 0;
     int mesh = is_mesh(s);
-    if (mesh) {
+    if (!why && mesh) {
         // Mesh draws (VK_EXT_mesh_shader): one set holding the mesh stage's bindings, the fragment stage's after them and
         // the task stage's after those (create_graphics renumbers both modules); no libraries (the GPL fast link is for
         // vertex pipelines). They go to the workers like the others: built here, each new one stopped the frame for its
         // whole compile (0.26-0.51 s in Kokiri Forest), and they are recorded for the boot prewarm (keys_note).
         uint32_t fspan = s->fs ? binding_span(s->fs) : 1;
-        if (!vk_ctx()->has_mesh_shader) why = "the GPU has no mesh shaders";
-        else if ((s->fs && gfx_shader_stage(s->fs) != GFX_STAGE_FS) || (s->ts && gfx_shader_stage(s->ts) != GFX_STAGE_TS)) why = "stage mismatch";
-        else if (!add_stage(&B, s->vs, 0) || (s->fs && !add_stage(&B, s->fs, span - 1)) ||
-                 (s->ts && !add_stage(&B, s->ts, span - 1 + fspan - 1))) why = "too many bindings";
-        else if (!(l = layout_get(&B))) why = "descriptor layout creation failed";
-    } else if (gfx_shader_stage(s->vs) != GFX_STAGE_VS || (s->fs && gfx_shader_stage(s->fs) != GFX_STAGE_FS)) why = "stage mismatch";
-    else if (k->topo_class == 3) why = "patches need tessellation stages, which are not translated";
-    else if (P.indep) {
+        if (!add_stage(&B, s->vs, 0) || (s->fs && !add_stage(&B, s->fs, span - 1)) ||
+            (s->ts && !add_stage(&B, s->ts, span - 1 + fspan - 1))) why = "too many bindings";
+        else if (k->native_rmw_marker &&
+                 (module_binding_missing(s->vs, B.b, B.n, 0) >= 0 ||
+                  (s->fs && module_binding_missing(s->fs, B.b, B.n, span - 1) >= 0) ||
+                  (s->ts && module_binding_missing(s->ts, B.b, B.n, span - 1 + fspan - 1) >= 0) ||
+                  !native_rmw_binding_add(&B, GFX_STAGE_MS, &marker_binding)))
+            why = "native mesh atomic marker binding is unavailable";
+        else if (!(l = layout_get_for(&B, layout_status))) why = "descriptor layout creation failed";
+    } else if (!why && P.indep) {
         Bindings F = {0};
         if (!add_stage(&B, s->vs, 0) || (s->fs && !add_stage(&F, s->fs, 0))) why = "too many bindings";
-        else if (!(l = layout_pair(&B, &F))) why = "descriptor layout creation failed";
+        else if (k->native_rmw_marker == VK_PIPE_RMW_FRAGMENT_BITMAP &&
+                 (module_binding_missing(s->fs, F.b, F.n, 0) >= 0 ||
+                  !native_rmw_binding_add(&F, GFX_STAGE_FS, &marker_binding)))
+            why = "fragment atomic marker binding is unavailable";
+        else if (!(l = layout_pair_for(&B, &F, layout_status))) why = "descriptor layout creation failed";
         B.pool |= F.pool;
         span = 1;
-    } else if (!add_stage(&B, s->vs, 0) || (s->fs && !add_stage(&B, s->fs, span - 1))) why = "too many bindings";
-    else if (!(l = layout_get(&B))) why = "descriptor layout creation failed";
+    } else if (!why) {
+        if (!add_stage(&B, s->vs, 0) || (s->fs && !add_stage(&B, s->fs, span - 1))) why = "too many bindings";
+        else if (k->native_rmw_marker == VK_PIPE_RMW_FRAGMENT_BITMAP &&
+                 (module_binding_missing(s->vs, B.b, B.n, 0) >= 0 ||
+                  module_binding_missing(s->fs, B.b, B.n, span - 1) >= 0 ||
+                  !native_rmw_binding_add(&B, GFX_STAGE_FS, &marker_binding)))
+            why = "fragment atomic marker binding is unavailable";
+        else if (!(l = layout_get_for(&B, layout_status))) why = "descriptor layout creation failed";
+    }
     char lack[128];
     if (!why && !layout_covers(s, l, span - 1, lack, sizeof lack)) why = lack, l = NULL;
-    VkPipeline pipe = VK_NULL_HANDLE;
     Job *j = NULL;
     if (!why && mode && workers_start() && (j = calloc(1, sizeof *j))) {
         *j = (Job){.l = l, .fs_off = span - 1, .low = mode == 2, .prebuild = mode == 2, .worker = -1, .s = *s, .k = *k};
-    } else if (!why && !(pipe = create_graphics(s, k, l, span - 1))) {
-        why = "pipeline creation failed";
+    } else if (!why && (mode == 1 || (mode == 2 && !prep_mode))) {
+        *queued = mode == 1 ? -1 : 0;   // keep the identity retryable
+        return NULL;
     }
+    Pipe *p = pipe_add(k, sizeof *k, h, VK_NULL_HANDLE, l, l ? &B : NULL,
+                       VK_PIPELINE_BIND_POINT_GRAPHICS, gfx_shader_inputs(s->vs, NULL));
+    if (!p) {
+        if (j && mode == 1) *queued = -1;
+        free(j);
+        return NULL;
+    }
+    p->required_layout = required;
+    if (!why) p->info.native_rmw_binding = marker_binding;
     if (why) {
+        p->graphics_unsupported = unsupported;
+        p->graphics_error = unsupported ? VK_ERROR_FEATURE_NOT_PRESENT : layout_error;
+        p->graphics_failure = why == lack ? "translated stage disagrees with the selected descriptor layout" : why;
         P.stats.failures++;
         rt_log("vk_pipeline: graphics pipeline not built: %s", why);
-    } else if (!j) {
-        P.stats.graphics++;
-        if (mode != 2) keys_note(s);
+        return p;
     }
-    Pipe *p = pipe_add(k, sizeof *k, h, pipe, l, l ? &B : NULL, VK_PIPELINE_BIND_POINT_GRAPHICS, gfx_shader_inputs(s->vs, NULL));
-    if (!j || !p) {
-        free(j);
+    if (required && j && P.gpl && l->set1 && !mesh && !k->native_rmw_marker && (!k->fbl || gpl_feedback()) &&
+        (!l->half[0] || !l->half[1]) && pipe_budget_enter_native()) {
+        // The required layout owner makes both halves before releasing its
+        // permit. A half-layout failure still allows the exact monolithic path.
+        if (!half_layout(l, 0) || !half_layout(l, 1)) p->fast_tried = 1;
+    }
+    if (!j) {
+        // Publish an exact owner before dropping the lock for synchronous creation.
+        p->building = 1;
+        A.external++;
+        plat_mutex_unlock(&P.lock);
+        VkResult result;
+        RcNativeRmwWord word = {0};
+        GraphicsSampledQueries queries;
+        VkPipeline pipe = create_graphics(s, k, l, span - 1, &result, marker_binding, &word, &queries);
+        plat_mutex_lock(&P.lock);
+        p->building = 0;
+        if (!--A.external) plat_cond_broadcast(&A.idle);
+        plat_cond_broadcast(&done_cv);
+        if (A.closed || pipe_budget_stopped()) {
+            if (pipe && !vk_device_is_lost()) vkDestroyPipeline(P.device, pipe, NULL);
+            return NULL;
+        }
+        if (word.atomic_word) p->info.native_rmw = word;
+        (void)graphics_publish_full_locked(p, pipe, queries);
+        if (pipe) {
+            P.stats.graphics++;
+            if (mode != 2) keys_note(s);
+        } else {
+            p->graphics_failure = "native graphics pipeline creation failed";
+            p->graphics_error = result;
+            P.stats.failures++;
+            rt_log("vk_pipeline: graphics pipeline not built: pipeline creation failed");
+        }
         return p;
     }
     j->p = p;
     p->building = 1, p->job = j;
     if (mode != 2) p->t_miss = plat_now_ns();
-    if (mode == 2) {
-        j->prev = A.low_tail;
-        if (A.low_tail) A.low_tail->next = j;
-        else A.low = j;
-        A.low_tail = j;
-        K.left++;
-    } else {
-        if (A.tail) A.tail->next = j;
-        else A.head = j;
-        A.tail = j;
-        if (U.lib_workers && fast_workers()) plat_cond_signal(&lib_cv);   // its fast link (lib_worker)
-    }
+    if (mode == 2) K.left++;
     A.inflight++;
-    plat_cond_signal(&work_cv);
+    job_push(j, 0);
     *queued = 1;
     return p;
 }
 
-// A job still in the draw queue goes to the head of the low queue: its pipeline has (or is about to have) a fast-linked
-// one, so the optimised build waits behind other draws' misses. Caller holds P.lock.
-static void job_lower(Job *j) {
-    if (!j || j->worker != -1 || j->low) return;
-    if (A.head == j) {
-        if (!(A.head = j->next)) A.tail = NULL;
-    } else {
-        Job *q = A.head;
-        while (q && q->next != j) q = q->next;
-        if (!q) return;
-        if (!(q->next = j->next)) A.tail = q;
-    }
-    j->low = 1, P.g.requeued++;
-    j->prev = NULL, j->next = A.low;
-    if (A.low) A.low->prev = j;
-    else A.low_tail = j;
-    A.low = j;
-}
+// A hint requests only the shader-bearing libraries. An actual link owns all four dependencies.
+typedef enum { LIB_QUEUE_UNAVAILABLE, LIB_QUEUE_READY, LIB_QUEUE_COLD } LibQueueResult;
 
-// A draw waits for pipeline s: its missing pre-rasterization and fragment shader libraries go to the head of the
-// worker queues (U), so they build in parallel on idle workers, and this thread sleeps until both are published or
-// end (now_ms) passes. A job no worker took within 1 ms (all busy) is built here. Caller holds P.lock.
-static void u_push(LibJob *j) {
-    if (U.tail) U.tail->next = j;
-    else U.head = j;
-    U.tail = j;
-}
-
-// Queues s's missing pre-rasterization and fragment shader libraries (b: both entries). 0 when one cannot be entered
-// (no layout half, out of memory). Caller holds P.lock.
-static int lib_queue(const VkPipeState *s, const GKey *k, Layout *l, Lib *b[2]) {
+static LibQueueResult lib_queue(const VkPipeState *s, const GKey *k, Layout *l, Lib *b[LIB_COUNT],
+    int optional, int create) {
+    if (A.closed) return LIB_QUEUE_UNAVAILABLE;
     ViKey vk_;
     PrKey pk;
     FsKey fk;
     FoKey ok;
     lib_keys(s, k, &vk_, &pk, &fk, &ok);
-    U.waits++;
-    const void *key[2] = {&pk, &fk};
-    uint32_t size[2] = {sizeof pk, sizeof fk};
-    int queued = 0;
-    for (int i = 0; i < 2; i++) {
-        uint64_t h = key_hash(key[i], size[i]);
-        if ((b[i] = lib_find(h, key[i], size[i]))) continue;
-        if (!half_layout(l, i)) return 0;   // gpl_link reports it
-        LibJob *j = calloc(1, sizeof *j);
-        if (!j || !(b[i] = lib_new(h, key[i], size[i]))) {
-            free(j);
-            return 0;
-        }
-        *j = (LibJob){.b = b[i], .kind = i ? LIB_FS : LIB_PR, .l = l, .s = *s, .k = *k};
-        b[i]->job = j;
-        u_push(j);
-        U.queued++, queued++;
-    }
-    if (queued) plat_cond_broadcast(&work_cv), plat_cond_broadcast(&lib_cv);
-    return 1;
-}
-
-// A waiting draw's whole fast link of p on the library workers: its library jobs, then the link job behind them.
-// The caller then waits for p->info.pipeline. 0 when nothing was queued (the caller links as before). Under P.lock.
-static int link_queue(Pipe *p, const VkPipeState *s, const GKey *k, Layout *l) {
-    Lib *b[2];
-    if (!U.lib_workers || !lib_queue(s, k, l, b)) return 0;
-    LibJob *j = calloc(1, sizeof *j);
-    if (!j) return 0;
-    *j = (LibJob){.l = l, .s = *s, .k = *k, .p = p};
-    p->link_queued = 1;
-    u_push(j);
-    plat_cond_broadcast(&work_cv), plat_cond_broadcast(&lib_cv);
-    return 1;
-}
-
-static void lib_wait(const VkPipeState *s, const GKey *k, Layout *l, double end) {
-    Lib *b[2];
-    if (!lib_queue(s, k, l, b)) return;
-    double steal_at = now_ms() + 1.0;
-    for (;;) {
-        if (!b[0]->building && !b[1]->building) return;
-        double now = now_ms();
-        if (now >= end) {
-            U.timeouts++;
-            return;
-        }
-        Lib *q = b[0]->job ? b[0] : b[1]->job ? b[1] : NULL;
-        if (q && !U.lib_workers && (now >= steal_at || !U.idle)) {
-            U.stolen++;
-            lib_steal(q);   // releases P.lock while building
+    const void *keys[LIB_COUNT] = {&vk_, &pk, &fk, &ok};
+    const uint32_t sizes[LIB_COUNT] = {sizeof vk_, sizeof pk, sizeof fk, sizeof ok};
+    int first = optional ? LIB_PR : LIB_VI;
+    int last = optional ? LIB_FS : LIB_FO;
+    U.waits += !optional;
+    for (int kind = first; kind <= last; kind++) {
+        const void *key = keys[kind];
+        uint32_t size = sizes[kind];
+        uint64_t h = key_hash(key, size);
+        if ((b[kind] = lib_find(h, key, size))) {
+            if (!optional) u_promote(b[kind]->job);
             continue;
         }
-        double until = q && steal_at < end ? steal_at : end;
-        plat_cond_wait_ms(&done_cv, &P.lock, (uint32_t)(until - now) + 1);
+        if (kind == LIB_PR || kind == LIB_FS) {
+            int half = kind == LIB_FS;
+            if (!l->half[half] && optional) {
+                if (!create) return LIB_QUEUE_COLD;
+                if (!pipe_budget_enter_native()) return LIB_QUEUE_UNAVAILABLE;
+            }
+            if (!half_layout(l, half)) return LIB_QUEUE_UNAVAILABLE;
+        }
+        LibJob *j = calloc(1, sizeof *j);
+        if (!j || !(b[kind] = lib_new(h, key, size))) {
+            free(j);
+            return LIB_QUEUE_UNAVAILABLE;
+        }
+        *j = (LibJob){.b = b[kind], .kind = kind, .l = l, .s = *s, .k = *k, .optional = optional};
+        b[kind]->job = j;
+        u_push(j);
+        U.queued++;
     }
+    return LIB_QUEUE_READY;
 }
 
-// ---- stage libraries ahead of their draws (NX2NAVI_PIPE_AHEAD, default 1; 0 off; vk_exec.c "looking ahead")
-// The replay names the state of a draw it has not reached yet. When no pipeline is known for it, its pre-rasterization
-// and fragment shader libraries are queued to the library workers now, so they build while the draws before it are
-// recorded, in parallel with each other and with those of the other draws named: the draw's own lookup then finds both
-// and links on its thread in microseconds instead of waiting for them or being skipped while they build. Nothing else
-// is entered, no pipeline, no optimised build and no key record: a state the scan guessed wrong costs two libraries
-// at most. The feedback loop bits, the topology and the targets do not matter here, as no shader library depends on
-// them. Returns the libraries queued.
+static int link_queue(Pipe *p, const VkPipeState *s, const GKey *k, Layout *l) {
+    Job *owner = p->job;
+    if (!owner || owner->worker != -1 || p->link_queued || !l->set1 || k->native_rmw_marker ||
+        (p->required_layout && (!l->half[0] || !l->half[1])) ||
+        (k->fbl && !gpl_feedback())) return 0;
+    LibJob *j = calloc(1, sizeof *j);
+    Lib *b[LIB_COUNT];
+    if (!j || lib_queue(s, k, l, b, 0, 1) != LIB_QUEUE_READY) {
+        free(j);
+        return 0;
+    }
+    *j = (LibJob){.l = l, .s = *s, .k = *k, .p = p};
+    memcpy(j->libraries, b, sizeof b);
+    job_unlink(owner);
+    owner->worker = JOB_WAIT_LINK;
+    p->link_queued = p->fast_tried = 1;
+    u_block(j, b);
+    return 1;
+}
+
 static int hint_on(void) {
     static int on = -1;
     if (on < 0) on = cfg_bool("NX2NAVI_PIPE_AHEAD");
     return on;
 }
 
+static int pipeline_hint_queue_locked(const VkPipeState *s, const GKey *k, uint64_t hash, int create, int *cold) {
+    *cold = 0;
+    if (A.closed || pipe_budget_stopped() || pipe_find(k, sizeof *k, hash)) return 0;
+    Bindings B = {0}, F = {0};
+    if (!add_stage(&B, s->vs, 0) || (s->fs && !add_stage(&F, s->fs, 0))) return 0;
+    VkResult error = VK_NOT_READY;
+    Layout *l = layout_pair_select(&B, &F, &error, create);
+    if (!l) {
+        *cold = !create && error == VK_NOT_READY;
+        return 0;
+    }
+    if (!l->set1 || !workers_start()) return 0;
+    Lib *b[LIB_COUNT];
+    uint64_t queued_before = U.queued, waits_before = U.waits;
+    *cold = lib_queue(s, k, l, b, 1, create) == LIB_QUEUE_COLD;
+    int queued = (int)(U.queued - queued_before);
+    U.waits = waits_before;
+    U.queued = queued_before; // Waiting-draw counters exclude speculative work.
+    P.g.hint_libs += (uint64_t)queued;
+    return queued;
+}
+
 int vk_pipeline_hint(const VkPipeState *s) {
-    if (!A.on || !U.on || !hint_on() || !s->vs || !ensure_init() || !P.gpl || !P.indep || is_mesh(s)) return 0;
+    if (!A.on || !U.on || !hint_on() || !s->vs || !__atomic_load_n(&P.ready, __ATOMIC_ACQUIRE) || !P.gpl || !P.indep ||
+        is_mesh(s) || s->native_rmw_marker) return 0;
     if (gfx_shader_stage(s->vs) != GFX_STAGE_VS || (s->fs && gfx_shader_stage(s->fs) != GFX_STAGE_FS)) return 0;
     GKey k;
     gkey_fill(s, &k);
     if (k.topo_class == 3) return 0;
     uint64_t h = key_hash(&k, sizeof k);
-    int queued = 0;
-    plat_mutex_lock(&P.lock);
-    if (!pipe_find(&k, sizeof k, h)) {
-        Bindings B = {0}, F = {0};
-        Layout *l = add_stage(&B, s->vs, 0) && (!s->fs || add_stage(&F, s->fs, 0)) ? layout_pair(&B, &F) : NULL;
-        Lib *b[2];
-        uint64_t q0 = U.queued, w0 = U.waits;
-        if (l && l->set1 && workers_start() && lib_queue(s, &k, l, b)) queued = (int)(U.queued - q0);
-        U.waits = w0, U.queued = q0;   // those count waiting draws' jobs
-        P.g.hints++, P.g.hint_libs += (uint64_t)queued;
-    }
+    if (!plat_mutex_trylock(&P.lock)) return 0;
+    int cold;
+    int queued = pipeline_hint_queue_locked(s, &k, h, 0, &cold);
+    P.g.hints++;
     plat_mutex_unlock(&P.lock);
+    if (!cold) return queued;
+
+    // A look-ahead still owns the recorder. It may only reserve optional capacity without waiting.
+    // A required owner can publish the same key while the admission lock is held.
+    PipeBudgetResult permit = pipe_budget_try_begin(PIPE_BUDGET_MB, 0, NULL);
+    if (permit != PIPE_BUDGET_OWNED) return queued;
+    if (plat_mutex_trylock(&P.lock)) {
+        queued += pipeline_hint_queue_locked(s, &k, h, 1, &cold);
+        plat_mutex_unlock(&P.lock);
+    }
+    pipe_budget_end(permit);
     return queued;
 }
 
@@ -4749,82 +5592,42 @@ static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int as
     uint64_t h = key_hash(&k, sizeof k);
     plat_mutex_lock(&P.lock);
     Pipe *p = pipe_find(&k, sizeof k, h);
-    int queued;
-    if (p) {
-        if (!p->building) P.stats.hits++;
-    } else {
-        p = pipe_miss(s, &k, h, async, &queued);
-    }
-    // A draw that would wait (wait_ms) gets its missing shader libraries built at once, the vertex and fragment ones in
-    // parallel on idle workers (lib_wait; about 0.12 ms per library from the driver's disk cache, 5-180 ms cold), and
-    // links them here: its own job may queue behind optimised builds of earlier pipelines. The job then only does the
-    // optimised build, from the low queue. Other draws leave the libraries to the job and are skipped meanwhile.
-    // NX2NAVI_PIPE_WAIT=draw builds them on this thread one after the other instead, as before; NX2NAVI_GPL_DRAW_BUILD=0
-    // leaves them to the job.
-    static int draw_build = -1;
-    if (draw_build < 0) {
-        const char *e = cfg_get("NX2NAVI_GPL_DRAW_BUILD");
-        draw_build = !(e && !strcmp(e, "0"));
-        rt_log("vk_pipeline: a draw that waits for its pipeline %s", !draw_build ? "leaves its libraries to its job"
-               : U.on ? "has its libraries built in parallel on the workers, ahead of other jobs"
-                      : "builds its libraries itself (NX2NAVI_PIPE_WAIT=draw)");
-    }
-    double end = wait_ms ? now_ms() + wait_ms : 0;
-    if (p && p->building && P.gpl && !p->info.pipeline && !p->fast_tried && !p->link_queued && p->lay && !is_mesh(s) &&
-        wait_ms && draw_build && U.on && link_queue(p, s, &k, (Layout *)p->lay)) {
-        // the libraries and the link on the library workers; this thread waits below without building
-        p->fast_tried = 1;
-        job_lower(p->job);
-    } else if (p && p->building && P.gpl && !p->info.pipeline && !p->fast_tried && !p->link_queued && p->lay &&
-               !is_mesh(s)) {
-        int final = 0, build = wait_ms != 0 && draw_build;
-        uint64_t p0 = perf_begin(), t0 = qpc();
-        if (build && U.on) {
-            job_lower(p->job);   // its worker would only wait for the same libraries; it links them if this draw cannot
-            lib_wait(s, &k, (Layout *)p->lay, end);   // releases P.lock while waiting
-            build = 0;                                // links here when both libraries exist (gpl_link build 0)
-        } else if (build) {
-            p->fast_tried = 1;   // the job, if a worker takes it meanwhile, goes straight to the optimised build
-        }
-        VkPipeline f = p->info.pipeline ? VK_NULL_HANDLE : gpl_link(s, &k, p->lay, build, &final);   // build 1 releases P.lock
-        perf_end(PERF_PIPE, p0);
-        if (wait_ms && draw_build) {
-            double ms = ms_since(t0);
-            P.g.dlinks++, P.g.dlink_ms += ms;
-            if (ms > P.g.dlink_max) P.g.dlink_max = ms;
-            if (ms > 5.0 && P.g.slow++ < 16)
-                rt_log("vk_pipeline: gpl: a waiting draw %s its libraries in %.1f ms", U.on ? "got" : "built", ms);
-        }
-        if (final) p->fast_tried = 1;
-        if (f && !p->info.pipeline) {
-            p->fast = p->info.pipeline = f;
-            ready_note(p, 1);
-            job_lower(p->job);
-            plat_cond_broadcast(&done_cv);
-        } else if (f) {
-            vkDestroyPipeline(P.device, f, NULL);   // a worker published one while the lock was free
-        }
-    }
-    if (p && p->building && !p->info.pipeline) {
-        promote(p);
-        uint64_t p0 = wait_ms ? perf_begin() : 0;   // the wait counts as the render thread's pipeline time
-        double now;
-        if (wait_ms) job_wanted(p->job, wait_ms);   // releases P.lock when it builds the job here
-        while (p->building && !p->info.pipeline && wait_ms && (now = now_ms()) < end)
-            plat_cond_wait_ms(&done_cv, &P.lock, (uint32_t)(end - now) + 1);
-        if (wait_ms) perf_end(PERF_PIPE, p0);
-        if (wait_ms && !p->building) perf_count(PERF_CNT_PIPE_WAIT);
-    }
-    int wait = p && p->building && !p->info.pipeline;
-    if (wait) P.stats.pending_skips++;
-    VkPipeline pipe = p ? p->info.pipeline : VK_NULL_HANDLE;
-    plat_mutex_unlock(&P.lock);
-    if (wait) {
-        if (pending) *pending = 1;
+    int queued = 0;
+    if (A.closed) {
+        plat_mutex_unlock(&P.lock);
         return VK_NULL_HANDLE;
     }
-    if (!p) return VK_NULL_HANDLE;
-    if (info) *info = &p->info;
+    if (p) {
+        if (!p->building) P.stats.hits++;
+    } else p = pipe_miss(s, &k, h, async, &queued, 0);
+
+    if (p && p->building && !p->info.pipeline) {
+        promote(p);
+        static int draw_build = -1;
+        if (draw_build < 0) draw_build = rt_knob("GPL_DRAW_BUILD", "1");
+        if (P.gpl && !p->fast_tried && !p->link_queued && p->lay && !is_mesh(s) &&
+            ((wait_ms && draw_build) || (U.on && fast_workers())))
+            link_queue(p, s, &k, (Layout *)p->lay);
+
+        if (!async) {
+            while (!A.closed && p->building && !p->info.pipeline)
+                plat_cond_wait(&done_cv, &P.lock);
+        } else if (wait_ms) {
+            uint64_t p0 = perf_begin();
+            double end = now_ms() + wait_ms, now;
+            job_wanted(p->job);
+            while (!A.closed && p->building && !p->info.pipeline && (now = now_ms()) < end)
+                plat_cond_wait_ms(&done_cv, &P.lock, (uint32_t)(end - now) + 1);
+            perf_end(PERF_PIPE, p0);
+            if (!p->building) perf_count(PERF_CNT_PIPE_WAIT);
+        }
+    }
+    int wait = !A.closed && (queued < 0 || (p && p->building && !p->info.pipeline));
+    if (wait) P.stats.pending_skips++;
+    VkPipeline pipe = p ? graphics_legacy_locked(p) : VK_NULL_HANDLE;
+    if (info && !wait && p) *info = &p->info;
+    if (pending) *pending = wait;
+    plat_mutex_unlock(&P.lock);
     return pipe;
 }
 
@@ -4834,6 +5637,177 @@ VkPipeline vk_pipeline_graphics(const VkPipeState *s, const VkPipeInfo **info) {
 
 VkPipeline vk_pipeline_graphics_async(const VkPipeState *s, const VkPipeInfo **info, int *pending, uint32_t wait_ms) {
     return graphics(s, info, A.on, pending, wait_ms);
+}
+
+static VkGraphicsPipelineResult graphics_stopped(VkGraphicsPipelineFailure *failure) {
+    failure->error = vk_device_is_lost() ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
+    return VK_GRAPHICS_STOPPED;
+}
+
+static VkGraphicsPipelineResult graphics_failure(VkGraphicsPipelineFailure *failure,
+                                                  VkResult error, const char *reason) {
+    failure->error = error;
+    failure->reason = reason;
+    return VK_GRAPHICS_TERMINAL;
+}
+
+// P.lock is held. A zero-start lookup cannot create or promote an owner.
+static VkGraphicsPipelineResult graphics_receive_locked(Pipe *p, VkGraphicsPipelineWait *wait,
+                                                         VkGraphicsPipelineUse *out,
+                                                         VkGraphicsPipelineFailure *failure) {
+    if (A.closed || pipe_budget_stopped()) return graphics_stopped(failure);
+    if (!p) return VK_GRAPHICS_PENDING;
+    if (graphics_acquire_locked(p, out)) {
+        if (!p->building) P.stats.hits++;
+        failure->error = VK_SUCCESS;
+        return VK_GRAPHICS_READY;
+    }
+    if (p->building) {
+        if (wait) graphics_wait_attach_locked(wait, p);
+        return VK_GRAPHICS_PENDING;
+    }
+    failure->admission = p->graphics_admission;
+    if (failure->admission != RC_ADMISSION_OK) failure->peak = pipe_budget_cost(PIPE_BUDGET_MB);
+    if (p->graphics_unsupported) {
+        failure->error = p->graphics_error;
+        failure->reason = p->graphics_failure;
+        return VK_GRAPHICS_UNSUPPORTED;
+    }
+    return graphics_failure(failure, p->graphics_error ? p->graphics_error : VK_ERROR_INITIALIZATION_FAILED,
+                            p->graphics_failure ? p->graphics_failure : "graphics pipeline is unavailable");
+}
+
+void vk_pipeline_graphics_cancel(VkGraphicsPipelineWait **wait) {
+    VkGraphicsPipelineWait *p = *wait;
+    if (!p) return;
+    *wait = NULL;
+    plat_mutex_lock(&P.lock);
+    graphics_wait_cancel_locked(p);
+    plat_mutex_unlock(&P.lock);
+    free(p);
+}
+
+static VkGraphicsPipelineResult graphics_prepare_parked(
+    const VkPipeState *state, VkGraphicsPipelineWait **wait, VkGraphicsPipelineUse *out,
+    VkGraphicsPipelineFailure *failure) {
+    if (!ensure_init()) return pipe_budget_stopped() ? graphics_stopped(failure) :
+             graphics_failure(failure, VK_ERROR_INITIALIZATION_FAILED, "could not initialize the graphics pipeline service");
+    VkGraphicsPipelineWait *request = *wait;
+    if (!request) {
+        request = calloc(1, sizeof *request);
+        if (!request) return graphics_failure(failure, VK_ERROR_OUT_OF_HOST_MEMORY, "could not own the selected graphics key");
+        request->state = *state;
+        gkey_fill(&request->state, &request->key);
+        request->hash = key_hash(&request->key, sizeof request->key);
+        *wait = request;
+    }
+
+    plat_mutex_lock(&P.lock);
+    Pipe *p = pipe_find(&request->key, sizeof request->key, request->hash);
+    VkGraphicsPipelineResult result = graphics_receive_locked(p, request, out, failure);
+    plat_mutex_unlock(&P.lock);
+    if (p || result != VK_GRAPHICS_PENDING) return result;
+    const char *unsupported = graphics_shape_unsupported(&request->state, &request->key);
+    if (unsupported) {
+        failure->error = VK_ERROR_FEATURE_NOT_PRESENT;
+        failure->reason = unsupported;
+        return VK_GRAPHICS_UNSUPPORTED;
+    }
+
+    // The cold layout and its cache prerequisites are prepared with the
+    // original compiler allowance while the real recorder is parked.
+    failure->peak = request->peak = pipe_budget_cost(PIPE_BUDGET_MB);
+    resource_core_budget_readiness(1, &failure->before);
+    PipeBudgetResult permit = pipe_budget_try_begin(PIPE_BUDGET_MB, 1, &failure->admission);
+    if (permit == PIPE_BUDGET_STOPPED) return graphics_stopped(failure);
+    if (permit == PIPE_BUDGET_REFUSED) {
+        if (pipe_budget_physically_impossible(&request->peak))
+            return graphics_failure(failure, VK_ERROR_OUT_OF_HOST_MEMORY, "compiler estimate exceeds physical RAM");
+        return VK_GRAPHICS_PENDING;
+    }
+    if (permit != PIPE_BUDGET_OWNED)
+        return graphics_failure(failure, VK_ERROR_INITIALIZATION_FAILED, "required graphics layout has no owned compiler permit");
+
+    plat_mutex_lock(&P.lock);
+    p = pipe_find(&request->key, sizeof request->key, request->hash);
+    if (!p && !A.closed && !pipe_budget_stopped()) {
+        int queued;
+        int async = A.on && workers_start();
+        p = pipe_miss(&request->state, &request->key, request->hash, async, &queued, 1);
+        if (!p && !A.closed && !pipe_budget_stopped())
+            graphics_failure(failure, VK_ERROR_OUT_OF_HOST_MEMORY, "could not publish the graphics build owner");
+    }
+    result = !p && failure->error == VK_ERROR_OUT_OF_HOST_MEMORY ? VK_GRAPHICS_TERMINAL :
+             graphics_receive_locked(p, request, out, failure);
+    plat_mutex_unlock(&P.lock);
+    pipe_budget_end(permit);
+    vk_device_lost_check(failure->error, "required graphics pipeline layout");
+    return result;
+}
+
+VkGraphicsPipelineResult vk_pipeline_graphics_prepare(
+    const VkPipeState *state, int allow_start, VkGraphicsPipelineWait **wait,
+    VkGraphicsPipelineUse *out, VkGraphicsPipelineFailure *failure) {
+    *out = (VkGraphicsPipelineUse){0};
+    *failure = (VkGraphicsPipelineFailure){.error = VK_NOT_READY};
+    if (pipe_budget_stopped()) {
+        if (allow_start) vk_pipeline_graphics_cancel(wait);
+        return graphics_stopped(failure);
+    }
+    if (!state || !state->vs)
+        return graphics_failure(failure, VK_ERROR_INITIALIZATION_FAILED, "missing selected vertex or mesh shader");
+
+    if (allow_start) {
+        VkGraphicsPipelineResult result = graphics_prepare_parked(state, wait, out, failure);
+        if (result != VK_GRAPHICS_PENDING) vk_pipeline_graphics_cancel(wait);
+        return result;
+    }
+    if (!__atomic_load_n(&P.ready, __ATOMIC_ACQUIRE) || !plat_mutex_trylock(&P.lock))
+        return VK_GRAPHICS_PENDING;
+    GKey key;
+    gkey_fill(state, &key);
+    uint64_t hash = key_hash(&key, sizeof key);
+    VkGraphicsPipelineResult result = graphics_receive_locked(pipe_find(&key, sizeof key, hash), NULL, out, failure);
+    plat_mutex_unlock(&P.lock);
+    return result;
+}
+
+int vk_pipeline_graphics_wait(VkGraphicsPipelineWait *wait) {
+    if (!wait) rt_fatal("vk_pipeline: required graphics wait has no exact key");
+    uint64_t next_scan = 0;
+    while (!pipe_budget_stopped()) {
+        plat_mutex_lock(&P.lock);
+        Pipe *p = pipe_find(&wait->key, sizeof wait->key, wait->hash);
+        if (p) {
+            while (!A.closed && !pipe_budget_stopped() && p->building && !graphics_selected(p))
+                plat_cond_wait_ms(&done_cv, &P.lock, (uint32_t)(PIPE_BUDGET_RESCAN_NS / 1000000ull));
+            int stopped = A.closed || pipe_budget_stopped();
+            plat_mutex_unlock(&P.lock);
+            return !stopped;
+        }
+        int closed = A.closed;
+        plat_mutex_unlock(&P.lock);
+        if (closed) return 0;
+
+        RcBudgetReadiness now;
+        resource_core_budget_readiness(1, &now);
+        if (resource_core_budget_peak_ready(&wait->peak, &now)) return !pipe_budget_stopped();
+        uint64_t time = plat_now_ns();
+        if (time >= next_scan) {
+            RcBudgetProgress progress;
+            if (now.available.amount[RC_BUDGET_RAM] < wait->peak.amount[RC_BUDGET_RAM] ||
+                now.available.amount[RC_BUDGET_COMMIT] < wait->peak.amount[RC_BUDGET_COMMIT]) {
+                resource_core_budget_service(1, &wait->peak, &progress);
+                resource_core_budget_wait_since(progress.event, (uint32_t)(PIPE_BUDGET_RESCAN_NS / 1000000ull));
+            } else {
+                resource_core_budget_wait((uint32_t)(PIPE_BUDGET_RESCAN_NS / 1000000ull));
+            }
+            next_scan = time + PIPE_BUDGET_RESCAN_NS;
+        } else {
+            resource_core_budget_wait((uint32_t)((next_scan - time + 999999ull) / 1000000ull));
+        }
+    }
+    return 0;
 }
 
 double vk_pipeline_building_ms(const VkPipeState *s) {
@@ -4862,9 +5836,30 @@ static int id_cmp(const void *x, const void *y) { return memcmp(x, y, 32); }
 static void warm_builder(void *arg) {
     int one = arg != NULL;
     plat_mutex_lock(&P.lock);
-    while (A.low && !(K.until && now_ms() >= K.until)) {
+    if (A.closed) {
+        plat_mutex_unlock(&P.lock);
+        return;
+    }
+    A.external++;
+    while (!A.closed && A.low && !(K.until && now_ms() >= K.until)) {
+        if (!prep_mode && (A.head || U.head)) break;
         double held;
-        if (!gate_enter(0, &held)) {
+        plat_mutex_unlock(&P.lock);
+        int admitted;
+        if (prep_mode) {
+            held = PIPE_BUDGET_MB;
+            admitted = pipe_budget_begin(held) >= 0;
+        } else admitted = gate_enter(0, &held);
+        plat_mutex_lock(&P.lock);
+        if (A.closed || !A.low || (!prep_mode && (A.head || U.head))) {
+            if (admitted) {
+                plat_mutex_unlock(&P.lock);
+                pipe_budget_end(PIPE_BUDGET_OWNED);
+                plat_mutex_lock(&P.lock);
+            }
+            break;
+        }
+        if (!admitted) {
             if (!K.gate_ended++) {
                 char g[256];
                 rt_log("vk_pipeline: prewarm: the boot builds fewer recorded pipelines side by side, or none: the commit "
@@ -4874,41 +5869,16 @@ static void warm_builder(void *arg) {
             break;
         }
         Job *j = A.low;
-        if ((A.low = j->next)) A.low->prev = NULL;
-        else A.low_tail = NULL;
-        j->next = j->prev = NULL;
-        j->low = 0;                    // not on a pool thread: promote() has nothing to raise
+        job_unlink(j);
+        j->worker = JOB_ON_DRAW;
+        job_build(j, 0);
         plat_mutex_unlock(&P.lock);
-        VkPipeline pipe = create_graphics(&j->s, &j->k, j->l, j->fs_off);
-        plat_mutex_lock(&P.lock);
-        if (pipe || !j->p->fast) j->p->info.pipeline = pipe;   // a failed optimised build keeps the fast-linked one
-        ready_note(j->p, 0);
-        if (pipe && j->p->fast) P.g.swaps++;
-        j->p->building = 0;
-        j->p->job = NULL;
-        if (pipe) {
-            P.stats.graphics++, P.stats.async_built++;
-            if (!j->prebuild) keys_note(&j->s);
-        } else {
-            P.stats.failures++;
-            rt_log("vk_pipeline: graphics pipeline not built: pipeline creation failed");
-        }
-        // An explicit boot timeout can start replay while these builders still drain
-        // the low queue. A fast-linked draw's optimized job shares that queue.
-        if (j->prebuild) {
-            if (pipe) K.built++;
-            else K.failed++;
-            K.promoted += j->demanded;
-            K.left--;
-        }
-        if (!--A.inflight) plat_cond_broadcast(&A.idle);
-        plat_cond_broadcast(&done_cv);
-        free(j);
         gate_leave(held);
+        plat_mutex_lock(&P.lock);
         if (one) break;
     }
+    if (!--A.external) plat_cond_broadcast(&A.idle);
     plat_mutex_unlock(&P.lock);
-    return;
 }
 
 static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]);
@@ -4928,14 +5898,29 @@ void vk_pipeline_prewarm_progress(VkPrewarmProgress *p) {
 }
 
 static void prewarm_run(void);
+static int prewarm_running;
+static PlatCond prewarm_idle = PLAT_COND_INIT;
 
 // Limit how long startup workers take new graphics jobs on drivers with fast linking.
 #define PREWARM_PIPE_MS 120000.0
 #define PREWARM_QUICK_MS 20000.0
 
 void vk_pipeline_prewarm(void) {
+    plat_mutex_lock(&P.lock);
+    if (pipe_budget_stopped() || prewarm_running) {
+        plat_mutex_unlock(&P.lock);
+        return;
+    }
+    prewarm_running = 1;
+    plat_mutex_unlock(&P.lock);
+
     prewarm_run();
+
+    plat_mutex_lock(&P.lock);
     __atomic_store_n(&pw_phase, 3, __ATOMIC_RELEASE);
+    prewarm_running = 0;
+    plat_cond_broadcast(&prewarm_idle);
+    plat_mutex_unlock(&P.lock);
 }
 
 static void prewarm_run(void) {
@@ -4951,7 +5936,9 @@ static void prewarm_run(void) {
         return;
     }
     double t0 = now_ms();
+    plat_mutex_lock(&P.lock);
     K.warm = 1;
+    plat_mutex_unlock(&P.lock);
     if (!ensure_init() || !K.file_n) {
         rt_log("vk_pipeline: prewarm: no pipeline keys (%s)", K.path[0] ? K.path : "<none>");
         if (P.ready) lb_start(pr_hist, fs_hist);
@@ -4981,6 +5968,11 @@ static void prewarm_run(void) {
     int procs = pe && *pe ? atoi(pe) : cpus / 2 > 16 ? 16 : cpus / 2;
     __atomic_store_n(&pw_phase, 1, __ATOMIC_RELEASE);
     gfx_shader_prewarm((const uint8_t(*)[32])ids, u, sh, cpus, procs < 1 ? 1 : procs);
+    if (pipe_budget_stopped()) {
+        free(ids);
+        free(sh);
+        return;
+    }
     double t1 = now_ms();
     size_t carried = 0, fresh = 0;   // the recorded pipelines' shaders by where their translation came from
     for (size_t i = 0; i < u; i++)
@@ -5015,7 +6007,7 @@ static void prewarm_run(void) {
     plat_mutex_lock(&P.lock);
     K.t0 = t1;
     K.loading = 1;
-    for (size_t i = 0; i < n; i++) {
+    for (size_t i = 0; i < n && !pipe_budget_stopped(); i++) {
         const uint8_t (*v)[32] = bsearch(r[i].vs, ids, u, 32, id_cmp);
         const uint8_t (*f)[32] = r[i].has_fs ? bsearch(r[i].fs, ids, u, 32, id_cmp) : NULL;
         const uint8_t (*t)[32] = r[i].has_ts ? bsearch(r[i].ts, ids, u, 32, id_cmp) : NULL;
@@ -5025,6 +6017,7 @@ static void prewarm_run(void) {
             continue;
         }
         VkPipeState s = r[i].s;
+        s.native_rmw_marker = 0; // The reserved byte in older base warm records carries no request.
         s.vs = vs, s.fs = fs, s.ts = ts;
         // a mesh pipeline of the shared list (keys_open_seed) on a GPU without mesh shaders, which draws them through
         // the mesh fallback: none to build, as the preparation skips it (seed_pipelines)
@@ -5041,7 +6034,7 @@ static void prewarm_run(void) {
         uint64_t h = key_hash(&k, sizeof k);
         int q = 0;
         if (pipe_find(&k, sizeof k, h)) known++;
-        else pipe_miss(&s, &k, h, 2, &q), queued += (uint32_t)q;
+        else pipe_miss(&s, &k, h, 2, &q, 0), queued += (uint32_t)q;
     }
     K.loading = 0;
     plat_mutex_unlock(&P.lock);
@@ -5054,12 +6047,14 @@ static void prewarm_run(void) {
     double budget = PREWARM_PIPE_MS;
     if (!P.gpl || (full && !strcmp(full, "1"))) budget = 0;
     else if (full && !strcmp(full, "0")) budget = PREWARM_QUICK_MS;
+    plat_mutex_lock(&P.lock);
     K.until = budget ? now_ms() + budget : 0;
+    plat_mutex_unlock(&P.lock);
     rt_log("vk_pipeline: prewarm: graphics queue budget %.0f s (0 waits for all)", budget / 1000.0);
     PlatThread *t[64];
     int nt = 0;
-    if (queued) warm_builder((void *)1);   // the first alone (warm_builder)
-    for (int i = 0; i < cpus && i < 64 && queued; i++)
+    if (queued && !pipe_budget_stopped()) warm_builder((void *)1);   // the first alone (warm_builder)
+    for (int i = 0; i < cpus && i < 64 && queued && !pipe_budget_stopped(); i++)
         if ((t[nt] = plat_thread_new(warm_builder, NULL, "pipe prewarm"))) nt++;
     if (!nt) warm_builder(NULL);
     double logged = now_ms();
@@ -5076,7 +6071,7 @@ static void prewarm_run(void) {
     uint32_t later = 0;
     for (Job *j = A.low; j; j = j->next) later += j->prebuild;
     if (!later)   // all built: wait for those a pool worker took
-        while (K.left) plat_cond_wait(&done_cv, &P.lock);
+        while (K.left && !pipe_budget_stopped()) plat_cond_wait(&done_cv, &P.lock);
     else          // the boot's time is up: the pool builds the rest while the game runs
         plat_cond_broadcast(&work_cv);
     rt_log("vk_pipeline: prewarm: %zu records in %s: %u pipelines built, %u left to build in the background, %u "
@@ -5282,16 +6277,44 @@ static uint32_t *spirv_fog_keep_froxels(const uint32_t *w, uint64_t n) {
 // A compute pipeline for cs in layout l; VK_NULL_HANDLE on failure. No lock needed (P.cache is driver-synchronised).
 // cached_only (needs P.cache_control): from P.cache or the driver's own disk cache, never compiled; VK_NULL_HANDLE when
 // neither holds it (the driver returns VK_PIPELINE_COMPILE_REQUIRED, a success code, with no pipeline).
-static VkPipeline compute_create(const GfxShader *cs, const Layout *l, int cached_only) {
+typedef struct {
+    int exact_source;
+    RcNativeImageStore image_store;
+    RcNativeImageSeedBindings seed_bindings, rmw_seed_bindings;
+    uint64_t query_size_lod0_mask;
+    int pool_domain_attested, pool_marks;
+    uint32_t pool_query_shape_kinds;
+} ComputeEffectProof;
+
+static VkPipeline compute_create_admitted(const GfxShader *cs, const Layout *l, int cached_only,
+                                          VkResult *status, ComputeEffectProof *proof) {
+    *proof = (ComputeEffectProof){0};
     uint64_t words;
     const uint32_t *code = gfx_shader_spirv(cs, &words);
     uint64_t ow = 0;
     uint32_t *over = spv_override(code, words, &ow);
+    const int override = over != NULL;
     if (over) code = over, words = ow;
     uint32_t *fog = spirv_fog_keep_froxels(code, words);
     if (fog) free(over), over = fog, code = fog;
-    VkShaderModule m = make_module(code, words, 0);
-    if (!m) return free(over), VK_NULL_HANDLE;
+    VkResult result;
+    int exact_module = 0;
+    const GfxShaderRes *images;
+    const int image_count = gfx_shader_resources(cs, GFX_RES_IMG, &images);
+    int image_output = 0;
+    for (int i = 0; !override && i < image_count && !image_output; ++i)
+        image_output = (images[i].flags & 4) != 0;
+    ModuleSampledQueries queries = module_sampled_queries(cs, RC_SAMPLED_IMAGE_QUERY_COMPUTE, 0, 0);
+    queries.pool_domain_candidate = !over && gfx_shader_has_pool_index_domain(cs);
+    VkShaderModule m = make_module_status(code, words, 0, &result, !over ? &exact_module : NULL, 0, 0, NULL,
+                                           image_output ? &proof->image_store : NULL,
+                                           image_output ? &proof->seed_bindings : NULL,
+                                           image_output ? &proof->rmw_seed_bindings : NULL, &queries);
+    if (!m) {
+        if (status) *status = result == VK_SUCCESS ? VK_ERROR_INITIALIZATION_FAILED : result;
+        free(over);
+        return VK_NULL_HANDLE;
+    }
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rqc;
     VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
                                       .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -5310,7 +6333,21 @@ static VkPipeline compute_create(const GfxShader *cs, const Layout *l, int cache
     VkPipelineCreationFeedback fb;
     ci.pNext = fb_chain(&fci, &fb, ci.pNext);
     crash_note("a compute pipeline", cs, NULL, NULL);
-    if (pipe_create(2, &ci, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
+    result = pipe_create(2, &ci, &pipe);
+    if (result != VK_SUCCESS) pipe = VK_NULL_HANDLE;
+    if (status) *status = !pipe && result == VK_SUCCESS ? VK_ERROR_INITIALIZATION_FAILED : result;
+    proof->exact_source = pipe && exact_module;
+    if (pipe) {
+        proof->query_size_lod0_mask = queries.attested;
+        proof->pool_domain_attested = queries.pool_domain_attested;
+        proof->pool_query_shape_kinds = queries.pool_query_shape_kinds;
+        proof->pool_marks = queries.pool_marks;
+    }
+    if (!pipe) {
+        proof->image_store = (RcNativeImageStore){0};
+        proof->seed_bindings = (RcNativeImageSeedBindings){0};
+        proof->rmw_seed_bindings = (RcNativeImageSeedBindings){0};
+    }
     plat_crash_context(NULL);
     if (pipe) fb_note(FB_COMPUTE, &fb);
     cc_hit = !pipe ? -1 : pb_last ? 1
@@ -5323,6 +6360,21 @@ static VkPipeline compute_create(const GfxShader *cs, const Layout *l, int cache
                (double)fb.duration / 1e6);
     vkDestroyShaderModule(P.device, m, NULL);
     free(over);
+    return pipe;
+}
+
+static double compute_budget_mb(uint64_t words, int cached_only) {
+    return !cached_only && words > 512u * 1024u ? GATE_BIG_MB : PIPE_BUDGET_MB;
+}
+
+static VkPipeline compute_create(const GfxShader *cs, const Layout *l, int cached_only, ComputeEffectProof *proof) {
+    *proof = (ComputeEffectProof){0};
+    uint64_t words = 0;
+    (void)gfx_shader_spirv(cs, &words);
+    int owned = pipe_budget_begin(compute_budget_mb(words, cached_only));
+    if (owned < 0) return VK_NULL_HANDLE;
+    VkPipeline pipe = compute_create_admitted(cs, l, cached_only, NULL, proof);
+    pipe_budget_end(owned);
     return pipe;
 }
 
@@ -5539,46 +6591,34 @@ static void journal_mark(int slot, const GfxWarmEnt *e) {
 // Compute shaders whose pipeline a thread is compiling now (P.lock): a cold driver takes about 2 s for one of Ocarina's
 // large compute shaders. The replay used to compile under P.lock, which held every other pipeline lookup that long, and
 // compiled a second copy of a pipeline the boot prebuild (lb_compute) was already compiling.
-#define CS_FLIGHT 32
-static const GfxShader *cs_flight[CS_FLIGHT];
+typedef struct CsFlight {
+    struct CsFlight *next;
+    const GfxShader *shader;
+    PlatThread *thread;
+    int wanted;
+} CsFlight;
 
-static int cs_flight_has(const GfxShader *cs) {
-    for (int i = 0; i < CS_FLIGHT; i++)
-        if (cs_flight[i] == cs) return 1;
-    return 0;
+static CsFlight *cs_flights;
+
+static CsFlight *cs_flight_find(const GfxShader *cs) {
+    for (CsFlight *flight = cs_flights; flight; flight = flight->next)
+        if (flight->shader == cs) return flight;
+    return NULL;
 }
 
-static volatile uint8_t cs_flight_want[CS_FLIGHT];   // a dispatch waits for the slot's pipeline (vk_pipeline_compute)
-static PlatThread *cs_flight_th[CS_FLIGHT];          // the boot prebuild thread compiling it below normal priority
-
-// th: the thread a waiting dispatch raises to normal priority, NULL when it compiles at normal priority already.
-static int cs_flight_add(const GfxShader *cs, PlatThread *th) {   // 0 when the table is full (the caller compiles anyway)
-    for (int i = 0; i < CS_FLIGHT; i++)
-        if (!cs_flight[i]) return cs_flight[i] = cs, cs_flight_want[i] = 0, cs_flight_th[i] = th, 1;
-    return 0;
+static void cs_flight_add(CsFlight *flight, const GfxShader *cs, PlatThread *thread) {
+    *flight = (CsFlight){.next = cs_flights, .shader = cs, .thread = thread};
+    cs_flights = flight;
 }
 
-// A dispatch waits for cs's build: a builder that would only have filled the pipeline cache keeps the pipeline. Returns
-// the thread to raise, the first time.
-static PlatThread *cs_flight_wanted(const GfxShader *cs) {
-    PlatThread *th = NULL;
-    for (int i = 0; i < CS_FLIGHT; i++)
-        if (cs_flight[i] == cs && !cs_flight_want[i]) cs_flight_want[i] = 1, th = cs_flight_th[i];
-    return th;
-}
-
-// Without P.lock, for the thread that holds cs's slot: whether a dispatch came to wait.
-static int cs_flight_is_wanted(const GfxShader *cs) {
-    for (int i = 0; i < CS_FLIGHT; i++)
-        if (__atomic_load_n(&cs_flight[i], __ATOMIC_RELAXED) == cs) return cs_flight_want[i];
-    return 0;
-}
-
-static int cs_flight_remove(const GfxShader *cs) {   // 1 when a dispatch waited for it
-    int want = 0;
-    for (int i = 0; i < CS_FLIGHT; i++)
-        if (cs_flight[i] == cs) cs_flight[i] = NULL, want |= cs_flight_want[i];
-    return want;
+// The owner removes this stack entry while holding P.lock, before its storage goes out of scope.
+static int cs_flight_remove(CsFlight *flight) {
+    CsFlight **at = &cs_flights;
+    while (*at && *at != flight) at = &(*at)->next;
+    if (!*at) rt_fatal("vk_pipeline: compute build lost its flight");
+    *at = flight->next;
+    plat_cond_broadcast(&done_cv);
+    return __atomic_load_n(&flight->wanted, __ATOMIC_RELAXED);
 }
 
 // ---- compute pipelines the boot keeps (compute-used.bin next to pipeline-keys.bin; NX2NAVI_COMPUTE_KEEP)
@@ -5829,76 +6869,258 @@ static struct {
     double ms;
 } BG;
 
-VkPipeline vk_pipeline_compute(const GfxShader *cs, const VkPipeInfo **info) {
-    if (info) *info = NULL;
-    if (!cs || !ensure_init()) return VK_NULL_HANDLE;
-    struct { const GfxShader *cs; uint64_t compute; } k = {cs, 1};   // no padding: the key is hashed and compared as bytes
-    uint64_t h = key_hash(&k, sizeof k);
-    plat_mutex_lock(&P.lock);
-    Pipe *p = pipe_find(&k, sizeof k, h);
-    double w0 = !p && cs_flight_has(cs) ? now_ms() : 0;
-    int bg = 0;
-    while (!p && cs_flight_has(cs)) {   // another thread is compiling it: its result, not a second compile
-        // a build that only fills the pipeline cache keeps its pipeline for this dispatch, and a boot prebuild thread
-        // compiling it below normal priority goes to normal
-        PlatThread *builder = cs_flight_wanted(cs);
-        if (builder) plat_thread_set_priority(builder, PLAT_PRIO_NORMAL);
-        if (BG.building == cs && BG.th && !plat_xchg32(&BG.raised, 1))   // the background builder: normal priority now
-            plat_thread_set_priority(BG.th, PLAT_PRIO_NORMAL), bg = 1;
-        plat_mutex_unlock(&P.lock);
-        plat_sleep_ms(1);
-        plat_mutex_lock(&P.lock);
-        p = pipe_find(&k, sizeof k, h);
-    }
-    if (w0 && now_ms() - w0 >= 2.0) {
-        static int logs;
-        if (logs++ < 16)
-            rt_log("vk_exec: a dispatch waited %.0f ms for its compute pipeline (%s)", now_ms() - w0,
-                   bg ? "built on the background thread" : "built by another thread");
-    }
-    if (p) {
-        P.stats.hits++;
-    } else {
-        const char *why = NULL;
-        Bindings B = {0};
-        Layout *l = compute_layout(cs, &B, &why);
-        VkPipeline pipe = VK_NULL_HANDLE;
-        if (!why) {
-            int flight = cs_flight_add(cs, NULL);
-            plat_mutex_unlock(&P.lock);   // the compile runs without the lock
-            uint64_t p0 = perf_begin();
-            double c0 = now_ms();
-            pipe = compute_create(cs, l, 0);
-            double cms = now_ms() - c0;
-            int hit = cc_hit;
-            perf_end(PERF_PIPE, p0);
-            plat_mutex_lock(&P.lock);
-            if (flight) cs_flight_remove(cs);
-            if (!pipe) why = "pipeline creation failed";
-            else cf_note(cms, hit);
-        }
-        if ((p = pipe_find(&k, sizeof k, h))) {   // another thread added it meanwhile (no flight slot was free)
-            if (pipe) vkDestroyPipeline(P.device, pipe, NULL);
-        } else {
-            if (why) {
-                P.stats.failures++;
-                rt_log("vk_pipeline: compute pipeline not built: %s", why);
-            } else {
-                P.stats.compute++;
-                LB.cs_draw++;
-            }
-            p = pipe_add(&k, sizeof k, h, pipe, l, l ? &B : NULL, VK_PIPELINE_BIND_POINT_COMPUTE, 0);
-        }
-    }
-    if (p && !p->used) {   // the first dispatch of this run: the boot of the next runs keeps this shader's pipeline
+// Identical to the key used by startup and background builds. It contains no padding.
+typedef struct { const GfxShader *cs; uint64_t compute; } ComputeKey;
+_Static_assert(sizeof(ComputeKey) == sizeof(void *) + sizeof(uint64_t), "compute key has no padding");
+static const char cached_compute_failure[] = "a previous compute pipeline build failed";
+
+static VkComputePipelineResult compute_stopped(VkComputePipelinePending *pending) {
+    pending->error = vk_device_is_lost() ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
+    return VK_COMPUTE_STOPPED;
+}
+
+static VkComputePipelineResult compute_terminal(VkComputePipelinePending *pending, VkResult error, const char *failure) {
+    pending->error = error;
+    pending->failure = failure;
+    return VK_COMPUTE_TERMINAL;
+}
+
+// P.lock held. A published pipeline belongs to the existing cache through renderer shutdown.
+static VkComputePipelineResult compute_receive(Pipe *p, const GfxShader *cs, VkPipeline *pipeline,
+                                                const VkPipeInfo **info, VkComputePipelinePending *pending) {
+    if (!p->info.pipeline)
+        return compute_terminal(pending, VK_ERROR_INITIALIZATION_FAILED, cached_compute_failure);
+    if (!p->info.n_bindings || !p->info.bindings)
+        return compute_terminal(pending, VK_ERROR_INITIALIZATION_FAILED, "compute pipeline has no retained bindings");
+    if (!p->used) {
         p->used = 1;
         CF.pre_used += p->pre;
-        if (p->info.pipeline) cu_note(cs);
+        cu_note(cs);
+    }
+    *pipeline = p->info.pipeline;
+    *info = &p->info;
+    pending->error = VK_SUCCESS;
+    return VK_COMPUTE_READY;
+}
+
+static VkComputePipelineResult compute_lookup_locked(const ComputeKey *key, uint64_t hash, VkPipeline *pipeline,
+                                                      const VkPipeInfo **info, VkComputePipelinePending *pending) {
+    if (pipe_budget_stopped()) return compute_stopped(pending);
+    Pipe *p = pipe_find(key, sizeof *key, hash);
+    if (p) {
+        P.stats.hits++;
+        return compute_receive(p, key->cs, pipeline, info, pending);
+    }
+    pending->kind = cs_flight_find(key->cs) ? VK_COMPUTE_FLIGHT : VK_COMPUTE_BUILD;
+    return VK_COMPUTE_PENDING;
+}
+
+static Pipe *compute_publish_locked(const ComputeKey *key, uint64_t hash, VkPipeline pipeline,
+                                    const Layout *layout, const Bindings *bindings, const ComputeEffectProof *proof) {
+    Pipe *p = pipe_add(key, sizeof *key, hash, pipeline, layout, bindings, VK_PIPELINE_BIND_POINT_COMPUTE, 0);
+    if (p && pipeline && p->info.n_bindings != bindings->n) {
+        // pipe_add inserted this record at the head under this lock. Do not publish an incomplete descriptor layout.
+        pipes[hash % PIPE_BUCKETS] = p->next;
+        free(p->bindings);
+        free(p);
+        return NULL;
+    }
+    if (p && pipeline && proof) {
+        if (proof->exact_source) p->info.compute_effect_shader = key->cs;
+        p->info.native_image_store = proof->image_store;
+        p->info.native_image_seed_bindings = proof->seed_bindings;
+        p->info.native_image_rmw_seed_bindings = proof->rmw_seed_bindings;
+        p->info.compute_query_size_lod0_mask = proof->query_size_lod0_mask;
+        if (proof->pool_domain_attested) {
+            p->info.compute_pool_domain_shader = key->cs;
+            p->info.compute_pool_query_shape_kinds = proof->pool_query_shape_kinds;
+            p->info.compute_pool_marks = proof->pool_marks;
+        }
+    }
+    return p;
+}
+
+VkComputePipelineResult vk_pipeline_compute_prepare(const GfxShader *cs, int allow_create, VkPipeline *pipeline,
+                                                      const VkPipeInfo **info, VkComputePipelinePending *pending) {
+    *pipeline = VK_NULL_HANDLE;
+    *info = NULL;
+    *pending = (VkComputePipelinePending){.shader = cs, .error = VK_NOT_READY};
+    if (pipe_budget_stopped()) return compute_stopped(pending);
+    if (!cs) return compute_terminal(pending, VK_ERROR_INITIALIZATION_FAILED, "missing compute shader");
+
+    const ComputeKey key = {cs, 1};
+    uint64_t hash = key_hash(&key, sizeof key);
+    if (allow_create) plat_mutex_lock(&P.lock);
+    else if (!plat_mutex_trylock(&P.lock)) return VK_COMPUTE_PENDING;
+    VkComputePipelineResult found = compute_lookup_locked(&key, hash, pipeline, info, pending);
+    plat_mutex_unlock(&P.lock);
+    if (found != VK_COMPUTE_PENDING || pending->kind != VK_COMPUTE_BUILD || !allow_create) return found;
+
+    uint64_t words = 0;
+    if (!gfx_shader_spirv(cs, &words) || !words)
+        return compute_terminal(pending, VK_ERROR_INITIALIZATION_FAILED, "compute shader has no native input");
+    double estimate = compute_budget_mb(words, 0);
+    pending->peak = pipe_budget_cost(estimate);
+    if (pipe_budget.ticket.token.ledger)
+        return compute_terminal(pending, VK_ERROR_INITIALIZATION_FAILED, "compute demand already holds a compiler permit");
+    resource_core_budget_readiness(1, &pending->before);
+    PipeBudgetResult permit = pipe_budget_try_begin(estimate, 1, &pending->admission);
+    if (permit == PIPE_BUDGET_STOPPED) return compute_stopped(pending);
+    if (permit == PIPE_BUDGET_REFUSED) {
+        int impossible = pipe_budget_physically_impossible(&pending->peak);
+        if (pipe_budget_stopped()) return compute_stopped(pending);
+        if (impossible)
+            return compute_terminal(pending, VK_ERROR_OUT_OF_HOST_MEMORY, "compiler estimate exceeds physical RAM");
+        pending->kind = VK_COMPUTE_CAPACITY;
+        return VK_COMPUTE_PENDING;
+    }
+    if (permit != PIPE_BUDGET_OWNED)
+        return compute_terminal(pending, VK_ERROR_INITIALIZATION_FAILED, "compiler estimate is unsupported by the shared budget");
+    if (!ensure_init()) {
+        pipe_budget_end(permit);
+        if (pipe_budget_stopped()) return compute_stopped(pending);
+        return compute_terminal(pending, VK_ERROR_INITIALIZATION_FAILED, "could not initialize the pipeline service");
+    }
+
+    // Another producer can publish or claim this key while the permit is acquired. Only the selected owner
+    // creates. Any unused reservation is canceled before re-entering a wait.
+    plat_mutex_lock(&P.lock);
+    found = compute_lookup_locked(&key, hash, pipeline, info, pending);
+    if (found != VK_COMPUTE_PENDING || pending->kind != VK_COMPUTE_BUILD) {
+        plat_mutex_unlock(&P.lock);
+        pipe_budget_end(permit);
+        return found;
+    }
+    const char *why = NULL;
+    Bindings bindings = {0};
+    Layout *layout = compute_layout(cs, &bindings, &why);
+    if (!layout) {
+        if (!pipe_budget_stopped()) {
+            compute_publish_locked(&key, hash, VK_NULL_HANDLE, NULL, NULL, 0);
+            P.stats.failures++;
+        }
+        plat_mutex_unlock(&P.lock);
+        pipe_budget_end(permit);
+        if (pipe_budget_stopped()) return compute_stopped(pending);
+        return compute_terminal(pending, VK_ERROR_INITIALIZATION_FAILED, why ? why : "compute layout unavailable");
+    }
+    CsFlight build;
+    cs_flight_add(&build, cs, NULL);
+    plat_mutex_unlock(&P.lock);
+
+    uint64_t perf = perf_begin();
+    double started = now_ms();
+    VkResult native_result;
+    ComputeEffectProof proof;
+    VkPipeline made = compute_create_admitted(cs, layout, 0, &native_result, &proof);
+    double elapsed = now_ms() - started;
+    int hit = cc_hit;
+    perf_end(PERF_PIPE, perf);
+    pipe_budget_end(permit);
+
+    plat_mutex_lock(&P.lock);
+    cs_flight_remove(&build);
+    if (pipe_budget_stopped()) {
+        plat_mutex_unlock(&P.lock);
+        if (made && !vk_device_is_lost()) vkDestroyPipeline(P.device, made, NULL);
+        return compute_stopped(pending);
+    }
+    Pipe *p = compute_publish_locked(&key, hash, made, made ? layout : NULL, made ? &bindings : NULL, &proof);
+    if (p && made) {
+        cf_note(elapsed, hit);
+        P.stats.compute++;
+        LB.cs_draw++;
+        found = compute_receive(p, cs, pipeline, info, pending);
+    } else {
+        P.stats.failures++;
+        found = compute_terminal(pending, made ? VK_ERROR_OUT_OF_HOST_MEMORY : native_result,
+                                 made ? "could not publish the compute pipeline bindings" : "native compute pipeline creation failed");
     }
     plat_mutex_unlock(&P.lock);
-    if (!p) return VK_NULL_HANDLE;
-    if (info) *info = &p->info;
-    return p->info.pipeline;
+    if (!p && made && !vk_device_is_lost()) vkDestroyPipeline(P.device, made, NULL);
+    return found;
+}
+
+static int compute_wait_flight(const ComputeKey *key, uint64_t hash) {
+    double start = now_ms();
+    int bg = 0;
+    plat_mutex_lock(&P.lock);
+    CsFlight *flight;
+    while (!pipe_budget_stopped() && !pipe_find(key, sizeof *key, hash) && (flight = cs_flight_find(key->cs))) {
+        if (!__atomic_exchange_n(&flight->wanted, 1, __ATOMIC_RELAXED) && flight->thread)
+            plat_thread_set_priority(flight->thread, PLAT_PRIO_NORMAL);
+        if (BG.building == key->cs && BG.th && !plat_xchg32(&BG.raised, 1))
+            plat_thread_set_priority(BG.th, PLAT_PRIO_NORMAL), bg = 1;
+        plat_cond_wait_ms(&done_cv, &P.lock, 100);
+    }
+    double elapsed = now_ms() - start;
+    if (elapsed >= 2.0) {
+        static int logs;
+        if (logs++ < 16)
+            rt_log("vk_exec: a dispatch waited %.0f ms for its compute pipeline (%s)", elapsed,
+                   bg ? "built on the background thread" : "built by another thread");
+    }
+    plat_mutex_unlock(&P.lock);
+    return !pipe_budget_stopped();
+}
+
+int vk_pipeline_compute_wait(const VkComputePipelinePending *pending) {
+    if (pipe_budget_stopped()) return 0;
+    const ComputeKey key = {pending->shader, 1};
+    uint64_t hash = key_hash(&key, sizeof key);
+    if (pending->kind == VK_COMPUTE_BUILD) return 1;
+    if (pending->kind == VK_COMPUTE_FLIGHT) return compute_wait_flight(&key, hash);
+
+    uint64_t next_scan = 0;
+    RcBudgetProgress progress = {0};
+    int use_event = 0;
+    while (!pipe_budget_stopped()) {
+        plat_mutex_lock(&P.lock);
+        int owned = pipe_find(&key, sizeof key, hash) || cs_flight_find(key.cs);
+        plat_mutex_unlock(&P.lock);
+        if (owned) return !pipe_budget_stopped();
+        RcBudgetReadiness now;
+        resource_core_budget_readiness(1, &now);
+        if (resource_core_budget_peak_ready(&pending->peak, &now)) return !pipe_budget_stopped();
+        uint64_t time = plat_now_ns();
+        if (time >= next_scan) {
+            if (now.available.amount[RC_BUDGET_RAM] < pending->peak.amount[RC_BUDGET_RAM] ||
+                now.available.amount[RC_BUDGET_COMMIT] < pending->peak.amount[RC_BUDGET_COMMIT]) {
+                resource_core_budget_service(1, &pending->peak, &progress);
+                use_event = 1;
+            }
+            next_scan = plat_now_ns() + PIPE_BUDGET_RESCAN_NS;
+            continue;
+        }
+        uint32_t wait_ms = (uint32_t)((next_scan - time + 999999ull) / 1000000ull);
+        if (use_event) {
+            resource_core_budget_wait_since(progress.event, wait_ms);
+            use_event = 0;
+        } else resource_core_budget_wait(wait_ms);
+    }
+    return 0;
+}
+
+VkPipeline vk_pipeline_compute(const GfxShader *cs, const VkPipeInfo **info) {
+    const VkPipeInfo *found = NULL;
+    if (info) *info = NULL;
+    if (!cs) return VK_NULL_HANDLE;
+    VkPipeline pipeline;
+    VkComputePipelinePending pending;
+    for (;;) {
+        VkComputePipelineResult result = vk_pipeline_compute_prepare(cs, 1, &pipeline, &found, &pending);
+        if (result == VK_COMPUTE_READY) {
+            if (info) *info = found;
+            return pipeline;
+        }
+        if (result == VK_COMPUTE_TERMINAL) {
+            if (pending.failure != cached_compute_failure)
+                rt_log("vk_pipeline: compute pipeline not built: %s (Vulkan %d, budget %d)",
+                       pending.failure, (int)pending.error, (int)pending.admission);
+            return VK_NULL_HANDLE;
+        }
+        if (result != VK_COMPUTE_PENDING || !vk_pipeline_compute_wait(&pending)) return VK_NULL_HANDLE;
+    }
 }
 
 static void lb_lock(void) {
@@ -5989,32 +7211,6 @@ static void bg_queue(const GfxShader *cs, const uint8_t iid[32], uint64_t words)
            iid[0], iid[1], iid[2], iid[3], iid[4], iid[5], iid[6], iid[7], (unsigned long long)words);
 }
 
-// NX2NAVI_BIG_BUILD_FREE_MB (default 8192; 0 no check): the system commit headroom a large compute build waits for.
-// A build of one of these shaders took the process up by 1-3 GB on an RTX 5090 and four at once by 16-19 GB on an
-// RTX 4090; started on a machine near its commit limit it can end the game. While the headroom is short the shader
-// waits, and if the game dispatches it first it is built there, as without the background builder.
-// The builds under way elsewhere count through their reservations at the memory gate (gate_enter), where this build
-// then reserves GATE_BIG_MB of its own for as long as it runs, so the other background builds leave it its room.
-static int bg_room(double *used, double *limit, double *held) {
-    static double need = -1;
-    if (need < 0) need = strtod(cfg_value("NX2NAVI_BIG_BUILD_FREE_MB"), NULL);
-    double proc;
-    plat_commit_info(&proc, used, limit);
-    if (!(need <= 0 || *limit < 0 || *limit - *used >= need)) return 0;
-    return gate_enter(GATE_BIG_MB, held);
-}
-
-// NX2NAVI_BIG_BUILD_MAX_MB (default 4096; 0 no cap): how far the builder may raise the process commit before it stops
-// and leaves the rest to their first dispatch. One of these shaders costs the driver 1-4 GB: on a 31 GB machine four of
-// them took the process from 15 to 29 GB and system commit to 60 of 65 GB, which is where a player feels the game
-// stutter. The builder exists to remove hitches, not to trade them for paging, so a machine that cannot hold them all
-// builds only what it can and pays one hitch per shader later.
-static double bg_growth_cap(void) {
-    static double cap = -1;
-    if (cap < 0) cap = strtod(cfg_value("NX2NAVI_BIG_BUILD_MAX_MB"), NULL);
-    return cap;
-}
-
 // The builder compiles into a pipeline cache of its own (own_cache at pipe_create_in), not into P.cache. A create into
 // P.cache holds cache_rw shared from start to end, and the cache is only saved at a moment when nobody holds it: on an
 // RX 7900 XT (26.10.1) the largest of these shaders (4,874,502 SPIR-V words) was still compiling 590 s after the boot,
@@ -6054,8 +7250,6 @@ static void bg_main(void *arg) {
         }
     plat_mutex_unlock(&LB.stat);
     double t_all = now_ms();
-    double c_start, c_used0, c_limit0;
-    plat_commit_info(&c_start, &c_used0, &c_limit0);
     for (size_t i = 0; !LB.stop; i++) {
         uint8_t idbuf[32];
         uint64_t words = 0;
@@ -6070,69 +7264,62 @@ static void bg_main(void *arg) {
         plat_mutex_unlock(&LB.stat);
         if (!have) break;
         const uint8_t *iid = idbuf;
-        struct { const GfxShader *cs; uint64_t compute; } k = {cs, 1};   // no padding: the key is hashed and compared as bytes
+        const ComputeKey k = {cs, 1};
         uint64_t h = key_hash(&k, sizeof k);
         Bindings B = {0};
         const char *why = NULL;
-        double used, limit, c_now;
-        plat_commit_info(&c_now, &used, &limit);
-        double cap = bg_growth_cap();
-        if (cap > 0 && c_now - c_start >= cap) {
-            rt_log("vk_pipeline: background compute build: stopping, the process grew %.0f MB in all (NX2NAVI_BIG_BUILD_MAX_MB "
-                   "%.0f); the shaders left build at their first dispatch", c_now - c_start, cap);
+        double held;
+        if (!gate_wait_for(compute_budget_mb(words, 0), "background compute build", &LB.stop, &held))
             break;
-        }
-        int waited = 0, no_room = 0;
-        double w0 = now_ms(), held = -1;   // held: this build's reservation at the memory gate, -1 none
-        while (!LB.stop && !bg_room(&used, &limit, &held)) {   // not under P.lock: a dispatch builds it meanwhile
-            held = -1;
-            if (!waited++)
-                rt_log("vk_pipeline: background compute build: waiting for commit headroom (system %.0f of %.0f MB, "
-                       "NX2NAVI_BIG_BUILD_FREE_MB %s)", used, limit, cfg_value("NX2NAVI_BIG_BUILD_FREE_MB"));
-            if (now_ms() - w0 > 30000.0) {   // waiting is only useful when the headroom will come back
-                rt_log("vk_pipeline: background compute build: no commit headroom after %.0f s; the shaders left build at "
-                       "their first dispatch", (now_ms() - w0) / 1000.0);
-                no_room = 1;
-                break;
-            }
-            plat_sleep_ms(2000);
-        }
-        if (LB.stop || no_room) {
-            if (held >= 0 && !no_room) gate_leave(held);   // stopped right after the gate let it in
-            break;
-        }
         plat_mutex_lock(&P.lock);
-        int there = cs_flight_has(cs) || pipe_find(&k, sizeof k, h);   // a dispatch got to it first
-        Layout *l = there ? NULL : compute_layout(cs, &B, &why);
-        int flight = l ? cs_flight_add(cs, NULL) : 0;   // vk_pipeline_compute raises this thread through BG.raised
-        if (l) BG.building = cs;
+        int there = cs_flight_find(cs) || pipe_find(&k, sizeof k, h);   // a dispatch got to it first
+        Layout *l = there || pipe_budget_stopped() ? NULL : compute_layout(cs, &B, &why);
+        CsFlight flight;
+        if (l) {
+            cs_flight_add(&flight, cs, NULL);   // vk_pipeline_compute raises this thread through BG.raised
+            BG.building = cs;
+        }
         plat_mutex_unlock(&P.lock);
         if (!l) {
-            if (held >= 0) gate_leave(held);
+            gate_leave(held);
+            if (pipe_budget_stopped()) break;
             if (there) BG.there++;
             else BG.failed++, rt_log("vk_pipeline: background compute build: %s", why ? why : "no layout");
             continue;
         }
         VkPipelineCache own = VK_NULL_HANDLE;
         VkPipelineCacheCreateInfo oci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
-        if (P.cache && vkCreatePipelineCache(P.device, &oci, NULL, &own) != VK_SUCCESS) own = VK_NULL_HANDLE;
+        if (P.cache && pipe_budget_enter_native()) {
+            VkResult made = vkCreatePipelineCache(P.device, &oci, NULL, &own);
+            vk_device_lost_check(made, "creating a background compiler cache");
+            if (made != VK_SUCCESS) own = VK_NULL_HANDLE;
+        }
         double t0 = now_ms();
         own_cache = own;   // without one the build goes into P.cache as before
-        VkPipeline pipe = compute_create(cs, l, 0);
+        ComputeEffectProof proof;
+        VkPipeline pipe = compute_create(cs, l, 0, &proof);
         own_cache = VK_NULL_HANDLE;
         double ms = now_ms() - t0;
-        if (held >= 0) gate_leave(held);
+        gate_leave(held);
         // The pipeline stays: only a shader a run dispatched is queued here (lb_compute), and it is entered before
         // the merge below, so a dispatch that comes meanwhile finds it.
         plat_mutex_lock(&P.lock);
-        if (flight) cs_flight_remove(cs);
+        cs_flight_remove(&flight);
         BG.building = NULL;
+        if (pipe_budget_stopped()) {
+            plat_mutex_unlock(&P.lock);
+            if (!vk_device_is_lost()) {
+                if (pipe) vkDestroyPipeline(P.device, pipe, NULL);
+                if (own) vkDestroyPipelineCache(P.device, own, NULL);
+            }
+            break;
+        }
         Pipe *e = NULL;
         if (pipe && !pipe_find(&k, sizeof k, h) &&
-            (e = pipe_add(&k, sizeof k, h, pipe, l, &B, VK_PIPELINE_BIND_POINT_COMPUTE, 0))) {
+            (e = compute_publish_locked(&k, h, pipe, l, &B, &proof))) {
             e->pre = 1;
             P.stats.compute++;
-        } else if (pipe) {   // a dispatch built its own meanwhile (no flight slot was free), or out of memory
+        } else if (pipe) {   // The ready record could not be published.
             vkDestroyPipeline(P.device, pipe, NULL);
         }
         plat_mutex_unlock(&P.lock);
@@ -6153,17 +7340,22 @@ static void bg_main(void *arg) {
 
 // The last boot prebuild worker starts the builder when it queued anything.
 static void bg_start(void) {
-    if (!BG.n || LB.stop || BG.th) return;
-    if (!(BG.th = plat_thread_new(bg_main, NULL, "big compute")))
-        rt_log("vk_pipeline: cannot start the background compute builder; %zu large compute shaders build at their first "
-               "dispatch", BG.n);
+    plat_mutex_lock(&P.lock);
+    if (BG.n && !LB.stop && !BG.th && !pipe_budget_stopped()) {
+        BG.th = plat_thread_new(bg_main, NULL, "big compute");
+        if (!BG.th)
+            rt_log("vk_pipeline: cannot start the background compute builder; %zu large compute shaders build at their first "
+                   "dispatch", BG.n);
+    }
+    plat_mutex_unlock(&P.lock);
 }
 
 // keep 0: the pipeline is built for the pipeline cache only and destroyed at once, unless a dispatch came to wait for
 // it meanwhile; a shader over LB.big_words is then not built at all (comment at compute-used.bin). cs may be a copy
 // the caller releases afterwards when keep is 0: nothing here holds on to it then.
-static void lb_compute(const GfxShader *cs, const uint8_t iid[32], int keep) {
-    struct { const GfxShader *cs; uint64_t compute; } k = {cs, 1};   // no padding: the key is hashed and compared as bytes
+// Returns zero when pressure or shutdown defers the unstarted portion of boot prebuild.
+static int lb_compute(const GfxShader *cs, const uint8_t iid[32], int keep) {
+    const ComputeKey k = {cs, 1};
     uint64_t h = key_hash(&k, sizeof k);
     Bindings B = {0};
     const char *why = NULL;
@@ -6174,22 +7366,29 @@ static void lb_compute(const GfxShader *cs, const uint8_t iid[32], int keep) {
         plat_mutex_lock(&LB.stat);
         LB.big_unused++;
         plat_mutex_unlock(&LB.stat);
-        return;
+        return 1;
     }
     if (big && !P.cache_control) {
         if (bg_on()) bg_queue(cs, iid, words);
         else lb_defer(iid, words);
-        return;
+        return 1;
     }
+    double held;
+    if (!gate_wait_for(compute_budget_mb(words, big), "stage library prebuild", &LB.stop, &held))
+        return 0;
     lb_lock();
-    int busy = cs_flight_has(cs);   // the replay compiles it now (vk_pipeline_compute)
-    Layout *l = busy || pipe_find(&k, sizeof k, h) ? NULL : compute_layout(cs, &B, &why);
+    int busy = cs_flight_find(cs) != NULL;
+    Layout *l = busy || pipe_budget_stopped() || pipe_find(&k, sizeof k, h) ? NULL : compute_layout(cs, &B, &why);
     PlatThread *me = LB.idle && lb_me >= 0 ? LB.th[lb_me] : NULL;
-    int have = !l && !why, flight = l ? cs_flight_add(cs, me) : 0;
+    int have = !l && !why;
+    CsFlight flight;
+    if (l) cs_flight_add(&flight, cs, me);
     lb_unlock();
     if (!l) {
+        gate_leave(held);
+        if (pipe_budget_stopped()) return 0;
         lb_count(2, have ? 1 : 2, 0);
-        return;
+        return 1;
     }
     double t0 = now_ms();
     // The compile runs below normal priority: after an update or a driver update every one of these pipelines is
@@ -6199,22 +7398,29 @@ static void lb_compute(const GfxShader *cs, const uint8_t iid[32], int keep) {
     // at idle priority under load held that frame for seconds. The dispatch may have come between the unlock and the
     // call below, which would undo its raise, hence the look at the slot after it. Without a slot or a handle nobody
     // could raise the thread, so it compiles at normal priority.
-    if (LB.idle && flight && me) {
+    if (LB.idle && me) {
         plat_thread_priority(PLAT_PRIO_BELOW_NORMAL);
-        if (cs_flight_is_wanted(cs)) plat_thread_priority(PLAT_PRIO_NORMAL);
+        if (__atomic_load_n(&flight.wanted, __ATOMIC_RELAXED)) plat_thread_priority(PLAT_PRIO_NORMAL);
     } else if (LB.idle) {
         plat_thread_priority(PLAT_PRIO_NORMAL);
     }
-    VkPipeline pipe = compute_create(cs, l, big);
+    ComputeEffectProof proof;
+    VkPipeline pipe = compute_create(cs, l, big, &proof);
+    gate_leave(held);
     double ms = now_ms() - t0;
     int compiled = pipe && cc_hit != 1, kept = 0;
     lb_lock();
-    if (flight && cs_flight_remove(cs)) keep = 1;   // a dispatch waits for it
+    if (cs_flight_remove(&flight)) keep = 1;   // a dispatch waits for it
+    if (pipe_budget_stopped()) {
+        lb_unlock();
+        if (pipe && !vk_device_is_lost()) vkDestroyPipeline(P.device, pipe, NULL);
+        return 0;
+    }
     Pipe *e = NULL;
     if (pipe && pipe_find(&k, sizeof k, h)) {
         vkDestroyPipeline(P.device, pipe, NULL);
         have = 1;
-    } else if (pipe && keep && (e = pipe_add(&k, sizeof k, h, pipe, l, &B, VK_PIPELINE_BIND_POINT_COMPUTE, 0))) {
+    } else if (pipe && keep && (e = compute_publish_locked(&k, h, pipe, l, &B, &proof))) {
         e->pre = 1, kept = 1;
         P.stats.compute++;
     } else if (pipe) {
@@ -6226,6 +7432,7 @@ static void lb_compute(const GfxShader *cs, const uint8_t iid[32], int keep) {
     if (!pipe && big && bg_on()) bg_queue(cs, iid, words);
     else if (!pipe && big) lb_defer(iid, words);
     else lb_count(2, !pipe ? 2 : have ? 1 : kept ? 0 : 3, ms);
+    return 1;
 }
 
 // The pre-rasterization (vertex) or fragment-shader library of one shader with the LB state.
@@ -6261,33 +7468,44 @@ static int lb_library(const GfxShader *sh, int vertex, int keep, LibraryProbe *p
     VkPipelineLayout lay = VK_NULL_HANDLE;
     lb_lock();
     int have = keep && lib_find(h, key, size) != NULL;
-    if (!have && add_stage(vertex ? &B : &F, sh, 0)) {
+    Lib *claim = NULL;
+    if (!have && !pipe_budget_stopped() && add_stage(vertex ? &B : &F, sh, 0)) {
         Layout *l = layout_pair(&B, &F);
         if (l) lay = half_layout(l, vertex ? 0 : 1);
+        if (lay && keep) {
+            claim = lib_new(h, key, size);
+            if (!claim) lay = VK_NULL_HANDLE;
+        }
     }
     lb_unlock();
     if (have || !lay) {
-        if (!probe) lb_count(stat, have ? 1 : 2, 0);
+        if (!probe && !pipe_budget_stopped()) lb_count(stat, have ? 1 : 2, 0);
         return have;
     }
     double t0 = now_ms();
-    VkPipeline pipe = lib_create(kind, &s, &k, lay, key, probe);
+    GraphicsStageProof module_proof = {0};
+    VkPipeline pipe = lib_create(kind, &s, &k, lay, key, probe, claim ? &module_proof : NULL);
     double ms = now_ms() - t0;
-    if (!keep) {
-        if (pipe) vkDestroyPipeline(P.device, pipe, NULL);
-        if (!probe) lb_count(stat, pipe ? 3 : 2, ms);
-        return pipe != VK_NULL_HANDLE;
+    if (!claim) {
+        if (pipe && !vk_device_is_lost()) vkDestroyPipeline(P.device, pipe, NULL);
+        if (!probe && !pipe_budget_stopped()) lb_count(stat, pipe ? 3 : 2, ms);
+        return pipe != VK_NULL_HANDLE && !pipe_budget_stopped();
     }
     lb_lock();
-    have = lib_find(h, key, size) != NULL;
-    VkPipeline got = lib_put(h, key, size, pipe);
-    if (!have && pipe) {
-        Lib *b = lib_find(h, key, size);
-        if (b) b->pre = 1;
-    }
+    int canceled = pipe_budget_stopped();
+    claim->pipe = canceled ? VK_NULL_HANDLE : pipe;
+    claim->proof = canceled ? (GraphicsStageProof){0} : module_proof;
+    claim->pre = pipe && !canceled;
+    claim->building = 0;
+    u_library_complete(claim);
+    plat_cond_broadcast(&done_cv);
     lb_unlock();
-    lb_count(stat, !pipe ? 2 : have || got != pipe ? 1 : 0, ms);
-    return got != VK_NULL_HANDLE;
+    if (canceled) {
+        if (pipe && !vk_device_is_lost()) vkDestroyPipeline(P.device, pipe, NULL);
+        return 0;
+    }
+    lb_count(stat, pipe ? 0 : 2, ms);
+    return pipe != VK_NULL_HANDLE;
 }
 
 // A vertex or fragment variant with the graphics pipeline library off: no stage library to build ahead.
@@ -6335,18 +7553,7 @@ static void lb_worker(void *arg) {
             plat_mutex_unlock(&LB.stat);
             continue;
         }
-        // The memory gate (gate_wait): without room for another build the worker waits, and after GATE_WAIT_MS it and
-        // the other workers end. What they leave is built at its first dispatch or draw, as what a run never recorded.
-        double held;
-        if (LB.short_mem || !gate_wait("stage library prebuild", &LB.stop, &held)) {
-            if (!LB.stop && !plat_xchg32(&LB.short_mem, 1)) {
-                char g[256];
-                rt_log("vk_pipeline: stage library prebuild: ends here, at %zu of %zu variants: no commit headroom for "
-                       "another build (%s). The others are built when the game first uses them", i, LB.n,
-                       gate_text(g, sizeof g));
-            }
-            break;
-        }
+        if (LB.short_mem || pipe_budget_stopped()) break;
         // A compute shader whose pipeline does not stay is read as a copy of this thread's own and released after its
         // build: kept in the shader cache's memory, the 3,900 of an installed copy's list were 240 MB of the process's
         // commit for shaders most runs never dispatch. A dispatch that does come reads its shader then (0.05 to
@@ -6357,18 +7564,36 @@ static void lb_worker(void *arg) {
         const GfxShader *sh = keep || LB.e[i].stage != GFX_STAGE_CS ? gfx_shader_load_input(LB.e[i].iid, 0)
                                                                     : gfx_shader_load_private(LB.e[i].iid, &owned);
         plat_thread_priority(PLAT_PRIO_IDLE);
+        int finished = !pipe_budget_stopped();
+        if (!finished) {
+            if (owned) gfx_shader_release_private(sh);
+            break;
+        }
         if (!sh) {
             plat_mutex_lock(&LB.stat);
             LB.noshader++;
             plat_mutex_unlock(&LB.stat);
         } else if (gfx_shader_stage(sh) == GFX_STAGE_CS) {
-            lb_compute(sh, LB.e[i].iid, keep);
+            finished = lb_compute(sh, LB.e[i].iid, keep);
         } else if (!owned && (gfx_shader_stage(sh) == GFX_STAGE_VS || gfx_shader_stage(sh) == GFX_STAGE_FS)) {
-            if (P.gpl) lb_library(sh, gfx_shader_stage(sh) == GFX_STAGE_VS, 1, NULL);   // a kept library points at sh: never a copy
-            else lb_skip_lib();
+            if (P.gpl) {
+                double held;
+                finished = gate_wait("stage library prebuild", &LB.stop, &held);
+                if (finished) {
+                    lb_library(sh, gfx_shader_stage(sh) == GFX_STAGE_VS, 1, NULL);
+                    gate_leave(held);
+                }
+            } else lb_skip_lib();
         }
         if (owned) gfx_shader_release_private(sh);
-        gate_leave(held);
+        if (!finished) {
+            if (!pipe_budget_stopped() && !LB.stop && !plat_xchg32(&LB.short_mem, 1)) {
+                char g[256];
+                rt_log("vk_pipeline: stage library prebuild deferred unstarted variants at %zu of %zu (%s)",
+                       i, LB.n, gate_text(g, sizeof g));
+            }
+            break;
+        }
         plat_mutex_lock(&LB.stat);
         LB.done++;
         plat_mutex_unlock(&LB.stat);
@@ -6524,6 +7749,7 @@ typedef struct { int eligible, hits, misses, built, stored, failed, missing, wro
 typedef enum { LW_RECORDED, LW_PREPARED, LW_TAIL, LW_VALIDATE } WarmRequest;
 
 static void lw_request(const GfxWarmEnt *e, WarmCounts *c, WarmRequest request, int force) {
+    if (pipe_budget_stopped()) { c->deferred++; return; }
     if (!lw_stage(e) || skip_listed(e->iid)) { c->skipped++; return; }
     c->eligible++;
     double held;
@@ -6553,6 +7779,12 @@ static void lw_request(const GfxWarmEnt *e, WarmCounts *c, WarmRequest request, 
         probe.driver_only_build = !exact && !PB.on && request == LW_TAIL;
         ok = lb_library(sh, e->stage == GFX_STAGE_VS, 0, exact || probe.driver_only_build ? &probe : NULL);
         if (!exact && ok) c->built++;   // completed create; the driver does not report cache residency here
+    }
+    if (pipe_budget_stopped()) {
+        if (owned) gfx_shader_release_private(sh);
+        gate_leave(held);
+        c->deferred++;
+        return;
     }
     if (probe.driver_hit || probe.app_hit) c->hits++;
     if (probe.compile_required) c->misses++;
@@ -6823,6 +8055,7 @@ static void lw_stop(void) {
 // Boot: compute shaders of the warm list (recorded and prepared), those whose pipeline stays first, then the first
 // KEEP recorded graphics variants.
 static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
+    if (pipe_budget_stopped()) return;
     const char *e = cfg_value("NX2NAVI_LIB_PREBUILD"), *ke = cfg_get("NX2NAVI_LIB_PREBUILD_KEEP");
     const char *te = cfg_get("NX2NAVI_LIB_PREBUILD_THREADS");   // no fixed default: 2 when unset (1 under 4 CPUs)
     const char *be = cfg_get("NX2NAVI_LIB_PREBUILD_BIG");       // SPIR-V words; LB_BIG_WORDS when unset, 0 no limit
@@ -6897,12 +8130,22 @@ static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
 }
 
 static void lb_stop(void) {
-    lw_stop();
     plat_xchg32(&LB.stop, 1);
+    lw_stop();
     for (int i = 0; i < LB.threads; i++)
         if (LB.th[i]) plat_thread_join(LB.th[i]), LB.th[i] = NULL;
     LB.threads = 0;
     if (BG.th) plat_thread_join(BG.th), BG.th = NULL;   // after its current build, if one runs
+    free(LB.e);
+    LB.e = NULL;
+    LB.n = 0;
+    free(BG.cs);
+    free(BG.iid);
+    free(BG.words);
+    BG.cs = NULL;
+    BG.iid = NULL;
+    BG.words = NULL;
+    BG.n = BG.cap = 0;
 }
 
 // An update can reuse the installer journal only after checking entries that the
@@ -6935,7 +8178,7 @@ static void lw_update_check(const GfxWarmEnt *entries, size_t n) {
 // the worker's journal slot.
 static void lb_warm_worker(void *arg) {
     int slot = (int)(intptr_t)arg;
-    for (;;) {
+    while (!pipe_budget_stopped()) {
         size_t i = (size_t)plat_inc64(&LB.next) - 1;
         if (i >= LB.n) return;
         if (update_completed && lw_stage(&LB.e[i]) && (update_completed[i / 8] & (1u << (i % 8))) &&
@@ -6949,7 +8192,17 @@ static void lb_warm_worker(void *arg) {
         int owned = 0, skip = skip_listed(LB.e[i].iid);
         const GfxShader *sh = skip ? NULL : gfx_shader_load_private(LB.e[i].iid, &owned);
         int st = sh ? gfx_shader_stage(sh) : -1;
-        if (sh) journal_mark(slot, &LB.e[i]);   // from here to its clearing below, a crash names this variant
+        int permit = 0;
+        if (st == GFX_STAGE_CS || (P.gpl && (st == GFX_STAGE_VS || st == GFX_STAGE_FS))) {
+            uint64_t words = 0;
+            if (st == GFX_STAGE_CS) (void)gfx_shader_spirv(sh, &words);
+            permit = pipe_budget_begin(compute_budget_mb(words, 0));
+            if (permit < 0) {
+                if (owned) gfx_shader_release_private(sh);
+                return;
+            }
+            journal_mark(slot, &LB.e[i]);
+        }
         if (skip) {
             skip_count();
         } else if (!sh) {
@@ -6963,17 +8216,18 @@ static void lb_warm_worker(void *arg) {
             Layout *l = compute_layout(sh, &B, &why);
             lb_unlock();
             double t0 = now_ms();
-            VkPipeline pipe = l ? compute_create(sh, l, 0) : VK_NULL_HANDLE;
+            VkPipeline pipe = l ? compute_create(sh, l, 0, NULL) : VK_NULL_HANDLE;
             if (pipe) vkDestroyPipeline(P.device, pipe, NULL);
-            lb_count(2, pipe ? 3 : 2, now_ms() - t0);
+            if (!pipe_budget_stopped()) lb_count(2, pipe ? 3 : 2, now_ms() - t0);
         } else if (st == GFX_STAGE_VS || st == GFX_STAGE_FS) {
             if (P.gpl) {
                 LibraryProbe probe = {.repair = 1};
                 int exact = P.cache_control && !PB.on;
                 double t0 = now_ms();
                 int ok = lb_library(sh, st == GFX_STAGE_VS, 0, exact ? &probe : NULL);
-                if (exact) lb_count(st == GFX_STAGE_VS ? 0 : 1, !ok ? 2 : probe.compiled ? 3 : 1, now_ms() - t0);
-                if (LW.progress) {
+                if (exact && !pipe_budget_stopped())
+                    lb_count(st == GFX_STAGE_VS ? 0 : 1, !ok ? 2 : probe.compiled ? 3 : 1, now_ms() - t0);
+                if (LW.progress && !pipe_budget_stopped()) {
                     plat_mutex_lock(&LW.io);
                     if (ok) warm_complete(LW.progress, i);
                     else LW.progress->bits[i / 8] &= (uint8_t)~(1u << (i % 8));
@@ -6982,8 +8236,12 @@ static void lb_warm_worker(void *arg) {
                 }
             } else lb_skip_lib();
         }
-        if (sh) journal_mark(slot, NULL);
+        if (permit > 0) {
+            journal_mark(slot, NULL);
+            pipe_budget_end(permit);
+        }
         if (owned) gfx_shader_release_private(sh);
+        if (pipe_budget_stopped()) return;
         plat_mutex_lock(&LB.stat);
         uint64_t d = ++LB.done;
         plat_mutex_unlock(&LB.stat);
@@ -7129,7 +8387,7 @@ static int seed_pipelines(const char *dir) {
     plat_mutex_lock(&P.lock);
     uint32_t built0 = K.built, failed0 = K.failed;
     K.loading = 1;
-    for (size_t i = 0; i < n; i++) {
+    for (size_t i = 0; i < n && !pipe_budget_stopped(); i++) {
         const uint8_t (*v)[32] = bsearch(r[i].vs, ids, u, 32, id_cmp);
         const uint8_t (*fi)[32] = r[i].has_fs ? bsearch(r[i].fs, ids, u, 32, id_cmp) : NULL;
         const uint8_t (*t)[32] = r[i].has_ts ? bsearch(r[i].ts, ids, u, 32, id_cmp) : NULL;
@@ -7139,6 +8397,7 @@ static int seed_pipelines(const char *dir) {
             continue;
         }
         VkPipeState s = r[i].s;
+        s.native_rmw_marker = 0; // The reserved byte in older base warm records carries no request.
         s.vs = vs, s.fs = fs, s.ts = ts;
         if (!is_mesh(&s) && !all) {
             other++;
@@ -7157,17 +8416,16 @@ static int seed_pipelines(const char *dir) {
         uint64_t hk = key_hash(&k, sizeof k);
         int q = 0;
         if (pipe_find(&k, sizeof k, hk)) known++;
-        else pipe_miss(&s, &k, hk, 2, &q), queued += (uint32_t)q, mesh += q && is_mesh(&s);
+        else pipe_miss(&s, &k, hk, 2, &q, 0), queued += (uint32_t)q, mesh += q && is_mesh(&s);
     }
     K.loading = 0;
     K.until = 0;   // every one of them: no boot waits for this
-    GATE.off = 1;  // and no game runs beside it: the memory gate (gate_enter) refuses nothing
     plat_mutex_unlock(&P.lock);
     free(ids), free(sh), free(r);
     PlatThread *th[64];
     int nt = 0;
-    if (queued) warm_builder((void *)1);   // the first alone (warm_builder)
-    for (int i = 0; i < cpus && i < 64 && queued; i++)
+    if (queued && !pipe_budget_stopped()) warm_builder((void *)1);   // the first alone (warm_builder)
+    for (int i = 0; i < cpus && i < 64 && queued && !pipe_budget_stopped(); i++)
         if ((th[nt] = plat_thread_new(warm_builder, NULL, "pipe list"))) nt++;
     if (!nt && queued) warm_builder(NULL);
     for (int i = 0; i < nt; i++)
@@ -7178,9 +8436,13 @@ static int seed_pipelines(const char *dir) {
             fflush(stdout);
         }
     plat_mutex_lock(&P.lock);
-    while (K.left) plat_cond_wait(&done_cv, &P.lock);   // those a pool worker took
+    while (K.left && !pipe_budget_stopped()) plat_cond_wait(&done_cv, &P.lock);   // those a pool worker took
     uint32_t built = K.built - built0, failed = K.failed - failed0;
     plat_mutex_unlock(&P.lock);
+    if (pipe_budget_stopped()) {
+        plat_file_delete(mark);
+        return 1;
+    }
     int saved = cache_save(5000, 0) > 0;   // explicit preparation waits for a moment with no build running
     plat_file_delete(mark);
     char msg[640];
@@ -7684,34 +8946,84 @@ static void autosave_once(void) {
 
 // On its own thread: the save (vkGetPipelineCacheData and the file write, about 60 ms) and the key appends (a flush to
 // the disk each) ran on the present thread, and the render thread waited for it to take the next frame.
+static PlatCond autosave_wake = PLAT_COND_INIT;
+static PlatThread *autosave_thread;
+static int32_t autosave_attempted;
+
 static void autosave_main(void *arg) {
     (void)arg;
     plat_thread_priority(PLAT_PRIO_BELOW_NORMAL);
-    for (;;) {
-        plat_sleep_ms(500);
+    plat_mutex_lock(&P.lock);
+    while (!pipe_budget_stopped()) {
+        plat_cond_wait_ns(&autosave_wake, &P.lock, 500000000ull);
+        if (pipe_budget_stopped()) break;
+        plat_mutex_unlock(&P.lock);
         autosave_once();
+        plat_mutex_lock(&P.lock);
     }
+    plat_mutex_unlock(&P.lock);
 }
 
 void vk_pipeline_autosave(void) {
-    static int32_t started;
-    if (!P.ready || plat_xchg32(&started, 1)) return;
-    if (!plat_thread_spawn(autosave_main, NULL, "pipe autosave", 0))
-        rt_log("vk_pipeline: cannot start the autosave thread; the cache is saved at exit only");
+    if (!__atomic_load_n(&P.ready, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&autosave_attempted, __ATOMIC_RELAXED)) return;
+    plat_mutex_lock(&P.lock);
+    if (P.ready && !__atomic_load_n(&autosave_attempted, __ATOMIC_RELAXED) && !pipe_budget_stopped()) {
+        __atomic_store_n(&autosave_attempted, 1, __ATOMIC_RELAXED);
+        autosave_thread = plat_thread_new(autosave_main, NULL, "pipe autosave");
+        if (!autosave_thread)
+            rt_log("vk_pipeline: cannot start the autosave thread; the cache is saved at exit only");
+    }
+    plat_mutex_unlock(&P.lock);
+}
+
+void vk_pipeline_stop_preparation(void) {
+    if (__atomic_exchange_n(&pipe_budget_stopping, 1, __ATOMIC_ACQ_REL)) return;
+    resource_core_budget_progress();
+    workers_close();
+    plat_mutex_lock(&P.lock);
+    plat_cond_broadcast(&autosave_wake);
+    plat_mutex_unlock(&P.lock);
 }
 
 void vk_pipeline_shutdown(void) {
-    if (!P.ready) return;
-    lb_stop();
-    workers_drain();   // jobs point at layouts and Pipe entries freed below
-    vk_pipeline_save();
+    static PlatMutex shutdown_lock = PLAT_MUTEX_INIT;
+    vk_pipeline_stop_preparation();
+    if (vk_device_is_lost()) return;
+    plat_mutex_lock(&shutdown_lock);
     plat_mutex_lock(&P.lock);
-    vk_device_wait_idle();
+    while (prewarm_running) plat_cond_wait(&prewarm_idle, &P.lock);
+    plat_mutex_unlock(&P.lock);
+    if (!P.ready || vk_device_is_lost()) {
+        plat_mutex_unlock(&shutdown_lock);
+        return;
+    }
+    lb_stop();
+    workers_drain();
+    if (autosave_thread) {
+        plat_thread_join(autosave_thread);
+        autosave_thread = NULL;
+    }
+    if (vk_device_is_lost()) {
+        plat_mutex_unlock(&shutdown_lock);
+        return;
+    }
+    vk_pipeline_save();
+    VkResult idle = vk_device_wait_idle();
+    if (idle != VK_SUCCESS) {
+        plat_mutex_unlock(&shutdown_lock);
+        vk_device_lost_check(idle, "draining pipeline owners before shutdown");
+        rt_fatal("vk_pipeline: cannot destroy pipelines before idle proof (%d)", (int)idle);
+    }
+    plat_mutex_lock(&P.lock);
     for (int i = 0; i < PIPE_BUCKETS; i++) {
         for (Pipe *p = pipes[i], *n; p; p = n) {
             n = p->next;
+            if (p->required_waiters || p->fast.users || p->full.users)
+                rt_fatal("vk_pipeline: shutdown still owns a required graphics request or revision");
             if (p->info.pipeline) vkDestroyPipeline(P.device, p->info.pipeline, NULL);
-            if (p->fast && p->fast != p->info.pipeline) vkDestroyPipeline(P.device, p->fast, NULL);
+            if (p->fast.pipeline && p->fast.pipeline != p->info.pipeline)
+                vkDestroyPipeline(P.device, p->fast.pipeline, NULL);
             free(p->bindings), free(p);
         }
         pipes[i] = NULL;
@@ -7738,7 +9050,11 @@ void vk_pipeline_shutdown(void) {
     plat_mutex_unlock(&save_lock);
     memset(&P.stats, 0, sizeof P.stats);
     plat_xchg32(&P.ready, 0);
+    free(K.file);
+    K.file = NULL;
+    K.file_n = 0;
     plat_mutex_unlock(&P.lock);
+    plat_mutex_unlock(&shutdown_lock);
 }
 
 // ---- self-test: census shaders (probe_census_dir, tools/shader_census.py) through gfx_shader_get into pipelines.
@@ -7973,7 +9289,7 @@ void vk_pipeline_sizes(PerfSizes *s) {
     uint64_t ent = 0, built = 0, fast = 0, libn = 0, libb = 0, lq = 0;
     plat_mutex_lock_shared(&P.lock);
     for (int i = 0; i < PIPE_BUCKETS; i++)
-        for (const Pipe *p = pipes[i]; p; p = p->next) ent++, built += p->info.pipeline != VK_NULL_HANDLE, fast += p->fast != VK_NULL_HANDLE;
+        for (const Pipe *p = pipes[i]; p; p = p->next) ent++, built += p->info.pipeline != VK_NULL_HANDLE, fast += p->fast.pipeline != VK_NULL_HANDLE;
     for (int i = 0; i < LIB_BUCKETS; i++)
         for (const Lib *b = libs[i]; b; b = b->next) libn++, libb += b->pipe != VK_NULL_HANDLE;
     for (const LibJob *j = U.head; j; j = j->next) lq++;

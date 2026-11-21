@@ -19,7 +19,7 @@
 // reuses it too, behind the same barrier, while it records into the same command buffer (scratch_get): a buffer per
 // texture, each kept until its batch completed, made a scene load (2641 textures in one frame in Kokiri Forest) hold
 // gigabytes of scratch at once and allocate 256 MiB device blocks inline, about half a second of the load frame. A
-// larger scratch replaces it; the old one is freed once the batches recorded so far completed (vk_defer_buffer).
+// larger scratch replaces it; the old one is freed after its last upload completes (vk_upload_defer_buffer).
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,6 +31,7 @@
 #include "host.h"
 #include "tex.h"
 #include "vk.h"
+#include "resource_core_vma.h"
 #include "platform/platform.h"
 
 // tex_astc.c's unquantization tables, as the shader reads them (Tables in astc_decode.comp): 12 + 16 row offsets in
@@ -301,7 +302,9 @@ static int create_pipeline(VkCtx *c) {
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = TAB_SIZE,
                              .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
     VmaAllocationCreateInfo aci = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
-    if (vmaCreateBuffer(c->vma, &bi, &aci, &G.tab, &G.tab_alloc, NULL) != VK_SUCCESS) return 0;
+    RcVmaRequest request = {.producer = RC_BUDGET_TEXTURE, .required = 1};
+    if (resource_core_vma_create_buffer(&request, c->vma, &bi, &aci, &G.tab, &G.tab_alloc, NULL, NULL) != VK_SUCCESS)
+        return 0; // decoder initialization falls back to the existing CPU path
     rt_log("vk: ASTC compute decoder ready (pipeline built in %.1f ms)", (double)(plat_now_ns() - t0) / 1e6);
     return 1;
 }
@@ -486,7 +489,7 @@ static void mem_barrier(VkCommandBuffer cb, VkPipelineStageFlags2 src, VkAccessF
 // The shared scratch and the command buffer it was last recorded into. An upload batch's command buffer is used again
 // only after that batch completed (vk_memory.c: completed batches go to the spare list), so the same handle means the
 // open batch, ordered by a barrier, or a finished one. g_lock held.
-static struct { VkBuffer buf; VmaAllocation alloc; VkDeviceSize size; VkCommandBuffer cb; VkDevice dev; uint64_t big_ns; } S;
+static struct { VkBuffer buf; VmaAllocation alloc; VkDeviceSize size; VkCommandBuffer cb; VkDevice dev; uint64_t big_ns, last_seq; } S;
 static uint64_t n_scratch_new, n_scratch_reuse;
 
 // NX2NAVI_ASTC_SCRATCH_KEEP=1 (the default): the scratch outlives its upload batch. Every
@@ -520,6 +523,8 @@ void vk_astc_scratch_fail(int n) { plat_xchg32(&scratch_fail_n, n); }
 static VkBuffer scratch_get(VkCtx *c, VkCommandBuffer cb, VkDeviceSize need, int *reused) {
     if (plat_cas32(&scratch_fail_n, 0, 0) > 0 && plat_add32(&scratch_fail_n, -1) >= 0) return VK_NULL_HANDLE;
     int keep = scratch_keep();
+    uint64_t sequence = vk_upload_recording_sequence(cb);
+    if (!sequence) rt_fatal("vk: ASTC scratch requires the active upload command buffer");
     plat_mutex_lock(&g_lock);
     uint64_t now = kern_now_ns();
     if (need > SCRATCH_MIN) S.big_ns = now;
@@ -536,25 +541,35 @@ static VkBuffer scratch_get(VkCtx *c, VkCommandBuffer cb, VkDeviceSize need, int
         VmaAllocationCreateInfo aci = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
         VkBuffer b;
         VmaAllocation a;
-        VkResult r = vmaCreateBuffer(c->vma, &bi, &aci, &b, &a, NULL);
-        if (r == VK_ERROR_OUT_OF_DEVICE_MEMORY && bi.size > need) {
+        RcVmaRequest request = {.producer = RC_BUDGET_TEXTURE, .required = bi.size == need};
+        RcAdmissionStatus admission;
+        VkResult r = resource_core_vma_create_buffer(&request, c->vma, &bi, &aci, &b, &a, NULL, &admission);
+        if ((r == VK_ERROR_OUT_OF_DEVICE_MEMORY || r == VK_ERROR_OUT_OF_HOST_MEMORY || r == VK_NOT_READY) && bi.size > need) {
             // The usual scratch leaves room for later textures. This upload can still fit without the spare bytes.
             bi.size = need;
-            r = vmaCreateBuffer(c->vma, &bi, &aci, &b, &a, NULL);
+            request.required = 1;
+            r = resource_core_vma_create_buffer(&request, c->vma, &bi, &aci, &b, &a, NULL, &admission);
         }
         if (r != VK_SUCCESS) {
+            static volatile int32_t refused;
+            if (plat_inc32(&refused) <= 16)
+                rt_log("vk: ASTC scratch growth of %llu bytes refused (result %d, shared admission %d); "
+                       "compatibility upload retry remains pending", (unsigned long long)bi.size, (int)r, (int)admission);
             plat_mutex_unlock(&g_lock);
+            // This adapter preserves vk_astc_record's -1 compatibility result. It does not claim successful
+            // preparation or discard the old scratch. A resumable required-decode boundary is separate work.
             return VK_NULL_HANDLE;
         }
-        // the old one may still be read by its command buffer: freed once the batches recorded so far completed
-        if (S.buf && S.dev == c->device) vk_defer_buffer(S.buf, S.alloc);
+        // Only upload commands name this scratch. Its last upload owns retirement, including growth within the
+        // same batch; an unrelated scene still being prepared must not retain every replaced scratch allocation.
+        if (S.buf && S.dev == c->device) vk_upload_defer_buffer(S.buf, S.alloc, S.last_seq);
         S.buf = b, S.alloc = a, S.size = bi.size, S.dev = c->device;
         n_scratch_new++;
         vk_texstat_time(VK_TS_SCRATCH, t0);
     } else {
         n_scratch_reuse++;
     }
-    S.cb = cb;
+    S.cb = cb, S.last_seq = sequence;
     VkBuffer out = S.buf;
     plat_mutex_unlock(&g_lock);
     return out;
@@ -815,9 +830,9 @@ void vk_astc_release(void) {
         if (G.bc_pipe) vkDestroyPipeline(c->device, G.bc_pipe, NULL);
         if (G.layout) vkDestroyPipelineLayout(c->device, G.layout, NULL);
         if (G.dsl) vkDestroyDescriptorSetLayout(c->device, G.dsl, NULL);
-        if (G.tab) vmaDestroyBuffer(c->vma, G.tab, G.tab_alloc);
+        if (G.tab) resource_core_vma_destroy_buffer(c->vma, G.tab, G.tab_alloc);
     }
-    if (c && S.buf && S.dev == c->device) vmaDestroyBuffer(c->vma, S.buf, S.alloc);   // the device is idle here
+    if (c && S.buf && S.dev == c->device) resource_core_vma_destroy_buffer(c->vma, S.buf, S.alloc); // device idle
     memset(&S, 0, sizeof S);
     memset(&G.dsl, 0, sizeof G - offsetof(__typeof__(G), dsl));
     G.dev = VK_NULL_HANDLE;

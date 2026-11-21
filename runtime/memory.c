@@ -16,6 +16,7 @@
 #include "layout.h"
 #include "mem_need.h"
 #include "mem_mapping.h"
+#include "resource_core_registry.h"
 #include "mem_file_read.h"
 #include "platform/platform.h"
 
@@ -195,7 +196,14 @@ static void unprobe_locked(uint64_t r) {
 // has the part's writes. Only a fault of the replay thread itself, a wait of 20 ms, or a release by a thaw goes ahead
 // inside the window (lz_gaps counts the faults): that part's writes to the range then reach guest memory with the
 // range's next write-back.
-typedef struct { uint64_t lo, hi, h0, h1; int64_t delta; uint8_t stale; } LzSeg;   // pages [lo, hi); buffer offset = address + delta
+typedef struct {
+    uint64_t lo, hi, h0, h1;
+    int64_t delta;
+    uint8_t stale;
+    void *provider;
+} LzSeg;   // pages [lo, hi); buffer offset = address + delta
+static PlatMutex lazy_write_lock = PLAT_MUTEX_INIT;
+static MemLazyWriteRange *lazy_writes;
 static LzSeg *lzs;                      // frz_lock
 static int lz_n, lz_cap;                // frz_lock
 static volatile uint8_t lzr[RT_ADDRESS_LIMIT >> FRZ_SHIFT];   // a segment reaches into the region
@@ -203,7 +211,8 @@ static uint32_t lz_hot[RT_ADDRESS_LIMIT >> FRZ_SHIFT];        // frz_lock: plat_
 static uint8_t lz_back[RT_ADDRESS_LIMIT >> FRZ_SHIFT];        // frz_lock: seconds of the region's last hold
 static volatile int32_t lz_on;
 static int lz_want;                     // the setting, read in mem_init
-static void (*lz_fetch)(uint64_t h0, uint64_t h1, uint64_t off, uint64_t size);
+static void (*lz_fetch)(uint64_t h0, uint64_t h1, uint64_t off, uint64_t size, uint64_t guest_addr, void *provider);
+static MemLazyFetchVerified lz_fetch_verified;
 // The back end's test that the mirror holds every CPU write to [lo, hi) (vk_memory.c lazy_clean): a fetch copies the
 // mirror's bytes over the whole range, so a CPU write the mirror does not have yet would be lost to it.
 static int (*lz_clean)(uint64_t lo, uint64_t hi, void *ctx);
@@ -277,7 +286,7 @@ static void lazy_drop_locked(int i, int why, uint64_t local_touch) {
         uint64_t t0 = plat_now_ns();
         __atomic_store_n(&lz_fetch_now, s.hi - s.lo, __ATOMIC_RELAXED);
         __atomic_store_n(&lz_fetch_tid, plat_thread_id(), __ATOMIC_RELEASE);
-        lz_fetch(s.h0, s.h1, (uint64_t)((int64_t)s.lo + s.delta), s.hi - s.lo);
+        lz_fetch(s.h0, s.h1, (uint64_t)((int64_t)s.lo + s.delta), s.hi - s.lo, s.lo, s.provider);
         __atomic_store_n(&lz_fetch_ms, (uint32_t)plat_now_ms() | 1, __ATOMIC_RELAXED);
         __atomic_store_n(&lz_fetch_total, lz_fetch_total + 1, __ATOMIC_RELAXED);
         __atomic_store_n(&lz_fetch_tid, 0, __ATOMIC_RELEASE);
@@ -354,7 +363,7 @@ static uint64_t lazy_piece_locked(int i, uint64_t a, int write) {
         uint64_t t0 = plat_now_ns();
         __atomic_store_n(&lz_fetch_now, c1 - c0, __ATOMIC_RELAXED);
         __atomic_store_n(&lz_fetch_tid, plat_thread_id(), __ATOMIC_RELEASE);
-        lz_fetch(s.h0, s.h1, (uint64_t)((int64_t)c0 + s.delta), c1 - c0);
+        lz_fetch(s.h0, s.h1, (uint64_t)((int64_t)c0 + s.delta), c1 - c0, c0, s.provider);
         __atomic_store_n(&lz_fetch_ms, (uint32_t)plat_now_ms() | 1, __ATOMIC_RELAXED);
         __atomic_store_n(&lz_fetch_total, lz_fetch_total + 1, __ATOMIC_RELAXED);
         __atomic_store_n(&lz_fetch_tid, 0, __ATOMIC_RELEASE);
@@ -365,8 +374,16 @@ static uint64_t lazy_piece_locked(int i, uint64_t a, int write) {
             rt_fatal("memory: giving back the lazily written pages %#llx+%#llx failed", (unsigned long long)x,
                      (unsigned long long)(y - x));
     lzs[i] = lzs[--lz_n];
-    if (c0 > s.lo) lazy_push_locked((LzSeg){s.lo, c0, s.h0, s.h1, s.delta, s.stale});
-    if (c1 < s.hi) lazy_push_locked((LzSeg){c1, s.hi, s.h0, s.h1, s.delta, s.stale});
+    if (c0 > s.lo) {
+        LzSeg left = s;
+        left.hi = c0;
+        lazy_push_locked(left);
+    }
+    if (c1 < s.hi) {
+        LzSeg right = s;
+        right.lo = c1;
+        lazy_push_locked(right);
+    }
     lazy_flags_locked(s.lo, s.hi);
     lz_faults[write != 0]++, lz_pieces++, lz_piece_bytes += c1 - c0;
     uint32_t now = (uint32_t)plat_now_ms();
@@ -433,10 +450,37 @@ static int lazy_protect_locked(uint64_t x, uint64_t e, void *ctx, uint64_t arm_e
     return 1;
 }
 
+// Arm only whole pages outside an active direct writer's guest and mirror ranges.
+static void lazy_write_arm_clip(uint64_t begin, uint64_t lo, uint64_t hi, uint64_t *end, int *blocked) {
+    lo &= ~(PAGE - 1);
+    hi = (hi + PAGE - 1) & ~(PAGE - 1);
+    if (lo >= *end || hi <= begin) return;
+    if (lo <= begin) {
+        *blocked = 1;
+        if (hi < *end) *end = hi;
+    } else if (!*blocked) *end = lo;
+}
+
+static int lazy_write_arm_limit(uint64_t begin, uint64_t *end, uint64_t mirror, uint64_t offset) {
+    int blocked = 0;
+    plat_mutex_lock(&lazy_write_lock);
+    for (const MemLazyWriteRange *w = lazy_writes; w; w = w->next) {
+        lazy_write_arm_clip(begin, w->address, w->address + w->size, end, &blocked);
+        if (w->mirror != mirror) continue;
+        const uint64_t limit = offset + (*end - begin);
+        const uint64_t lo = w->offset > offset ? w->offset : offset;
+        const uint64_t hi = w->offset + w->size < limit ? w->offset + w->size : limit;
+        if (lo < hi) lazy_write_arm_clip(begin, begin + (lo - offset), begin + (hi - offset), end, &blocked);
+    }
+    plat_mutex_unlock(&lazy_write_lock);
+    return blocked;
+}
+
 // Arms the whole pages of [a, a + n), which the back end has just written back from the buffer h0 into h1 at offset
 // off: they fault on their next access. Returns the bytes armed now. Not in a frozen, probed, held or thaw-held region.
 uint64_t mem_lazy_arm(uint64_t a, uint64_t n, uint64_t h0, uint64_t h1, uint64_t off, void *ctx) {
-    if (!__atomic_load_n(&lz_on, __ATOMIC_RELAXED) || a >= RT_ADDRESS_LIMIT || !watched(a, n)) return 0;
+    if (!__atomic_load_n(&lz_on, __ATOMIC_RELAXED) || a >= RT_ADDRESS_LIMIT ||
+        n > RT_ADDRESS_LIMIT - a || n > UINT64_MAX - off || !watched(a, n)) return 0;
     uint64_t lo = (a + PAGE - 1) & ~(PAGE - 1), hi = (a + n) & ~(PAGE - 1), armed = 0;
     int64_t delta = (int64_t)off - (int64_t)a;
     plat_mutex_lock(&frz_lock);
@@ -457,6 +501,7 @@ uint64_t mem_lazy_arm(uint64_t a, uint64_t n, uint64_t h0, uint64_t h1, uint64_t
         uint64_t r = x >> FRZ_SHIFT;
         e = (r + 1) << FRZ_SHIFT;
         if (e > hi) e = hi;
+        if (lazy_write_arm_limit(x, &e, h0, off + (x - a))) continue;
         if (lz_nhots) {   // a held piece stays out: this turn arms what lies before it, the next ones what lies behind
             uint64_t c = x >> LZ_CHUNK_SHIFT, y = x;
             while (y < e && lazy_chunk_held_locked(c, now)) y = ++c << LZ_CHUNK_SHIFT;
@@ -482,14 +527,15 @@ uint64_t mem_lazy_arm(uint64_t a, uint64_t n, uint64_t h0, uint64_t h1, uint64_t
         uint64_t slo = x, shi = e;
         uint8_t stale = 0;
         for (int j = 0; j < lz_n; j++)   // one segment for what touches in the same buffer
-            if (lzs[j].h0 == h0 && lzs[j].delta == delta && lzs[j].lo <= shi && lzs[j].hi >= slo) {
+            if (lzs[j].h0 == h0 && lzs[j].h1 == h1 && lzs[j].provider == ctx &&
+                lzs[j].delta == delta && lzs[j].lo <= shi && lzs[j].hi >= slo) {
                 if (lzs[j].lo < slo) slo = lzs[j].lo;
                 if (lzs[j].hi > shi) shi = lzs[j].hi;
                 stale |= lzs[j].stale;
                 lzs[j] = lzs[--lz_n];
                 j = -1;
             }
-        lazy_push_locked((LzSeg){slo, shi, h0, h1, delta, stale});
+        lazy_push_locked((LzSeg){slo, shi, h0, h1, delta, stale, ctx});
         __atomic_store_n(&lzr[r], 1, __ATOMIC_RELEASE);
         armed += e - x;
     }
@@ -503,14 +549,15 @@ uint64_t mem_lazy_arm(uint64_t a, uint64_t n, uint64_t h0, uint64_t h1, uint64_t
 // eviction ran) is given back instead, without a fetch: its buffer may be gone, and since its mirror went every GPU
 // write went to guest memory, so guest memory holds the bytes. Marked stale, it would have its next touch copy from the
 // freed buffer, a GPU read fault that loses the device.
-int mem_lazy_skip(uint64_t a, uint64_t n, uint64_t h0, int64_t delta, uint64_t out[][2], int max) {
+int mem_lazy_skip(uint64_t a, uint64_t n, uint64_t h0, int64_t delta, void *provider, uint64_t out[][2], int max) {
     if (!__atomic_load_n(&lz_on, __ATOMIC_RELAXED) || !n || a >= RT_ADDRESS_LIMIT || a + n > RT_ADDRESS_LIMIT) return 0;
     int any = 0, k = 0;
     for (uint64_t r = a >> FRZ_SHIFT; r <= (a + n - 1) >> FRZ_SHIFT && !any; r++) any = lzr[r];
     if (!any) return 0;
     plat_mutex_lock(&frz_lock);
     for (int i = lz_n; i-- > 0;)
-        if (lzs[i].lo < a + n && lzs[i].hi > a && (lzs[i].h0 != h0 || lzs[i].delta != delta)) {
+        if (lzs[i].lo < a + n && lzs[i].hi > a &&
+            (lzs[i].h0 != h0 || lzs[i].delta != delta || lzs[i].provider != provider)) {
             lzs[i].stale = 0;
             lz_foreign++;
             lazy_drop_locked(i, 4, 0);
@@ -534,6 +581,127 @@ int mem_lazy_armed(uint64_t a, uint64_t n) {
     int ok = lazy_covered_locked(a, a + n);
     plat_mutex_unlock(&frz_lock);
     return ok;
+}
+
+static int lazy_write_fetch_locked(const LzSeg *s, uint64_t lo, uint64_t hi) {
+    uint64_t t0 = plat_now_ns();
+    __atomic_store_n(&lz_fetch_now, hi - lo, __ATOMIC_RELAXED);
+    __atomic_store_n(&lz_fetch_tid, plat_thread_id(), __ATOMIC_RELEASE);
+    int fetched = lz_fetch_verified(s->h0, s->h1, lo + (uint64_t)s->delta, hi - lo, lo, s->provider);
+    __atomic_store_n(&lz_fetch_tid, 0, __ATOMIC_RELEASE);
+    if (!fetched) return 0;
+    __atomic_store_n(&lz_fetch_ms, (uint32_t)plat_now_ms() | 1, __ATOMIC_RELAXED);
+    __atomic_store_n(&lz_fetch_total, lz_fetch_total + 1, __ATOMIC_RELAXED);
+    lz_fetches++, lz_fetch_bytes += hi - lo, lz_fetch_ns += plat_now_ns() - t0;
+    return 1;
+}
+
+static void lazy_write_drop_pages(int i, uint64_t lo, uint64_t hi) {
+    LzSeg prior = lzs[i];
+    lzs[i].lo = lo;
+    lzs[i].hi = hi;
+    lzs[i].stale = 0; // Only this clipped area was fetched. Unchanged sides keep their state.
+    lazy_drop_locked(i, 2, 0);
+    if (prior.lo < lo) {
+        LzSeg left = prior;
+        left.hi = lo;
+        lazy_push_locked(left);
+    }
+    if (hi < prior.hi) {
+        LzSeg right = prior;
+        right.lo = hi;
+        lazy_push_locked(right);
+    }
+    lazy_flags_locked(prior.lo, prior.hi);
+}
+
+MemLazyWriteResult mem_lazy_write_acquire(MemLazyWriteRange *lease, uint64_t address, uint64_t size,
+    uint64_t mirror, uint64_t import_buffer, uint64_t offset, const void *provider, int parked) {
+    if (!lease || lease->size || !size || !mirror || !import_buffer || mirror == import_buffer || !provider ||
+        address >= RT_ADDRESS_LIMIT || size > RT_ADDRESS_LIMIT - address || size > UINT64_MAX - offset)
+        return MEM_LAZY_WRITE_INVALID;
+    if (!lz_want) return MEM_LAZY_WRITE_READY;
+    // A first write-back can enable lazy arming while this receipt is still live.
+    if (!mem_lazy_provider_transition_try()) return MEM_LAZY_WRITE_BUSY;
+    if (__atomic_load_n(&lz_win_tid, __ATOMIC_ACQUIRE)) {
+        mem_lazy_provider_transition_end();
+        return MEM_LAZY_WRITE_BUSY;
+    }
+
+    const uint64_t begin = address & ~(PAGE - 1);
+    const uint64_t end = (address + size + PAGE - 1) & ~(PAGE - 1);
+    const uint64_t delta = offset - address;
+    MemLazyWriteResult result = MEM_LAZY_WRITE_READY;
+    for (int i = 0; i < lz_n; ++i) {
+        const LzSeg *s = &lzs[i];
+        const int guest = begin < s->hi && end > s->lo;
+        const uint64_t native = s->lo + (uint64_t)s->delta;
+        const int overflow = s->h0 == mirror && s->hi - s->lo > UINT64_MAX - native;
+        const int physical = s->h0 == mirror && (overflow ||
+            (offset < native + (s->hi - s->lo) && offset + size > native));
+        if (!guest && !physical) continue;
+        if (!guest || overflow || s->h0 != mirror || s->h1 != import_buffer || s->provider != provider ||
+            (uint64_t)s->delta != delta) {
+            result = MEM_LAZY_WRITE_FOREIGN;
+            break;
+        }
+        if (s->stale && (!parked || !lz_fetch_verified)) result = MEM_LAZY_WRITE_NEEDS_FETCH;
+    }
+    if (result == MEM_LAZY_WRITE_READY) {
+        // Keep all protections and old ownership until every matching stale page was fetched.
+        for (int i = 0; i < lz_n; ++i) {
+            const LzSeg *s = &lzs[i];
+            const uint64_t lo = s->lo > begin ? s->lo : begin;
+            const uint64_t hi = s->hi < end ? s->hi : end;
+            if (lo < hi && s->stale && !lazy_write_fetch_locked(s, lo, hi)) {
+                result = MEM_LAZY_WRITE_FETCH_FAILED;
+                break;
+            }
+        }
+    }
+    if (result == MEM_LAZY_WRITE_READY) {
+        for (int i = 0; i < lz_n;) {
+            const LzSeg *s = &lzs[i];
+            const uint64_t lo = s->lo > begin ? s->lo : begin;
+            const uint64_t hi = s->hi < end ? s->hi : end;
+            if (lo < hi) lazy_write_drop_pages(i, lo, hi);
+            else ++i;
+        }
+        plat_mutex_lock(&lazy_write_lock);
+        *lease = (MemLazyWriteRange){.next = lazy_writes, .address = address, .size = size,
+                                     .mirror = mirror, .offset = offset};
+        lazy_writes = lease;
+        plat_mutex_unlock(&lazy_write_lock);
+    }
+    mem_lazy_provider_transition_end();
+    return result;
+}
+
+void mem_lazy_write_release(MemLazyWriteRange *lease) {
+    if (!lease || !lease->size) return;
+    // Retirement does not take the fault lock or wait for the recorder.
+    plat_mutex_lock(&lazy_write_lock);
+    MemLazyWriteRange **at = &lazy_writes;
+    while (*at && *at != lease) at = &(*at)->next;
+    if (!*at) rt_fatal("memory: lost direct-writer lazy range");
+    *at = lease->next;
+    *lease = (MemLazyWriteRange){0};
+    plat_mutex_unlock(&lazy_write_lock);
+}
+
+int mem_lazy_provider_transition_try(void) {
+    // The fault path can hold this lock while submitting a fetch. An ordered recorder must not wait for it.
+    return plat_mutex_trylock(&frz_lock);
+}
+
+int mem_lazy_provider_borrowed(const void *provider, uint64_t native_buffer) {
+    for (int i = 0; i < lz_n; ++i)
+        if (lzs[i].provider == provider || lzs[i].h0 == native_buffer) return 1;
+    return 0;
+}
+
+void mem_lazy_provider_transition_end(void) {
+    plat_mutex_unlock(&frz_lock);
 }
 
 // Copies each of n ranges of guest memory, src[i] = {address, bytes}, to dst[i] when every page of it can be read
@@ -575,10 +743,11 @@ void mem_lazy_release(uint64_t a, uint64_t n) {
 
 // The back end is ready to fetch: arming starts. 0 when the setting is off (or the probe is on, which watches the
 // same pages).
-int mem_lazy_enable(void (*fetch)(uint64_t h0, uint64_t h1, uint64_t off, uint64_t size),
-                    int (*clean)(uint64_t lo, uint64_t hi, void *ctx)) {
+int mem_lazy_enable(void (*fetch)(uint64_t h0, uint64_t h1, uint64_t off, uint64_t size, uint64_t guest_addr, void *provider),
+                    int (*clean)(uint64_t lo, uint64_t hi, void *ctx), MemLazyFetchVerified fetch_verified) {
     if (!lz_want) return 0;
     lz_fetch = fetch, lz_clean = clean;
+    lz_fetch_verified = fetch_verified;
     __atomic_store_n(&lz_on, 1, __ATOMIC_RELEASE);
     return 1;
 }
@@ -1021,7 +1190,8 @@ static int freeze_locked(uint64_t r) {
     return n > 0;
 }
 
-int mem_freeze(uint64_t a) {
+int mem_freeze_observed(uint64_t a, MemFreezeTransition *transition) {
+    if (transition) *transition = (MemFreezeTransition){0};
     if ((a & (FRZ_SIZE - 1)) || !watched(a, FRZ_SIZE)) return 0;
     uint64_t r = a >> FRZ_SHIFT;
     int ok = 0;
@@ -1032,6 +1202,7 @@ int mem_freeze(uint64_t a) {
     else if (thaw_ms[r] && (int32_t)(now - thaw_ms[r]) < (int32_t)FRZ_HOLD_MS) ok = 0;   // |1 may be ahead
     else if (frz_hot_until[r] && (int32_t)(frz_hot_until[r] - now) > 0) ok = 0;         // hot: held thawed
     else {
+        uint64_t before = mem_protection_region((uint32_t)r), mapping_before = mem_mapping_region((uint32_t)r);
         protection_publish(r, 1);
         if (freeze_locked(r)) {
             frz_ms[r] = now | 1;
@@ -1041,10 +1212,15 @@ int mem_freeze(uint64_t a) {
             ok = 1;
         }
         protection_publish(r, 0);
+        uint64_t after = mem_protection_region((uint32_t)r), mapping_after = mem_mapping_region((uint32_t)r);
+        if (transition && ok && before && after > before && mapping_before && mapping_after == mapping_before)
+            *transition = (MemFreezeTransition){before, after, mapping_before};
     }
     plat_mutex_unlock(&frz_lock);
     return ok;
 }
+
+int mem_freeze(uint64_t a) { return mem_freeze_observed(a, NULL); }
 
 int mem_frozen(uint64_t a) { return a < RT_ADDRESS_LIMIT && __atomic_load_n(&frz[a >> FRZ_SHIFT], __ATOMIC_ACQUIRE); }
 
@@ -1240,6 +1416,96 @@ static void reexec_or_fail(const char *what) {
     plat_reexec();
 }
 
+// A single sparse storage map is the canonical view of host bytes. Importing the same allocation into multiple
+// Vulkan buffers cannot create multiple identities. This monitor owns metadata, not the memory or Vulkan lifetime.
+enum { HOST_STORAGE_NAMESPACE = 1 };
+static RcBackingStore *host_backing_store;
+static RcBackingMapId host_backing_map;
+static int host_backing_failure;
+// Kernel backing publication also runs under the kernel allocator lock, outside the host mapping lock.
+// Serialize canonical mutations with scoped receipt measurement and fill.
+static PlatMutex host_backing_topology_lock = PLAT_MUTEX_INIT;
+struct MemBackingCapture {
+    uint64_t address, size;
+    uint32_t count;
+    RcInterval intervals[];
+};
+
+static RcBackingResult host_backing_status(void) {
+    return (RcBackingResult)__atomic_load_n(&host_backing_failure, __ATOMIC_ACQUIRE);
+}
+
+static void host_backing_note_failure(RcBackingResult result, const char *operation) {
+    int expected = RC_BACKING_OK;
+    if (result != RC_BACKING_OK &&
+        __atomic_compare_exchange_n(&host_backing_failure, &expected, result, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+        RcBackingConfig usage = rc_backing_store_usage(host_backing_store);
+        rt_log("memory: canonical host backing unavailable after %s (%d): %u backings, %u current intervals, "
+               "%u retained captures, %u captured intervals", operation, (int)result, usage.backings,
+               usage.current_segments, usage.captures, usage.captured_segments);
+    }
+}
+
+static void host_backing_init(void) {
+    const RcBackingConfig capacity = {16384, 1, 32768, 8192, 65536};
+    host_backing_store = rc_backing_store_create(capacity);
+    if (!host_backing_store) {
+        host_backing_note_failure(RC_BACKING_CAPACITY, "store creation");
+        return;
+    }
+    host_backing_note_failure(rc_backing_storage_map_create(host_backing_store, HOST_STORAGE_NAMESPACE,
+                                                           0, 0, RT_ADDRESS_LIMIT, &host_backing_map), "map creation");
+}
+
+static void host_backing_publish(uint64_t address, uint64_t size) {
+    if (!size || host_backing_status() != RC_BACKING_OK) return;
+    plat_mutex_lock(&host_backing_topology_lock);
+    host_backing_note_failure(rc_backing_storage_map_publish(host_backing_store, host_backing_map, address, size),
+                              "storage publication");
+    plat_mutex_unlock(&host_backing_topology_lock);
+}
+
+static void host_backing_notify(uint64_t address, uint64_t size, int retired) {
+    if (!size || host_backing_status() != RC_BACKING_OK) return;
+    uint64_t end = address + size;
+    RcRegistry *registry = rc_registry_runtime();
+    // The caller holds the host mapping lock. The first read validates the full range and later reads can only
+    // narrow it. Every current interval is visited without using provider/capture slots.
+    while (address < end) {
+        RcInterval intervals[32];
+        uint32_t count;
+        RcBackingResult result = rc_backing_map_intervals(host_backing_store, host_backing_map, address, end - address,
+                                                         intervals, sizeof intervals / sizeof *intervals, &count);
+        if (result != RC_BACKING_OK || !count) {
+            host_backing_note_failure(result != RC_BACKING_OK ? result : RC_BACKING_STALE, "storage notification");
+            return;
+        }
+        for (uint32_t i = 0; i < count; i++) {
+            RcSourceRange range = intervals[i].range;
+            if (!range.backing) continue;
+            if (retired) rc_registry_range_gone(registry, range);
+            else rc_registry_cpu_changed(registry, range);
+        }
+        address = intervals[count - 1].address + intervals[count - 1].range.size;
+    }
+}
+
+static void host_backing_invalidate(uint64_t address, uint64_t size) {
+    if (!size || host_backing_status() != RC_BACKING_OK) return;
+    host_backing_notify(address, size, 1);
+    // A failed split could leave old topology in the store. Disable certification before the native change.
+    plat_mutex_lock(&host_backing_topology_lock);
+    host_backing_note_failure(rc_backing_import_invalidate(host_backing_store, HOST_STORAGE_NAMESPACE, address, size),
+                              "storage invalidation");
+    plat_mutex_unlock(&host_backing_topology_lock);
+}
+
+void mem_backing_publish_module(uint64_t address, uint64_t size) {
+    plat_mutex_lock(&lock);
+    host_backing_publish(address, size);
+    plat_mutex_unlock(&lock);
+}
+
 void mem_init(void) {
     if (L.pool) return;
     // Fixed window: modules, kernel region, host-function addresses.
@@ -1289,6 +1555,7 @@ void mem_init(void) {
         .pool = pool ? strtoull(pool, NULL, 0) : DEFAULT_POOL + res_heap_extra_bytes(),   // resolution.c
     };
     if (!L.pool) rt_fatal("memory: NX2NAVI_APP_POOL is 0");
+    host_backing_init();
 #ifdef _WIN32
     if (cfg_bool("NX2NAVI_HEAP_LAZY")) {   // set before the game's first SetHeapSize
         plat_mem_access_hook(access_fault);
@@ -1374,7 +1641,12 @@ uint32_t mem_set_heap_size(uint64_t size, uint64_t *addr) {
     uint64_t was = heap_size;
     uint64_t changed = L.heap.base + (size < was ? size : was), moved = size > was ? size - was : was - size;
     mem_mapping_publish(&mapping, changed, moved, 1);
-    if (size > was && !heap_lazy) commit(L.heap.base + was, size - was, "heap");
+    if (size > was) {
+        if (!heap_lazy) commit(changed, moved, "heap");
+        host_backing_publish(changed, moved);
+    } else if (size < was) {
+        host_backing_invalidate(changed, moved);
+    }
     __atomic_store_n(&heap_size, size, __ATOMIC_RELEASE);   // before a shrink: no first-use commit past the new end
     if (size < was) decommit(L.heap.base + size, was - size, "heap");   // reserved pages in the range are fine
     mem_mapping_publish(&mapping, changed, moved, 0);
@@ -1493,6 +1765,8 @@ static uint32_t stack_move(int unmap, uint64_t dst, uint64_t src, uint64_t n) {
         mem_mapping_publish(&mapping, dst, n, 1);
         protect(src, n, PLAT_PROT_RW, "moved stack source");
         memcpy((void *)(uintptr_t)src, (const void *)(uintptr_t)dst, n);
+        host_backing_notify(src, n, 0);
+        host_backing_invalidate(dst, n);
         decommit(dst, n, "moved stack");
         stack_maps[found] = stack_maps[--nstack_maps];
         mem_mapping_publish(&mapping, src, n, 0);
@@ -1513,6 +1787,7 @@ static uint32_t stack_move(int unmap, uint64_t dst, uint64_t src, uint64_t n) {
         commit(dst, n, "moved stack");
         memcpy((void *)(uintptr_t)dst, (const void *)(uintptr_t)src, n);
         protect(src, n, PLAT_PROT_NONE, "moved stack source");
+        host_backing_publish(dst, n);
         stack_maps[nstack_maps++] = (StackMap){dst, src, n};
         mem_mapping_publish(&mapping, src, n, 0);
         mem_mapping_publish(&mapping, dst, n, 0);
@@ -1539,8 +1814,13 @@ static uint64_t alias_runs(uint64_t first, uint64_t count, int do_commit) {   //
         if (!next) next = end;
         uint64_t a = L.alias.base + (uint64_t)(p - alias_pages) * PAGE, n = (uint64_t)(next - p) * PAGE;
         mem_mapping_publish(&mapping, a, n, 1);
-        if (do_commit) commit(a, n, "physical memory");
-        else decommit(a, n, "physical memory");
+        if (do_commit) {
+            commit(a, n, "physical memory");
+            host_backing_publish(a, n);
+        } else {
+            host_backing_invalidate(a, n);
+            decommit(a, n, "physical memory");
+        }
         memset(p, !want, (size_t)(next - p));
         mem_mapping_publish(&mapping, a, n, 0);
         changed += n;
@@ -1678,6 +1958,241 @@ int mem_read_hold(uint64_t a, uint64_t n) {
 }
 
 void mem_read_release(void) { plat_mutex_unlock_shared(&lock); }
+
+void mem_backing_cpu_changed(uint64_t address, uint64_t size) {
+    if (!size || address >= RT_ADDRESS_LIMIT || size > RT_ADDRESS_LIMIT - address) return;
+    plat_mutex_lock_shared(&lock);
+    host_backing_notify(address, size, 0);
+    plat_mutex_unlock_shared(&lock);
+}
+
+void mem_backing_cpu_changed_held(const MemBackingCapture *capture, uint64_t address, uint64_t size,
+                                  const RcRegistryVisibility *overwritten) {
+    if (!size || address >= RT_ADDRESS_LIMIT || size > RT_ADDRESS_LIMIT - address) return;
+    if (!capture) {
+        host_backing_notify(address, size, 0);
+        return;
+    }
+    RcRegistry *registry = rc_registry_runtime();
+    uint64_t end = address + size;
+    for (uint32_t i = 0; i < capture->count; i++) {
+        const RcInterval *span = &capture->intervals[i];
+        uint64_t lo = address > span->address ? address : span->address;
+        uint64_t hi = span->address + span->range.size;
+        if (hi > end) hi = end;
+        if (hi <= lo) continue;
+        RcSourceRange actual = {span->range.backing, span->range.offset + (lo - span->address), hi - lo};
+        rc_registry_cpu_changed(registry, actual);
+        if (overwritten && overwritten->horizon) rc_registry_visibility_apply(registry, overwritten, actual);
+    }
+}
+
+static size_t mem_backing_capture_bytes(uint32_t count) {
+    size_t available = (SIZE_MAX - sizeof(MemBackingCapture)) / sizeof(RcInterval);
+    return count && count <= available ? sizeof(MemBackingCapture) + (size_t)count * sizeof(RcInterval) : 0;
+}
+
+static RcBackingResult host_capture_coverage(const RcInterval *intervals, uint32_t count,
+                                             uint64_t *address, uint64_t end, uint64_t *latest_mapping) {
+    if (!count) return RC_BACKING_STALE;
+    for (uint32_t i = 0; i < count; i++) {
+        const RcInterval *interval = &intervals[i];
+        if (interval->address != *address || !interval->range.size || interval->range.size > end - *address)
+            return RC_BACKING_STALE;
+        if (!interval->mapping || !interval->range.backing) return RC_BACKING_ABSENT;
+        if (interval->mapping > *latest_mapping) *latest_mapping = interval->mapping;
+        *address += interval->range.size;
+    }
+    return RC_BACKING_OK;
+}
+
+RcBackingResult mem_backing_capture_plan(uint64_t address, uint64_t size, MemBackingCapturePlan *out) {
+    if (!out || !size || address >= RT_ADDRESS_LIMIT || size > RT_ADDRESS_LIMIT - address) return RC_BACKING_INVALID;
+    *out = (MemBackingCapturePlan){0};
+    plat_mutex_lock_shared(&lock);
+    plat_mutex_lock_shared(&host_backing_topology_lock);
+    RcBackingResult result = host_backing_status();
+    if (result == RC_BACKING_OK && !host_backing_store) result = RC_BACKING_ABSENT;
+    uint64_t next = address, end = address + size, latest_mapping = 0;
+    uint32_t count = 0;
+    // A bounded projection can succeed with only its first intervals. Follow the returned coverage to the end.
+    while (result == RC_BACKING_OK && next != end) {
+        RcInterval intervals[32];
+        uint32_t copied;
+        result = rc_backing_map_intervals(host_backing_store, host_backing_map, next, end - next,
+                                          intervals, sizeof intervals / sizeof *intervals, &copied);
+        if (result != RC_BACKING_OK) break;
+        if (copied > sizeof intervals / sizeof *intervals || copied > UINT32_MAX - count) {
+            result = RC_BACKING_CAPACITY;
+            break;
+        }
+        result = host_capture_coverage(intervals, copied, &next, end, &latest_mapping);
+        count += copied;
+    }
+    if (result == RC_BACKING_OK) {
+        size_t bytes = mem_backing_capture_bytes(count);
+        if (bytes) *out = (MemBackingCapturePlan){address, size, latest_mapping, bytes, count};
+        else result = RC_BACKING_CAPACITY;
+    }
+    plat_mutex_unlock_shared(&host_backing_topology_lock);
+    plat_mutex_unlock_shared(&lock);
+    return result;
+}
+
+static RcBackingResult mem_backing_capture_impl(uint64_t address, uint64_t size,
+                                               const MemBackingCapturePlan *plan, MemBackingCapture **out) {
+    if (out) *out = NULL;
+    if (!out || !size || address >= RT_ADDRESS_LIMIT || size > RT_ADDRESS_LIMIT - address) return RC_BACKING_INVALID;
+    plat_mutex_lock_shared(&lock);
+    if (plan) plat_mutex_lock_shared(&host_backing_topology_lock);
+    RcBackingResult result = host_backing_status();
+    uint32_t count = 0;
+    if (result == RC_BACKING_OK)
+        result = host_backing_store ? rc_backing_map_intervals(host_backing_store, host_backing_map, address, size,
+                                                              NULL, 0, &count) : RC_BACKING_ABSENT;
+    MemBackingCapture *capture = NULL;
+    if (result == RC_BACKING_OK) {
+        size_t bytes = mem_backing_capture_bytes(count);
+        if (plan && (count != plan->count || bytes != plan->bytes)) result = RC_BACKING_STALE;
+        else {
+            capture = bytes ? malloc(bytes) : NULL;
+            if (!capture) result = RC_BACKING_CAPACITY;
+        }
+    }
+    if (result == RC_BACKING_OK) {
+        uint32_t copied;
+        *capture = (MemBackingCapture){.address = address, .size = size, .count = count};
+        result = rc_backing_map_intervals(host_backing_store, host_backing_map, address, size,
+                                          capture->intervals, count, &copied);
+        if (result == RC_BACKING_OK && copied != count) result = RC_BACKING_STALE;
+        if (result == RC_BACKING_OK && plan) {
+            uint64_t next = address, end = address + size, latest_mapping = 0;
+            result = host_capture_coverage(capture->intervals, copied, &next, end, &latest_mapping);
+            // The private host storage map only inserts into holes, with monotonically increasing mapping
+            // IDs assigned under its lock. Invalidation removes coverage or clips its existing IDs and offsets.
+            // A changed, fully mapped range must therefore contain an ID newer than its previous maximum.
+            if (result == RC_BACKING_OK && (next != end || latest_mapping != plan->latest_mapping))
+                result = RC_BACKING_STALE;
+        }
+    }
+    if (plan) plat_mutex_unlock_shared(&host_backing_topology_lock);
+    plat_mutex_unlock_shared(&lock);
+    for (uint32_t i = 0; result == RC_BACKING_OK && i < count; i++)
+        if (!capture->intervals[i].range.backing) result = RC_BACKING_ABSENT;
+    if (result == RC_BACKING_OK) *out = capture;
+    else free(capture);
+    return result;
+}
+
+RcBackingResult mem_backing_capture(uint64_t address, uint64_t size, MemBackingCapture **out) {
+    return mem_backing_capture_impl(address, size, NULL, out);
+}
+
+RcBackingResult mem_backing_capture_bounded(const MemBackingCapturePlan *plan, MemBackingCapture **out) {
+    if (!plan) return RC_BACKING_INVALID;
+    return mem_backing_capture_impl(plan->address, plan->size, plan, out);
+}
+
+const RcInterval *mem_backing_intervals(const MemBackingCapture *capture, uint32_t *count) {
+    if (count) *count = capture ? capture->count : 0;
+    return capture ? capture->intervals : NULL;
+}
+
+static int host_backing_range_current_locked(const MemBackingCapture *capture, uint64_t address, uint64_t size) {
+    return capture && host_backing_status() == RC_BACKING_OK &&
+        rc_backing_map_intervals_current(host_backing_store, host_backing_map, capture->intervals, capture->count,
+                                         address, size);
+}
+
+uint64_t mem_mapping_validate_read_ranges(const MemMappingReadRange *ranges, uint32_t count, uint64_t before) {
+    if (!before) return 0;
+    plat_mutex_lock_shared(&lock);
+    plat_mutex_lock_shared(&host_backing_topology_lock);
+    uint64_t result = mem_mapping_serial();
+    for (uint32_t i = 0; result && i < count; i++) {
+        const MemMappingReadRange *range = &ranges[i];
+        int current = range->backing ?
+            host_backing_range_current_locked(range->backing, range->address, range->bytes) :
+            mem_mapping_range_unchanged(range->address, range->bytes, before);
+        if (current && range->needs_readable) current = readable_locked(range->address, range->bytes);
+        if (!current) result = 0;
+    }
+    plat_mutex_unlock_shared(&host_backing_topology_lock);
+    plat_mutex_unlock_shared(&lock);
+    return result;
+}
+
+int mem_backing_current_range(const MemBackingCapture *capture, uint64_t address, uint64_t size) {
+    if (!capture) return 0;
+    plat_mutex_lock_shared(&lock);
+    int current = host_backing_range_current_locked(capture, address, size);
+    plat_mutex_unlock_shared(&lock);
+    return current;
+}
+
+int mem_backing_current(const MemBackingCapture *capture) {
+    return capture && mem_backing_current_range(capture, capture->address, capture->size);
+}
+
+int mem_backing_read_hold_at(const MemBackingCapture *capture, uint64_t address, uint64_t size) {
+    plat_mutex_lock_shared(&lock);
+    if (host_backing_range_current_locked(capture, address, size) && readable_locked(address, size)) return 1;
+    plat_mutex_unlock_shared(&lock);
+    return 0;
+}
+
+int mem_backing_read_hold_no_fault_at(const MemBackingCapture *capture, uint64_t address, uint64_t size) {
+    if (!size || address>=RT_ADDRESS_LIMIT || size>RT_ADDRESS_LIMIT-address ||
+        !mem_backing_read_hold_at(capture,address,size)) return 0;
+    // A lazy fetch can already hold the fault lock and wait for the recorder. Never wait here.
+    if (!mem_lazy_provider_transition_try()) {
+        mem_read_release();
+        return 0;
+    }
+    const uint64_t end=address+size;
+    int safe=1;
+    for (uint64_t region=address>>FRZ_SHIFT; safe && region<=((end-1)>>FRZ_SHIFT); ++region)
+        safe=!__atomic_load_n(&prb[region],__ATOMIC_RELAXED);
+    for (int i=0; safe && i<lz_n; ++i)
+        safe=lzs[i].hi<=address || lzs[i].lo>=end;
+    if (safe) return 1;
+    mem_backing_read_release_no_fault();
+    return 0;
+}
+
+void mem_backing_read_release_no_fault(void) {
+    mem_lazy_provider_transition_end();
+    mem_read_release();
+}
+
+int mem_backing_read_hold(const MemBackingCapture *capture) {
+    return capture && mem_backing_read_hold_at(capture, capture->address, capture->size);
+}
+
+int mem_backing_write_hold(const MemBackingCapture *capture) {
+    if (!capture) return 0;
+    plat_mutex_lock_shared(&lock);
+    if (host_backing_range_current_locked(capture, capture->address, capture->size)) {
+        uint64_t cursor = capture->address;
+        const uint64_t end = cursor + capture->size;
+        while (cursor < end) {
+            RtMemoryInfo region;
+            query_locked(cursor, &region);
+            if (region.state == ST_FREE || region.state == ST_INACCESSIBLE ||
+                (region.perm & PERM_RW) != PERM_RW || region.base + region.size <= cursor) break;
+            cursor = region.base + region.size;
+        }
+        if (cursor >= end) return 1;
+    }
+    plat_mutex_unlock_shared(&lock);
+    return 0;
+}
+
+void mem_backing_release(MemBackingCapture **owned) {
+    if (!owned) return;
+    free(*owned);
+    *owned = NULL;
+}
 
 uint32_t mem_query(uint64_t a, RtMemoryInfo *out) {
     plat_mutex_lock_shared(&lock);
@@ -1820,6 +2335,7 @@ void *mem_kernel_alloc(uint64_t size, uint64_t align) {
         if (!kcommitted) kcommitted = RT_KERNEL_BASE;
         if (need > kcommitted) {
             commit(kcommitted, need - kcommitted, "kernel region");
+            host_backing_publish(kcommitted, need - kcommitted);
             kcommitted = need;
         }
         kbump = a + bytes;
